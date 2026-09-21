@@ -41,6 +41,7 @@ export default function CaseDetailsTabs({
   hideEscalationTab = true,
   escalationCount,
   isEscalated = false,
+  verificationsCount,
 }: CaseDetailsTabsProps): JSX.Element {
   const theme = useTheme();
   const tabs = CASE_DETAILS_TABS.filter((t) => {
@@ -92,6 +93,7 @@ export default function CaseDetailsTabs({
           const isCallsTab = label.startsWith("Calls");
           const isKnowledgeBaseTab = label.startsWith("Knowledge Base");
           const isEscalationTab = label === "Escalation";
+          const isVerificationsTab = label === "Verifications";
 
           let tabLabel: ReactNode = label;
           let tabIcon: ReactNode = <Icon size={14} />;
@@ -123,6 +125,8 @@ export default function CaseDetailsTabs({
             if (isEscalated) {
               tabIcon = <Box component="span" sx={{ color: theme.palette.warning.main, display: "flex" }}><Icon size={14} /></Box>;
             }
+          } else if (isVerificationsTab && verificationsCount !== undefined) {
+            tabLabel = `Verifications (${verificationsCount})`;
           }
 
           return (

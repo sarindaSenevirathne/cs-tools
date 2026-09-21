@@ -22,6 +22,7 @@ import useInfiniteProjects, { flattenProjectPages } from "@api/useGetProjects";
 import useGetProjectDetails from "@api/useGetProjectDetails";
 import useGetProjectFeatures from "@api/useGetProjectFeatures";
 import useGetMetadata from "@api/useGetMetadata";
+import { usePendingVerificationsListSearch } from "@features/support/api/usePendingVerificationsListSearch";
 import { APP_SHELL_NAV_ITEMS } from "@features/project-hub/constants/appLayoutConstants";
 import type { AppShellNavItem } from "@features/project-hub/types/appLayout";
 import { getProjectPermissions } from "@utils/permission";
@@ -61,6 +62,17 @@ export default function SideBar({
   const { data: portalMetadata } = useGetMetadata();
   const usageMetricsEnabled =
     portalMetadata?.featureFlags?.usageMetricsEnabled === true;
+
+  // Live unverified-record count for the "Pending Verification" nav badge —
+  // limit: 1 since only totalRecords (aggregated over the full filtered set,
+  // not just the page) is needed.
+  const { data: pendingVerificationData } = usePendingVerificationsListSearch(
+    projectId || "",
+    { includeVerified: false },
+    { limit: 1, offset: 0 },
+    !!projectId,
+  );
+  const pendingVerificationCount = pendingVerificationData?.totalRecords ?? 0;
 
   const projectTypeLabel =
     selectedProject?.type?.label ?? projectDetails?.type?.label;
@@ -147,7 +159,29 @@ export default function SideBar({
                 <Sidebar.ItemIcon>
                   <item.icon />
                 </Sidebar.ItemIcon>
-                <Sidebar.ItemLabel>{item.label}</Sidebar.ItemLabel>
+                <Sidebar.ItemLabel
+                  sx={{
+                    minWidth: "0px !important",
+                    flex: "1 1 auto",
+                    overflow: "hidden",
+                    "& .MuiListItemText-primary": {
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      display: "block",
+                    },
+                  }}
+                >
+                  {item.label}
+                </Sidebar.ItemLabel>
+                {item.id === "verifications" && pendingVerificationCount > 0 && (
+                  <Sidebar.ItemBadge
+                    color="success"
+                    sx={{ flexShrink: 0 }}
+                  >
+                    {pendingVerificationCount}
+                  </Sidebar.ItemBadge>
+                )}
               </Sidebar.Item>
             </Link>
           ))}

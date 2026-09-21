@@ -40,6 +40,7 @@ import PendingUpdatesPage from "@features/updates/pages/PendingUpdatesPage";
 import UpdateLevelDetailsPage from "@features/updates/pages/UpdateLevelDetailsPage";
 import AnnouncementsPage from "@features/announcements/pages/AnnouncementsPage";
 import AnnouncementDetailsPage from "@features/announcements/pages/AnnouncementDetailsPage";
+import PendingVerificationsPage from "@features/support/pages/PendingVerificationsPage";
 import OperationsPage from "@features/operations/pages/OperationsPage";
 import SecurityPage from "@features/security/pages/SecurityPage";
 import VulnerabilityDetailsPage from "@features/security/pages/VulnerabilityDetailsPage";
@@ -254,6 +255,11 @@ export default function App(): JSX.Element {
                       element={<AnnouncementDetailsPage />}
                     />
                   </Route>
+                  {/* Pending Verification */}
+                  <Route
+                    path="verifications"
+                    element={<PendingVerificationsPage />}
+                  />
                   {/* Settings */}
                   <Route path="settings" element={<SettingsPage />} />
                 </Route>

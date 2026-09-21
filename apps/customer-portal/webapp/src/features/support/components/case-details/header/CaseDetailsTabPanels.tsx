@@ -25,6 +25,7 @@ import CaseDetailsDetailsPanel from "@case-details-details/CaseDetailsDetailsPan
 import CallsPanel from "@case-details-calls/CallsPanel";
 import CaseKnowledgeBaseRecommendations from "@features/support/components/knowledge-base/CaseKnowledgeBaseRecommendations";
 import CaseEscalationHistoryPanel from "../escalation/CaseEscalationHistoryPanel";
+import CaseVerificationsPanel from "../verifications-tab/CaseVerificationsPanel";
 
 /**
  * Renders the active tab panel for case details (Activity, Details, Attachments, Calls,
@@ -203,6 +204,17 @@ export default function CaseDetailsTabPanels({
           caseCreatedOn={data?.createdOn}
         />
       );
+    case 7: {
+      const resolvedProjectId = data?.project?.id ?? projectId;
+      if (!resolvedProjectId) {
+        return (
+          <Typography variant="body2" color="text.secondary">
+            Verification history will appear here.
+          </Typography>
+        );
+      }
+      return <CaseVerificationsPanel projectId={resolvedProjectId} caseId={caseId} />;
+    }
     default:
       return null;
   }

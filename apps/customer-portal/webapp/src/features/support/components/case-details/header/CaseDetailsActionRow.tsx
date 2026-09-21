@@ -30,6 +30,7 @@ import RejectSolutionDialog from "@features/support/components/case-details/dial
 import EscalateCaseModal from "../escalation/EscalateCaseModal";
 import DeescalateCaseModal from "../escalation/DeescalateCaseModal";
 import CaseFeedbackModal from "../feedback/CaseFeedbackModal";
+import AddToVerificationDialog from "../verifications-tab/AddToVerificationDialog";
 import { type JSX, useState } from "react";
 import {
   CASE_STATUS_ACTIONS,
@@ -42,6 +43,8 @@ import {
 import useGetProjectFilters from "@api/useGetProjectFilters";
 import { usePatchCase } from "@features/support/api/usePatchCase";
 import { usePostComment } from "@features/support/api/usePostComment";
+import { useCreatePendingVerification } from "@features/support/api/useCreatePendingVerification";
+import { useVerifyPendingVerification } from "@features/support/api/useVerifyPendingVerification";
 import { useErrorBanner } from "@context/error-banner/ErrorBannerContext";
 import { useSuccessBanner } from "@context/success-banner/SuccessBannerContext";
 import {
@@ -52,7 +55,7 @@ import {
   toPresentTenseActionLabel,
 } from "@features/support/utils/support";
 import { escapeHtml } from "@features/support/utils/richTextEditor";
-import { TriangleAlert } from "@wso2/oxygen-ui-icons-react";
+import { CircleCheck, ShieldCheck, TriangleAlert } from "@wso2/oxygen-ui-icons-react";
 
 const ACTION_BUTTON_ICON_SIZE = 12;
 const DEESCALATE_PERMISSION_TOOLTIP =
@@ -110,6 +113,12 @@ export default function CaseDetailsActionRow({
   isEscalated,
   canDeescalate,
   onDeescalateSuccess,
+  isCaseClosed = false,
+  hasNoVerificationRecord = false,
+  isPendingVerification = false,
+  pendingVerificationId,
+  onAddToVerificationSuccess,
+  onMarkVerifiedSuccess,
 }: CaseDetailsActionRowProps): JSX.Element {
   void assignedEngineer;
   void engineerInitials;
@@ -123,6 +132,8 @@ export default function CaseDetailsActionRow({
 
   const patchCase = usePatchCase(projectId, caseId);
   const postComment = usePostComment();
+  const createPendingVerification = useCreatePendingVerification(projectId, caseId);
+  const verifyPendingVerification = useVerifyPendingVerification(projectId, caseId);
   const [pendingActionLabel, setPendingActionLabel] = useState<string | null>(null);
   const [confirmAction, setConfirmAction] = useState<{
     label: string;
@@ -133,6 +144,41 @@ export default function CaseDetailsActionRow({
   const [feedbackModalOpen, setFeedbackModalOpen] = useState(false);
   const [rejectDialogOpen, setRejectDialogOpen] = useState(false);
   const [isRejectSubmitting, setIsRejectSubmitting] = useState(false);
+  const [addToVerificationOpen, setAddToVerificationOpen] = useState(false);
+  const [markVerifiedOpen, setMarkVerifiedOpen] = useState(false);
+
+  const showAddToVerificationButton = isCaseClosed && hasNoVerificationRecord;
+  const showMarkVerifiedButton = isPendingVerification && !!pendingVerificationId;
+
+  const handleAddToVerificationConfirm = (note?: string): void => {
+    createPendingVerification.mutate(
+      { workItemId: caseId, addedReason: "manual", note },
+      {
+        onSuccess: () => {
+          showSuccess("Case added to verification list.");
+          onAddToVerificationSuccess?.();
+        },
+        onError: (err) => {
+          showError(err?.message ?? "Failed to add case to verification list.");
+        },
+        onSettled: () => setAddToVerificationOpen(false),
+      },
+    );
+  };
+
+  const handleMarkVerifiedConfirm = (): void => {
+    if (!pendingVerificationId) return;
+    verifyPendingVerification.mutate(pendingVerificationId, {
+      onSuccess: () => {
+        showSuccess("Case marked as verified.");
+        onMarkVerifiedSuccess?.();
+      },
+      onError: (err) => {
+        showError(err?.message ?? "Failed to mark case as verified.");
+      },
+      onSettled: () => setMarkVerifiedOpen(false),
+    });
+  };
 
   const resolvedEscalationLevelId = escalationLevelId != null ? String(escalationLevelId) : null;
   const escalationLevelInfo = resolvedEscalationLevelId != null ? ESCALATION_NEXT_LEVEL[resolvedEscalationLevelId ?? "0"] : null;
@@ -319,6 +365,28 @@ export default function CaseDetailsActionRow({
           </Box>
         </Tooltip>
       )}
+      {showAddToVerificationButton && (
+        <Button
+          variant="outlined"
+          size="small"
+          startIcon={<ShieldCheck size={ACTION_BUTTON_ICON_SIZE} />}
+          onClick={() => setAddToVerificationOpen(true)}
+          sx={getActionButtonSx(theme, "info") as Record<string, unknown>}
+        >
+          Add to Verification
+        </Button>
+      )}
+      {showMarkVerifiedButton && (
+        <Button
+          variant="outlined"
+          size="small"
+          startIcon={<CircleCheck size={ACTION_BUTTON_ICON_SIZE} />}
+          onClick={() => setMarkVerifiedOpen(true)}
+          sx={getActionButtonSx(theme, "success") as Record<string, unknown>}
+        >
+          Mark Verified
+        </Button>
+      )}
       <CaseStateConfirmDialog
         open={!!confirmAction}
         actionLabel={confirmAction ? toPresentTenseActionLabel(confirmAction.label) : ""}
@@ -392,6 +460,20 @@ export default function CaseDetailsActionRow({
           onError={(msg) => showError(msg)}
         />
       )}
+      <AddToVerificationDialog
+        open={addToVerificationOpen}
+        isPending={createPendingVerification.isPending}
+        onClose={() => setAddToVerificationOpen(false)}
+        onConfirm={handleAddToVerificationConfirm}
+      />
+      <CaseStateConfirmDialog
+        open={markVerifiedOpen}
+        title="Mark as Verified"
+        actionLabel="mark as verified"
+        isPending={verifyPendingVerification.isPending}
+        onClose={() => setMarkVerifiedOpen(false)}
+        onConfirm={handleMarkVerifiedConfirm}
+      />
     </Stack>
   );
 }

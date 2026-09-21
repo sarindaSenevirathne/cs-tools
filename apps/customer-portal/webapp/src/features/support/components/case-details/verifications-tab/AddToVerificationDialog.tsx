@@ -14,7 +14,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { type JSX } from "react";
+import { type JSX, useState } from "react";
 import {
   Button,
   CircularProgress,
@@ -24,55 +24,76 @@ import {
   DialogContentText,
   DialogTitle,
   IconButton,
+  TextField,
 } from "@wso2/oxygen-ui";
 import { X } from "@wso2/oxygen-ui-icons-react";
 
-export interface CaseStateConfirmDialogProps {
+export interface AddToVerificationDialogProps {
   open: boolean;
-  actionLabel: string;
   isPending: boolean;
   onClose: () => void;
-  onConfirm: () => void;
-  title?: string;
+  onConfirm: (note?: string) => void;
 }
 
-export default function CaseStateConfirmDialog({
+/**
+ * Confirmation dialog for manually adding a closed case to the pending
+ * verification list, with an optional free-text note.
+ *
+ * @param {AddToVerificationDialogProps} props - Open/pending state and callbacks.
+ * @returns {JSX.Element} The dialog.
+ */
+export default function AddToVerificationDialog({
   open,
-  actionLabel,
   isPending,
   onClose,
   onConfirm,
-  title = "Confirm State Change",
-}: CaseStateConfirmDialogProps): JSX.Element {
+}: AddToVerificationDialogProps): JSX.Element {
+  const [note, setNote] = useState("");
+
+  const handleClose = (): void => {
+    if (isPending) return;
+    setNote("");
+    onClose();
+  };
+
   return (
-    <Dialog open={open} onClose={isPending ? undefined : onClose} maxWidth="xs" fullWidth>
+    <Dialog open={open} onClose={isPending ? undefined : handleClose} maxWidth="xs" fullWidth>
       <DialogTitle
         sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}
       >
-        {title}
-        <IconButton size="small" onClick={onClose} aria-label="close" disabled={isPending}>
+        Add to Verification
+        <IconButton size="small" onClick={handleClose} aria-label="close" disabled={isPending}>
           <X size={18} />
         </IconButton>
       </DialogTitle>
       <DialogContent>
-        <DialogContentText>
-          Are you sure you want to{" "}
-          <strong>{actionLabel.toLowerCase()}</strong> this case?
+        <DialogContentText sx={{ mb: 2 }}>
+          Add this case to the verification list so it can be reviewed and signed off.
         </DialogContentText>
+        <TextField
+          label="Note (optional)"
+          placeholder="Add any context for the verification history"
+          fullWidth
+          multiline
+          minRows={3}
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          disabled={isPending}
+        />
       </DialogContent>
       <DialogActions>
-        <Button onClick={onClose} disabled={isPending}>
+        <Button onClick={handleClose} disabled={isPending}>
           Cancel
         </Button>
         <Button
           variant="contained"
-          onClick={onConfirm}
+          onClick={() => onConfirm(note.trim() || undefined)}
           disabled={isPending}
           startIcon={
             isPending ? <CircularProgress size={16} color="inherit" /> : undefined
           }
         >
-          {isPending ? "Updating…" : "Confirm"}
+          {isPending ? "Adding…" : "Add to Verification"}
         </Button>
       </DialogActions>
     </Dialog>

@@ -76,6 +76,7 @@ export const ApiQueryKeys = {
   CASE_ESCALATIONS_SEARCH: "case-escalations-search",
   CASE_FEEDBACK: "case-feedback",
   GLOBAL_SEARCH: "global-search",
+  PENDING_VERIFICATIONS_SEARCH: "pending-verifications-search",
 } as const;
 
 // Constants for API-related mutation keys.

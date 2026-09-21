@@ -58,6 +58,8 @@ export type CaseDetailsHeaderProps = {
   variant?: CaseDetailsHeaderVariant;
   isEscalated?: boolean;
   escalationLevelLabel?: string | null;
+  isPendingVerification?: boolean;
+  isCaseVerified?: boolean;
 };
 
 export type OutstandingCasesListProps = {
@@ -410,6 +412,7 @@ export type CaseDetailsTabsProps = {
   hideEscalationTab?: boolean;
   escalationCount?: number;
   isEscalated?: boolean;
+  verificationsCount?: number;
 };
 
 export type CaseDetailsTabPanelsProps = {
@@ -452,6 +455,13 @@ export type CaseDetailsActionRowProps = {
   isEscalated?: boolean;
   canDeescalate?: boolean;
   onDeescalateSuccess?: () => void;
+  isCaseClosed?: boolean;
+  hasNoVerificationRecord?: boolean;
+  isPendingVerification?: boolean;
+  isCaseVerified?: boolean;
+  pendingVerificationId?: string | null;
+  onAddToVerificationSuccess?: () => void;
+  onMarkVerifiedSuccess?: () => void;
 };
 
 export type EscalateCaseModalProps = {

@@ -37,6 +37,7 @@ import {
   XCircle,
   FileCheck,
   AlertCircle,
+  ShieldCheck,
 } from "@wso2/oxygen-ui-icons-react";
 import type { ProjectCasesStats } from "@features/support/types/cases";
 import type {
@@ -330,6 +331,7 @@ export const CASE_DETAILS_TABS: CaseDetailsTabConfig[] = [
   { label: "Knowledge Base (0)", Icon: BookOpen },
   { label: "Related Change Requests", Icon: GitBranch },
   { label: "Escalation", Icon: TriangleAlert },
+  { label: "Verifications", Icon: ShieldCheck },
 ];
 
 export const ESCALATION_MAX_LEVEL_ID = "5";
@@ -541,6 +543,25 @@ export const ANNOUNCEMENT_STAT_CONFIGS: SupportStatConfig<AnnouncementStatKey>[]
       key: "total",
       label: "Total",
     },
+  ];
+
+/**
+ * Valid keys for pending-verification list statistics. Limited to what the
+ * search response actually aggregates over the full filtered set
+ * (totalRecords/autoClosedCount/manualCount) — no full-set "verified" count
+ * is exposed by the backend, so that stat is deliberately not included here
+ * rather than showing a misleading current-page-only number.
+ */
+export type PendingVerificationStatKey = "total" | "autoClosed" | "manual";
+
+/**
+ * Configuration for the pending-verification list's statistics cards.
+ */
+export const PENDING_VERIFICATION_STAT_CONFIGS: SupportStatConfig<PendingVerificationStatKey>[] =
+  [
+    { icon: ShieldCheck, iconColor: "info", key: "total", label: "Total" },
+    { icon: RotateCcw, iconColor: "warning", key: "autoClosed", label: "Auto-closed" },
+    { icon: FileText, iconColor: "secondary", key: "manual", label: "Manual" },
   ];
 
 /**
