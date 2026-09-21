@@ -35,6 +35,10 @@ handoffs/
 # Local working docs (PR reply/decision drafts, etc.) — never committed/pushed
 local-docs/
 
+# Local-dev-only reverse proxy (translates auth headers for testing backend-v2
+# without the Choreo gateway in front of it) — never committed/pushed
+local-dev-proxy/
+
 # Local Claude Code config and installed skills — kept out of version
 # control. Note other CLAUDE.md files in this repo (csm-portal,
 # entity-service, integrations/*) are deliberately tracked, so those are

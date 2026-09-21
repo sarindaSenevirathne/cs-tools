@@ -116,8 +116,12 @@ func mapOrPassthrough(v string, m map[string]string) string {
 // pending-verification entry. Field names match the requirements doc's §4
 // data model exactly (caseId/caseTitle/addedAt), even for a non-Case record
 // -- the doc uses these names generically across every in-scope record type.
+// caseId is the record's human-readable number (e.g. "CS0441731"), for
+// display only -- workItemId is the actual work_item UUID, for navigating
+// back into the record's own detail page.
 type PendingVerificationView struct {
 	ID             string     `json:"id"`
+	WorkItemID     string     `json:"workItemId"`
 	CaseID         string     `json:"caseId"`
 	CaseTitle      string     `json:"caseTitle"`
 	Severity       *string    `json:"severity,omitempty"`
@@ -136,6 +140,7 @@ type PendingVerificationView struct {
 func MapPendingVerification(pv entity.PendingVerification) PendingVerificationView {
 	view := PendingVerificationView{
 		ID:          pv.ID,
+		WorkItemID:  pv.WorkItemID,
 		CaseID:      pv.RecordNumber,
 		CaseTitle:   pv.RecordTitle,
 		Severity:    pv.Severity,
