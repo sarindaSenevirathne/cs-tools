@@ -17,15 +17,18 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/auth"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/config"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/eventbus"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/handler"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/middleware"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/salesentity"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/service"
 	integrationservice "github.com/wso2-open-operations/cs-tools/entity-service/internal/servicenow-integration-service"
 )
@@ -41,8 +44,17 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 	userSvc := service.NewUserService(userRepo)
 	userHandler := handler.NewUserHandler(userSvc)
 
-	// event_publish_failures, sla_clocks, scheduled_task_run, and
-	// alert_incident_mapping have no ServiceNow equivalent. They are
+	// accessSvc resolves the caller's AccessScope from the validated identity
+	// auth.Middleware attaches to every request (see AccessService's own doc
+	// comment for the full decision table). Constructed once and shared by
+	// every Postgres-backed service that scopes its reads by it. It only takes
+	// effect on the Postgres data source: in ServiceNow mode the project/case
+	// reads go to ServiceNow itself with the forwarded x-user-id-token, so
+	// scoping there is ServiceNow's own (snProjectService/snCaseService hold a
+	// pgFallback but do not route GetProjectByID/GetCaseByID through it).
+	accessSvc := service.NewAccessService(repository.NewAccessRepository(db), cfg.AuthInternalClientIDs)
+
+	// event_publish_failures has no ServiceNow equivalent. It is
 	// Postgres-backed and registered only when a pool is available
 	// (db.NewPoolIfNeeded returns nil for DATA_SOURCE=servicenow so local
 	// SN-mode startups are not blocked). Gate the whole chain on db != nil:
@@ -123,8 +135,28 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 		pendingVerificationHandler = handler.NewPendingVerificationHandler(service.NewPendingVerificationService(pendingVerificationRepo))
 	}
 
+	// announcement_requests has no ServiceNow equivalent either — same
+	// reasoning as sla_clocks/scheduled_task_run/alert_incident_mapping
+	// above, gated the same way: nil db means nil handler means the routes
+	// below are never registered, rather than panicking on a nil pool.
+	var announcementRequestHandler *handler.AnnouncementRequestHandler
+	if db != nil {
+		announcementRequestHandler = handler.NewAnnouncementRequestHandler(service.NewAnnouncementRequestService(repository.NewAnnouncementRequestRepository(db)))
+	}
+
 	accountRepo := repository.NewAccountRepository(db)
 	accountHandler := handler.NewAccountHandler(service.NewAccountService(accountRepo))
+
+	var salesforceEventHandler *handler.SalesforceEventHandler
+	if db != nil && cfg.DataSource == config.DataSourcePostgres && cfg.SalesEntityConfigured() {
+		salesEntityClient := salesentity.New(cfg.SalesEntityBaseURL, salesentity.ClientCredentialsConfig{
+			TokenURL:     cfg.SalesEntityTokenURL,
+			ClientID:     cfg.SalesEntityClientID,
+			ClientSecret: cfg.SalesEntityClientSecret,
+			Scopes:       cfg.SalesEntityScopes,
+		})
+		salesforceEventHandler = handler.NewSalesforceEventHandler(service.NewSalesforceEventService(accountRepo, salesEntityClient))
+	}
 
 	var serviceNowIntegrationServiceClient *integrationservice.Client
 	if cfg.DataSource == config.DataSourceServiceNow {
@@ -166,7 +198,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 	}
 
 	projectRepo := repository.NewProjectRepository(db)
-	pgProjectSvc := service.NewProjectService(projectRepo)
+	pgProjectSvc := service.NewProjectService(projectRepo, accessSvc)
 	var activeProjectSvc service.ProjectService
 	if cfg.DataSource == config.DataSourceServiceNow {
 		activeProjectSvc = service.NewServiceNowProjectService(serviceNowIntegrationServiceClient, pgProjectSvc)
@@ -189,10 +221,32 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 		projectUpdateHandler = handler.NewProjectUpdateHandler(service.NewServiceNowProjectUpdateService(serviceNowIntegrationServiceClient))
 	}
 
+	// referenceDataRepo backs GET /projects/{id}/metadata and GET /metadata's
+	// Postgres-mode choice lists (project_type rows, enum labels) -- see
+	// ReferenceDataRepository's own doc comment.
+	referenceDataRepo := repository.NewReferenceDataRepository(db)
+
 	var projectStatsHandler *handler.ProjectStatsHandler
+	var snProjectStatsSvc service.ProjectStatsService
 	if cfg.DataSource == config.DataSourceServiceNow {
-		projectStatsHandler = handler.NewProjectStatsHandler(service.NewServiceNowProjectStatsService(serviceNowIntegrationServiceClient))
+		snProjectStatsSvc = service.NewServiceNowProjectStatsService(serviceNowIntegrationServiceClient)
+		projectStatsHandler = handler.NewProjectStatsHandler(snProjectStatsSvc)
 	}
+
+	// GET /projects/{id}/metadata is wired independently of projectStatsHandler
+	// above: it's the one ProjectStatsService method with a Postgres-backed
+	// implementation, so it's available regardless of cfg.DataSource, while
+	// the remaining project-stats routes stay ServiceNow-only. In ServiceNow
+	// mode, snProjectStatsSvc already satisfies ProjectMetadataService
+	// structurally, so the same client-backed value is reused rather than
+	// built twice.
+	var projectMetadataSvc service.ProjectMetadataService
+	if cfg.DataSource == config.DataSourceServiceNow {
+		projectMetadataSvc = snProjectStatsSvc
+	} else {
+		projectMetadataSvc = service.NewProjectMetadataService(referenceDataRepo)
+	}
+	projectMetadataHandler := handler.NewProjectMetadataHandler(projectMetadataSvc)
 
 	productRepo := repository.NewProductRepository(db)
 	productSvc := service.NewProductService(productRepo)
@@ -241,7 +295,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 	}
 
 	caseRepo := repository.NewCaseRepository(db)
-	pgCaseSvc := service.NewCaseService(caseRepo, userRepo, eventPublisher)
+	pgCaseSvc := service.NewCaseService(caseRepo, userRepo, eventPublisher, accessSvc)
 	var activeCaseSvc service.CaseService
 	if cfg.DataSource == config.DataSourceServiceNow {
 		activeCaseSvc = service.NewServiceNowCaseService(serviceNowIntegrationServiceClient, pgCaseSvc, eventPublisher, slaClockService, snUserService, cfg.SupportEngineerRole, cfg.CustomerRoles)
@@ -250,10 +304,16 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 	}
 	caseHandler := handler.NewCaseHandler(activeCaseSvc)
 
-	var callRequestHandler *handler.CallRequestHandler
+	// customer_call (migration 000072) backs call requests on the Postgres
+	// data source, so these routes are registered for both data sources.
+	callRequestRepo := repository.NewCallRequestRepository(db)
+	var activeCallRequestSvc service.CallRequestService
 	if cfg.DataSource == config.DataSourceServiceNow {
-		callRequestHandler = handler.NewCallRequestHandler(service.NewServiceNowCallRequestService(serviceNowIntegrationServiceClient))
+		activeCallRequestSvc = service.NewServiceNowCallRequestService(serviceNowIntegrationServiceClient)
+	} else {
+		activeCallRequestSvc = service.NewCallRequestService(callRequestRepo, userRepo)
 	}
+	callRequestHandler := handler.NewCallRequestHandler(activeCallRequestSvc)
 
 	var caseGithubIssueHandler *handler.CaseGithubIssueHandler
 	if cfg.DataSource == config.DataSourceServiceNow {
@@ -293,10 +353,18 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 	}
 	timeCardHandler := handler.NewTimeCardHandler(activeTimeCardSvc)
 
-	var catalogHandler *handler.CatalogHandler
+	// sr_category/catalog_item/catalog_item_category/catalog_variable/
+	// sr_category_routing_rule (migrations 000067-000071) back the service
+	// request catalog on the Postgres data source, so these routes are
+	// registered for both data sources.
+	catalogRepo := repository.NewCatalogRepository(db)
+	var activeCatalogSvc service.CatalogService
 	if cfg.DataSource == config.DataSourceServiceNow {
-		catalogHandler = handler.NewCatalogHandler(service.NewServiceNowCatalogService(serviceNowIntegrationServiceClient))
+		activeCatalogSvc = service.NewServiceNowCatalogService(serviceNowIntegrationServiceClient)
+	} else {
+		activeCatalogSvc = service.NewCatalogService(catalogRepo)
 	}
+	catalogHandler := handler.NewCatalogHandler(activeCatalogSvc)
 
 	var feedbackHandler *handler.FeedbackHandler
 	if cfg.DataSource == config.DataSourceServiceNow {
@@ -312,15 +380,27 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 	}
 	productVulnerabilityHandler := handler.NewProductVulnerabilityHandler(activeProductVulnerabilitySvc)
 
-	var incidentHandler *handler.IncidentHandler
+	// incident/problem/incident_task/conversation (migrations 000057-000060,
+	// 000066) -- see incident_repo.go/problem_repo.go's own doc comments for
+	// what's implemented (reads) vs. still ServiceUnavailableError (writes
+	// needing work_item.number generation or undiscoverable business rules).
+	incidentRepo := repository.NewIncidentRepository(db)
+	var activeIncidentSvc service.IncidentService
 	if cfg.DataSource == config.DataSourceServiceNow {
-		incidentHandler = handler.NewIncidentHandler(service.NewServiceNowIncidentService(serviceNowIntegrationServiceClient, eventPublisher))
+		activeIncidentSvc = service.NewServiceNowIncidentService(serviceNowIntegrationServiceClient, eventPublisher)
+	} else {
+		activeIncidentSvc = service.NewIncidentService(incidentRepo)
 	}
+	incidentHandler := handler.NewIncidentHandler(activeIncidentSvc)
 
-	var problemHandler *handler.ProblemHandler
+	problemRepo := repository.NewProblemRepository(db)
+	var activeProblemSvc service.ProblemService
 	if cfg.DataSource == config.DataSourceServiceNow {
-		problemHandler = handler.NewProblemHandler(service.NewServiceNowProblemService(serviceNowIntegrationServiceClient))
+		activeProblemSvc = service.NewServiceNowProblemService(serviceNowIntegrationServiceClient)
+	} else {
+		activeProblemSvc = service.NewProblemService(problemRepo)
 	}
+	problemHandler := handler.NewProblemHandler(activeProblemSvc)
 
 	var alertHandler *handler.AlertHandler
 	if cfg.DataSource == config.DataSourceServiceNow {
@@ -332,23 +412,42 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 		smartAlertHandler = handler.NewSmartAlertHandler(service.NewServiceNowSmartAlertService(serviceNowIntegrationServiceClient))
 	}
 
-	var incidentTaskHandler *handler.IncidentTaskHandler
+	incidentTaskRepo := repository.NewIncidentTaskRepository(db)
+	var activeIncidentTaskSvc service.IncidentTaskService
 	if cfg.DataSource == config.DataSourceServiceNow {
-		incidentTaskHandler = handler.NewIncidentTaskHandler(service.NewServiceNowIncidentTaskService(serviceNowIntegrationServiceClient))
+		activeIncidentTaskSvc = service.NewServiceNowIncidentTaskService(serviceNowIntegrationServiceClient)
+	} else {
+		activeIncidentTaskSvc = service.NewIncidentTaskService(incidentTaskRepo)
 	}
+	incidentTaskHandler := handler.NewIncidentTaskHandler(activeIncidentTaskSvc)
 
-	var conversationHandler *handler.ConversationHandler
+	conversationRepo := repository.NewConversationRepository(db)
+	var activeConversationSvc service.ConversationService
 	if cfg.DataSource == config.DataSourceServiceNow {
-		conversationHandler = handler.NewConversationHandler(service.NewServiceNowConversationService(serviceNowIntegrationServiceClient))
+		activeConversationSvc = service.NewServiceNowConversationService(serviceNowIntegrationServiceClient)
+	} else {
+		activeConversationSvc = service.NewConversationService(conversationRepo)
 	}
+	conversationHandler := handler.NewConversationHandler(activeConversationSvc)
 
 	var outageHandler *handler.OutageHandler
 	if cfg.DataSource == config.DataSourceServiceNow {
 		outageHandler = handler.NewOutageHandler(service.NewServiceNowOutageService(serviceNowIntegrationServiceClient))
 	}
+	// globalHandler is wired for both data sources now: GetSystemMetadata has
+	// a Postgres-backed implementation (globalService, reusing
+	// referenceDataRepo above); GlobalSearch does not yet, and returns a
+	// clear error in Postgres mode rather than 404 -- see globalService's own
+	// doc comment.
 	var globalHandler *handler.GlobalHandler
 	if cfg.DataSource == config.DataSourceServiceNow {
 		globalHandler = handler.NewGlobalHandler(service.NewServiceNowGlobalService(serviceNowIntegrationServiceClient))
+	} else {
+		globalHandler = handler.NewGlobalHandler(service.NewGlobalService(
+			referenceDataRepo,
+			repository.NewGlobalSearchRepository(db),
+			accessSvc,
+		))
 	}
 
 	// instance/usage tracking tables (migration 000054) -- see
@@ -436,6 +535,10 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 
 	mux.HandleFunc("GET /health", handler.HealthCheck)
 
+	if salesforceEventHandler != nil {
+		mux.HandleFunc("POST /salesforce/events", salesforceEventHandler.HandleEvent)
+	}
+
 	// event_publish_failures, sla_clocks, scheduled_task_run and
 	// alert_incident_mapping are not data-source specific, but all four are
 	// Postgres-backed, and the database is optional when
@@ -466,6 +569,16 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 	if alertIncidentMappingHandler != nil {
 		mux.HandleFunc("POST /alert-incident-mappings", alertIncidentMappingHandler.CreateAlertIncidentMapping)
 		mux.HandleFunc("POST /alert-incident-mappings/lookup", alertIncidentMappingHandler.LookupAlertIncidentMappings)
+	}
+	if announcementRequestHandler != nil {
+		mux.HandleFunc("POST /announcement-requests", announcementRequestHandler.CreateAnnouncementRequest)
+		mux.HandleFunc("GET /announcement-requests/{id}", announcementRequestHandler.GetAnnouncementRequest)
+		mux.HandleFunc("POST /announcement-requests/search", announcementRequestHandler.SearchAnnouncementRequests)
+		mux.HandleFunc("PATCH /announcement-requests/{id}", announcementRequestHandler.UpdateAnnouncementRequest)
+		mux.HandleFunc("POST /announcement-requests/{id}/dry-run", announcementRequestHandler.RecordAnnouncementRequestDryRun)
+		mux.HandleFunc("POST /announcement-requests/{id}/submit", announcementRequestHandler.SubmitAnnouncementRequest)
+		mux.HandleFunc("POST /announcement-requests/{id}/approve", announcementRequestHandler.ApproveAnnouncementRequest)
+		mux.HandleFunc("POST /announcement-requests/{id}/publish", announcementRequestHandler.PublishAnnouncementRequest)
 	}
 
 	if snUserHandler != nil {
@@ -503,8 +616,8 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 	if projectUpdateHandler != nil {
 		mux.HandleFunc("PATCH /projects/{id}", projectUpdateHandler.UpdateProject)
 	}
+	mux.HandleFunc("GET /projects/{id}/metadata", projectMetadataHandler.GetProjectMetadata)
 	if projectStatsHandler != nil {
-		mux.HandleFunc("GET /projects/{id}/metadata", projectStatsHandler.GetProjectMetadata)
 		mux.HandleFunc("GET /projects/{id}/stats", projectStatsHandler.GetProjectStats)
 		mux.HandleFunc("GET /projects/{id}/cases/stats", projectStatsHandler.GetProjectCaseStats)
 		mux.HandleFunc("GET /projects/{id}/conversations/stats", projectStatsHandler.GetProjectConversationStats)
@@ -560,12 +673,10 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 	//nolint:staticcheck // SA1019: intentional one-release compatibility route; remove with the handler.
 	mux.HandleFunc("GET /tags/search", caseHandler.SearchTagsQuery)
 
-	if callRequestHandler != nil {
-		mux.HandleFunc("POST /call-requests", callRequestHandler.CreateCallRequest)
-		mux.HandleFunc("POST /call-requests/search", callRequestHandler.SearchCallRequests)
-		mux.HandleFunc("POST /call-requests/search-all", callRequestHandler.SearchAllCallRequests)
-		mux.HandleFunc("PATCH /call-requests/{id}", callRequestHandler.PatchCallRequest)
-	}
+	mux.HandleFunc("POST /call-requests", callRequestHandler.CreateCallRequest)
+	mux.HandleFunc("POST /call-requests/search", callRequestHandler.SearchCallRequests)
+	mux.HandleFunc("POST /call-requests/search-all", callRequestHandler.SearchAllCallRequests)
+	mux.HandleFunc("PATCH /call-requests/{id}", callRequestHandler.PatchCallRequest)
 
 	if caseGithubIssueHandler != nil {
 		mux.HandleFunc("POST /cases/{id}/github-issues", caseGithubIssueHandler.CreateCaseGithubIssue)
@@ -588,10 +699,8 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 	mux.HandleFunc("POST /cases/time-cards/search", timeCardHandler.SearchCaseTimeCards)
 	mux.HandleFunc("DELETE /time-cards/{id}", timeCardHandler.DeleteTimeCard)
 
-	if catalogHandler != nil {
-		mux.HandleFunc("POST /catalogs/search", catalogHandler.SearchCatalogs)
-		mux.HandleFunc("GET /catalogs/{catalogId}/items/{catalogItemId}/variables", catalogHandler.GetCatalogItemVariables)
-	}
+	mux.HandleFunc("POST /catalogs/search", catalogHandler.SearchCatalogs)
+	mux.HandleFunc("GET /catalogs/{catalogId}/items/{catalogItemId}/variables", catalogHandler.GetCatalogItemVariables)
 
 	mux.HandleFunc("POST /products/vulnerabilities/search", productVulnerabilityHandler.SearchProductVulnerabilities)
 	mux.HandleFunc("GET /products/vulnerabilities/{id}", productVulnerabilityHandler.GetProductVulnerability)
@@ -622,15 +731,13 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 	mux.HandleFunc("POST /cases/{id}/tasks", taskHandler.CreateCaseTask)
 	mux.HandleFunc("PATCH /tasks/{id}", taskHandler.UpdateTask)
 
-	if incidentHandler != nil {
-		mux.HandleFunc("GET /incidents/{id}", incidentHandler.GetIncident)
-		mux.HandleFunc("PATCH /incidents/{id}", incidentHandler.PatchIncident)
-		mux.HandleFunc("POST /incidents", incidentHandler.CreateIncident)
-		mux.HandleFunc("POST /incidents/search", incidentHandler.SearchIncidents)
-		mux.HandleFunc("POST /incidents/aggregate", incidentHandler.AggregateIncidents)
-		mux.HandleFunc("POST /incidents/{id}/activities/search", incidentHandler.SearchIncidentActivities)
-		mux.HandleFunc("POST /incidents/{id}/specialist-handoffs", incidentHandler.HandOffIncidentToSpecialist)
-	}
+	mux.HandleFunc("GET /incidents/{id}", incidentHandler.GetIncident)
+	mux.HandleFunc("PATCH /incidents/{id}", incidentHandler.PatchIncident)
+	mux.HandleFunc("POST /incidents", incidentHandler.CreateIncident)
+	mux.HandleFunc("POST /incidents/search", incidentHandler.SearchIncidents)
+	mux.HandleFunc("POST /incidents/aggregate", incidentHandler.AggregateIncidents)
+	mux.HandleFunc("POST /incidents/{id}/activities/search", incidentHandler.SearchIncidentActivities)
+	mux.HandleFunc("POST /incidents/{id}/specialist-handoffs", incidentHandler.HandOffIncidentToSpecialist)
 
 	if outageHandler != nil {
 		mux.HandleFunc("POST /outages", outageHandler.CreateOutage)
@@ -642,19 +749,15 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 		mux.HandleFunc("POST /outages/{id}/communications/search", outageHandler.SearchOutageCommunications)
 	}
 
-	if problemHandler != nil {
-		mux.HandleFunc("POST /problems", problemHandler.CreateProblem)
-		mux.HandleFunc("POST /problems/search", problemHandler.SearchProblems)
-		mux.HandleFunc("POST /problems/aggregate", problemHandler.AggregateProblems)
-		mux.HandleFunc("GET /problems/{id}", problemHandler.GetProblem)
-		mux.HandleFunc("PATCH /problems/{id}", problemHandler.PatchProblem)
-	}
+	mux.HandleFunc("POST /problems", problemHandler.CreateProblem)
+	mux.HandleFunc("POST /problems/search", problemHandler.SearchProblems)
+	mux.HandleFunc("POST /problems/aggregate", problemHandler.AggregateProblems)
+	mux.HandleFunc("GET /problems/{id}", problemHandler.GetProblem)
+	mux.HandleFunc("PATCH /problems/{id}", problemHandler.PatchProblem)
 
-	if incidentTaskHandler != nil {
-		mux.HandleFunc("POST /incident-tasks/search", incidentTaskHandler.SearchIncidentTasks)
-		mux.HandleFunc("POST /incident-tasks/aggregate", incidentTaskHandler.AggregateIncidentTasks)
-		mux.HandleFunc("GET /incident-tasks/{id}", incidentTaskHandler.GetIncidentTask)
-	}
+	mux.HandleFunc("POST /incident-tasks/search", incidentTaskHandler.SearchIncidentTasks)
+	mux.HandleFunc("POST /incident-tasks/aggregate", incidentTaskHandler.AggregateIncidentTasks)
+	mux.HandleFunc("GET /incident-tasks/{id}", incidentTaskHandler.GetIncidentTask)
 
 	if alertHandler != nil {
 		mux.HandleFunc("GET /alerts/{id}", alertHandler.GetAlert)
@@ -664,17 +767,13 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 		mux.HandleFunc("GET /smart-alerts/{id}", smartAlertHandler.GetSmartAlert)
 	}
 
-	if conversationHandler != nil {
-		mux.HandleFunc("POST /conversations/search", conversationHandler.SearchConversations)
-		mux.HandleFunc("GET /conversations/{id}", conversationHandler.GetConversation)
-		mux.HandleFunc("POST /conversations", conversationHandler.CreateConversation)
-		mux.HandleFunc("PATCH /conversations/{id}", conversationHandler.UpdateConversation)
-	}
+	mux.HandleFunc("POST /conversations/search", conversationHandler.SearchConversations)
+	mux.HandleFunc("GET /conversations/{id}", conversationHandler.GetConversation)
+	mux.HandleFunc("POST /conversations", conversationHandler.CreateConversation)
+	mux.HandleFunc("PATCH /conversations/{id}", conversationHandler.UpdateConversation)
 
-	if globalHandler != nil {
-		mux.HandleFunc("GET /metadata", globalHandler.GetSystemMetadata)
-		mux.HandleFunc("POST /search", globalHandler.GlobalSearch)
-	}
+	mux.HandleFunc("GET /metadata", globalHandler.GetSystemMetadata)
+	mux.HandleFunc("POST /search", globalHandler.GlobalSearch)
 
 	mux.HandleFunc("POST /escalations/search", escalationHandler.SearchEscalations)
 	mux.HandleFunc("POST /escalations", escalationHandler.CreateEscalation)
@@ -685,11 +784,27 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 	mux.HandleFunc("POST /instances/metrics/stats/search", instanceHandler.SearchInstanceMetricsStats)
 	mux.HandleFunc("POST /instances/usages/stats/search", instanceHandler.SearchInstanceUsageStats)
 
+	// Token validation always runs -- there is no config flag to disable it.
+	// The JWKS must load right here at startup: a wrong URL panics now instead
+	// of silently rejecting every token later (same fail-fast posture as
+	// apps/csm-portal/backend).
+	tokenValidator, err := auth.NewValidator(context.Background(), auth.Config{
+		Issuer:             cfg.AuthIssuer,
+		JWKSURL:            cfg.AuthJWKSURL,
+		UserTokenAudiences: cfg.AuthUserTokenAudiences,
+		ClockSkew:          cfg.AuthClockSkew,
+	})
+	if err != nil {
+		panic("auth: could not initialise token validation: " + err.Error())
+	}
+
 	return middleware.CorrelationID(
 		middleware.Recovery(
 			middleware.Logger(
 				middleware.UserIDToken(
-					middleware.Timeout(30 * time.Second)(mux),
+					auth.Middleware(tokenValidator)(
+						middleware.Timeout(30 * time.Second)(mux),
+					),
 				),
 			),
 		),

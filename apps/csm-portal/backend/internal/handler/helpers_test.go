@@ -35,7 +35,6 @@ import (
 var testUser = &middleware.UserInfo{
 	Email:  "agent@example.com",
 	UserID: "f2d9bf5b-7067-43dc-8578-802c8623af5d",
-	Groups: []string{"csm-agents"},
 }
 
 // testPlatformUserID is the id GET /users/me resolves for testUser: the

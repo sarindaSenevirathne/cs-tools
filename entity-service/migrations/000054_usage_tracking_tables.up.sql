@@ -122,7 +122,7 @@ CREATE TABLE IF NOT EXISTS daily_usage_summary (
     deployment_node_id UUID REFERENCES deployment_node(id) ON DELETE CASCADE,
     deployment_ref VARCHAR(1000),
     summary_date DATE,
-    usage_type VARCHAR(1000),
+    count_type VARCHAR(1000),
     value INTEGER,
     data_source usage_data_source_enum
 );

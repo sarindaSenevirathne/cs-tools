@@ -42,12 +42,14 @@ import (
 // are populated from them.
 type ProjectRepository interface {
 	// SearchProjects returns a filtered, paginated slice of projects together
-	// with the total count of matching rows before pagination.
+	// with the total count of matching rows before pagination, narrowed to
+	// scope.
 	// COUNT and SELECT are executed concurrently on separate pool connections.
-	SearchProjects(ctx context.Context, req domain.SearchProjectsRequest) ([]domain.Project, int, error)
+	SearchProjects(ctx context.Context, req domain.SearchProjectsRequest, scope SearchScope) ([]domain.Project, int, error)
 	// GetProjectByID returns the enriched project detail with the linked account,
-	// or a NotFoundError if no such project exists.
-	GetProjectByID(ctx context.Context, id string) (domain.ProjectDetailsView, error)
+	// or a NotFoundError if no such project exists OR it exists but scope
+	// excludes it (existence is never revealed to a caller who can't see it).
+	GetProjectByID(ctx context.Context, id string, scope SearchScope) (domain.ProjectDetailsView, error)
 }
 
 type projectRepo struct {
@@ -60,11 +62,19 @@ func NewProjectRepository(db *pgxpool.Pool) ProjectRepository {
 }
 
 // SearchProjects implements ProjectRepository.
-func (r *projectRepo) SearchProjects(ctx context.Context, req domain.SearchProjectsRequest) ([]domain.Project, int, error) {
+func (r *projectRepo) SearchProjects(ctx context.Context, req domain.SearchProjectsRequest, scope SearchScope) ([]domain.Project, int, error) {
 	filterArgs := []any{}
 	argIdx := 1
 
 	where := "WHERE 1=1"
+
+	// See CaseRepository.SearchCases's identical scope clause for why this is
+	// independent of any project filter the request itself may carry.
+	if !scope.Unrestricted {
+		where += " AND " + scopePredicate("id", argIdx)
+		filterArgs = append(filterArgs, scope.ProjectIDs)
+		argIdx++
+	}
 
 	if req.SearchQuery != "" {
 		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(req.SearchQuery)
@@ -108,17 +118,23 @@ func (r *projectRepo) SearchProjects(ctx context.Context, req domain.SearchProje
 		result := make([]domain.Project, 0, req.Pagination.Limit)
 		for rows.Next() {
 			var p domain.Project
-			// account_id and name are nullable columns; scan into *string
-			// locals and default to "" on NULL, same pattern as every other
+			// account_id/start_date/end_date are nullable (migration 000009);
+			// domain.Project's fields are pointers to match -- see that
+			// struct's own doc comment. A non-pointer scan here used to
+			// error "cannot scan NULL into *time.Time" the moment any of the
+			// 13-14 (of 1956) rows with a NULL date reached this query.
+			//
+			// project.name is also nullable, but domain.Project.Name is a
+			// plain string (not a pointer) -- scan into a local *string and
+			// default to "" on NULL instead, same pattern as every other
 			// nullable-VARCHAR-column fix in this repository package.
-			var accountID, name *string
+			var name *string
 			if err := rows.Scan(
-				&p.ID, &accountID, &p.SfID, &name, &p.Key,
+				&p.ID, &p.AccountID, &p.SfID, &name, &p.Key,
 				&p.StartDate, &p.EndDate, &p.CreatedOn, &p.UpdatedOn,
 			); err != nil {
 				return fmt.Errorf("scan project: %w", err)
 			}
-			p.AccountID = stringOrEmpty(accountID)
 			p.Name = stringOrEmpty(name)
 			// SubscriptionType/ClosureStatus have no real column -- see this
 			// repository's own doc comment.
@@ -139,7 +155,7 @@ func (r *projectRepo) SearchProjects(ctx context.Context, req domain.SearchProje
 }
 
 // GetProjectByID implements ProjectRepository.
-func (r *projectRepo) GetProjectByID(ctx context.Context, id string) (domain.ProjectDetailsView, error) {
+func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope SearchScope) (domain.ProjectDetailsView, error) {
 	var v domain.ProjectDetailsView
 	// account.ai_gen_response_enabled/smart_knowledge_base_suggestions_enabled
 	// are nullable BOOLEAN columns, but ProjectAccountRef.AgentEnabled/
@@ -149,18 +165,36 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string) (domain.Pro
 	// project.name is a nullable column; scan into a *string local and
 	// default to "" on NULL, same pattern SearchProjects uses.
 	var name *string
+	// account is a LEFT JOIN, not an INNER JOIN: project.account_id
+	// (migration 000009) is nullable and genuinely NULL on live data (14 of
+	// 1956 rows) -- an INNER JOIN here used to make every such project
+	// invisible (zero rows -> misreported as 404 "project not found"), the
+	// same class of false-404 GetCaseByID had for its own optional joins
+	// before that was fixed (see this file's "Case-like work_item types"
+	// history). aID/aName are scanned nullable for the same reason;
+	// ActivationDate/Region are already pointer fields on ProjectAccountRef
+	// so they tolerate NULL (whether from a real account or a LEFT JOIN
+	// producing no row at all) without a separate local var.
+	var aID, aName *string
+	// Same "existence never revealed to a caller who can't see it" reasoning
+	// as CaseRepository.GetCaseByID.
+	scopeClause, scopeArgs := "", []any{id}
+	if !scope.Unrestricted {
+		scopeClause = " AND " + scopePredicate("p.id", 2)
+		scopeArgs = append(scopeArgs, scope.ProjectIDs)
+	}
 	err := r.db.QueryRow(ctx,
 		`SELECT p.id, p.sf_id, p.name, p.key,
 		        p.start_date, p.end_date, p.created_on, p.updated_on,
 		        a.id, a.name, a.activation_date, a.region,
 		        a.ai_gen_response_enabled, a.smart_knowledge_base_suggestions_enabled
 		 FROM project p
-		 JOIN account a ON p.account_id = a.id
-		 WHERE p.id = $1`, id,
+		 LEFT JOIN account a ON p.account_id = a.id
+		 WHERE p.id = $1`+scopeClause, scopeArgs...,
 	).Scan(
 		&v.ID, &v.SfID, &name, &v.Key,
 		&v.StartDate, &v.EndDate, &v.CreatedOn, &v.UpdatedOn,
-		&v.Account.ID, &v.Account.Name, &v.Account.ActivationDate, &v.Account.Region,
+		&aID, &aName, &v.Account.ActivationDate, &v.Account.Region,
 		&agentEnabled, &kbReferencesEnabled,
 	)
 	v.Name = stringOrEmpty(name)
@@ -171,6 +205,12 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string) (domain.Pro
 	}
 	if err != nil {
 		return domain.ProjectDetailsView{}, fmt.Errorf("get project by id: %w", err)
+	}
+	if aID != nil {
+		v.Account.ID = *aID
+	}
+	if aName != nil {
+		v.Account.Name = *aName
 	}
 	v.Account.AgentEnabled = agentEnabled != nil && *agentEnabled
 	v.Account.KbReferencesEnabled = kbReferencesEnabled != nil && *kbReferencesEnabled

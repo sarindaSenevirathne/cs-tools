@@ -128,13 +128,57 @@ type Config struct {
 	// nothing to do with case state) — the two are read by separate
 	// processes/environments and don't interact.
 	CustomerRoles []string
+	// Auth* configure token validation (internal/auth), always on -- there is
+	// no config flag to disable it. AuthIssuer/AuthJWKSURL/
+	// AuthUserTokenAudiences are required (Validate rejects startup without
+	// them, and NewRouter panics if the JWKS can't be loaded), so a caller's
+	// identity is always verified.
+	//
+	// AuthIssuer/AuthJWKSURL locate the Asgardeo issuer's signing keys, used to
+	// validate both tokens a request can carry: the end user's ID token in
+	// x-user-id-token, and the calling application's client-credentials access
+	// token in Authorization: Bearer. AuthUserTokenAudiences are the client ids
+	// (Asgardeo SPA/application ids) an ID token's aud must contain to be
+	// accepted as a user token.
+	AuthIssuer             string
+	AuthJWKSURL            string
+	AuthUserTokenAudiences []string
+	AuthClockSkew          time.Duration
+	// AuthInternalClientIDsRaw is the AUTH_INTERNAL_CLIENT_IDS value, a
+	// comma-separated list of Asgardeo application client ids;
+	// AuthInternalClientIDs is its parsed set. A request whose
+	// Authorization: Bearer client-credentials token names one of these ids
+	// is unconditionally treated as an internal caller with unrestricted
+	// access to every project and case, regardless of any x-user-id-token it
+	// also carries -- a forwarded user token from an internal caller is used
+	// only for attribution (created_by/updated_by), never for scoping,
+	// because every caller this deployment configures here is itself an
+	// already-trusted internal service.
+	//
+	// A client id NOT in this set is resolved purely from its
+	// x-user-id-token: an INTERNAL user_type still sees everything, an
+	// EXTERNAL (customer) user sees only their REGISTERED project_contact
+	// projects, and no user token at all is refused. Which real client ids
+	// go in this list is a deployment decision, not something this file
+	// prescribes.
+	AuthInternalClientIDsRaw string
+	AuthInternalClientIDs    map[string]bool
+	// SalesEntity* is the Choreo connection to REST sales/sales-entity-service
+	// (POST /customer-search), not GraphQL sales/entity-graphql-service and not
+	// Salesforce. The four connection fields are all-or-nothing like Event Hub.
+	// Scopes are optional (same as SERVICENOW_INTEGRATION_SERVICE_SCOPES).
+	SalesEntityBaseURL      string
+	SalesEntityTokenURL     string
+	SalesEntityClientID     string
+	SalesEntityClientSecret string
+	SalesEntityScopes       string
 }
 
 // Load reads configuration from environment variables and returns a populated
 // Config. Missing variables fall back to sensible defaults; callers should
 // validate required fields (e.g. DBUser, DBPassword, DBName) before use.
 func Load() *Config {
-	return &Config{
+	cfg := &Config{
 		DBHost:                                   getEnvOrDefault("DB_HOST", "localhost"),
 		DBPort:                                   getEnvOrDefault("DB_PORT", "5432"),
 		DBUser:                                   os.Getenv("DB_USER"),
@@ -156,9 +200,33 @@ func Load() *Config {
 		CRNoticesEnabled:                         os.Getenv("CR_NOTICES_ENABLED") == "true",
 		CREventHubTopic:                          getEnvOrDefault("CR_EVENT_HUB_TOPIC", "cr-events"),
 		CRNoticePollInterval:                     envDuration("CR_NOTICE_POLL_INTERVAL", 5*time.Second),
+		AuthIssuer:                               os.Getenv("AUTH_ISSUER"),
+		AuthJWKSURL:                              os.Getenv("AUTH_JWKS_URL"),
+		AuthUserTokenAudiences:                   splitComma(os.Getenv("AUTH_USER_TOKEN_AUDIENCES")),
+		AuthClockSkew:                            envDuration("AUTH_CLOCK_SKEW", 30*time.Second),
+		AuthInternalClientIDsRaw:                 os.Getenv("AUTH_INTERNAL_CLIENT_IDS"),
 		SupportEngineerRole:                      os.Getenv("SUPPORT_ENGINEER_ROLE"),
 		CustomerRoles:                            splitComma(os.Getenv("CUSTOMER_ROLES")),
+		SalesEntityBaseURL:                       os.Getenv("SALES_ENTITY_BASE_URL"),
+		SalesEntityTokenURL:                      os.Getenv("SALES_ENTITY_TOKEN_URL"),
+		SalesEntityClientID:                      os.Getenv("SALES_ENTITY_CLIENT_ID"),
+		SalesEntityClientSecret:                  os.Getenv("SALES_ENTITY_CLIENT_SECRET"),
+		SalesEntityScopes:                        os.Getenv("SALES_ENTITY_SCOPES"),
 	}
+	cfg.AuthInternalClientIDs = ParseInternalClientIDs(cfg.AuthInternalClientIDsRaw)
+	return cfg
+}
+
+// ParseInternalClientIDs parses AUTH_INTERNAL_CLIENT_IDS ("clientId,clientId")
+// into a set for O(1) membership checks. Unlike most of this file's other
+// comma-separated values, this one has no per-entry validation to fail: any
+// non-empty, trimmed entry is a valid client id.
+func ParseInternalClientIDs(raw string) map[string]bool {
+	out := make(map[string]bool)
+	for _, id := range splitComma(raw) {
+		out[id] = true
+	}
+	return out
 }
 
 func getEnvOrDefault(key, defaultVal string) string {
@@ -204,8 +272,9 @@ func (c *Config) HasDatabase() bool {
 // missing when DATA_SOURCE=postgres (see db.NewPoolIfNeeded) or only
 // partially set in either mode, if
 // SERVICENOW_INTEGRATION_SERVICE_BASE_URL is missing when
-// DATA_SOURCE=servicenow, or if EVENT_HUB_BROKER/EVENT_HUB_CONNECTION_STRING/
-// EVENT_HUB_TOPIC are only partially set.
+// DATA_SOURCE=servicenow, if EVENT_HUB_BROKER/EVENT_HUB_CONNECTION_STRING/
+// EVENT_HUB_TOPIC are only partially set, or if the SALES_ENTITY_* vars are
+// only partially set.
 func (c *Config) Validate() error {
 	// The health server is a separate listener precisely so that only its
 	// own routes are reachable at public visibility (see HealthPort). Two
@@ -302,7 +371,29 @@ func (c *Config) Validate() error {
 	if eventHubSet && !eventHubComplete {
 		return fmt.Errorf("EVENT_HUB_BROKER, EVENT_HUB_CONNECTION_STRING, and EVENT_HUB_TOPIC must be set together or not at all")
 	}
+	// Token validation is always on and unconditionally needs to know whose
+	// keys to trust and which audiences make an ID token a user token, or it
+	// would either accept everything or reject everything. Reject that at
+	// startup rather than at the first request.
+	if c.AuthIssuer == "" || c.AuthJWKSURL == "" {
+		return fmt.Errorf("AUTH_ISSUER and AUTH_JWKS_URL are required")
+	}
+	if len(c.AuthUserTokenAudiences) == 0 {
+		return fmt.Errorf("AUTH_USER_TOKEN_AUDIENCES is required")
+	}
+	salesEntitySet := c.SalesEntityBaseURL != "" || c.SalesEntityTokenURL != "" || c.SalesEntityClientID != "" || c.SalesEntityClientSecret != "" || c.SalesEntityScopes != ""
+	if salesEntitySet && !c.SalesEntityConfigured() {
+		return fmt.Errorf("SALES_ENTITY_BASE_URL, SALES_ENTITY_TOKEN_URL, SALES_ENTITY_CLIENT_ID, and SALES_ENTITY_CLIENT_SECRET must be set together or not at all")
+	}
 	return nil
+}
+
+// SalesEntityConfigured reports whether every REST sales/sales-entity-service env var is set.
+func (c *Config) SalesEntityConfigured() bool {
+	return c.SalesEntityBaseURL != "" &&
+		c.SalesEntityTokenURL != "" &&
+		c.SalesEntityClientID != "" &&
+		c.SalesEntityClientSecret != ""
 }
 
 // DSN constructs a PostgreSQL connection string from the config fields.

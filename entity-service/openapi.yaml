@@ -19,6 +19,49 @@ paths:
         "200":
           description: Ok
 
+  /salesforce/events:
+    post:
+      summary: >-
+        Ingest a Salesforce change event from sales-apex-trigger-subscriber.
+        Fetches the Account via REST sales/sales-entity-service POST /customer-search
+        (isRealTime true), not GraphQL sales/entity-graphql-service, and upserts
+        the csm-platform account table. Registered only when DATA_SOURCE=postgres
+        and REST sales-entity-service config is present.
+      operationId: handleSalesforceEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SalesforceEventRequest'
+      responses:
+        "204":
+          description: Event accepted (including ignored non-Account entities and idempotent deletes).
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "503":
+          description: Salesforce is temporarily unavailable (including Account 404 so the event can be retried).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /event-publish-failures:
     post:
       summary: >-
@@ -250,6 +293,366 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         "404":
           description: No such clock has been registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /announcement-requests:
+    post:
+      summary: >-
+        Create a new announcement request in state draft. Has no ServiceNow
+        equivalent — always backed by Postgres.
+      operationId: createAnnouncementRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAnnouncementRequestRequest'
+      responses:
+        "201":
+          description: Request created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnnouncementRequest'
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /announcement-requests/search:
+    post:
+      summary: Search announcement_requests rows, newest first, optionally filtered by state and/or createdBy.
+      operationId: searchAnnouncementRequests
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchAnnouncementRequestsRequest'
+      responses:
+        "200":
+          description: Requests matching the filters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchAnnouncementRequestsResponse'
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /announcement-requests/{id}:
+    get:
+      summary: Get one announcement request by id.
+      operationId: getAnnouncementRequest
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The requested announcement request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnnouncementRequest'
+        "404":
+          description: No such request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    patch:
+      summary: >-
+        Edit an announcement request's own content. What actually happens
+        depends entirely on the request's current state, not on anything the
+        caller chooses: a draft is edited in place; a request pending
+        approval is edited *and* reverted to draft as one atomic side effect
+        (clearing its dry-run record and frozen audience snapshot); an
+        approved request has subject/description/isSecurityAnnouncement
+        edited in place with no state change and no audience change allowed;
+        a published request cannot be edited at all.
+      operationId: updateAnnouncementRequest
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAnnouncementRequestRequest'
+      responses:
+        "200":
+          description: Request updated successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnnouncementRequest'
+        "400":
+          description: Bad request, or an audience change was attempted on an approved request (the approved snapshot is frozen).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No such request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "409":
+          description: The request is published.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /announcement-requests/{id}/dry-run:
+    post:
+      summary: >-
+        Record that a dry run has completed for this request. caseId is the
+        real case id the caller's own dry-run mechanism already created —
+        this endpoint does not create it and does not verify it exists.
+        Recording one is a precondition for Submit.
+      operationId: recordAnnouncementRequestDryRun
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordAnnouncementDryRunRequest'
+      responses:
+        "200":
+          description: Dry run recorded successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnnouncementRequest'
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No such request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "409":
+          description: The request is not in state draft.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /announcement-requests/{id}/submit:
+    post:
+      summary: >-
+        Move a draft to pending_approval, freezing resolvedProjectIds as the
+        audience snapshot. Rejected unless the request is currently a draft
+        and a dry run has already been recorded — the dry-run case is the
+        only preview the approver ever sees.
+      operationId: submitAnnouncementRequest
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitAnnouncementRequestRequest'
+      responses:
+        "200":
+          description: Request submitted for approval.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnnouncementRequest'
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No such request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "409":
+          description: The request is not a draft, or has no recorded dry run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /announcement-requests/{id}/approve:
+    post:
+      summary: >-
+        Move a request pending approval to approved. There is no
+        approver-role check here — the real approval decision already
+        happened over email, outside this service; this call only records
+        that whoever is working the request says it's been approved.
+      operationId: approveAnnouncementRequest
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnnouncementRequestActorRequest'
+      responses:
+        "200":
+          description: Request approved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnnouncementRequest'
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No such request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "409":
+          description: The request is not pending approval.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /announcement-requests/{id}/publish:
+    post:
+      summary: >-
+        Move an approved request to published. Does not itself create any
+        cases — the caller's own fan-out (POST /cases per project) is
+        unchanged and happens separately; this call only records that
+        publishing happened, by whom, and when.
+      operationId: publishAnnouncementRequest
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnnouncementRequestActorRequest'
+      responses:
+        "200":
+          description: Request published.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnnouncementRequest'
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No such request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "409":
+          description: The request is not approved.
           content:
             application/json:
               schema:
@@ -944,6 +1347,12 @@ paths:
   /projects/{id}:
     get:
       summary: Get a project by ID.
+      description: >
+        On the Postgres data source, this is one of the endpoints scoped to the caller
+        (see POST /search's own description for the full rule). A project that exists but
+        is outside the caller's scope is indistinguishable from one that doesn't exist --
+        both are a 404, never a 403, so existence is never revealed to a caller who can't
+        see it.
       operationId: getProject
       parameters:
         - name: id
@@ -964,8 +1373,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: On the Postgres data source, a token is invalid or expired, or neither a user token nor an authorized internal client credential was supplied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: On the Postgres data source, the caller's x-user-id-token resolves to a real but insufficient user (inactive, unknown to this data source, or not a customer/internal person).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         "404":
-          description: Project not found.
+          description: Project not found, or it exists but is outside the caller's access scope (Postgres data source).
           content:
             application/json:
               schema:
@@ -1034,6 +1455,9 @@ paths:
   /projects/search:
     post:
       summary: Search projects by name, key, or subscription type.
+      description: >
+        On the Postgres data source, results are scoped to the caller (see POST
+        /search's own description for the full rule).
       operationId: searchProjects
       requestBody:
         required: true
@@ -1050,6 +1474,18 @@ paths:
                 $ref: '#/components/schemas/SearchProjectsResponse'
         "400":
           description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: On the Postgres data source, a token is invalid or expired, or neither a user token nor an authorized internal client credential was supplied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: On the Postgres data source, the caller's x-user-id-token resolves to a real but insufficient user (inactive, unknown to this data source, or not a customer/internal person).
           content:
             application/json:
               schema:
@@ -1157,7 +1593,9 @@ paths:
   /projects/{id}/metadata:
     get:
       summary: Get a project's reference metadata (choice lists, feature flags).
-      description: ServiceNow data source only; there is no Postgres equivalent.
+      description: >
+        Postgres: choice lists are read live from the database enums; severityBasedAllocationTime
+        and the feature access flags have no Postgres source yet and come back empty/false.
       operationId: getProjectMetadata
       parameters:
         - name: id
@@ -1662,6 +2100,11 @@ paths:
   /cases/{id}:
     get:
       summary: Get a support case by ID.
+      description: >
+        On the Postgres data source, this is one of the endpoints scoped to the caller
+        (see POST /search's own description for the full rule). A case that exists but
+        is outside the caller's scope (its project isn't one they can see) is
+        indistinguishable from one that doesn't exist -- both are a 404, never a 403.
       operationId: getCase
       parameters:
         - name: id
@@ -1683,8 +2126,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: On the Postgres data source, a token is invalid or expired, or neither a user token nor an authorized internal client credential was supplied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: On the Postgres data source, the caller's x-user-id-token resolves to a real but insufficient user (inactive, unknown to this data source, or not a customer/internal person).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         "404":
-          description: Case not found.
+          description: Case not found, or it exists but is outside the caller's access scope (Postgres data source).
           content:
             application/json:
               schema:
@@ -1776,6 +2231,10 @@ paths:
   /cases/search:
     post:
       summary: Search support cases.
+      description: >
+        On the Postgres data source, results are scoped to the caller (see POST
+        /search's own description for the full rule) -- a scope applied independently
+        of, and never widened by, any projectId filter the request itself carries.
       operationId: searchCases
       requestBody:
         required: true
@@ -1792,6 +2251,18 @@ paths:
                 $ref: '#/components/schemas/SearchCasesResponse'
         "400":
           description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: On the Postgres data source, a token is invalid or expired, or neither a user token nor an authorized internal client credential was supplied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: On the Postgres data source, the caller's x-user-id-token resolves to a real but insufficient user (inactive, unknown to this data source, or not a customer/internal person).
           content:
             application/json:
               schema:
@@ -2910,7 +3381,10 @@ paths:
 
   /call-requests:
     post:
-      summary: Create a call request (ServiceNow data source only).
+      summary: Create a call request.
+      description: >
+        Postgres: inserts a customer_call row in state pending_on_wso2. The call request's
+        number is not generated on this data source yet (returned as an empty string on read).
       operationId: createCallRequest
       requestBody:
         required: true
@@ -2937,6 +3411,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: Case not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         "500":
           description: Internal server error.
           content:
@@ -2946,7 +3426,7 @@ paths:
 
   /call-requests/search:
     post:
-      summary: Search call requests (ServiceNow data source only).
+      summary: Search call requests of a case.
       operationId: searchCallRequests
       requestBody:
         required: true
@@ -2984,7 +3464,8 @@ paths:
     post:
       summary: Search call requests across all cases, filtered by assignee/state.
       description: >
-        Returns a paginated list of call requests (ServiceNow data source only). Call
+        Returns a paginated list of call requests. filters.assignmentTeamIds is supported by
+        the ServiceNow data source only (400 on Postgres). Call
         requests are inherently case-related; this endpoint provides independent search
         and filtering capabilities across cases, distinct from /call-requests/search
         which is scoped to a single case.
@@ -3023,13 +3504,14 @@ paths:
 
   /call-requests/{id}:
     patch:
-      summary: Update a call request (supported by the backing data source only).
+      summary: Update a call request.
       description: >
         The target state selects the behaviour: customer/agent state
         transitions, scheduling (with meetingDate, durationInMinutes,
         assignee), rejection or cancellation (with cancellationReason), or
         conclusion with post-call notes (notes, plan, attendees, actionItems,
-        actualDurationMin).
+        actualDurationMin). On the Postgres data source cancellationReason is
+        rejected with 400, because customer_call has no column to store it.
       operationId: updateCallRequest
       parameters:
         - name: id
@@ -3301,7 +3783,11 @@ paths:
 
   /catalogs/search:
     post:
-      summary: Search service catalogs by deployed product (ServiceNow data source only).
+      summary: Search service catalogs by deployed product.
+      description: >
+        Postgres: a catalog is an sr_category; its items are those made available for the
+        deployed product by sr_category_routing_rule (product unit + classification). A deployed
+        product whose unit is unknown (NULL) is not excluded by unit.
       operationId: searchCatalogs
       requestBody:
         required: true
@@ -3328,6 +3814,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: Deployed product not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         "500":
           description: Internal server error.
           content:
@@ -3337,7 +3829,10 @@ paths:
 
   /catalogs/{catalogId}/items/{catalogItemId}/variables:
     get:
-      summary: Get variables (form fields) for a catalog item (ServiceNow data source only).
+      summary: Get variables (form fields) for a catalog item.
+      description: >
+        Postgres: readOnly, hidden, maxLength, referenceTable, validation and choices have no
+        backing column yet and come back at their zero value.
       operationId: getCatalogItemVariables
       parameters:
         - name: catalogId
@@ -5347,7 +5842,9 @@ paths:
   /metadata:
     get:
       summary: Get system-wide reference metadata (time zones, project types, feedback emojis).
-      description: ServiceNow data source only; there is no Postgres equivalent.
+      description: >
+        Postgres: projectTypes come from project_type; timeZones and feedbackEmojies have no
+        Postgres source yet and come back empty.
       operationId: getSystemMetadata
       responses:
         "200":
@@ -5369,7 +5866,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         "503":
-          description: System metadata is only supported for the ServiceNow data source.
+          description: The ServiceNow metadata dependency is unavailable.
           content:
             application/json:
               schema:
@@ -5377,10 +5874,26 @@ paths:
 
   /search:
     post:
-      summary: Global search across projects and cases (ServiceNow data source only).
+      summary: Global search across the projects and cases the caller can access.
       description: >
         Runs a single free-text query against both the projects and cases tables and
         returns paginated results for each independently.
+
+
+        On the Postgres data source, every request's tokens are validated (Asgardeo), and
+        results are scoped to the caller (the same rule GET /projects/{id}, POST
+        /projects/search, GET /cases/{id}, and POST /cases/search also apply): if the
+        request's `Authorization: Bearer` client-credentials token names a client id in
+        AUTH_INTERNAL_CLIENT_IDS, the caller sees every project and case unconditionally --
+        regardless of any `x-user-id-token` the same request also carries (that token, if
+        present, is never used to scope an internal caller). Any other caller is resolved
+        purely from its `x-user-id-token`: an internal user still sees everything, a
+        customer sees only projects they are a REGISTERED contact of and the cases in
+        them, and any other user type, an inactive user, or an unknown email is refused
+        (403). No user token and not an internal client id is refused (401) -- there is no
+        legitimate caller to resolve. A token that is present but invalid is always
+        rejected with 401. The project counts (`activeChatsCount`, `actionRequiredCount`,
+        `outstandingCount`) are 0 on Postgres.
       operationId: globalSearch
       requestBody:
         required: false
@@ -5402,7 +5915,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         "401":
-          description: Unauthorized.
+          description: A token is invalid or expired, or neither a user token nor an authorized client credential was supplied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller's x-user-id-token resolves to a real but insufficient user (inactive, unknown to this data source, or not a customer/internal person).
           content:
             application/json:
               schema:
@@ -5414,7 +5933,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         "503":
-          description: Global search is only supported for the ServiceNow data source.
+          description: The ServiceNow metadata/search dependency is unavailable.
           content:
             application/json:
               schema:
@@ -8351,7 +8870,12 @@ components:
           layer). notIn matches cases whose value is NOT one of the given
           labels -- e.g. `{"field": "projectOnboardingStatus", "op": "notIn",
           "values": ["In-Progress"]}` means "onboarding status is not in
-          progress".
+          progress". On the relational data source the labels are matched
+          case-insensitively, ignoring hyphens, underscores and spaces, against
+          Not-Started, In-Progress, Completed, OnHold, Not-Applicable, Expired
+          and Cancelled; any other value is a validation error. A case with no
+          project, or a project with no status, never matches in but does match
+          notIn.
         - **projectType** (in): the parent project's type, matched by the
           project type's name (e.g. "Subscription").
         - **creTeam** (in): the parent account's CRE (Customer Renewal &
@@ -8378,9 +8902,8 @@ components:
           for "at risk or breached"). Not capped at 100: a long-overdue,
           never-resolved SLA's percentage keeps climbing well past it (values
           in the tens of thousands are real, observed data), so 100 means
-          "breached", not "the maximum possible value". Only applied by the
-          ServiceNow data source (a Task SLA table join); filtering logic is
-          confined to the SN adapter.
+          "breached", not "the maximum possible value". Both bounds apply to the
+          same SLA record, and a record counts whatever its stage.
         - **escalationLevel** (in): one or more escalation level ids, "0"
           (EL0, not escalated) through "5" (EL5, CEO). Matches cases whose
           current escalation level is any of the given ids.
@@ -11858,6 +12381,26 @@ components:
           type: boolean
           description: Whether additional pages are available.
 
+    SalesforceEventRequest:
+      type: object
+      additionalProperties: false
+      required: [eventType, entity, referenceId]
+      properties:
+        eventType:
+          type: string
+          enum: [CREATED, UPDATED, DELETED, RESTORED, UNDEFINED]
+          description: >-
+            Salesforce change type from the ASB envelope. UNDEFINED is a valid
+            envelope value from Apex but this endpoint returns 400 for it.
+        entity:
+          type: string
+          pattern: '.*\S.*'
+          description: Salesforce sObject name. Non-Account values are ignored with 204.
+        referenceId:
+          type: string
+          pattern: '.*\S.*'
+          description: Salesforce record Id.
+
     ErrorResponse:
       type: object
       properties:
@@ -14236,6 +14779,11 @@ components:
       properties:
         field:
           type: string
+          description: >
+            Postgres accepts `name` (a project's name / a case's subject), `createdOn` and
+            `updatedOn`, applied to both tables; anything else is a 400. Defaults: projects
+            by name ascending, cases by updatedOn descending. `order` defaults to ascending
+            for `name` and descending for the date fields.
         order:
           type: string
           enum: [asc, desc]
@@ -15971,6 +16519,181 @@ components:
             completed it once. Only rely on this field to gate a reaction
             if that risk is acceptable, or if the reaction's own completion
             is tracked separately and durably instead.
+
+    AnnouncementRequest:
+      description: >
+        A draft, in-review, or approved announcement that has not yet been
+        published. Carries an announcement through
+        draft -> pending_approval -> approved -> published while the real
+        approval decision happens over email, outside this service entirely.
+        Has no ServiceNow equivalent — always backed by Postgres.
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [customer, eol]
+        state:
+          type: string
+          enum: [draft, pending_approval, approved, published]
+        subject:
+          type: string
+        description:
+          type: string
+        isSecurityAnnouncement:
+          type: boolean
+        audienceDefinition:
+          type: object
+          description: >-
+            Whichever shape the caller's own create form builds — opaque to
+            this service, stored and returned as-is.
+        resolvedProjectIds:
+          type: array
+          items:
+            type: string
+          nullable: true
+          description: The frozen audience snapshot, set at Submit. Null until then.
+        resolvedProjectCount:
+          type: integer
+          nullable: true
+        dryRunCaseId:
+          type: string
+          nullable: true
+        dryRunAt:
+          type: string
+          format: date-time
+          nullable: true
+        dryRunBy:
+          type: string
+          nullable: true
+        createdBy:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        submittedBy:
+          type: string
+          nullable: true
+        submittedAt:
+          type: string
+          format: date-time
+          nullable: true
+        approvedBy:
+          type: string
+          nullable: true
+        approvedAt:
+          type: string
+          format: date-time
+          nullable: true
+        publishedBy:
+          type: string
+          nullable: true
+        publishedAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    CreateAnnouncementRequestRequest:
+      type: object
+      required: [kind, createdBy]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [customer, eol]
+        subject:
+          type: string
+        description:
+          type: string
+        isSecurityAnnouncement:
+          type: boolean
+        audienceDefinition:
+          type: object
+        createdBy:
+          type: string
+          description: The caller-resolved actor id — this service is called server-to-server and does not resolve one itself.
+
+    UpdateAnnouncementRequestRequest:
+      type: object
+      required: [actorId]
+      additionalProperties: false
+      properties:
+        subject:
+          type: string
+        description:
+          type: string
+        isSecurityAnnouncement:
+          type: boolean
+        audienceDefinition:
+          type: object
+          description: Rejected with 400 if the request is currently approved — the approved audience snapshot is frozen.
+        actorId:
+          type: string
+
+    RecordAnnouncementDryRunRequest:
+      type: object
+      required: [caseId, actorId]
+      additionalProperties: false
+      properties:
+        caseId:
+          type: string
+        actorId:
+          type: string
+
+    SubmitAnnouncementRequestRequest:
+      type: object
+      required: [resolvedProjectIds, actorId]
+      additionalProperties: false
+      properties:
+        resolvedProjectIds:
+          type: array
+          items:
+            type: string
+          minItems: 1
+        actorId:
+          type: string
+
+    AnnouncementRequestActorRequest:
+      type: object
+      required: [actorId]
+      additionalProperties: false
+      properties:
+        actorId:
+          type: string
+
+    SearchAnnouncementRequestsRequest:
+      type: object
+      required: [pagination]
+      additionalProperties: false
+      properties:
+        state:
+          type: string
+          enum: [draft, pending_approval, approved, published]
+        createdBy:
+          type: string
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    SearchAnnouncementRequestsResponse:
+      type: object
+      properties:
+        requests:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnnouncementRequest'
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+        hasMore:
+          type: boolean
 
     ScheduledTaskRun:
       description: >

@@ -116,12 +116,14 @@ type CaseRepository interface {
 	// CreateCase inserts a new case row (both work_item and "case").
 	CreateCase(ctx context.Context, req domain.CreateCaseRequest) (domain.Case, error)
 	// GetCaseByID returns the enriched case view for the given UUID, or a
-	// NotFoundError if no matching row exists.
-	GetCaseByID(ctx context.Context, id string) (domain.CaseView, error)
+	// NotFoundError if no matching row exists OR it exists but scope excludes
+	// it (existence is never revealed to a caller who can't see it).
+	GetCaseByID(ctx context.Context, id string, scope SearchScope) (domain.CaseView, error)
 	// SearchCases returns a filtered, paginated slice of enriched case views
-	// together with the total count of matching rows before pagination.
+	// together with the total count of matching rows before pagination,
+	// narrowed to scope regardless of what project filter req itself carries.
 	// COUNT and SELECT are executed concurrently on separate pool connections.
-	SearchCases(ctx context.Context, req domain.SearchCasesRequest) ([]domain.SearchCaseView, int, error)
+	SearchCases(ctx context.Context, req domain.SearchCasesRequest, scope SearchScope) ([]domain.SearchCaseView, int, error)
 	// CreateCaseComment inserts a new comment row for the given case.
 	CreateCaseComment(ctx context.Context, req domain.CreateCaseCommentRequest) (domain.CaseComment, error)
 	// SearchCaseComments returns a paginated slice of comments for the given case
@@ -289,7 +291,7 @@ func (r *caseRepo) CreateCase(ctx context.Context, req domain.CreateCaseRequest)
 // other extension table has them); state/cause/close_notes/resolved_on/
 // closed_on are COALESCEd across whichever extension table actually matches
 // wi.type (caseLike*Column consts) since exactly one ever does.
-func (r *caseRepo) GetCaseByID(ctx context.Context, id string) (domain.CaseView, error) {
+func (r *caseRepo) GetCaseByID(ctx context.Context, id string, scope SearchScope) (domain.CaseView, error) {
 	var cv domain.CaseView
 	var (
 		// internalID is scanned as *string even though CaseView.InternalID
@@ -301,24 +303,33 @@ func (r *caseRepo) GetCaseByID(ctx context.Context, id string) (domain.CaseView,
 		// *string". stringOrEmpty below converts it back to "" for the
 		// response, matching CaseView.InternalID's own doc comment on why
 		// it can't become *string.
-		internalID                                    *string
-		aeID, aeName                                  *string
-		pcID, pcNum, pcType                           *string
-		rcID, rcNum                                   *string
-		accountID, accountName                        *string
-		severity, issueType, workState, caseType      *string
-		state, cause, resolutionNotes, resolutionCode *string
-		escalationLevel                               *string
-		isEscalated                                   *bool
-		resolvedOn                                    *time.Time
-		description                                   *string
-		projID, projName                              *string
-		depID, depName                                *string
-		dpID, dpDisplayName                           *string
-		prodID, prodName                              *string
-		creatorEmail                                  string
-		creatorID, creatorName                        *string
+		internalID                               *string
+		aeID, aeName                             *string
+		pcID, pcNum, pcType                      *string
+		rcID, rcNum                              *string
+		accountID, accountName                   *string
+		severity, issueType, workState, caseType *string
+		state, cause, closeNotes, resolutionCode *string
+		escalationLevel                          *string
+		isEscalated                              *bool
+		resolvedOn                               *time.Time
+		description                              *string
+		projID, projName                         *string
+		depID, depName                           *string
+		dpID, dpDisplayName                      *string
+		prodID, prodName                         *string
+		creatorEmail                             string
+		creatorID, creatorName                   *string
 	)
+	// A scoped caller asking for a case outside their access still gets
+	// pgx.ErrNoRows -> NotFoundError below, the same as a genuinely
+	// nonexistent id: existence is never revealed to a caller who can't see
+	// the case, matching GetProjectByID's own reasoning.
+	scopeClause, scopeArgs := "", []any{id}
+	if !scope.Unrestricted {
+		scopeClause = " AND " + scopePredicate("wi.project_id", 2)
+		scopeArgs = append(scopeArgs, scope.ProjectIDs)
+	}
 	err := r.db.QueryRow(ctx,
 		`SELECT wi.id, wi.number, wi.wso2_id, wi.type::TEXT,
 		        wi.description, c.severity::TEXT, c.issue_type::TEXT, c.work_state::TEXT,
@@ -349,11 +360,11 @@ func (r *caseRepo) GetCaseByID(ctx context.Context, id string) (domain.CaseView,
 		 LEFT JOIN work_item pw ON pw.id = wi.parent_id
 		 LEFT JOIN "case" rc ON rc.id = c.related_case_id
 		 LEFT JOIN work_item rc_wi ON rc_wi.id = rc.id
-		 WHERE wi.id = $1 AND wi.type = ANY(`+caseLikeWorkItemTypes+`)`, id,
+		 WHERE wi.id = $1 AND wi.type = ANY(`+caseLikeWorkItemTypes+`)`+scopeClause, scopeArgs...,
 	).Scan(
 		&cv.ID, &cv.Number, &internalID, &caseType,
 		&description, &severity, &issueType, &workState,
-		&state, &cause, &resolutionNotes,
+		&state, &cause, &closeNotes,
 		&resolutionCode, &escalationLevel, &isEscalated,
 		&cv.CreatedOn, &cv.UpdatedOn, &cv.ClosedOn, &resolvedOn,
 		&cv.Subject,
@@ -400,8 +411,17 @@ func (r *caseRepo) GetCaseByID(ctx context.Context, id string) (domain.CaseView,
 		c := domain.CaseCause(*cause)
 		cv.Cause = &c
 	}
-	if resolutionNotes != nil {
-		cv.ResolutionNotes = resolutionNotes
+	// caseLikeCloseNotesColumn genuinely is "close notes" (the only such
+	// column this schema has -- "case"/engagement/service_request/
+	// security_report_analysis/announcement all name it close_notes, not
+	// resolution_notes) and belongs on CaseView.CloseNotes, not
+	// CaseView.ResolutionNotes -- a distinct field on the ServiceNow data
+	// source (sn_case_service.go sets both from two separate upstream
+	// fields) that this schema has no separate column for at all, so it's
+	// correctly left nil here rather than double-filled from the same
+	// value.
+	if closeNotes != nil {
+		cv.CloseNotes = closeNotes
 	}
 	if resolutionCode != nil {
 		rc := domain.CaseResolutionCode(*resolutionCode)
@@ -984,12 +1004,57 @@ var pgSortColMap = map[domain.CaseSortField]string{
 	domain.CaseSortFieldState:     "c.state",
 }
 
+// onboardingStatusLabels maps a projectOnboardingStatus filter value (keyed by
+// its normalized form, see onboardingStatusEnumLabels) to
+// onboarding_status_enum. The filter's vocabulary is ServiceNow's choice labels
+// ("In-Progress", "Not-Applicable", "OnHold"), which are not the enum's spelling,
+// so values are compared with case, hyphens, underscores and spaces ignored.
+var onboardingStatusLabels = map[string]string{
+	"notstarted":    "NOT_STARTED",
+	"inprogress":    "IN_PROGRESS",
+	"completed":     "COMPLETED",
+	"onhold":        "ON_HOLD",
+	"notapplicable": "NOT_APPLICABLE",
+	"expired":       "EXPIRED",
+	"cancelled":     "CANCELLED",
+}
+
+var onboardingStatusKeyStripper = strings.NewReplacer("-", "", "_", "", " ", "")
+
+// onboardingStatusEnumLabels translates projectOnboardingStatus filter values
+// to onboarding_status_enum labels. An unknown value is a ValidationError
+// rather than a silent no-match: for notIn that would widen the result set.
+func onboardingStatusEnumLabels(values []string) ([]string, error) {
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		label, ok := onboardingStatusLabels[onboardingStatusKeyStripper.Replace(strings.ToLower(strings.TrimSpace(v)))]
+		if !ok {
+			return nil, &apierror.ValidationError{Msg: "projectOnboardingStatus contains invalid value: " + v}
+		}
+		out = append(out, label)
+	}
+	return out, nil
+}
+
 // SearchCases implements CaseRepository.
-func (r *caseRepo) SearchCases(ctx context.Context, req domain.SearchCasesRequest) ([]domain.SearchCaseView, int, error) {
+func (r *caseRepo) SearchCases(ctx context.Context, req domain.SearchCasesRequest, scope SearchScope) ([]domain.SearchCaseView, int, error) {
 	filterArgs := []any{}
 	argIdx := 1
 
 	where := "WHERE 1=1"
+
+	// The caller's access scope is ANDed in independently of whatever project
+	// filter the request itself carries (req.Parsed.ProjectIDs below): a
+	// scoped caller asking for a project outside their own scope gets zero
+	// rows, never someone else's data, and a scoped caller with no project
+	// filter of their own is still narrowed to just what they can see. An
+	// empty scope.ProjectIDs (no access at all) correctly matches nothing via
+	// ANY('{}').
+	if !scope.Unrestricted {
+		where += " AND " + scopePredicate("wi.project_id", argIdx)
+		filterArgs = append(filterArgs, scope.ProjectIDs)
+		argIdx++
+	}
 
 	if len(req.Parsed.Types) > 0 {
 		// req.Parsed.Types holds validCaseType's lowercase values
@@ -1140,6 +1205,50 @@ func (r *caseRepo) SearchCases(ctx context.Context, req domain.SearchCasesReques
 		where += fmt.Sprintf(" AND wi.updated_on <= $%d", argIdx)
 		filterArgs = append(filterArgs, req.Parsed.EndUpdatedDate)
 		argIdx++
+	}
+
+	// projectOnboardingStatus: the parent project's onboarding_status (p is
+	// the LEFT JOIN below). A case whose project has no status set (NULL)
+	// satisfies notIn -- "not in progress" is true of it -- but never in.
+	if len(req.Parsed.ProjectOnboardingStatuses) > 0 {
+		labels, err := onboardingStatusEnumLabels(req.Parsed.ProjectOnboardingStatuses)
+		if err != nil {
+			return nil, 0, err
+		}
+		where += fmt.Sprintf(" AND p.onboarding_status = ANY($%d::text[]::onboarding_status_enum[])", argIdx)
+		filterArgs = append(filterArgs, labels)
+		argIdx++
+	}
+	if len(req.Parsed.ExcludeProjectOnboardingStatuses) > 0 {
+		labels, err := onboardingStatusEnumLabels(req.Parsed.ExcludeProjectOnboardingStatuses)
+		if err != nil {
+			return nil, 0, err
+		}
+		where += fmt.Sprintf(" AND (p.onboarding_status IS NULL OR p.onboarding_status <> ALL($%d::text[]::onboarding_status_enum[]))", argIdx)
+		filterArgs = append(filterArgs, labels)
+		argIdx++
+	}
+
+	// taskSLABusinessElapsedPercent: matches a case with at least one SLA row
+	// whose business_elapsed_percentage is within the bound(s). Both bounds
+	// apply to the SAME row (a range like 75..100 means one SLA in that range,
+	// not one row >= 75 and another <= 100), which is why this is a single
+	// EXISTS. Any SLA row counts, whatever its stage -- the contract of
+	// domain.TaskSLAFilter. The percentage is uncapped (long-overdue SLAs
+	// climb far past 100), and 0 is a real bound, hence the nil checks.
+	if f := req.Parsed.TaskSLAFilter; f != nil && (f.MinBusinessElapsedPercent != nil || f.MaxBusinessElapsedPercent != nil) {
+		slaWhere := "tsla.work_item_id = wi.id"
+		if f.MinBusinessElapsedPercent != nil {
+			slaWhere += fmt.Sprintf(" AND tsla.business_elapsed_percentage >= $%d::numeric", argIdx)
+			filterArgs = append(filterArgs, *f.MinBusinessElapsedPercent)
+			argIdx++
+		}
+		if f.MaxBusinessElapsedPercent != nil {
+			slaWhere += fmt.Sprintf(" AND tsla.business_elapsed_percentage <= $%d::numeric", argIdx)
+			filterArgs = append(filterArgs, *f.MaxBusinessElapsedPercent)
+			argIdx++
+		}
+		where += " AND EXISTS (SELECT 1 FROM sla tsla WHERE " + slaWhere + ")"
 	}
 
 	if req.Filters.SearchQuery != "" {
@@ -1621,6 +1730,21 @@ func scanCaseActivity(row interface{ Scan(...any) error }) (domain.CaseActivity,
 // journal entry might), so each row becomes its own CaseActivity with a
 // single-element Changes slice, rather than guessing at a bundling rule.
 func (r *caseRepo) SearchCaseActivities(ctx context.Context, req domain.SearchCaseActivitiesRequest) ([]domain.CaseActivity, int, error) {
+	// Confirm req.CaseID is actually a case-like work item before reading
+	// its activity feed -- comment/case_attachments/work_item_activity are
+	// all keyed by the generic work_item_id with no type filter of their
+	// own, so without this check a caller could pass any other work_item's
+	// UUID (a change request, incident, ...) through this endpoint and read
+	// that record's comments/attachments/field changes instead. Same class
+	// of gap as IncidentRepository.SearchIncidentActivities' own fix.
+	var exists bool
+	if err := r.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM work_item WHERE id = $1 AND type = ANY(`+caseLikeWorkItemTypes+`))`, req.CaseID).Scan(&exists); err != nil {
+		return nil, 0, fmt.Errorf("check case exists: %w", err)
+	}
+	if !exists {
+		return nil, 0, &apierror.NotFoundError{Msg: "case not found"}
+	}
+
 	includeFieldChanges := req.IncludeFieldChanges != nil && *req.IncludeFieldChanges
 
 	countQuery := `

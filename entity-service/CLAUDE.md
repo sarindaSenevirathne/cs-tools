@@ -43,6 +43,11 @@ The server loads `.env` automatically on startup (silently ignored if absent). P
 | `EVENT_PUBLISHING_ENABLED` | no | `false` | Must be `"true"` for `EventPublisherService` to actually get constructed, even with `EVENT_HUB_BROKER` fully configured — a separate safe-by-default kill switch |
 | `SUPPORT_ENGINEER_ROLE` | no | — | ServiceNow role name whose presence on a case comment's resolved author completes the case's "response" SLA clock — see "SLA clocks" below |
 | `CUSTOMER_ROLES` | no | — | Comma-separated ServiceNow role names whose presence on a case comment's resolved author marks a customer reply — see `applyCustomerReplyStateTransition` in "SLA clocks" below |
+| `SALES_ENTITY_BASE_URL` | no* | — | REST `sales/sales-entity-service` base URL (not GraphQL `sales/entity-graphql-service`). *Required once any `SALES_ENTITY_*` var is set |
+| `SALES_ENTITY_TOKEN_URL` | no* | — | OAuth2 token endpoint (client_credentials grant) |
+| `SALES_ENTITY_CLIENT_ID` | no* | — | Choreo connection client id |
+| `SALES_ENTITY_CLIENT_SECRET` | no* | — | Choreo connection client secret |
+| `SALES_ENTITY_SCOPES` | no | — | Optional space-separated OAuth2 scopes for REST `sales/sales-entity-service` |
 
 \* `DB_USER`/`DB_PASSWORD`/`DB_NAME` are required when `DATA_SOURCE=postgres`
 and **optional** when `DATA_SOURCE=servicenow`, where entity reads and writes
@@ -157,6 +162,29 @@ just a bool, either `"true"` or not. `NewRouter` returns the constructed
 `EventPublisherService` (nil if unconfigured) alongside the `http.Handler`,
 threaded through `server.New` to `cmd/api/main.go`, which calls `Close()` on
 it during shutdown, after `srv.Shutdown`.
+
+## Salesforce Account ingest
+
+`POST /salesforce/events` accepts the ASB envelope `{eventType, entity, referenceId}`
+from `sales-apex-trigger-subscriber`, which dual-forwards every envelope to
+ServiceNow and to this endpoint. The subscriber has no `dataSource` switch.
+Wired in `internal/server/routes.go` only when entity-service
+`DATA_SOURCE=postgres`, a pool is available, and all four `SALES_ENTITY_*`
+vars are set — the same optional all-or-nothing style as Event Hub.
+`Config.Validate` rejects a partial REST sales-entity-service set at startup.
+
+`internal/salesentity` uses stdlib `net/http` and an OAuth2 `client_credentials`
+grant, then REST `POST /customer-search` with `{ids, isRealTime: true, limit: 1}`
+against Choreo id `sales/sales-entity-service` (not GraphQL
+`sales/entity-graphql-service`). Token is refreshed on 401. An empty
+search result on CREATED/UPDATED/RESTORED is a 503 so the caller can retry
+(the event can arrive before Salesforce commits). This service does not call
+Salesforce REST; the REST sales entity-service does. REST Customer has no AccountNumber,
+Account_Vertical__c, or Technical_Owner_2 — `number` falls back to Salesforce
+Id and those other columns stay null.
+Non-Account entities return 204 and are ignored (do not 400 — ASB would
+retry forever). DELETED soft-deletes by setting `deactivation_date`; never
+`DELETE FROM account` (project → account is `ON DELETE CASCADE`).
 
 Seven call sites publish today, all ServiceNow-data-source-only (`DATA_SOURCE=servicenow`;
 there is no Postgres-backed equivalent for any of them). There is also one
@@ -661,7 +689,18 @@ already use — no route path, request, or response shape changed.
 - **Comments**: `comment.work_item_id` is a foreign key into `work_item(id)`,
   so only reference types that are themselves work_item subtypes can be
   commented on through Postgres — see
-  `repository.ReferenceTypeToWorkItemType`. `"deployment"` has no entry:
+  `repository.ReferenceTypeToWorkItemType`. **`"case"` maps to all five
+  case-like work_item types** (`CASE`/`ENGAGEMENT`/`SERVICE_REQUEST`/
+  `SECURITY_REPORT_ANALYSIS`/`ANNOUNCEMENT`), not just literal `CASE` — found
+  live as a real bug via a HAR comparison against the ServiceNow data
+  source: a `CS`-numbered work_item whose real type was `SERVICE_REQUEST`
+  returned zero comments through `POST /comments/search` (which
+  `csm-portal-backend`'s case-scoped comment endpoint forwards to, injecting
+  `referenceType:"case"`) even though it had real comment rows, because this
+  map used to bind a single `"CASE"` value where `case_repo.go`'s own
+  `GetCaseByID`/`SearchCases` have matched all five case-like types since
+  "Case-like work_item types" landed — this file was simply never updated to
+  match. `"deployment"` has no entry:
   `deployment` (migration 000013) is its own standalone table with its own
   primary key space, not a work_item subtype, so `CreateComment`/
   `SearchComments` reject it with a `ValidationError` before any query runs.
@@ -1082,6 +1121,81 @@ product, account, deployment, deployed_product, split across
     conflict loop — either way, the exact prefix/padding/format needs a
     real answer, not an invented one.
 
+## GetProjectByID 404'd on any project with no linked account
+
+Found in the same audit pass as the SearchProjects fix below, by explicitly
+testing a project confirmed to have `account_id IS NULL` (not just spot
+checking one that had an account, which the first pass over this endpoint
+missed). `GetProjectByID`'s `JOIN account a ON p.account_id = a.id` was an
+INNER JOIN, so a project with no linked account produced zero rows and came
+back as `&apierror.NotFoundError{Msg: "project not found"}` even though the
+project genuinely exists -- confirmed live against one of the 14 (of 1956)
+such projects. Same class of false-404 `GetCaseByID` already had for its own
+optional joins (see "Case-like work_item types" history above) before that
+was fixed. Fixed the same way: `JOIN` -> `LEFT JOIN`, with `a.id`/`a.name`
+scanned into nullable locals and left as `ProjectAccountRef`'s zero value
+(`""`, not fabricated) when no account matched -- `Account` stays a required,
+always-present object on the wire (`ProjectDetailsView.Account` has no
+`omitempty` and no doc comment claiming otherwise), just with empty fields,
+rather than changing the JSON contract to nullable. `ActivationDate`/`Region`
+already tolerated a LEFT JOIN's NULLs without any change, since
+`ProjectAccountRef` already types them as pointers.
+
+## SearchProjects crashed on any page containing a NULL start_date/end_date/account_id
+
+Found while auditing whether `GetProjectByID`/`SearchProjects` still work
+correctly. `project.start_date`/`end_date`/`account_id` (migration 000009)
+are all nullable, but `domain.Project` (the internal repository<->service
+handoff type `SearchProjects` uses -- never serialized directly; `ProjectView`
+is what actually reaches a caller) had non-pointer `time.Time`/`string`
+fields for them, so `project_repo.go`'s scan failed with `cannot scan NULL
+into *time.Time` the moment any of the 13-14 (of 1956) rows with a NULL date
+reached the query -- confirmed live, and this wasn't a rare edge case: the
+very first unfiltered page (most-recently-created projects first) already
+contained one. Fixed by making `Project.AccountID`/`StartDate`/`EndDate`
+pointers, matching `ProjectDetailsView`'s own already-pointer `StartDate`/
+`EndDate` (which already carries a doc comment for exactly this "ServiceNow
+may legitimately leave either unset" reality). Also fixed a second, smaller
+gap found in the same pass: `project_service.go`'s mapping into `ProjectView`
+never set `StartDate` at all (only `EndDate`), even though `ProjectView.
+StartDate` is a real, already-documented field -- both now pass through
+directly rather than being re-boxed through a local copy. `ProjectView.
+Account` staying `nil` for Postgres-sourced results is unrelated and
+unchanged -- that one's already documented as "(ServiceNow data source
+only)", a deliberate scope boundary, not a bug. Verified by paging through
+all 1956 projects (every NULL row included) with no error afterward.
+
+## CreateCase is still completely broken for the Postgres data source (deliberately, pending a product decision)
+
+Re-confirmed still true, verified live (`ERROR: relation "cases" does not
+exist (SQLSTATE 42P01)`) -- see `case_repo.go`'s own doc comment on
+`CreateCase` and "Fixing the plural/singular table-name mismatch" above for
+the full history. Restated here because it's easy to mistake for "just needs
+a table rename" (the same class of bug every other method in this file had):
+fixing the table/column names alone would only trade this error for a `NOT
+NULL`/unique-constraint failure, because `work_item.number`/`wso2_id` have no
+DB default, no backing sequence anywhere in `migrations/`, and no confirmed
+intended format. **Do not guess a fix here** -- the product decision (DB
+sequence + column default vs. Go-side generation with retry-on-conflict, and
+the actual number format) has been deferred twice now, not overlooked.
+
+## GetCaseByID's CloseNotes was silently swapped with ResolutionNotes
+
+Found via a HAR comparison against the ServiceNow data source for the same
+case: `closeNotes` was always `null` in every Postgres `GetCaseByID`
+response, while `resolutionNotes` held what was actually close-notes data.
+`caseLikeCloseNotesColumn` (`COALESCE(c.close_notes, eng.close_notes,
+sr.close_notes, sra.close_notes, ann.close_notes)`) was scanned into a
+local variable named `resolutionNotes` and assigned to
+`cv.ResolutionNotes` -- but this schema has no separate `resolution_notes`
+column anywhere (only `close_notes`, on all five case-like tables), and the
+ServiceNow-backed path (`sn_case_service.go`) treats `CloseNotes`/
+`ResolutionNotes` as genuinely distinct fields from two different upstream
+values. Fixed by scanning into `closeNotes` and assigning it to
+`cv.CloseNotes`; `cv.ResolutionNotes` now correctly stays `nil` on this data
+source (no confirmed column for it), rather than being double-filled from
+`close_notes`.
+
 ## CaseView.ProjectDetails / SearchCaseView.Project are now optional
 
 Both were required (non-pointer) `EntityRef` fields, but `work_item.project_id`
@@ -1288,6 +1402,140 @@ side. `domain.UpdatedCase.State`/`Severity` (the `PATCH /cases/{id}`
 response) became pointers too, matching the sibling `WorkState` field's
 existing pointer convention there.
 
+## Incident, Problem, IncidentTask, and Conversation (migrations 000057-000060, 000066)
+
+A large schema addition (10 migrations: `conversation`, `incident`, `problem`,
+`change_task`, `communication_plan`, `communication_task_definition`,
+`incident_alert`, `incident_alert_task`, `incident_task`, plus incident/
+problem subcategory lookup tables) landed on `dev-app-csm-portal` in one
+batch. None of these 11 tables exist on the staging database this was
+developed against yet (checked directly) -- same recurring gap as several
+other recently-merged migrations. `change_task`/`communication_plan`/
+`communication_task_definition`/`incident_alert`/`incident_alert_task` have
+**no existing endpoint on any data source** to wire up at all (no
+`sn_*_service.go` for any of them) and are left entirely unimplemented --
+nothing to back. `Incident`/`Problem`/`IncidentTask`/`Conversation` do have
+existing ServiceNow-only endpoints; new `incident_repo.go`/`problem_repo.go`/
+`incident_task_repo.go`/`conversation_repo.go` (+ matching `*_service.go`)
+wire up the read side of all four, following the standard "SN branch vs.
+Postgres branch, same service interface" pattern.
+
+**`IncidentView`/`SearchIncidentView`/`ProblemDetail`/`SearchProblemView`/
+`IncidentTaskDetail` render State/Priority/Category/Subcategory/ContactType/
+ResolutionCode as plain, unvalidated strings** (per those fields' own doc
+comments) -- so reads need no enum reconciliation against
+`domain.IncidentState`/`IncidentPriority`/etc at all; the real Postgres enum
+text is simply passed through as-is. Only the **search filter path** uses
+the strict domain enums (`SearchIncidentsFilters.Priorities`, the generic
+`Filters` array's `"state"` on both Incident and Problem), and reading the
+migration SQL side by side with `domain.go`'s Go constants (a static,
+line-by-line comparison, not something that needed live data) turned up
+three real, easy-to-miss mismatches:
+
+- `incident_state_enum`'s cancelled label is `'CANCELED'` (one L), not
+  `domain.IncidentStateCancelled`'s `"CANCELLED"` (two Ls).
+- `incident_priority_enum` has no `'PLANNING'` label at all (only
+  `CRITICAL`/`HIGH`/`MODERATE`/`LOW`) -- `domain.IncidentPriorityPlanning`
+  is rejected with a `ValidationError` on this data source rather than
+  silently dropped or bound into an invalid enum cast.
+- `conversation_state_enum`'s closed label is `'CLOSE'` (no D), not
+  `domain.ConversationStateClosed`'s `"CLOSED"`.
+
+`incidentStateToEnum`/`incidentPriorityToEnum` (`incident_service.go`) and
+`conversationStateToEnum`/`conversationStateFromEnum` (`conversation_repo.go`)
+hold these mappings, used consistently on every read/write/filter path so
+none of them can drift from the others -- each has a unit test locking in
+the exact mismatch. `domain.ProblemState`'s values match `problem_state_enum`
+by identity (a rarer case in this codebase where no mapping was needed at
+all).
+
+**`ParseIncidentFieldFilters`/`ParseProblemFieldFilters`/
+`ParseIncidentTaskFieldFilters` (the existing `incident_filters.go`/
+`problem_filters.go`/`incident_task_filters.go`) are NOT reused for the
+Postgres data source's "state" filter.** All three translate a caller's
+`domain.IncidentState`/`ProblemState` value into ServiceNow's own raw
+numeric state keys (`parsedIncidentFilters.StateKeys` and siblings) --
+correct for that data source, meaningless for Postgres's own clean enum
+columns. Each new `*_service.go` has its own
+`parse*FieldFiltersPostgres` that reuses those files' field/op allow-lists,
+`requireFilterValues`/`badFilterCombo` helpers, and (for Incident)
+`parseIncidentFilterDate`/`parseIncidentFilterBool` (both fully
+data-source-agnostic), but maps `"state"` through the Postgres-specific enum
+functions above instead. `incident_task`'s SN state choice list has no
+confirmed-complete, unambiguous enum at all (see
+`parsedIncidentTaskFilters.StateKeys`'s own doc comment) -- Postgres's own
+`incident_task_state_enum` has no such ambiguity, so that data source
+accepts the enum's own label strings (case-insensitive) directly in the
+`"state"` filter, a deliberate, documented divergence from SN's
+raw-integer convention for the same field.
+
+**Filters with no backing column are accepted, validated, and silently not
+applied** (never rejected outright) -- matching `changeRequestWhereClause`'s
+own established precedent for the identical class of gap (e.g.
+`change_request`'s own `assignmentGroupId`): `assignmentGroupId` on all
+three of Incident/Problem/IncidentTask, `configurationItemId`, and
+`productName` on Incident. `businessServiceId` on Incident IS applied,
+mapped to `incident.service_id` -- "business service" is ServiceNow's own
+name for what this schema calls `service`, the same identification
+`service_offering_repo.go` already makes. `assignedUserId` on
+Problem/Incident IS applied too, mapped to `work_item.assigned_to_id`, a
+real, direct column. `madeSla`/`slaViolated` on Incident map to
+`incident.is_sla_met` and an `EXISTS`/`NOT EXISTS` check against `sla.has_breached`
+(migration 000052) respectively.
+
+**`SearchIncidentActivities` reuses `scanCaseActivity`'s exact query shape**
+(`case_repo.go`) -- an activity feed entry (comment or field change) is not
+inherently case-specific, and `comment`/`work_item_activity` are both keyed
+by the generic `work_item_id`. Unlike `SearchCaseActivities`, there is no
+`case_attachments`-equivalent table for incidents, so this feed can never
+have an `"attachment"` kind entry.
+
+**`UpdateConversation` is implemented** (a plain `conversation.state` enum
+write, no `work_item.number` generation needed for an update) but
+**`CreateConversation`/`CreateProblem`/`CreateIncident` are not**: all three
+need `work_item.number`, which has no DB default or backing sequence
+anywhere in `migrations/` -- the same blocker `CaseRepository.CreateCase`
+already has. **`UpdateProblem`/`UpdateIncident`/`HandOffIncidentToSpecialist`
+are also not implemented**: `UpdateProblem.Transition` is validated
+server-side by ServiceNow's own workflow engine with no fixed, confirmed
+transition rule set to reimplement (see that field's own doc comment --
+deliberately not a closed enum for exactly this reason);
+`UpdateIncident` touches several fields with no backing column at all
+(`AssignmentGroupID`, `ConfigurationItemID`, `WatchList`) alongside ones
+that do, and would need `comment`-table side effects for
+`AdditionalComments`/`WorkNotes` mirroring `caseService.UpdateCase`'s own
+comment-on-update behavior -- deferred as a unit rather than
+half-implemented; `HandOffIncidentToSpecialist` is an inherently
+ServiceNow-workflow-specific feature (moves the incident to a specialist
+group, opens a runbook-gap task, files a GitHub issue) with no
+assignment-group or handoff-tracking concept anywhere in this schema to
+derive an equivalent from. `IncidentView.SpecialistHandoff` is always `nil`
+on this data source for the same reason -- the correct "never handed off"
+representation per that field's own doc comment, not a gap.
+
+`IncidentView.WatchList`/`LinkedServiceRequests` are always empty slices on
+this data source (never populated) -- `work_item_watcher` could back the
+former (same table `SetCaseWatchList`/`fetchCaseWatchers` already use for
+cases) and `work_item.parent_id` reverse lookups could back the latter,
+matching the pattern `ProblemRepository.GetProblem`'s `LinkedIncidents`
+already uses for `incident.problem_id`'s own reverse lookup -- left as a
+known, flagged gap rather than built out further given the size of this
+change, not because either is infeasible.
+
+**`SearchIncidentActivities`/`SearchCaseActivities` verify the id is
+actually an incident/case-like work item before reading its activity
+feed** (`EXISTS (SELECT 1 FROM incident WHERE id = $1)` and the
+`caseLikeWorkItemTypes`-filtered equivalent respectively) -- found as a
+real IDOR during review: `comment`/`case_attachments`/`work_item_activity`
+are all keyed by the generic `work_item_id` with no type filter of their
+own, so without this check a caller could pass any other work item's UUID
+(a change request, a different case, ...) through either endpoint and read
+that record's comments/attachments/field changes instead of a 404.
+`SearchCaseActivities`'s copy of this gap pre-dated this change (inherited
+from the original comment/attachment UNION ALL implementation) and was
+fixed alongside the new incident one rather than left for later, since it's
+the identical bug.
+
 ## change_request.change_model and work_item_activity (migrations 000055/000056)
 
 Two small, unrelated migrations, both unverified against real data (neither
@@ -1477,6 +1725,415 @@ its own `resume_condition` column (distinct from `pause_condition`, which
 is mapped to `PauseCondition`), but `TaskSlaDefinitionDetail` has no field
 for it at all -- a real, minor gap, left unselected rather than adding a
 new response field speculatively.
+
+## GET /metadata and GET /projects/{id}/metadata now have Postgres support
+
+Both were entirely ServiceNow-only (their handlers were only wired when
+`DATA_SOURCE=servicenow`), which broke `apps/customer-portal/backend-v2`'s
+`/filters` and `/features` endpoints in Postgres mode -- its own CLAUDE.md
+says both are built purely from `GetProjectMetadata`, with no fallback.
+
+**`GetProjectMetadata` lives on `ProjectStatsService`, a 7-method interface
+bundled with all the `/projects/{id}/stats/*` endpoints -- and only this one
+method got a Postgres implementation.** Rather than stub the other 6
+(`GetProjectStats`, `GetProjectCaseStats`, `GetProjectConversationStats`,
+`GetProjectDeploymentStats`, `GetProjectTimeCardStats`,
+`GetProjectChangeRequestStats`) with fake "not implemented" errors -- which
+would have turned their routes from a clean 404 in Postgres mode into a
+misleading 4xx, breaking the `TestPostgresOnlyRoutesAreAbsentWithoutAPool`-style
+convention this codebase already relies on for signaling "this route doesn't
+exist on this data source" -- `GetProjectMetadata` was split out into its own
+narrower interface, `service.ProjectMetadataService`, and its own handler,
+`ProjectMetadataHandler` (`internal/handler/project_metadata_handler.go`).
+`GET /projects/{id}/metadata` is now registered unconditionally in
+`routes.go`, backed by `projectMetadataService` (Postgres) or reusing the
+already-constructed `snProjectStatsSvc` value (ServiceNow) -- Go interfaces
+being structural, `snProjectStatsService` satisfies `ProjectMetadataService`
+without any change. `ProjectStatsHandler`/`ProjectStatsService` are
+unchanged and still ServiceNow-only for the remaining 6 stats methods. If a
+future entity-service method needs the same treatment (real Postgres support
+for one method of an otherwise-ServiceNow-only bundled interface), follow
+this same split-interface-and-handler pattern rather than stubbing the rest.
+
+**`ReferenceDataRepository`** (`internal/repository/reference_data_repo.go`)
+backs both endpoints:
+- `ListProjectTypes`/`GetProjectByID` read the `project_type` table
+  (migration 000026) and `project.project_type_id` (migration 000027) --
+  confirmed live: 1952 of 1956 `project` rows have a `project_type_id` set.
+- `EnumLabels` queries `pg_catalog.pg_enum`/`pg_type` directly (`WHERE
+  t.typname = ANY($1::text[])`) rather than hardcoding each enum's label
+  list, so `ProjectMetadataResponse`'s choice lists (case states/severities/
+  issue types, deployment types, engagement types/payment types,
+  change-request states/impacts, time-card states, conversation states)
+  always match whatever the migrations currently define. Each label becomes
+  a `ChoiceListItem{ID: label, Label: label}` -- Postgres enums have no
+  separate numeric-id/display-label pair the way ServiceNow's `sys_choice`
+  records do, so the raw enum label is used as both.
+- `ProjectMetadataResponse.CaseTypes` is NOT queried -- it's
+  `case_service.go`'s own `validCaseType` vocabulary (`case`, `engagement`,
+  `security_report_analysis`, `service_request`, `announcement`), listed
+  directly as `caseTypeRefItems` in `project_metadata_service.go` since it's
+  a fixed filter vocabulary, not a database table.
+
+**Left empty with a TODO comment, not fabricated** (per this codebase's
+existing convention of flagging genuine data-source gaps rather than
+inventing data): `SystemMetadataResponse.TimeZones`/`FeedbackEmojis` (static
+ServiceNow-side config, not project/case data); `SeverityBasedAllocationTime`
+(no SLA-allocation-time table exists);
+`ProjectFeatures.AcceptedSeverityValues` and every `Has*Access`/product-
+category field (no per-project feature-entitlement or severity-restriction
+columns exist anywhere in the Postgres schema -- checked directly against
+the `project` table's full column list, not just assumed). (`CallRequestStates`
+used to be on this list; `customer_call` -- migration 000072 -- has since
+landed, so it's now read live from `customer_call_state_enum` like every other
+choice list. See "Call requests and the service-request catalog" below.)
+
+**`GlobalService.GlobalSearch` (`POST /search`) still has no Postgres
+implementation** -- cross-entity project+case search is a materially larger
+feature (its own query/ranking design across two tables) than the
+reference-data reads `GetSystemMetadata` serves, so it returns a
+`ValidationError` explaining the gap in Postgres mode rather than 404 (the
+route itself is now registered in both modes, since `GetSystemMetadata`
+needed to be) or a silently-empty result.
+
+## Token validation and caller-scoped access
+
+entity-service used to read `x-user-id-token` without verifying it and had no
+notion of "what may this caller see" -- in Phase 1 ServiceNow applied that via
+the forwarded token, so moving to Postgres removed the only enforcement. This
+adds it back, in entity-service (next to the data), not in each caller.
+
+**Token validation (`internal/auth`)** mirrors `apps/csm-portal/backend`'s
+validator (`golang-jwt/jwt/v5` + `keyfunc/v3`, same versions), against
+**Asgardeo** (not Choreo). Two tokens can arrive on the same request:
+- `x-user-id-token`: the end user's ID token. Checked for signature, issuer,
+  expiry, an `aud` among `AUTH_USER_TOKEN_AUDIENCES`, and an `email` claim.
+- `Authorization: Bearer`: the calling application's client-credentials access
+  token (every backend, including csm-integration-service, sends one -- it's
+  the only token a pure machine-to-machine caller ever sends). Checked for
+  signature/issuer/expiry; its `client_id` (else `azp`) claim is the client id.
+  No audience check -- the client id is what gets authorized.
+
+**Always on -- there is no config flag to disable it.** `AUTH_ISSUER`/
+`AUTH_JWKS_URL`/`AUTH_USER_TOKEN_AUDIENCES` are required (`config.Validate`
+rejects startup without them). Only asymmetric algorithms are accepted (an
+HS256 token "signed" with the public key is rejected -- there is a test). A
+token that is **present but invalid is always a 401 on every route**, never
+downgraded to "no token": that would turn a forged user token into an
+anonymous request. A request with no tokens at all passes through the
+middleware; whether that's acceptable is decided per endpoint (see below).
+
+Two things learned the hard way, both mirrored from/corrected against the CSM
+backend: Asgardeo publishes JWKS `x5c` certs Go 1.23+ refuses to parse, so the
+JWKS transport strips `x5c` (`x5c_transport.go`); and `keyfunc` does **not**
+fail when the JWKS URL is unreachable at construction -- it logs and retries in
+the background, which would leave a misconfigured deployment up rejecting every
+token. `NewValidator` therefore fails unless at least one key actually loaded,
+and `NewRouter` panics on that error at startup.
+
+**Who may see what (`AccessService.ResolveScope`)**. The decision comes from
+the *validated* identity, never from a list the caller sends, and applies the
+same way everywhere it's wired (see "Where this is actually enforced" below):
+
+| Request carries | Result |
+|---|---|
+| no verified identity (only possible if the auth middleware was left out of the chain -- a bug) | 503 -- never scope from an unverified token |
+| Bearer client id is in `AUTH_INTERNAL_CLIENT_IDS` | **everything, unconditionally** -- regardless of any `x-user-id-token` the same request also carries |
+| not an internal client, user token, `user_type` INTERNAL (all active rows for the email) | everything |
+| not an internal client, user token, EXTERNAL (customer) | only projects where their email is a `REGISTERED` `project_contact`, and the cases in them; none registered = an empty result, never "no filter" |
+| not an internal client, user token, inactive / SYSTEM / NOT_AVAILABLE / unknown email | 403 |
+| not an internal client, no user token | 401 -- no legitimate caller to resolve |
+
+**An internal client id wins outright -- there is no comparison with the user
+token's own scope.** Every client id configured here is itself an
+already-trusted internal service (see `AUTH_INTERNAL_CLIENT_IDS` config
+below), so a user token it forwards (if any) is used only for attribution
+elsewhere (`created_by`/`updated_by`), never for scoping -- not even to widen
+or narrow anything. This is simpler than an earlier revision of this design
+(a "rescue" that only kicked in for an *unknown* forwarded email, deferring to
+the user's own scope otherwise): once real deployments settled on which
+callers are genuinely internal, there was no longer a case where an internal
+client legitimately forwards a real customer's token, so the extra nuance was
+removed. `AccessRepository` is never even queried on the internal-client path
+(there is a test asserting zero DB calls).
+
+`user.email` is **not unique** (staging shares emails across rows), so on the
+non-internal-client path rows are combined conservatively: internal access
+needs every active row to be INTERNAL; an email that is also an EXTERNAL
+customer is scoped as a customer. `user.is_active` NULL counts as active.
+`project_contact` states other than `REGISTERED` (INVITED, RE-INVITED,
+DEACTIVATED) grant nothing -- **staging data caveat**: at the time of writing
+only 97 REGISTERED contact rows covered 68 of ~1956 projects (260 INVITED), so
+customer results are limited by how much has been synced; flip the state in
+`access_repo.go` if INVITED contacts should count.
+
+**A related, separate gap surfaced while building this, not yet fixed**:
+`recompute_user_type()`'s trigger (migration 000007) classifies only the
+`admin` and `internal` Asgardeo/SN roles as `user_type = INTERNAL` -- a person
+whose only role is `agent` ends up `NOT_AVAILABLE` and is denied here even
+though they *do* have a `user` row. Whether `agent` should count as internal
+is a product decision, not something to guess at here.
+
+**`AUTH_INTERNAL_CLIENT_IDS`** (config.go's `ParseInternalClientIDs`) is a
+plain comma-separated set of client ids -- no `clientId=role` grammar, no
+"delegate" role: those existed in an earlier revision, when a caller that
+always forwards a user token needed a role distinct from one that sometimes
+doesn't. In practice every caller either (a) is itself trusted with
+unconditional access (an internal client id), or (b) is resolved purely from
+whatever user token it forwards -- there's no third case, so a plain
+allow-list is all `ResolveScope` needs. Which real client ids belong in it is
+a deployment decision this file doesn't prescribe.
+
+### Where this is actually enforced
+
+`AccessService` is wired into, and enforced by:
+- `POST /search` (global search) -- projects match name/key, cases match
+  number/subject/WSO2 id/description (case-insensitive, LIKE metacharacters
+  escaped so `%` and `_` are literal); results are limited to `project`/
+  case-like work items; `sortBy` accepts `name`/`createdOn`/`updatedOn` only
+  (mapped to fixed columns, never interpolated). Case `state`/`severity` use
+  the raw enum labels as id and label (same vocabulary as project metadata).
+  `activeChatsCount`/`actionRequiredCount`/`outstandingCount` are 0 -- their
+  definition lives in ServiceNow-side logic with no Postgres equivalent yet
+  (TODO).
+- `GET /projects/{id}` / `GET /cases/{id}` -- a project or case outside scope
+  is a 404, indistinguishable from one that doesn't exist at all (never a 403
+  that would reveal it exists). The scope filter is folded straight into the
+  `WHERE` clause (`ProjectRepository.GetProjectByID`/`CaseRepository.
+  GetCaseByID`'s new `scope SearchScope` parameter) rather than fetched-then-
+  checked, so this is one query either way.
+- `POST /projects/search` / `POST /cases/search` -- the scope's project list
+  is ANDed into the query **independently** of whatever project filter the
+  request itself carries (`SearchCasesRequest.Filters.Filters`'
+  `projectId`/`in`, if present): a scoped caller explicitly asking for a
+  project outside their own scope gets zero rows, never someone else's data,
+  and gets the same narrowing even with no project filter of their own.
+
+**This applies to the Postgres data source only.** In ServiceNow mode
+`GetProjectByID`/`GetCaseByID` (and the search endpoints) go to ServiceNow
+itself with the forwarded `x-user-id-token`, so what a caller may see there is
+ServiceNow's own decision, and `AccessService` is not consulted. Note that
+`snProjectService`/`snCaseService` *hold* a `pgFallback` (their constructor
+doc comments say by-id reads use it), but their `GetProjectByID`/`GetCaseByID`
+bodies don't call it -- do not assume this scoping reaches ServiceNow mode
+because of that field. Tokens are still validated on every request in both
+modes; only the per-caller project/case scoping is Postgres-only. Bringing
+ServiceNow mode under the same scoping would mean routing those two reads
+through the Postgres services, which changes where their data comes from --
+a separate decision, not made here.
+
+**Deploy prerequisite: machine-to-machine callers.** Any service that calls a
+scoped endpoint directly with only a client-credentials token (no
+`x-user-id-token`) gets a 401 unless its client id is in
+`AUTH_INTERNAL_CLIENT_IDS`. Before rolling this out, list every direct
+service-to-service caller of `GET /projects/{id}`, `GET /cases/{id}`,
+`POST /projects/search`, `POST /cases/search` and `POST /search` and add the
+ones that should have unconditional access. A caller that reaches entity-service
+*through* another service is identified by that other service's client id, not
+its own.
+
+**Not yet wired**: every other project/case-adjacent read (comments,
+escalations, time cards, attachments, conversations, change requests,
+call requests, catalogs, instances, etc.) still does no per-caller scoping --
+the auth middleware validates tokens on every route, but only the five
+operations above actually call `AccessService`. Extending it further is
+follow-up work, not done in this pass.
+
+## Call requests and the service-request catalog (migrations 000067-000072)
+
+Six tables landed together (`customer_call`, `sr_category`, `catalog_item`,
+`catalog_item_category`, `catalog_variable`, `sr_category_routing_rule`) and
+each backs a previously ServiceNow-only feature. Both feature groups' routes
+are now registered for **both** data sources (`callRequestRepo`/`catalogRepo`
+in `routes.go`, same wiring shape as every other dual-source entity).
+
+**Verification status**: the six tables exist in staging with exactly the
+migrations' columns/types/enum labels, but are all **empty (0 rows)** -- so
+the assumptions marked ASSUMPTION below could not be checked against real
+synced rows. What *was* verified against staging: every read path executes
+without error on real data (real cases, projects, deployed products), both
+write statements `PREPARE` cleanly against the real schema (no write was made),
+and the catalog matching logic was run with the real repository code on real
+deployed products using session-local `TEMP` tables shadowing the empty ones.
+The rest (create/update semantics, edge cases) was proven on a throwaway local
+Postgres built from all 72 migrations.
+
+**A data finding that changed the design**: `product.unit` is NULL for
+**every** product in staging (17/17) and 214 deployed products have no
+`product_id`, so a strict `rule.product_unit = product.unit` could never match
+any rule that names a unit -- the catalog would always be empty. Unit matching
+is therefore fail-open: it is only compared when both sides are known. Classification
+(`deployed_product.product_category`, populated for ~88% of rows) stays strict:
+a deployed product with no category only matches rules with no classification
+requirement. TODO: make unit strict again once `product.unit` is populated.
+
+### Call requests (`customer_call`) -- `call_request_repo.go`/`call_request_service.go`
+
+**Per-caller scoping is not enforced here yet.** Every route's tokens are now
+validated (see "Token validation and caller-scoped access" above), but call
+requests aren't one of the operations `AccessService` is wired into (see that
+section's "Not yet wired" list) -- a validated caller can read/write any
+call request regardless of project access. The `x-user-id-token` is read
+only to attribute writes (`created_by`/`updated_by`, `opened_by_id`), not to
+authorize them. Extending `AccessService` here is the same follow-up work
+called out there, not done in this pass.
+
+All four `CallRequestService` methods are implemented. `state` maps to
+`customer_call_state_enum` by upper/lower-casing (all eight labels match
+`domain.CallRequestStateType` exactly -- `CANCELED` both sides, no spelling
+drift; `TestCallRequestStatesMatchMigration` diffs them against the real
+migration file). Timestamps are RFC3339 UTC like the rest of the Postgres code.
+
+- `case` ref <- `work_item` (LEFT JOIN: `customer_call.work_item_id` is
+  nullable); `assignee` <- the `"user"` display name (falling back to email);
+  `notes` <- `all_notes`; `meetingLink` <- `call_link`;
+  `scheduleTime` <- `scheduled_on`; `durationMin` <- `duration` (INTERVAL).
+- **ASSUMPTION**: `preferredTimes` <- `final_times` (JSONB), read only if it is
+  a JSON array of strings, otherwise `[]` -- the column name doesn't say which
+  side's times it holds and its real contents weren't seen.
+- **ASSUMPTION**: `actualDurationMin` <- `actual_call_duration` (free VARCHAR),
+  parsed as a whole number of minutes (what this service writes); any other
+  format reads as `nil`.
+- **ASSUMPTION**: create -> state `pending_on_wso2` (the customer raised it,
+  WSO2 must schedule). `PATCH`'s `assignee` is interpreted as an **email**
+  (resolved via `GetUserByEmail`).
+- `callRequestStates` in project metadata uses the lowercase domain ids
+  (`pending_on_wso2`) with display labels -- the vocabulary these endpoints
+  accept -- unlike the other metadata choice lists, which still use the raw
+  UPPER_SNAKE enum labels (see the metadata section above; not yet aligned
+  with each list's own API vocabulary).
+- Search-all's `assignmentTeamIds` is rejected with a 400 rather than
+  ignored: nothing on this schema holds a case's assignment team
+  (`customer_call.assignment_group` was deliberately skipped in the
+  migration), and a silently-ignored filter would widen the result set.
+  `caseStates`/`excludeCaseStates` reuse `caseLikeStateColumn`/`caseLikeJoins`
+  so they work for every case-like type.
+- **Not done, deliberately (same "don't guess" rule as `CreateCase`)**:
+  `number` is left NULL on create (no default, no sequence, no confirmed
+  format -- returned as `""`); `cancellationReason` is **rejected with a 400**
+  rather than accepted-and-dropped (no column: `reason` is the request's own
+  reason -- note the customer portal passes it through, so cancelling *with* a
+  reason fails on this data source until a column exists); `closed_on`/`closed_by_id`
+  are never set (which states count as "closed" is unspecified); state
+  transitions aren't validated against the current state.
+
+### Service-request catalog -- `catalog_repo.go`/`catalog_service.go`
+
+- **ASSUMPTION**: a "catalog" is an `sr_category` row (it's the only
+  catalog-level entity with a UUID and a name; ServiceNow's `sc_catalog` level
+  was collapsed into the plain `sr_category.catalog` enum), its items linked
+  through `catalog_item_category`.
+- Availability for a deployed product: a `sr_category_routing_rule` matches when
+  `rule.product_unit = product.unit` and `rule.classification =
+  deployed_product.product_category` (same label sets but distinct enum types,
+  hence `::TEXT` casts). **ASSUMPTION**: a NULL on the rule side is a wildcard
+  ("any"). A NULL unit on the deployed-product side does not exclude a rule
+  (see the data finding above); a NULL classification only matches rules that
+  don't specify one. Only active categories with at least one available item are returned;
+  an unknown deployed product is a 404.
+- `GetCatalogItemVariables` 404s unless the item is linked to that catalog.
+  `catalog_variable` has no columns for `readOnly`/`hidden`/`maxLength`/
+  `referenceTable`/`validation`/`choices`, so those stay at their zero value
+  (TODO: choice-based variables render as free text until a choices table
+  exists). A NULL `is_active` counts as active.
+
+## Case search filters on the Postgres data source
+
+`caseRepo.SearchCases` implements `projectOnboardingStatus` (in/notIn) and
+`taskSLABusinessElapsedPercent` (gte/lte). The rest of the ServiceNow-shaped
+filters are still rejected with a 400 by `caseService.SearchCases` (`tag`,
+`escalationLevel`, `anyOf`, `product`, `projectType`, `creTeam`/`sreTeam`, ...)
+because dropping one would silently widen the result set.
+
+- **onboarding status**: matched against `project.onboarding_status` through the
+  existing LEFT JOIN. The wire vocabulary is ServiceNow's ("Not-Applicable",
+  "OnHold"), the enum's is `NOT_APPLICABLE`/`ON_HOLD`, so `onboardingStatusEnumLabels`
+  normalizes (case, `-`, `_`, space ignored) and rejects unknown values -- an
+  unknown value in a `notIn` would otherwise widen the result. A NULL status
+  (or no project) never matches `in` but does match `notIn`.
+- **SLA percent**: one `EXISTS` over `sla.business_elapsed_percentage`, so both
+  bounds apply to the *same* SLA row. Any SLA row counts regardless of `stage`
+  (the `domain.TaskSLAFilter` contract). Checked against staging: restricting to
+  in-progress SLAs changed a 1,652-case result to 1,634, so the choice barely
+  matters on real data.
+- **Data caveats (staging, when checked)**: 6,833 of 8,055 `CASE` work items
+  have a NULL `project_id` (mostly 2023-2024 cases; `deployment` doesn't carry
+  the project either), so project-based filters only ever see the remaining
+  ~15% -- a sync gap, not a query bug. The `work_item_tag` table from migration
+  000021 did not exist in staging (the `tag` table did), which is why `tag`
+  filtering is not implemented here and why add/remove-case-tag would fail there.
+## Announcement requests
+
+`announcement_requests` (migration `000040`, `internal/domain/entity.go`'s
+`AnnouncementRequest`, `internal/repository/announcement_request_repo.go`,
+`internal/service/announcement_request_service.go`) is durable state for an
+announcement that hasn't been published yet — `draft -> pending_approval ->
+approved -> published`. Like `sla_clocks`/`scheduled_task_run`, it has no
+ServiceNow equivalent and is always backed by Postgres regardless of
+`DATA_SOURCE`. It exists purely to let the CSM portal remember an
+announcement is mid-flight while the real approval decision happens over
+email, entirely outside this service — there is no approver role, no email
+sending, and no preview-rendering component here. The dry-run case the
+caller's own mechanism already creates (a real case in a test project) *is*
+the preview the approver reviews; this service just records that one
+happened (`dryRunCaseId`/`dryRunAt`/`dryRunBy`) and refuses `Submit` until it
+has (see `AnnouncementRequestService.Submit`'s own doc comment) — submitting
+for approval without one would send an approval request for content nobody
+has actually seen rendered.
+
+`audienceDefinition` is an opaque JSON blob (whichever shape the caller's own
+create form builds) that this service never interprets, so a draft can be
+re-opened and re-edited without re-deriving anything. `resolvedProjectIds` is
+a *different* field: the actual resolved project id list, frozen by the
+caller (with whatever exclusions it applies — see `AnnouncementHandler`'s
+`injectExcludeProjectKeys` in `csm-portal-backend`) at the moment of
+`Submit`, never re-resolved later. That's a deliberate choice: the frozen
+snapshot is what the dry-run link and the approval email actually describe,
+so `Publish` must send to exactly that list, not to whatever "all customer
+projects" happens to resolve to by the time someone gets around to
+publishing.
+
+**Editing behaves differently depending on the row's current state — this is
+the one piece of real business logic here, not just CRUD.** `Update` (backing
+`PATCH /announcement-requests/{id}`) branches on the row's current state,
+fetched fresh immediately before deciding what to do:
+- `draft` → a plain field update, no state change.
+- `pending_approval` → the same field update, but reverts to `draft` as one
+  atomic side effect, clearing the frozen `resolvedProjectIds` snapshot and
+  the dry-run record. The content is out for real review over email at this
+  point, so a silent change under the reviewer isn't safe, and the old dry
+  run no longer describes whatever's about to be re-submitted.
+- `approved` → subject/description/`isSecurityAnnouncement` may still be
+  updated in place with **no** state change and **no** audience change (an
+  audience-change attempt here is rejected outright) — a human has already
+  said yes over email, so this is a deliberate, explicitly-accepted
+  trade-off: a post-approval edit is not re-verified against a fresh dry run
+  before `Publish` sends whatever's currently there.
+- `published` → rejected outright; nothing about a published request is
+  editable through this entity again.
+
+**Every state-transition write is atomically conditioned on the state (and,
+for `Submit`, the dry-run precondition) it requires, inside the `UPDATE`'s
+own `WHERE` clause — not just checked beforehand in the service layer.** A
+service-layer "fetch current state, validate, then write" sequence is not
+atomic against two concurrent transitions on the same row (e.g. one caller's
+`Submit` racing another's `RecordDryRun`-clearing `RevertToDraft`); without
+the state repeated in the `WHERE` clause itself, the slower writer would
+silently apply its own stale-precondition write after the faster one already
+moved the row on. Every mutating repository method (`Update`, `RecordDryRun`,
+`Submit`, `Approve`, `RevertToDraft`, `MarkPublished`) follows this shape;
+`announcementRequestRepo.onConflictOrNotFound` is what a 0-row `UPDATE ...
+RETURNING` turns into — a `ConflictError` if the row still exists (the
+precondition changed underneath the caller, a real race) or the propagated
+`NotFoundError` if it doesn't (checked via one extra `Get`, only on this rare
+path, so the common case stays a single round trip).
+
+This service never creates the real per-project cases itself — `MarkPublished`
+only records that publishing happened, by whom, and when. The actual fan-out
+(`POST /cases` per project) is, and remains, the caller's own job, unchanged
+from before this entity existed; there is deliberately no persisted
+per-project delivery ledger here either — that belongs to a future batch
+entity, not this one.
 
 ## Adding a new entity
 

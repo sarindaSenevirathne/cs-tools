@@ -57,6 +57,39 @@ func TestValidateHTTPSURL(t *testing.T) {
 	}
 }
 
+// TestValidateHTTPSBaseURL covers the check behind ENGINEERING_ENTITY_BASE_URL:
+// unlike validateHTTPSURL it allows a path, since a gateway-hosted service's
+// base URL normally has one, but it still refuses anything that would send the
+// OAuth2 token or request in cleartext or carry credentials in the URL.
+func TestValidateHTTPSBaseURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "https host ok", value: "https://engineering.example.com", wantErr: false},
+		{name: "https with trailing slash ok", value: "https://engineering.example.com/", wantErr: false},
+		{name: "https with gateway path ok", value: "https://engineering.example.com/org/service/v1.0", wantErr: false},
+		{name: "https with port ok", value: "https://engineering.example.com:8443/v1", wantErr: false},
+		{name: "http rejected", value: "http://engineering.example.com", wantErr: true},
+		{name: "http on localhost rejected", value: "http://localhost:9090", wantErr: true},
+		{name: "no scheme rejected", value: "engineering.example.com/v1", wantErr: true},
+		{name: "empty host rejected", value: "https:///v1", wantErr: true},
+		{name: "userinfo rejected", value: "https://user:pass@engineering.example.com/v1", wantErr: true},
+		{name: "query rejected", value: "https://engineering.example.com/v1?x=1", wantErr: true},
+		{name: "fragment rejected", value: "https://engineering.example.com/v1#frag", wantErr: true},
+		{name: "unparseable rejected", value: "https://exa mple.com", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateHTTPSBaseURL(tt.value)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateHTTPSBaseURL(%q) error = %v, wantErr %v", tt.value, err, tt.wantErr)
+			}
+		})
+	}
+}
+
 // TestLoadSftpgoConfigRejectsBadURLs exercises the real exit path exercised
 // at server startup: loadSftpgoConfig calls os.Exit(1) via mustHTTPSURL when
 // SFTPGO_BASE_URL or SFTPGO_PUBLIC_BASE_URL is invalid while the feature flag

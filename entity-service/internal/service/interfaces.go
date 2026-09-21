@@ -70,6 +70,12 @@ type AccountService interface {
 	GetAccountByID(ctx context.Context, id string) (domain.AccountDetail, error)
 }
 
+// SalesforceEventService handles POST /salesforce/events. Account fetch goes
+// through REST sales/sales-entity-service POST /customer-search, not GraphQL.
+type SalesforceEventService interface {
+	HandleEvent(ctx context.Context, req domain.SalesforceEventRequest) error
+}
+
 // EventPublishFailureService defines the operations available on the
 // event_publish_failures entity — see domain.EventPublishFailure's doc
 // comment for what it's for.
@@ -186,6 +192,47 @@ type AlertIncidentMappingService interface {
 	LookupAlertIncidentMappings(ctx context.Context, req domain.LookupAlertIncidentMappingsRequest) (domain.LookupAlertIncidentMappingsResponse, error)
 }
 
+// AnnouncementRequestService defines the operations available on the
+// announcement_requests entity — see domain.AnnouncementRequest's own doc
+// comment for the full state machine (draft -> pending_approval -> approved
+// -> published) and what each transition does and doesn't allow.
+type AnnouncementRequestService interface {
+	// CreateDraft creates a new request in state draft. A ValidationError is
+	// returned if kind isn't "customer"/"eol" or createdBy is missing.
+	CreateDraft(ctx context.Context, req domain.CreateAnnouncementRequestRequest) (domain.AnnouncementRequest, error)
+	// Get returns the request by id. A NotFoundError is returned if it
+	// doesn't exist.
+	Get(ctx context.Context, id string) (domain.AnnouncementRequest, error)
+	// Search returns requests matching req's optional state/createdBy
+	// filters, paginated.
+	Search(ctx context.Context, req domain.SearchAnnouncementRequestsRequest) (domain.SearchAnnouncementRequestsResponse, error)
+	// Update edits the request's own content — what actually happens
+	// (plain edit, edit-and-revert-to-draft, or edit-in-place) depends
+	// entirely on the request's current state; see the service's own
+	// implementation doc comment for the full breakdown. A ConflictError is
+	// returned if the request is published; a ValidationError if an
+	// audience change is attempted while approved (the approved snapshot
+	// is frozen — this is a rejected request shape, not a state conflict).
+	Update(ctx context.Context, id string, req domain.UpdateAnnouncementRequestRequest) (domain.AnnouncementRequest, error)
+	// RecordDryRun records that a dry run (created by the caller's own
+	// mechanism, not this service) has completed for this request. A
+	// ConflictError is returned unless the current state is draft.
+	RecordDryRun(ctx context.Context, id string, req domain.RecordAnnouncementDryRunRequest) (domain.AnnouncementRequest, error)
+	// Submit moves draft -> pending_approval, freezing req.ResolvedProjectIDs
+	// as the audience snapshot. A ConflictError is returned unless the
+	// current state is draft and a dry run has already been recorded; a
+	// ValidationError if resolvedProjectIds is empty.
+	Submit(ctx context.Context, id string, req domain.SubmitAnnouncementRequestRequest) (domain.AnnouncementRequest, error)
+	// Approve moves pending_approval -> approved. A ConflictError is
+	// returned unless the current state is pending_approval. There is no
+	// approver-role check — see the interface's own doc comment.
+	Approve(ctx context.Context, id, actorID string) (domain.AnnouncementRequest, error)
+	// MarkPublished moves approved -> published. Does not itself create any
+	// cases. A ConflictError is returned unless the current state is
+	// approved.
+	MarkPublished(ctx context.Context, id, actorID string) (domain.AnnouncementRequest, error)
+}
+
 // SNAccountService defines the account operations backed by the ServiceNow data source.
 type SNAccountService interface {
 	// SearchAccounts returns a paginated list of ServiceNow accounts matching the
@@ -202,7 +249,11 @@ type ProjectService interface {
 	// indicates an infrastructure failure.
 	SearchProjects(ctx context.Context, req domain.SearchProjectsRequest) (domain.SearchProjectsResponse, error)
 	// GetProjectByID returns the enriched project detail with the linked account.
-	// A ValidationError is returned for a malformed UUID; a NotFoundError if no project matches.
+	// A ValidationError is returned for a malformed UUID; a NotFoundError if no
+	// project matches OR (Postgres data source) it exists but is outside the
+	// caller's AccessScope -- see CLAUDE.md's "Token validation and
+	// caller-scoped access" for the full rule and why existence is hidden
+	// rather than returning a 403.
 	GetProjectByID(ctx context.Context, id string) (domain.ProjectDetailsView, error)
 }
 
@@ -216,9 +267,22 @@ type ProjectUpdateService interface {
 	UpdateProject(ctx context.Context, id string, req domain.ProjectUpdateRequest) (domain.ProjectUpdateResponse, error)
 }
 
+// ProjectMetadataService is the GetProjectMetadata slice of ProjectStatsService,
+// split out because it's the one method of that interface with a Postgres-backed
+// implementation (projectMetadataService) as well as the ServiceNow one --
+// snProjectStatsService satisfies this interface structurally, so the same
+// concrete value backs both ProjectStatsService and ProjectMetadataService in
+// ServiceNow mode. See ProjectMetadataHandler.
+type ProjectMetadataService interface {
+	// GetProjectMetadata returns the reference data (choice lists, feature
+	// flags) needed to build the project's UI.
+	GetProjectMetadata(ctx context.Context, projectID string) (domain.ProjectMetadataResponse, error)
+}
+
 // ProjectStatsService defines the project-scoped metadata and statistics
-// operations. All methods require the ServiceNow data source; there is no
-// Postgres fallback.
+// operations. GetProjectMetadata also has a Postgres-backed implementation --
+// see ProjectMetadataService. The remaining stats methods require the
+// ServiceNow data source; there is no Postgres fallback for them yet.
 type ProjectStatsService interface {
 	// GetProjectMetadata returns the reference data (choice lists, feature
 	// flags) needed to build the project's UI.
@@ -372,7 +436,10 @@ type CaseService interface {
 	// State defaults to open. A ValidationError is returned for invalid input.
 	CreateCase(ctx context.Context, req domain.CreateCaseRequest) (domain.CreateCaseResponse, error)
 	// GetCaseByID returns the enriched case view for the given UUID. A
-	// ValidationError is returned for a malformed UUID; a NotFoundError if no case matches.
+	// ValidationError is returned for a malformed UUID; a NotFoundError if no
+	// case matches OR (Postgres data source) it exists but is outside the
+	// caller's AccessScope -- see ProjectService.GetProjectByID's identical
+	// note and CLAUDE.md for the full rule.
 	GetCaseByID(ctx context.Context, id string) (domain.CaseView, error)
 	// SearchCases returns a paginated list of cases filtered by optional project IDs,
 	// deployment IDs, deployed product IDs, state keys, severity keys, and search query.
@@ -490,8 +557,11 @@ type CaseEscalationService interface {
 	CreateCaseEscalation(ctx context.Context, caseID string, reason *string, action *domain.EscalationAction) (domain.CreatedEscalation, error)
 }
 
-// CatalogService defines the operations available on service catalogs.
-// All methods require the ServiceNow data source; there is no Postgres fallback.
+// CatalogService defines the operations available on service catalogs. The
+// Postgres-backed implementation (catalogService) reads sr_category,
+// catalog_item, catalog_item_category, catalog_variable and
+// sr_category_routing_rule (migrations 000067-000071) -- see catalog_repo.go
+// for how a "catalog" and item availability are defined there.
 type CatalogService interface {
 	// SearchCatalogs returns catalogs available for the given deployed product.
 	// DeployedProductID is required. A ValidationError is returned for missing input.
@@ -515,8 +585,10 @@ type FeedbackService interface {
 	AggregateFeedback(ctx context.Context, req domain.AggregateFeedbackRequest) (domain.AggregateFeedbackResponse, error)
 }
 
-// CallRequestService defines the operations available on the call_requests entity.
-// All methods require the ServiceNow data source; there is no Postgres fallback.
+// CallRequestService defines the operations available on call requests. The
+// Postgres-backed implementation (callRequestService) reads and writes
+// customer_call (migration 000072) -- see call_request_repo.go for the fields
+// with no backing column.
 type CallRequestService interface {
 	// CreateCallRequest creates a new call request for the given case.
 	// A ValidationError is returned for invalid input.
@@ -862,8 +934,10 @@ type ConversationService interface {
 }
 
 // GlobalService serves system-wide metadata and cross-entity search that
-// isn't scoped to any single project or case.
-// All methods require the ServiceNow data source; there is no Postgres fallback.
+// isn't scoped to any single project or case. Both methods have Postgres-backed
+// implementations (globalService); GlobalSearch on that data source returns
+// only what the caller may see (AccessService), so it also needs token
+// validation to be configured.
 type GlobalService interface {
 	// GetSystemMetadata returns system-wide reference data (time zones, project types,
 	// and feedback emoji choices) used across the frontend.

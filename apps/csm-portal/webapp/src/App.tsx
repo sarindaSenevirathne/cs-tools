@@ -34,6 +34,7 @@ import {
   featureStateForPath,
   firstEnabledDestination,
 } from "@config/featureFlags";
+import { usePortalAccess } from "@context/current-user/usePortalAccess";
 import {
   POST_LOGIN_REDIRECT_KEY,
   PostLoginRedirectConsumer,
@@ -158,11 +159,14 @@ function RootLanding(): JSX.Element | null {
  */
 function FeatureRouteGuard(): JSX.Element {
   const { pathname } = useLocation();
+  const access = usePortalAccess();
   const node = navNodeForPath(pathname);
-  const state = featureStateForPath(pathname);
+  // Per-user: a page the user's roles don't unlock (e.g. Operations for a
+  // view-only role) is hidden the same way a deployment-hidden page is.
+  const state = featureStateForPath(pathname, access);
 
   if (state === "hidden") {
-    const fallback = firstEnabledDestination();
+    const fallback = firstEnabledDestination(access);
     const samePath = fallback !== undefined && fallback.split(/[?#]/)[0] === pathname;
     return <Navigate to={!fallback || samePath ? "/404" : fallback} replace />;
   }

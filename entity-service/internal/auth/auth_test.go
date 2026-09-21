@@ -1,0 +1,255 @@
+// Copyright (c) 2026 WSO2 LLC. (https://www.wso2.com).
+//
+// WSO2 LLC. licenses this file to you under the Apache License,
+// Version 2.0 (the "License"); you may not use this file except
+// in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package auth
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/base64"
+	"encoding/json"
+	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+const (
+	testIssuer = "https://api.asgardeo.io/t/example/oauth2/token"
+	testSPA    = "spa-client-id"
+	testM2M    = "integration-client-id"
+)
+
+func newKey(t *testing.T) *rsa.PrivateKey {
+	t.Helper()
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
+func sign(t *testing.T, key *rsa.PrivateKey, claims jwt.MapClaims) string {
+	t.Helper()
+	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	tok.Header["kid"] = "k1"
+	s, err := tok.SignedString(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func testConfig() Config {
+	return Config{Issuer: testIssuer, UserTokenAudiences: []string{testSPA}, ClockSkew: 5 * time.Second}
+}
+
+func staticValidator(key *rsa.PrivateKey) *Validator {
+	return NewValidatorWithKeyfunc(testConfig(), func(*jwt.Token) (any, error) { return &key.PublicKey, nil })
+}
+
+func userClaims(mod func(jwt.MapClaims)) jwt.MapClaims {
+	c := jwt.MapClaims{"iss": testIssuer, "aud": []string{testSPA}, "sub": "user-1", "email": "Jane@Example.com", "exp": time.Now().Add(time.Hour).Unix()}
+	if mod != nil {
+		mod(c)
+	}
+	return c
+}
+
+func clientClaims(mod func(jwt.MapClaims)) jwt.MapClaims {
+	c := jwt.MapClaims{"iss": testIssuer, "aud": []string{testM2M}, "sub": "m2m-sub", "client_id": testM2M, "exp": time.Now().Add(time.Hour).Unix()}
+	if mod != nil {
+		mod(c)
+	}
+	return c
+}
+
+func TestValidateUserToken(t *testing.T) {
+	key, other := newKey(t), newKey(t)
+	v := staticValidator(key)
+
+	uc, err := v.ValidateUserToken(sign(t, key, userClaims(nil)))
+	if err != nil || uc.Email != "Jane@Example.com" || uc.Subject != "user-1" {
+		t.Fatalf("valid token: %+v, %v", uc, err)
+	}
+
+	bad := map[string]string{
+		"wrong issuer":        sign(t, key, userClaims(func(c jwt.MapClaims) { c["iss"] = "https://evil.example/token" })),
+		"audience not listed": sign(t, key, userClaims(func(c jwt.MapClaims) { c["aud"] = []string{"someone-else"} })),
+		"expired":             sign(t, key, userClaims(func(c jwt.MapClaims) { c["exp"] = time.Now().Add(-time.Hour).Unix() })),
+		"no exp":              sign(t, key, userClaims(func(c jwt.MapClaims) { delete(c, "exp") })),
+		"no email":            sign(t, key, userClaims(func(c jwt.MapClaims) { delete(c, "email") })),
+		"blank email":         sign(t, key, userClaims(func(c jwt.MapClaims) { c["email"] = "  " })),
+		"signed by other key": sign(t, other, userClaims(nil)),
+		"not a jwt":           "garbage",
+	}
+	for name, tok := range bad {
+		if _, err := v.ValidateUserToken(tok); err == nil {
+			t.Errorf("%s: token was accepted", name)
+		}
+	}
+}
+
+// A token whose header says HS256 and is MACed with the (public) key bytes
+// must never validate: accepted algorithms are asymmetric only.
+func TestValidateUserToken_RejectsAlgorithmConfusion(t *testing.T) {
+	key := newKey(t)
+	v := NewValidatorWithKeyfunc(testConfig(), func(*jwt.Token) (any, error) { return []byte("public-key-bytes"), nil })
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, userClaims(nil))
+	s, _ := tok.SignedString([]byte("public-key-bytes"))
+	if _, err := v.ValidateUserToken(s); err == nil {
+		t.Fatal("HS256 token was accepted")
+	}
+	_ = key
+}
+
+func TestValidateClientToken(t *testing.T) {
+	key, other := newKey(t), newKey(t)
+	v := staticValidator(key)
+
+	cc, err := v.ValidateClientToken(sign(t, key, clientClaims(nil)))
+	if err != nil || cc.ClientID != testM2M {
+		t.Fatalf("client_id claim: %+v, %v", cc, err)
+	}
+	cc, err = v.ValidateClientToken(sign(t, key, clientClaims(func(c jwt.MapClaims) { delete(c, "client_id"); c["azp"] = "from-azp" })))
+	if err != nil || cc.ClientID != "from-azp" {
+		t.Fatalf("azp fallback: %+v, %v", cc, err)
+	}
+
+	bad := map[string]string{
+		"no client id":        sign(t, key, clientClaims(func(c jwt.MapClaims) { delete(c, "client_id") })),
+		"wrong issuer":        sign(t, key, clientClaims(func(c jwt.MapClaims) { c["iss"] = "https://evil.example/token" })),
+		"expired":             sign(t, key, clientClaims(func(c jwt.MapClaims) { c["exp"] = time.Now().Add(-time.Hour).Unix() })),
+		"signed by other key": sign(t, other, clientClaims(nil)),
+	}
+	for name, tok := range bad {
+		if _, err := v.ValidateClientToken(tok); err == nil {
+			t.Errorf("%s: token was accepted", name)
+		}
+	}
+}
+
+func run(t *testing.T, v *Validator, headers map[string]string) (code int, id Identity, called bool) {
+	t.Helper()
+	h := Middleware(v)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		called = true
+		id = IdentityFromContext(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/search", nil)
+	for k, val := range headers {
+		req.Header.Set(k, val)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec.Code, id, called
+}
+
+// TestMiddleware_NilValidatorIsADefensiveFallbackNotADeploymentMode: routes.go
+// always supplies a real Validator, so a nil one here is only reachable if
+// some caller wires this middleware incorrectly -- it must still fail safe
+// (pass through, never trust the token) rather than panic.
+func TestMiddleware_NilValidatorIsADefensiveFallbackNotADeploymentMode(t *testing.T) {
+	code, id, called := run(t, nil, map[string]string{"x-user-id-token": "garbage", "Authorization": "Bearer garbage"})
+	if code != http.StatusOK || !called {
+		t.Fatalf("a nil validator must pass through, got %d called=%v", code, called)
+	}
+	if id != (Identity{}) {
+		t.Fatalf("unvalidated identity must be empty, got %+v", id)
+	}
+}
+
+func TestMiddleware_Enabled(t *testing.T) {
+	key := newKey(t)
+	v := staticValidator(key)
+	user := sign(t, key, userClaims(nil))
+	bearer := sign(t, key, clientClaims(nil))
+
+	t.Run("no tokens passes as validated-but-anonymous", func(t *testing.T) {
+		code, id, called := run(t, v, nil)
+		if code != 200 || !called || !id.Validated || id.UserEmail != "" || id.ClientID != "" {
+			t.Fatalf("got %d %+v called=%v", code, id, called)
+		}
+	})
+	t.Run("m2m: bearer only", func(t *testing.T) {
+		_, id, _ := run(t, v, map[string]string{"Authorization": "Bearer " + bearer})
+		if !id.Validated || id.ClientID != testM2M || id.UserEmail != "" {
+			t.Fatalf("got %+v", id)
+		}
+	})
+	t.Run("on behalf of a user: bearer + user token", func(t *testing.T) {
+		_, id, _ := run(t, v, map[string]string{"authorization": "bearer " + bearer, "x-user-id-token": user})
+		if id.ClientID != testM2M || id.UserEmail != "Jane@Example.com" || id.UserSubject != "user-1" {
+			t.Fatalf("got %+v", id)
+		}
+	})
+	t.Run("invalid user token is rejected, not downgraded to anonymous", func(t *testing.T) {
+		code, _, called := run(t, v, map[string]string{"Authorization": "Bearer " + bearer, "x-user-id-token": "garbage"})
+		if code != http.StatusUnauthorized || called {
+			t.Fatalf("got %d called=%v", code, called)
+		}
+	})
+	t.Run("invalid bearer is rejected", func(t *testing.T) {
+		code, _, called := run(t, v, map[string]string{"Authorization": "Bearer garbage"})
+		if code != http.StatusUnauthorized || called {
+			t.Fatalf("got %d called=%v", code, called)
+		}
+	})
+	t.Run("a client-credentials token is not accepted as a user token", func(t *testing.T) {
+		code, _, called := run(t, v, map[string]string{"x-user-id-token": bearer})
+		if code != http.StatusUnauthorized || called {
+			t.Fatalf("got %d called=%v", code, called)
+		}
+	})
+}
+
+// Asgardeo publishes x5c certs Go's x509 parser rejects; NewValidator must
+// still load the JWKS (the transport strips x5c) and validate real tokens.
+func TestNewValidator_LoadsJWKSDespiteUnparseableX5C(t *testing.T) {
+	key := newKey(t)
+	jwk := map[string]any{
+		"kty": "RSA", "kid": "k1", "use": "sig", "alg": "RS256",
+		"n":   base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes()),
+		"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.PublicKey.E)).Bytes()),
+		"x5c": []string{"bm90LWEtY2VydA=="},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{jwk}})
+	}))
+	defer srv.Close()
+
+	cfg := testConfig()
+	cfg.JWKSURL = srv.URL
+	v, err := NewValidator(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewValidator: %v", err)
+	}
+	if _, err := v.ValidateUserToken(sign(t, key, userClaims(nil))); err != nil {
+		t.Fatalf("token signed by the published key was rejected: %v", err)
+	}
+}
+
+func TestNewValidator_FailsWhenJWKSUnreachable(t *testing.T) {
+	cfg := testConfig()
+	cfg.JWKSURL = "http://127.0.0.1:1/jwks"
+	if _, err := NewValidator(context.Background(), cfg); err == nil {
+		t.Fatal("want an error at startup when the JWKS cannot be fetched")
+	}
+}

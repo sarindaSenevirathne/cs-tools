@@ -2,6 +2,20 @@ openapi: 3.0.1
 info:
   title: CSM Portal API
   version: 1.0.0
+  description: |
+    Authentication is a valid token; authorisation is the `roles` claim on that token, checked
+    against the role names configured for each role. A caller whose token holds none of the
+    required roles receives `403`. `GET /users/me` returns the resulting `roles`.
+
+    | Permission | Endpoints | Roles that grant it |
+    |---|---|---|
+    | (any authenticated caller) | `GET`/`PATCH /users/me` | none needed |
+    | `view` | every other `GET`, `*/search` and `*/aggregate` | any role below |
+    | `view_operations` | the same reads under `/incidents`, `/change-requests`, `/problems`, `/incident-tasks`, `/outages`, `/alerts`, `/smart-alerts` | support-engineer, admin |
+    | `time_cards_and_updates` | every `/time-cards` route and `GET /updates/product-update-levels`, `POST /updates/levels/search` | support-engineer, time-card-approver, admin |
+    | `escalate` | `POST /cases/{id}/escalations` | escalator, support-engineer, admin |
+    | `download_attachment` | `GET /attachments/{id}/content`, `POST /attachments/{id}/share` | attachment-downloader, support-engineer, admin |
+    | `write` | every other `POST`/`PATCH`/`DELETE`, including case, incident and change-request comments | support-engineer, admin |
 security:
   - bearerAuth: []
 servers:
@@ -1247,6 +1261,12 @@ paths:
                   $ref: '#/components/schemas/ProductUpdateLevel'
         "401":
           description: Unauthorized
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
         "500":
           description: InternalServerError
 
@@ -2910,6 +2930,12 @@ paths:
                 $ref: '#/components/schemas/ErrorPayload'
         "401":
           description: Unauthorized
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
         "413":
           description: RequestEntityTooLarge
           content:
@@ -3133,7 +3159,13 @@ paths:
 
   /cases/{id}/github-issues:
     post:
-      summary: Create a GitHub issue from a case (ServiceNow data source only).
+      summary: Create a GitHub issue from a case.
+      description: |
+        By default the request is forwarded to the entity service (ServiceNow data source only).
+        When the backend is configured with an engineering entity service, the issue is filed
+        through it instead: `repoOverride` is then required and must be one of the configured
+        repository options (otherwise `400`), `reason` is ignored, and the case's work notes are
+        not updated.
       operationId: createCaseGithubIssue
       security:
         - bearerAuth: []
@@ -8525,6 +8557,8 @@ components:
 
     UserResponse:
       type: object
+      required:
+        - roles
       properties:
         id:
           type: string
@@ -8543,6 +8577,11 @@ components:
           type: array
           items:
             type: string
+            enum: [viewer, escalator, attachment_downloader, support_engineer, usage_metrics_viewer, timecard_approver, dashboard_designer, admin]
+          description: >
+            The portal roles the caller holds, decided from the roles on their token. A caller can
+            hold several. Always present; empty when they hold none. This is not the entity
+            service's own role data, which is no longer returned here.
         phoneNumber:
           type: string
           description: Mobile phone number in E.164 format (sourced from SCIM)
@@ -11643,22 +11682,37 @@ components:
 
     CreateCaseGithubIssuePayload:
       type: object
-      required: [reason, title, description]
+      required: [title, description]
       additionalProperties: false
       properties:
         reason:
           type: string
           enum: [default, migration, rd_ticket]
-          description: Reason code that selects the GitHub repo target.
+          description: >
+            Reason code that selects the GitHub repo target. Required when the request is
+            forwarded to the entity service (the default). Ignored when the backend files the
+            issue through the engineering entity service.
         title:
           type: string
+          maxLength: 256
           description: Title of the GitHub issue.
         description:
           type: string
           description: Body/description of the GitHub issue.
         repoOverride:
-          type: string
-          description: Optional repository override (e.g. org/repo).
+          type: object
+          required: [owner, repo]
+          description: >
+            Explicit target repository. Optional when forwarded to the entity service, which then
+            routes by the case's product unit. Required when the backend files the issue through
+            the engineering entity service, where it must match a configured repository option.
+          properties:
+            owner:
+              type: string
+              description: GitHub organisation or owner of the repository.
+            repo:
+              type: string
+              description: Repository name.
         updateLevel:
           type: string
           description: Affected product update level.
@@ -11676,20 +11730,26 @@ components:
           description: GitHub label for the issue type.
         priorityLevel:
           type: string
-          description: Priority level for the issue.
+          description: Priority level for the issue. Only applied for the "Type/Incident" issue type.
 
     CreateCaseGithubIssueResponse:
       type: object
       properties:
-        issueUrl:
+        message:
           type: string
-          description: URL of the created GitHub issue.
-        issueNumber:
-          type: integer
-          description: Number of the created GitHub issue.
-        repository:
-          type: string
-          description: Repository where the issue was created (org/repo).
+          description: Human-readable result message.
+        issue:
+          type: object
+          properties:
+            url:
+              type: string
+              description: URL of the created GitHub issue.
+            number:
+              type: integer
+              description: Number of the created GitHub issue.
+            repo:
+              type: string
+              description: Repository where the issue was created. "owner/repo" when the backend files the issue through the engineering entity service.
 
     ConversationMessage:
       type: object

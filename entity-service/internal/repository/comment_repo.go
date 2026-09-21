@@ -41,17 +41,25 @@ type CommentRow struct {
 }
 
 // ReferenceTypeToWorkItemType maps a domain.ReferenceType to the
-// work_item_type_enum value it corresponds to. comment.work_item_id is a
+// work_item_type_enum value(s) it corresponds to. comment.work_item_id is a
 // foreign key into work_item(id), so only reference types that are
 // themselves work_item subtypes can be commented on through this data
 // source. "deployment" has no entry: deployment (migration 000013) is its
 // own standalone table with its own primary key space, not a work_item
 // subtype, so a comment can never point at one here.
-var ReferenceTypeToWorkItemType = map[domain.ReferenceType]string{
-	domain.ReferenceTypeCase:          "CASE",
-	domain.ReferenceTypeConversation:  "CONVERSATION",
-	domain.ReferenceTypeChangeRequest: "CHANGE_REQUEST",
-	domain.ReferenceTypeIncident:      "INCIDENT",
+//
+// ReferenceTypeCase maps to all five case-like work_item types (the same
+// set case_repo.go's own caseLikeWorkItemTypes names), not just literal
+// "CASE" -- found live as a real bug (a CS-numbered work_item whose real
+// type is SERVICE_REQUEST returned zero comments through this path, even
+// though case_repo.go's own GetCaseByID/SearchCases have served all five
+// case-like types since "Case-like work_item types" landed; this file's own
+// comment search/create was never updated to match).
+var ReferenceTypeToWorkItemType = map[domain.ReferenceType][]string{
+	domain.ReferenceTypeCase:          {"CASE", "ENGAGEMENT", "SERVICE_REQUEST", "SECURITY_REPORT_ANALYSIS", "ANNOUNCEMENT"},
+	domain.ReferenceTypeConversation:  {"CONVERSATION"},
+	domain.ReferenceTypeChangeRequest: {"CHANGE_REQUEST"},
+	domain.ReferenceTypeIncident:      {"INCIDENT"},
 }
 
 // CommentRepository defines the persistence operations for the comment table.
@@ -93,21 +101,26 @@ func scanComment(row interface{ Scan(...any) error }) (CommentRow, error) {
 
 // CreateComment implements CommentRepository.
 func (r *commentRepo) CreateComment(ctx context.Context, referenceID string, referenceType domain.ReferenceType, typeEnum, content, createdBy string) (CommentRow, error) {
-	workItemType, ok := ReferenceTypeToWorkItemType[referenceType]
+	workItemTypes, ok := ReferenceTypeToWorkItemType[referenceType]
 	if !ok {
 		return CommentRow{}, &apierror.ValidationError{Msg: "referenceType is not supported by the Postgres data source: " + string(referenceType)}
 	}
 
 	// INSERT ... SELECT ... WHERE EXISTS rather than a plain INSERT, so the
 	// work_item's type is checked in the same round trip as the insert.
+	// ::text[] before ::work_item_type_enum[]: this repository never
+	// registers work_item_type_enum/_work_item_type_enum with pgx, so
+	// binding workItemTypes ([]string) directly to the enum array type has
+	// no encode plan -- same fix as every other enum array bind in this
+	// codebase (e.g. time_card_repo.go's state filter).
 	const query = `
 		INSERT INTO comment (id, created_on, created_by, type, work_item_id, content)
 		SELECT gen_random_uuid(), NOW(), $1, $2::comment_type_enum, wi.id, $3
 		FROM work_item wi
-		WHERE wi.id = $4 AND wi.type = $5::work_item_type_enum
+		WHERE wi.id = $4 AND wi.type = ANY($5::text[]::work_item_type_enum[])
 		RETURNING ` + commentColumns
 
-	c, err := scanComment(r.db.QueryRow(ctx, query, createdBy, typeEnum, content, referenceID, workItemType))
+	c, err := scanComment(r.db.QueryRow(ctx, query, createdBy, typeEnum, content, referenceID, workItemTypes))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return CommentRow{}, &apierror.NotFoundError{Msg: "no " + string(referenceType) + " found with id " + referenceID}
 	}
@@ -119,13 +132,15 @@ func (r *commentRepo) CreateComment(ctx context.Context, referenceID string, ref
 
 // SearchComments implements CommentRepository.
 func (r *commentRepo) SearchComments(ctx context.Context, referenceID string, referenceType domain.ReferenceType, typeEnumFilter *string, pagination domain.Pagination) ([]CommentRow, int, error) {
-	workItemType, ok := ReferenceTypeToWorkItemType[referenceType]
+	workItemTypes, ok := ReferenceTypeToWorkItemType[referenceType]
 	if !ok {
 		return nil, 0, &apierror.ValidationError{Msg: "referenceType is not supported by the Postgres data source: " + string(referenceType)}
 	}
 
-	args := []any{referenceID, workItemType}
-	where := "WHERE c.work_item_id = $1 AND wi.type = $2::work_item_type_enum"
+	args := []any{referenceID, workItemTypes}
+	// ::text[] before ::work_item_type_enum[] -- see CreateComment's own
+	// comment on the identical bind above for why.
+	where := "WHERE c.work_item_id = $1 AND wi.type = ANY($2::text[]::work_item_type_enum[])"
 	if typeEnumFilter != nil {
 		args = append(args, *typeEnumFilter)
 		where += fmt.Sprintf(" AND c.type = $%d::comment_type_enum", len(args))

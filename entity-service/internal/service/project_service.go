@@ -25,12 +25,14 @@ import (
 )
 
 type projectService struct {
-	repo repository.ProjectRepository
+	repo   repository.ProjectRepository
+	access AccessService
 }
 
-// NewProjectService constructs a ProjectService backed by the given repository.
-func NewProjectService(repo repository.ProjectRepository) ProjectService {
-	return &projectService{repo: repo}
+// NewProjectService constructs a ProjectService backed by the given
+// repository, scoping every read through access (see AccessService).
+func NewProjectService(repo repository.ProjectRepository, access AccessService) ProjectService {
+	return &projectService{repo: repo, access: access}
 }
 
 // SearchProjects implements ProjectService.
@@ -42,7 +44,12 @@ func (s *projectService) SearchProjects(ctx context.Context, req domain.SearchPr
 		return domain.SearchProjectsResponse{}, err
 	}
 
-	projects, total, err := s.repo.SearchProjects(ctx, req)
+	scope, err := s.access.ResolveScope(ctx)
+	if err != nil {
+		return domain.SearchProjectsResponse{}, err
+	}
+
+	projects, total, err := s.repo.SearchProjects(ctx, req, scope)
 	if err != nil {
 		return domain.SearchProjectsResponse{}, err
 	}
@@ -54,8 +61,14 @@ func (s *projectService) SearchProjects(ctx context.Context, req domain.SearchPr
 			Name:             p.Name,
 			Key:              p.Key,
 			SubscriptionType: p.SubscriptionType,
-			EndDate:          p.EndDate,
-			CreatedOn:        p.CreatedOn,
+			// StartDate/EndDate are already *time.Time on domain.Project
+			// (nil when the column is NULL), so they pass straight through
+			// instead of being re-boxed through a local copy. StartDate was
+			// previously dropped entirely here despite ProjectView having a
+			// real field for it.
+			StartDate: p.StartDate,
+			EndDate:   p.EndDate,
+			CreatedOn: p.CreatedOn,
 		}
 	}
 
@@ -70,8 +83,9 @@ func (s *projectService) SearchProjects(ctx context.Context, req domain.SearchPr
 
 // GetProjectByID implements ProjectService.
 func (s *projectService) GetProjectByID(ctx context.Context, id string) (domain.ProjectDetailsView, error) {
-	if err := validateUUIDs("id", []string{id}); err != nil {
+	scope, err := resolveScopeForID(ctx, s.access, id)
+	if err != nil {
 		return domain.ProjectDetailsView{}, err
 	}
-	return s.repo.GetProjectByID(ctx, id)
+	return s.repo.GetProjectByID(ctx, id, scope)
 }

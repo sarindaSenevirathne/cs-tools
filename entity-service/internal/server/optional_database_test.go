@@ -38,13 +38,15 @@ import (
 // calls them.
 func newDBLessServiceNowRouter(t *testing.T) http.Handler {
 	t.Helper()
-	router, _ := NewRouter(nil, &config.Config{
+	cfg := &config.Config{
 		DataSource:                               config.DataSourceServiceNow,
 		ServiceNowIntegrationServiceBaseURL:      "https://example.invalid",
 		ServiceNowIntegrationServiceTokenURL:     "https://example.invalid/oauth2/token",
 		ServiceNowIntegrationServiceClientID:     "test-client",
 		ServiceNowIntegrationServiceClientSecret: "test-secret",
-	})
+	}
+	withTestAuth(t, cfg)
+	router, _ := NewRouter(nil, cfg)
 	return router
 }
 
