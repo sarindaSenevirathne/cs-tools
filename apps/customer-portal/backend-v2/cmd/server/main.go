@@ -184,6 +184,7 @@ func main() {
 	webSocketHandler := handler.NewWebSocketHandler(aiChatAgentWsClient, entityClient, tokenValidator, nil)
 	productConsumptionHandler := handler.NewProductConsumptionHandler(productConsumptionClient, entityClient)
 	globalHandler := handler.NewGlobalHandler(entityClient)
+	pendingVerificationHandler := handler.NewPendingVerificationHandler(entityClient)
 	instanceHandler := handler.NewInstanceHandler(entityClient)
 	registryHandler := handler.NewRegistryHandler(entityClient, registryClient, adminRole)
 	contactHandler := handler.NewContactHandler(entityClient, userManagementClient)
@@ -305,6 +306,10 @@ func main() {
 
 	mux.HandleFunc("GET /metadata", globalHandler.GetMetadata)
 	mux.HandleFunc("POST /search", globalHandler.GlobalSearch)
+
+	mux.HandleFunc("POST /pending-verifications", pendingVerificationHandler.CreatePendingVerification)
+	mux.HandleFunc("POST /pending-verifications/search", pendingVerificationHandler.SearchPendingVerifications)
+	mux.HandleFunc("PATCH /pending-verifications/{id}", pendingVerificationHandler.VerifyPendingVerification)
 
 	mux.HandleFunc("POST /deployments/products/{deployedProductId}/catalogs/search", catalogHandler.SearchCatalogs)
 	mux.HandleFunc("GET /catalogs/{catalogId}/items/{itemId}", catalogHandler.GetCatalogItemVariables)
