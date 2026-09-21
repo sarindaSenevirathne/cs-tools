@@ -112,6 +112,17 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 		alertIncidentMappingHandler = handler.NewAlertIncidentMappingHandler(service.NewAlertIncidentMappingService(alertIncidentMappingRepo))
 	}
 
+	// pending_verification has no ServiceNow equivalent either — same
+	// reasoning as sla_clocks/scheduled_task_run/event_publish_failures/
+	// alert_incident_mapping above, gated the same way: nil db means nil
+	// handler means the routes below are never registered, rather than
+	// panicking on a nil pool.
+	var pendingVerificationHandler *handler.PendingVerificationHandler
+	if db != nil {
+		pendingVerificationRepo := repository.NewPendingVerificationRepository(db)
+		pendingVerificationHandler = handler.NewPendingVerificationHandler(service.NewPendingVerificationService(pendingVerificationRepo))
+	}
+
 	accountRepo := repository.NewAccountRepository(db)
 	accountHandler := handler.NewAccountHandler(service.NewAccountService(accountRepo))
 
@@ -440,6 +451,11 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 		mux.HandleFunc("POST /cases/{caseId}/sla-clocks", slaClockHandler.RegisterSLAClock)
 		mux.HandleFunc("GET /cases/{caseId}/sla-clocks/{clockType}", slaClockHandler.GetSLAClock)
 		mux.HandleFunc("PATCH /cases/{caseId}/sla-clocks/{clockType}/tiers/{tier}", slaClockHandler.SetSLAClockTierReached)
+	}
+	if pendingVerificationHandler != nil {
+		mux.HandleFunc("POST /pending-verifications", pendingVerificationHandler.CreatePendingVerification)
+		mux.HandleFunc("POST /pending-verifications/search", pendingVerificationHandler.SearchPendingVerifications)
+		mux.HandleFunc("PATCH /pending-verifications/{id}", pendingVerificationHandler.VerifyPendingVerification)
 	}
 	if scheduledTaskRunHandler != nil {
 		mux.HandleFunc("POST /scheduled-tasks/attempts", scheduledTaskRunHandler.AttemptScheduledTaskRun)

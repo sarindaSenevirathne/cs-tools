@@ -108,12 +108,18 @@ func (r *projectRepo) SearchProjects(ctx context.Context, req domain.SearchProje
 		result := make([]domain.Project, 0, req.Pagination.Limit)
 		for rows.Next() {
 			var p domain.Project
+			// account_id and name are nullable columns; scan into *string
+			// locals and default to "" on NULL, same pattern as every other
+			// nullable-VARCHAR-column fix in this repository package.
+			var accountID, name *string
 			if err := rows.Scan(
-				&p.ID, &p.AccountID, &p.SfID, &p.Name, &p.Key,
+				&p.ID, &accountID, &p.SfID, &name, &p.Key,
 				&p.StartDate, &p.EndDate, &p.CreatedOn, &p.UpdatedOn,
 			); err != nil {
 				return fmt.Errorf("scan project: %w", err)
 			}
+			p.AccountID = stringOrEmpty(accountID)
+			p.Name = stringOrEmpty(name)
 			// SubscriptionType/ClosureStatus have no real column -- see this
 			// repository's own doc comment.
 			result = append(result, p)
@@ -140,6 +146,9 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string) (domain.Pro
 	// KbReferencesEnabled are plain (non-pointer) bool -- scan into *bool
 	// and treat a NULL column as false, not an error.
 	var agentEnabled, kbReferencesEnabled *bool
+	// project.name is a nullable column; scan into a *string local and
+	// default to "" on NULL, same pattern SearchProjects uses.
+	var name *string
 	err := r.db.QueryRow(ctx,
 		`SELECT p.id, p.sf_id, p.name, p.key,
 		        p.start_date, p.end_date, p.created_on, p.updated_on,
@@ -149,11 +158,12 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string) (domain.Pro
 		 JOIN account a ON p.account_id = a.id
 		 WHERE p.id = $1`, id,
 	).Scan(
-		&v.ID, &v.SfID, &v.Name, &v.Key,
+		&v.ID, &v.SfID, &name, &v.Key,
 		&v.StartDate, &v.EndDate, &v.CreatedOn, &v.UpdatedOn,
 		&v.Account.ID, &v.Account.Name, &v.Account.ActivationDate, &v.Account.Region,
 		&agentEnabled, &kbReferencesEnabled,
 	)
+	v.Name = stringOrEmpty(name)
 	// v.SubscriptionType and v.Account.Tier have no real column -- see this
 	// repository's own doc comment; left as their zero value.
 	if errors.Is(err, pgx.ErrNoRows) {

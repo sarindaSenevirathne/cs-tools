@@ -657,6 +657,23 @@ type CommentService interface {
 	CreateComment(ctx context.Context, req domain.CreateCommentRequest) (domain.CreateCommentResponse, error)
 }
 
+// PendingVerificationService defines the operations available on the
+// pending-verifications entity -- see domain.PendingVerification's own doc
+// comment for what it's for. Like SLAClockService/EventPublishFailureService,
+// this has no ServiceNow equivalent and is always backed by Postgres
+// regardless of DATA_SOURCE.
+type PendingVerificationService interface {
+	// CreatePendingVerification adds a work item to a project's Pending
+	// Verification list.
+	CreatePendingVerification(ctx context.Context, req domain.CreatePendingVerificationRequest) (domain.CreatePendingVerificationResponse, error)
+	// SearchPendingVerifications returns a paginated, filtered page of a
+	// project's Pending Verification list.
+	SearchPendingVerifications(ctx context.Context, req domain.SearchPendingVerificationsRequest) (domain.SearchPendingVerificationsResponse, error)
+	// VerifyPendingVerification marks an entry verified, removing it from
+	// the active list without altering the underlying work item.
+	VerifyPendingVerification(ctx context.Context, req domain.VerifyPendingVerificationRequest) (domain.VerifyPendingVerificationResponse, error)
+}
+
 // TaskSlaService defines the operations available on the task-slas entity.
 // On Postgres this is backed by sla/sla_policy (migrations 000051/000052) --
 // see TaskSlaRepository's own doc comment for the fields with no confirmed
