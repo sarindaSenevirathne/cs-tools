@@ -39,6 +39,10 @@ local-docs/
 # without the Choreo gateway in front of it) — never committed/pushed
 local-dev-proxy/
 
+# Personal reference documentation written while building a feature (not the
+# project's own docs) — never committed/pushed
+documentation/
+
 # Local Claude Code config and installed skills — kept out of version
 # control. Note other CLAUDE.md files in this repo (csm-portal,
 # entity-service, integrations/*) are deliberately tracked, so those are
