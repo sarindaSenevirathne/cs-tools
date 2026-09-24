@@ -184,6 +184,7 @@ type PendingVerificationSearchFilters struct {
 	RecordTypes     []string `json:"recordTypes,omitempty"`
 	SearchQuery     string   `json:"searchQuery,omitempty"`
 	IncludeVerified bool     `json:"includeVerified,omitempty"`
+	VerifiedOnly    bool     `json:"verifiedOnly,omitempty"`
 }
 
 // PendingVerificationSearchRequest is the portal's request shape for
@@ -210,6 +211,7 @@ func BuildEntitySearchPendingVerificationsRequest(req PendingVerificationSearchR
 			WorkItemTypes:   workItemTypes,
 			SearchQuery:     req.Filters.SearchQuery,
 			IncludeVerified: req.Filters.IncludeVerified,
+			VerifiedOnly:    req.Filters.VerifiedOnly,
 		},
 	}
 }

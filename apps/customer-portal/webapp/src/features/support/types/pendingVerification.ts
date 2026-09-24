@@ -68,6 +68,8 @@ export interface PendingVerificationSearchFilters {
   recordTypes?: PendingVerificationRecordType[];
   searchQuery?: string;
   includeVerified?: boolean;
+  /** Overrides includeVerified entirely — narrows to verified rows only. */
+  verifiedOnly?: boolean;
 }
 
 export interface PendingVerificationSearchRequest {

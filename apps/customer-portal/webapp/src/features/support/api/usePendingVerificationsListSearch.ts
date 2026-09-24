@@ -28,6 +28,8 @@ export interface PendingVerificationsListFilters {
   recordTypes?: PendingVerificationRecordType[];
   searchQuery?: string;
   includeVerified?: boolean;
+  /** Overrides includeVerified entirely — narrows to verified rows only. */
+  verifiedOnly?: boolean;
 }
 
 export interface PendingVerificationsListPagination {
@@ -77,6 +79,7 @@ export function usePendingVerificationsListSearch(
           recordTypes: filters.recordTypes,
           searchQuery: filters.searchQuery,
           includeVerified: filters.includeVerified ?? false,
+          verifiedOnly: filters.verifiedOnly ?? false,
         },
       };
 

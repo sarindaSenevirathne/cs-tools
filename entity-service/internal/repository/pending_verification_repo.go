@@ -153,7 +153,9 @@ func buildSearchWhere(f domain.PendingVerificationSearchFilters, includeTypeFilt
 	args := []any{f.ProjectID}
 	argIdx := 2
 
-	if !f.IncludeVerified {
+	if f.VerifiedOnly {
+		where += " AND pv.verified_on IS NOT NULL"
+	} else if !f.IncludeVerified {
 		where += " AND pv.verified_on IS NULL"
 	}
 	if f.WorkItemID != nil {

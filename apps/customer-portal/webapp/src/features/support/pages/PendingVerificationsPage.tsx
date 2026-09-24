@@ -88,43 +88,45 @@ export default function PendingVerificationsPage(): JSX.Element {
   const debouncedSearchTerm = useDebouncedValue(searchTerm, 300);
   const [recordTypes, setRecordTypes] = useState<PendingVerificationRecordType[]>([]);
   const [activeTab, setActiveTab] = useState<VerificationTab>("unverified");
-  const [page, setPage] = useState(1);
+  // Independent per-tab page state — paginating Unverified to page 2, then
+  // switching to Verified and back, lands you back on Unverified page 2
+  // rather than snapping to page 1.
+  const [unverifiedPage, setUnverifiedPage] = useState(1);
+  const [verifiedPage, setVerifiedPage] = useState(1);
   const [confirmingRecord, setConfirmingRecord] = useState<PendingVerificationView | null>(null);
   const [isFiltersOpen, setIsFiltersOpen] = useState(
     () => hasListSearchOrFilters(searchTerm, { recordTypes }),
   );
 
-  // Always fetch both — the search endpoint's includeVerified only adds
-  // verified rows alongside unverified ones, it has no "verified only" mode,
-  // so both tabs are split client-side from one combined fetch rather than
-  // needing two separate queries.
-  const filters = useMemo(
+  const sharedFilters = useMemo(
     () => ({
       recordTypes: recordTypes.length > 0 ? recordTypes : undefined,
       searchQuery: debouncedSearchTerm || undefined,
-      includeVerified: true,
     }),
     [recordTypes, debouncedSearchTerm],
   );
 
-  // Unverified-only, same filters, limit 1 — not used for any rows, only for
-  // its server-computed total/autoClosedCount/manualCount, which (unlike the
-  // main fetch above) are true full-backlog counts against the current
-  // filters, not scoped to whatever page of ROWS_PER_PAGE happens to be
-  // loaded. Same pattern as SideBar.tsx's own sidebar-badge count query.
-  const statsFilters = useMemo(
-    () => ({
-      recordTypes: recordTypes.length > 0 ? recordTypes : undefined,
-      searchQuery: debouncedSearchTerm || undefined,
-      includeVerified: false,
-    }),
-    [recordTypes, debouncedSearchTerm],
+  // Two independent, always-live queries (not gated on activeTab) — each is
+  // both its own tab's row source AND its own true, unpaginated count source
+  // (totalRecords/autoClosedCount/manualCount are a separate COUNT(*) query
+  // server-side, unaffected by LIMIT/OFFSET — see pending_verification_repo.go's
+  // Search). Keeping both always-on is what lets both tab badges and the
+  // summary tiles stay accurate regardless of which tab is currently open.
+  const unverifiedFilters = useMemo(
+    () => ({ ...sharedFilters, includeVerified: false }),
+    [sharedFilters],
   );
-  const statsPagination = useMemo(() => ({ limit: 1, offset: 0 }), []);
-
-  const pagination = useMemo(
-    () => ({ limit: ROWS_PER_PAGE, offset: (page - 1) * ROWS_PER_PAGE }),
-    [page],
+  const verifiedFilters = useMemo(
+    () => ({ ...sharedFilters, verifiedOnly: true }),
+    [sharedFilters],
+  );
+  const unverifiedPagination = useMemo(
+    () => ({ limit: ROWS_PER_PAGE, offset: (unverifiedPage - 1) * ROWS_PER_PAGE }),
+    [unverifiedPage],
+  );
+  const verifiedPagination = useMemo(
+    () => ({ limit: ROWS_PER_PAGE, offset: (verifiedPage - 1) * ROWS_PER_PAGE }),
+    [verifiedPage],
   );
 
   const { data: projectDetails } = useGetProjectDetails(projectId || "");
@@ -139,25 +141,23 @@ export default function PendingVerificationsPage(): JSX.Element {
     }
   }, [projectId, projectDetails, verificationEnabled, navigate]);
 
-  const { data, isLoading, isError } = usePendingVerificationsListSearch(
+  const unverifiedQuery = usePendingVerificationsListSearch(
     projectId || "",
-    filters,
-    pagination,
+    unverifiedFilters,
+    unverifiedPagination,
+    !!projectId && verificationEnabled,
+  );
+  const verifiedQuery = usePendingVerificationsListSearch(
+    projectId || "",
+    verifiedFilters,
+    verifiedPagination,
     !!projectId && verificationEnabled,
   );
 
-  const { data: statsData, isLoading: isStatsLoading } = usePendingVerificationsListSearch(
-    projectId || "",
-    statsFilters,
-    statsPagination,
-    !!projectId && verificationEnabled,
-  );
-
-  const allRecords = useMemo(() => data?.pendingVerifications ?? [], [data?.pendingVerifications]);
-  const unverifiedRecords = useMemo(() => allRecords.filter((r) => !r.verifiedAt), [allRecords]);
-  const verifiedRecords = useMemo(() => allRecords.filter((r) => !!r.verifiedAt), [allRecords]);
-  const records = activeTab === "unverified" ? unverifiedRecords : verifiedRecords;
-  const totalRecords = records.length;
+  const activeQuery = activeTab === "unverified" ? unverifiedQuery : verifiedQuery;
+  const { data, isLoading, isError } = activeQuery;
+  const records = useMemo(() => data?.pendingVerifications ?? [], [data?.pendingVerifications]);
+  const totalRecords = data?.totalRecords ?? 0;
   const hasListRefinement = !!searchTerm || recordTypes.length > 0;
 
   // Single mutation instance, re-parameterized by whichever record is
@@ -178,21 +178,27 @@ export default function PendingVerificationsPage(): JSX.Element {
 
   const handleSearchChange = (value: string): void => {
     setSearchTerm(value);
-    setPage(1);
+    setUnverifiedPage(1);
+    setVerifiedPage(1);
   };
 
   const handleRecordTypesChange = (event: SelectChangeEvent<PendingVerificationRecordType[]>): void => {
     const value = event.target.value;
     setRecordTypes(typeof value === "string" ? (value.split(",") as PendingVerificationRecordType[]) : value);
-    setPage(1);
+    setUnverifiedPage(1);
+    setVerifiedPage(1);
   };
 
   const handleClearFilters = (): void => {
     setSearchTerm("");
     setRecordTypes([]);
-    setPage(1);
+    setUnverifiedPage(1);
+    setVerifiedPage(1);
   };
 
+  // The active tab's own type breakdown — correctly reflects only what that
+  // tab would actually show (each tab now has its own real typeCounts,
+  // rather than always showing the combined-both-tabs breakdown).
   const typeCountByType = useMemo(() => {
     const map = new Map<string, number>();
     for (const tc of data?.typeCounts ?? []) map.set(tc.recordType, tc.count);
@@ -202,30 +208,21 @@ export default function PendingVerificationsPage(): JSX.Element {
   const activeFiltersCount = countListSearchAndFilters(searchTerm, { recordTypes });
 
   // Stats describe the pending (unverified) backlog specifically, matching
-  // "Total Pending"/"Auto Marked"/"Manually Marked". Read from statsData's
-  // own totalRecords/autoClosedCount/manualCount (the dedicated
-  // includeVerified:false, limit:1 query above) rather than derived from
-  // unverifiedRecords.length — the latter is scoped to whatever ROWS_PER_PAGE
-  // page happens to be loaded, and would silently undercount once a
-  // project's filtered unverified backlog exceeds that page size.
+  // "Total Pending"/"Auto Marked"/"Manually Marked" — read straight from
+  // unverifiedQuery's own totalRecords/autoClosedCount/manualCount, a true
+  // full-backlog count against the current filters regardless of which page
+  // is loaded (see the comment on unverifiedFilters/verifiedFilters above).
   const pendingStats = useMemo(
     () => ({
-      total: statsData?.totalRecords ?? 0,
-      autoClosed: statsData?.autoClosedCount ?? 0,
-      manual: statsData?.manualCount ?? 0,
+      total: unverifiedQuery.data?.totalRecords ?? 0,
+      autoClosed: unverifiedQuery.data?.autoClosedCount ?? 0,
+      manual: unverifiedQuery.data?.manualCount ?? 0,
     }),
-    [statsData],
+    [unverifiedQuery.data],
   );
 
-  // Tab badge counts, same pagination-independence reasoning as pendingStats
-  // above. data.totalRecords (includeVerified:true) is the server's own
-  // COUNT(*) over the full filtered set, run as a separate query from the
-  // LIMIT/OFFSET-ed row fetch (pending_verification_repo.go's Search) — so
-  // it's already a true combined total, not scoped to ROWS_PER_PAGE, and
-  // subtracting statsData's unverified-only total from it gives a true
-  // verified-only total with no extra network call.
-  const unverifiedTabCount = statsData?.totalRecords ?? 0;
-  const verifiedTabCount = Math.max(0, (data?.totalRecords ?? 0) - unverifiedTabCount);
+  const unverifiedTabCount = unverifiedQuery.data?.totalRecords ?? 0;
+  const verifiedTabCount = verifiedQuery.data?.totalRecords ?? 0;
 
   return (
     <Stack spacing={3} sx={{ minWidth: 0 }}>
@@ -235,10 +232,10 @@ export default function PendingVerificationsPage(): JSX.Element {
       />
 
       <ListStatGrid
-        isLoading={isLoading || isStatsLoading}
+        isLoading={unverifiedQuery.isLoading}
         configs={PENDING_VERIFICATION_STAT_CONFIGS}
         stats={pendingStats}
-        isError={isError}
+        isError={unverifiedQuery.isError}
         entityName="pending verifications"
       />
 
@@ -248,10 +245,7 @@ export default function PendingVerificationsPage(): JSX.Element {
           { id: "verified", label: "Verified", icon: CircleCheck, count: verifiedTabCount, badgeColor: "success.main" },
         ]}
         activeTab={activeTab}
-        onTabChange={(id) => {
-          setActiveTab(id as VerificationTab);
-          setPage(1);
-        }}
+        onTabChange={(id) => setActiveTab(id as VerificationTab)}
       />
 
       <ListSearchBar
@@ -320,9 +314,11 @@ export default function PendingVerificationsPage(): JSX.Element {
 
       <ListPagination
         totalRecords={totalRecords}
-        page={page}
+        page={activeTab === "unverified" ? unverifiedPage : verifiedPage}
         rowsPerPage={ROWS_PER_PAGE}
-        onPageChange={(_e, value) => setPage(value)}
+        onPageChange={(_e, value) =>
+          activeTab === "unverified" ? setUnverifiedPage(value) : setVerifiedPage(value)
+        }
         onRowsPerPageChange={() => {
           /* fixed page size for this list */
         }}

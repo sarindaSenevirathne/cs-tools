@@ -2846,6 +2846,7 @@ type PendingVerificationSearchFilters struct {
 	WorkItemTypes   []string `json:"workItemTypes,omitempty"`
 	SearchQuery     string   `json:"searchQuery,omitempty"`
 	IncludeVerified bool     `json:"includeVerified,omitempty"`
+	VerifiedOnly    bool     `json:"verifiedOnly,omitempty"`
 }
 
 // SearchPendingVerificationsRequest mirrors entity-service's

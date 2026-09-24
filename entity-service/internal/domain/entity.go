@@ -7326,12 +7326,17 @@ type VerifyPendingVerificationResponse struct {
 // (e.g. a Security-role user who may only ever see SRA records) enforces
 // that by only ever sending the types it's allowed to ask for — this
 // service has no identity/role layer of its own to enforce it independently.
+// VerifiedOnly, when true, overrides IncludeVerified entirely and narrows to
+// verified rows only — added so the list page's Verified tab can paginate
+// independently of the Unverified tab, rather than both sharing one combined
+// IncludeVerified=true page.
 type PendingVerificationSearchFilters struct {
 	ProjectID       string   `json:"projectId"`
 	WorkItemID      *string  `json:"workItemId,omitempty"`
 	WorkItemTypes   []string `json:"workItemTypes,omitempty"`
 	SearchQuery     string   `json:"searchQuery,omitempty"`
 	IncludeVerified bool     `json:"includeVerified,omitempty"`
+	VerifiedOnly    bool     `json:"verifiedOnly,omitempty"`
 }
 
 // SearchPendingVerificationsRequest is the input for
