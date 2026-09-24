@@ -171,7 +171,7 @@ function VerificationTimelineItem({
           </Typography>
         </Box>
 
-        {!isVerified && record.note && (
+        {record.note && (
           <Box sx={{ bgcolor: "action.hover", borderRadius: 1, px: 1.5, py: 1 }}>
             <Typography variant="body2" color="text.secondary">
               {record.note}
