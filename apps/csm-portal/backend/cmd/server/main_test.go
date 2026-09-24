@@ -153,3 +153,114 @@ func isExitError(err error, target **exec.ExitError) bool {
 	}
 	return ok
 }
+
+// TestValidateCustomerEntityDataSource covers the pure validation logic
+// behind loadCustomerEntityDataSource, which resolves which data source the
+// paired entity-service instance is configured with.
+func TestValidateCustomerEntityDataSource(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "servicenow ok", value: "servicenow", wantErr: false},
+		{name: "postgres ok", value: "postgres", wantErr: false},
+		{name: "empty rejected", value: "", wantErr: true},
+		{name: "unrecognized value rejected", value: "mysql", wantErr: true},
+		{name: "wrong case rejected (caller must normalize first)", value: "Postgres", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateCustomerEntityDataSource(tt.value)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateCustomerEntityDataSource(%q) error = %v, wantErr %v", tt.value, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestCheckAnnouncementDataSourceCompatibility covers the pure check behind
+// validateAnnouncementDataSourceCompatibility: entity-service's Postgres-
+// backed project search rejects a non-empty excludeProjectKeys outright, so
+// a mandatory denylist configured against a Postgres-backed entity-service
+// would make every announcement audience search fail — this must be caught,
+// but only when the denylist is actually non-empty; an unconfigured (empty)
+// denylist against Postgres is fine, since nothing is ever sent to exclude.
+func TestCheckAnnouncementDataSourceCompatibility(t *testing.T) {
+	tests := []struct {
+		name                string
+		dataSource          string
+		excludedProjectKeys []string
+		wantErr             bool
+	}{
+		{name: "servicenow with keys ok", dataSource: "servicenow", excludedProjectKeys: []string{"Apexia"}, wantErr: false},
+		{name: "servicenow with no keys ok", dataSource: "servicenow", excludedProjectKeys: nil, wantErr: false},
+		{name: "postgres with no keys ok", dataSource: "postgres", excludedProjectKeys: nil, wantErr: false},
+		{name: "postgres with empty (non-nil) keys ok", dataSource: "postgres", excludedProjectKeys: []string{}, wantErr: false},
+		{name: "postgres with keys rejected", dataSource: "postgres", excludedProjectKeys: []string{"Apexia"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := checkAnnouncementDataSourceCompatibility(tt.dataSource, tt.excludedProjectKeys)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("checkAnnouncementDataSourceCompatibility(%q, %v) error = %v, wantErr %v",
+					tt.dataSource, tt.excludedProjectKeys, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestStartupRejectsPostgresWithExcludedProjectKeys exercises the real exit
+// path exercised at server startup: main() calls
+// validateAnnouncementDataSourceCompatibility(loadCustomerEntityDataSource(),
+// loadAnnouncementExcludedProjectKeys()), which calls os.Exit(1) if a
+// mandatory excluded-project-key denylist is configured against a
+// Postgres-backed entity-service (see the two functions' own doc comments
+// for why). This re-execs the test binary as a subprocess (the standard Go
+// pattern for testing os.Exit call sites) and asserts on its exit status.
+func TestStartupRejectsPostgresWithExcludedProjectKeys(t *testing.T) {
+	if os.Getenv("BE_STARTUP_DATA_SOURCE_GUARD_SUBPROCESS") == "1" {
+		validateAnnouncementDataSourceCompatibility(loadCustomerEntityDataSource(), loadAnnouncementExcludedProjectKeys())
+		return
+	}
+
+	tests := []struct {
+		name                string
+		dataSource          string
+		excludedProjectKeys string
+		wantExitNonZero     bool
+	}{
+		{name: "servicenow with keys starts fine", dataSource: "servicenow", excludedProjectKeys: "Apexia,Veridian", wantExitNonZero: false},
+		{name: "postgres with no keys starts fine", dataSource: "postgres", excludedProjectKeys: "", wantExitNonZero: false},
+		{name: "default data source (unset) with keys starts fine", dataSource: "", excludedProjectKeys: "Apexia", wantExitNonZero: false},
+		{name: "postgres with keys rejected", dataSource: "postgres", excludedProjectKeys: "Apexia,Veridian", wantExitNonZero: true},
+		{name: "unrecognized data source rejected", dataSource: "mysql", excludedProjectKeys: "", wantExitNonZero: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestStartupRejectsPostgresWithExcludedProjectKeys$")
+			cmd.Env = append(os.Environ(),
+				"BE_STARTUP_DATA_SOURCE_GUARD_SUBPROCESS=1",
+				"CUSTOMER_ENTITY_DATA_SOURCE="+tt.dataSource,
+				"CSM_ANNOUNCEMENT_EXCLUDED_PROJECT_KEYS="+tt.excludedProjectKeys,
+			)
+			out, err := cmd.CombinedOutput()
+
+			if tt.wantExitNonZero {
+				if err == nil {
+					t.Fatalf("expected startup to exit non-zero, but it exited cleanly; output:\n%s", out)
+				}
+				var exitErr *exec.ExitError
+				if !isExitError(err, &exitErr) {
+					t.Fatalf("expected an *exec.ExitError, got %T: %v; output:\n%s", err, err, out)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("expected startup to exit cleanly, got error %v; output:\n%s", err, out)
+			}
+		})
+	}
+}

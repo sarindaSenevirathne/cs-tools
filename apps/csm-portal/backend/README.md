@@ -197,6 +197,14 @@ schema.
 | `DASHBOARDS_HOT_RELOAD` | Re-read `DASHBOARDS_DIR` on every request instead of serving the startup snapshot. Parsed with `strconv.ParseBool`, so `1`/`t`/`true`/`yes`-style values are not interchangeable — `1`, `t`, `T`, `TRUE`, `true`, `True` are true, and an unparseable non-empty value logs a warning and is treated as false. **Local development only**; default false |
 | `DASHBOARDS_CONFIG` | **Deprecated.** The whole registry crammed into one JSON array variable. Honoured only when `DASHBOARDS_DIR` is unset, and warns when used. Malformed content is fatal |
 
+A dashboard definition may set `"restricted": true` — then only a caller holding the `support_engineer`
+or `admin` role can see it: `GET /dashboards` leaves it out of the list for everyone else, and
+`GET /dashboards/{id}` returns `403` for a direct request to its id. Every other role sees only the
+unrestricted dashboards. Unset (the default, `false`) means every portal role can see it, same as
+before this field existed. This is enforced by `handler.DashboardHandler` itself, not by the route's
+own permission (`GET /dashboards`/`GET /dashboards/{id}` both stay `PermView` — the list route must
+still run for every viewer and only filter its result, not reject the whole request).
+
 ### Directory vocabularies
 
 Two curated lists are supplied as configuration rather than code, so adding a team or a role is a

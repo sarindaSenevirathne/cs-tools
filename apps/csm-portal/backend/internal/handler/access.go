@@ -51,6 +51,13 @@ const (
 	PermDownloadAttachment
 	// PermWrite is every other state-changing route.
 	PermWrite
+	// PermViewAllDashboards is seeing a dashboard marked dashboard.Dashboard.Restricted
+	// (the team/advanced dashboards) rather than only the unrestricted ones every
+	// portal role can see. Checked inside DashboardHandler itself, per dashboard —
+	// unlike every other permission here, no route is registered with it directly,
+	// since GET /dashboards must still run for every viewer and just filter its
+	// result rather than reject the whole request.
+	PermViewAllDashboards
 )
 
 // AccessConfig names, per portal role, the role names on the token that grant
@@ -125,6 +132,7 @@ func NewAccessGuard(cfg AccessConfig) *AccessGuard {
 			PermEscalate:            build(cfg.Escalator, cfg.SupportEngineer, cfg.Admin),
 			PermDownloadAttachment:  build(cfg.AttachmentDownloader, cfg.SupportEngineer, cfg.Admin),
 			PermWrite:               build(cfg.SupportEngineer, cfg.Admin),
+			PermViewAllDashboards:   build(cfg.SupportEngineer, cfg.Admin),
 		},
 	}
 }
@@ -160,7 +168,7 @@ func (g *AccessGuard) Require(perm Permission, next http.HandlerFunc) http.Handl
 			next(w, r)
 			return
 		}
-		if !g.permits(perm, user.Roles) {
+		if !g.Permits(perm, user.Roles) {
 			slog.WarnContext(r.Context(), "access denied: token carries no role granting this permission", "userID", user.UserID, "method", r.Method, "path", r.URL.Path)
 			writeError(w, http.StatusForbidden, ErrMsgForbidden)
 			return
@@ -169,9 +177,12 @@ func (g *AccessGuard) Require(perm Permission, next http.HandlerFunc) http.Handl
 	}
 }
 
-// permits reports whether any of the roles satisfies perm. An unknown permission
-// has no allowed set and so is denied.
-func (g *AccessGuard) permits(perm Permission, roles []string) bool {
+// Permits reports whether any of roles satisfies perm. An unknown permission
+// has no allowed set and so is denied. Exported so a handler that must gate a
+// specific resource against a caller's roles inside its own logic — rather
+// than a whole route via Require — can reuse the same policy (see
+// DashboardHandler and PermViewAllDashboards).
+func (g *AccessGuard) Permits(perm Permission, roles []string) bool {
 	allowed := g.allowed[perm]
 	for _, role := range roles {
 		if _, ok := allowed[role]; ok {

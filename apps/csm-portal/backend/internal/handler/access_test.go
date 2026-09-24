@@ -196,6 +196,32 @@ func TestAccessGuard_OperationsAreForSupportEngineersAndAdmins(t *testing.T) {
 	}
 }
 
+// TestAccessGuard_ViewAllDashboardsIsForSupportEngineersAndAdmins covers
+// PermViewAllDashboards directly through Permits rather than serveWithRoles:
+// unlike every other permission here, no route is ever registered with it —
+// DashboardHandler checks it itself, per dashboard, alongside the caller's
+// unconditional PermView access to the (unrestricted) dashboard list.
+func TestAccessGuard_ViewAllDashboardsIsForSupportEngineersAndAdmins(t *testing.T) {
+	g := NewAccessGuard(testAccessConfig())
+	for _, role := range []string{
+		"test-viewer", "test-escalator",
+		"test-attachment-downloader", "test-usage-metrics-viewer",
+		"test-timecard-approver", "test-dashboard-designer",
+	} {
+		if g.Permits(PermViewAllDashboards, []string{role}) {
+			t.Errorf("%s: Permits(PermViewAllDashboards) = true, want false", role)
+		}
+	}
+	for _, role := range []string{"test-support-engineer", "test-admin"} {
+		if !g.Permits(PermViewAllDashboards, []string{role}) {
+			t.Errorf("%s: Permits(PermViewAllDashboards) = false, want true", role)
+		}
+	}
+	if g.Permits(PermViewAllDashboards, nil) {
+		t.Error("no roles: Permits(PermViewAllDashboards) = true, want false")
+	}
+}
+
 func TestAccessGuard_UnconfiguredRolesAreHeldByNobody(t *testing.T) {
 	g := NewAccessGuard(AccessConfig{})
 	for _, perm := range []Permission{PermView, PermViewOperations, PermTimeCardsAndUpdates, PermEscalate, PermDownloadAttachment, PermWrite} {
