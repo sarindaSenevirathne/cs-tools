@@ -114,10 +114,10 @@ export default function ChangeRequestDetailsPage(): JSX.Element {
   const isPendingVerification = verificationEnabled && !!unverifiedVerificationRecord;
   const isChangeRequestVerified =
     !isPendingVerification && verificationEnabled && hasVerifiedRecord;
-  const hasNoVerificationRecord =
-    verificationEnabled &&
-    verificationData !== undefined &&
-    verificationRecords.length === 0;
+  // Allows re-adding after a prior cycle was verified — gated on "nothing
+  // currently pending", not "never had an entry".
+  const canAddToVerification =
+    verificationEnabled && isChangeRequestClosed && !isPendingVerification;
 
   const { workflowStages, currentStateIndex } = useMemo(
     () => buildChangeRequestWorkflowStages(changeRequest),
@@ -547,7 +547,7 @@ export default function ChangeRequestDetailsPage(): JSX.Element {
                     projectId={projectId || ""}
                     workItemId={changeRequestId || ""}
                     isRecordClosed={isChangeRequestClosed}
-                    hasNoVerificationRecord={hasNoVerificationRecord}
+                    canAddToVerification={canAddToVerification}
                     isPendingVerification={isPendingVerification}
                     pendingVerificationId={unverifiedVerificationRecord?.id ?? null}
                   />

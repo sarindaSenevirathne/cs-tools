@@ -112,7 +112,7 @@ export default function CaseDetailsActionRow({
   canDeescalate,
   onDeescalateSuccess,
   isCaseClosed = false,
-  hasNoVerificationRecord = false,
+  canAddToVerification = false,
   isPendingVerification = false,
   pendingVerificationId,
   onAddToVerificationSuccess,
@@ -330,7 +330,7 @@ export default function CaseDetailsActionRow({
         projectId={projectId}
         workItemId={caseId}
         isRecordClosed={isCaseClosed}
-        hasNoVerificationRecord={hasNoVerificationRecord}
+        canAddToVerification={canAddToVerification}
         isPendingVerification={isPendingVerification}
         pendingVerificationId={pendingVerificationId}
         onAddToVerificationSuccess={onAddToVerificationSuccess}

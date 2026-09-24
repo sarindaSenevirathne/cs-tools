@@ -31,7 +31,8 @@ export interface VerificationActionButtonsProps {
   workItemId: string;
   /** True once the underlying record is closed — "Add to Verification" only ever applies to a closed record. */
   isRecordClosed?: boolean;
-  hasNoVerificationRecord?: boolean;
+  /** True when there's no currently-unverified entry for this record — i.e. it's either never been added, or a previous cycle was already verified. Allows re-adding after a prior verify. */
+  canAddToVerification?: boolean;
   isPendingVerification?: boolean;
   pendingVerificationId?: string | null;
   onAddToVerificationSuccess?: () => void;
@@ -72,7 +73,7 @@ export default function VerificationActionButtons({
   projectId,
   workItemId,
   isRecordClosed = false,
-  hasNoVerificationRecord = false,
+  canAddToVerification = false,
   isPendingVerification = false,
   pendingVerificationId,
   onAddToVerificationSuccess,
@@ -87,7 +88,7 @@ export default function VerificationActionButtons({
   const [addToVerificationOpen, setAddToVerificationOpen] = useState(false);
   const [markVerifiedOpen, setMarkVerifiedOpen] = useState(false);
 
-  const showAddToVerificationButton = isRecordClosed && hasNoVerificationRecord;
+  const showAddToVerificationButton = isRecordClosed && canAddToVerification;
   const showMarkVerifiedButton = isPendingVerification && !!pendingVerificationId;
 
   const handleAddToVerificationConfirm = (note?: string): void => {

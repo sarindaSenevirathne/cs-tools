@@ -469,7 +469,7 @@ export type CaseDetailsActionRowProps = {
   canDeescalate?: boolean;
   onDeescalateSuccess?: () => void;
   isCaseClosed?: boolean;
-  hasNoVerificationRecord?: boolean;
+  canAddToVerification?: boolean;
   isPendingVerification?: boolean;
   isCaseVerified?: boolean;
   pendingVerificationId?: string | null;

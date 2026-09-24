@@ -249,10 +249,11 @@ export default function CaseDetailsContent({
   const hasVerifiedRecord = verificationRecords.some((r) => !!r.verifiedAt);
   const isPendingVerification = verificationEnabled && !!unverifiedRecord;
   const isCaseVerified = !isPendingVerification && verificationEnabled && hasVerifiedRecord;
-  const hasNoVerificationRecord =
-    verificationEnabled &&
-    verificationData !== undefined &&
-    verificationRecords.length === 0;
+  // Allows re-adding after a prior cycle was verified — gated on "nothing
+  // currently pending", not "never had an entry", so a record can go
+  // through Add -> Verify -> Add -> Verify any number of times.
+  const canAddToVerification =
+    verificationEnabled && isCaseClosed && !isPendingVerification;
 
   const visibleTabs = useMemo(
     () => [
@@ -436,7 +437,7 @@ export default function CaseDetailsContent({
                     canDeescalate={!hideEscalationTab && canDeescalate}
                     onDeescalateSuccess={() => void refetchEscalations()}
                     isCaseClosed={isCaseClosed}
-                    hasNoVerificationRecord={hasNoVerificationRecord}
+                    canAddToVerification={canAddToVerification}
                     isPendingVerification={isPendingVerification}
                     isCaseVerified={isCaseVerified}
                     pendingVerificationId={unverifiedRecord?.id ?? null}

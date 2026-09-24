@@ -134,12 +134,11 @@ export default function AnnouncementDetailsPanel({
   const hasVerifiedRecord = verificationRecords.some((r) => !!r.verifiedAt);
   const isPendingVerification = verificationEnabled && !!unverifiedRecord;
   const isVerified = !isPendingVerification && verificationEnabled && hasVerifiedRecord;
-  const hasNoVerificationRecord =
-    verificationEnabled &&
-    verificationData !== undefined &&
-    verificationRecords.length === 0;
+  // Allows re-adding after a prior cycle was verified — gated on "nothing
+  // currently pending", not "never had an entry".
+  const canAddToVerification = verificationEnabled && isClosed && !isPendingVerification;
   const showVerificationActions =
-    verificationEnabled && (hasNoVerificationRecord || isPendingVerification);
+    verificationEnabled && (canAddToVerification || isPendingVerification);
 
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -218,7 +217,7 @@ export default function AnnouncementDetailsPanel({
                 caseId={caseId}
                 statusLabel={data.status?.label}
                 isCaseClosed={isClosed}
-                hasNoVerificationRecord={hasNoVerificationRecord}
+                canAddToVerification={canAddToVerification}
                 isPendingVerification={isPendingVerification}
                 pendingVerificationId={unverifiedRecord?.id ?? null}
                 assignedEngineer={data.assignedEngineer}
