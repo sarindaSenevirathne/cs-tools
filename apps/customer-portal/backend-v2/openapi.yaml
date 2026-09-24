@@ -5837,6 +5837,136 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorPayload'
 
+  /pending-verifications:
+    post:
+      summary: Add a work item to a project's Pending Verification list.
+      description: >-
+        Manually flags a closed Case/Engagement/Security Report/Service
+        Request/Announcement/Change Request as needing formal customer
+        sign-off. addedBy is never accepted from the caller — entity-service
+        resolves it from the caller's own authenticated identity.
+      operationId: postPendingVerifications
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PendingVerificationCreateRequest'
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PendingVerificationCreateResponse'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /pending-verifications/search:
+    post:
+      summary: Search a project's Pending Verification entries.
+      description: >-
+        Newest first. filters.includeVerified adds verified rows alongside
+        unverified ones; filters.verifiedOnly overrides includeVerified
+        entirely and narrows to verified rows only, letting a caller
+        paginate verified and unverified entries independently.
+      operationId: postPendingVerificationsSearch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PendingVerificationSearchRequest'
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PendingVerificationSearchResponse'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /pending-verifications/{id}:
+    patch:
+      summary: Mark a Pending Verification entry verified.
+      description: >-
+        Not idempotent — verifying an already-verified entry, or an unknown
+        id, is a 404. Takes no request body. verifiedBy is never accepted
+        from the caller — entity-service resolves it from the caller's own
+        authenticated identity.
+      operationId: patchPendingVerificationsId
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PendingVerificationVerifyResponse'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: NotFound
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -5876,6 +6006,161 @@ components:
           type: string
         number:
           type: string
+
+    # ---- pending verifications ----
+
+    PendingVerificationView:
+      type: object
+      description: >-
+        A single entry in a project's Pending Verification list. caseId is
+        the record's human-readable number (e.g. "CS0441731"), for display
+        only, even for a non-Case record type — workItemId is the actual
+        work_item UUID, for navigating back into the record's own detail
+        page.
+      properties:
+        id:
+          type: string
+          format: uuid
+        workItemId:
+          type: string
+          format: uuid
+        caseId:
+          type: string
+        caseTitle:
+          type: string
+        severity:
+          type: string
+          description: Bare code (e.g. "S1") — only ever set for Case-like record types.
+        recordType:
+          type: string
+          enum: [Case, Engagement, Security Report, Service Request, Announcement, Change Request]
+        addedReason:
+          type: string
+          enum: [auto-closed, manual]
+        previousStatus:
+          type: string
+          enum: [Solution Proposed, Awaiting Info]
+          description: Set iff addedReason is auto-closed.
+        addedAt:
+          type: string
+          format: date-time
+        addedBy:
+          type: string
+          description: Email, resolved server-side — never caller-supplied.
+        verifiedAt:
+          type: string
+          format: date-time
+        verifiedBy:
+          type: string
+          description: Email, resolved server-side — never caller-supplied.
+        note:
+          type: string
+
+    PendingVerificationCreateRequest:
+      type: object
+      required: [workItemId, addedReason]
+      properties:
+        workItemId:
+          type: string
+          format: uuid
+        addedReason:
+          type: string
+          enum: [auto-closed, manual]
+        previousStatus:
+          type: string
+          enum: [Solution Proposed, Awaiting Info]
+          description: Required iff addedReason is auto-closed, must be omitted when manual.
+        note:
+          type: string
+
+    PendingVerificationCreateResponse:
+      type: object
+      properties:
+        message:
+          type: string
+        pendingVerification:
+          $ref: '#/components/schemas/PendingVerificationView'
+
+    PendingVerificationVerifyResponse:
+      type: object
+      properties:
+        message:
+          type: string
+        pendingVerification:
+          $ref: '#/components/schemas/PendingVerificationView'
+
+    PendingVerificationSearchFilters:
+      type: object
+      properties:
+        workItemId:
+          type: string
+          format: uuid
+          description: Narrows to a single record's own entries.
+        recordTypes:
+          type: array
+          items:
+            type: string
+            enum: [Case, Engagement, Security Report, Service Request, Announcement, Change Request]
+        searchQuery:
+          type: string
+        includeVerified:
+          type: boolean
+          description: >-
+            false (default): unverified only. true: adds verified rows
+            alongside unverified ones — there is no way to ask for verified
+            only via this field; use verifiedOnly instead.
+        verifiedOnly:
+          type: boolean
+          description: >-
+            Overrides includeVerified entirely — narrows to verified rows
+            only. Lets the list page paginate verified and unverified
+            entries independently.
+
+    PendingVerificationSearchRequest:
+      type: object
+      required: [projectId]
+      properties:
+        projectId:
+          type: string
+          format: uuid
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+        filters:
+          $ref: '#/components/schemas/PendingVerificationSearchFilters'
+
+    PendingVerificationTypeCountView:
+      type: object
+      properties:
+        recordType:
+          type: string
+        count:
+          type: integer
+
+    PendingVerificationSearchResponse:
+      type: object
+      properties:
+        pendingVerifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/PendingVerificationView'
+        totalRecords:
+          type: integer
+          description: Computed against the current filters (not a global count).
+        autoClosedCount:
+          type: integer
+        manualCount:
+          type: integer
+        typeCounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/PendingVerificationTypeCountView'
+          description: Computed against every filter except recordTypes itself.
+        limit:
+          type: integer
+        offset:
+          type: integer
+        hasMore:
+          type: boolean
 
     # ---- users ----
 
@@ -6016,8 +6301,9 @@ components:
     ProjectUpdateRequest:
       type: object
       description: |
-        AI chat assistant settings. Exactly one property may be present per
-        request — the upstream rejects anything else.
+        AI chat assistant settings, or the Pending Verification feature
+        toggle. Exactly one property may be present per request — the
+        upstream rejects anything else.
       properties:
         hasAgent:
           type: boolean
@@ -6025,10 +6311,14 @@ components:
         hasKbReferences:
           type: boolean
           description: Whether the assistant cites knowledge-base articles.
+        verificationEnabled:
+          type: boolean
+          description: Whether the Pending Verification feature is enabled for the project.
       additionalProperties: false
       oneOf:
         - required: [hasAgent]
         - required: [hasKbReferences]
+        - required: [verificationEnabled]
     UpdatedProject:
       type: object
       description: The project as it stands after the patch.
@@ -6042,6 +6332,8 @@ components:
         hasAgent:
           type: boolean
         hasKbReferences:
+          type: boolean
+        verificationEnabled:
           type: boolean
     ProjectDetails:
       type: object
@@ -6105,6 +6397,9 @@ components:
           type: string
         closureState:
           type: string
+        verificationEnabled:
+          type: boolean
+          description: Whether the Pending Verification feature is enabled for the project.
 
     # ---- cases ----
 
