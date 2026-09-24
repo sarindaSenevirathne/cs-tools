@@ -559,7 +559,7 @@ export type PendingVerificationStatKey = "total" | "autoClosed" | "manual";
  */
 export const PENDING_VERIFICATION_STAT_CONFIGS: SupportStatConfig<PendingVerificationStatKey>[] =
   [
-    { icon: ShieldCheck, iconColor: "info", key: "total", label: "Total" },
+    { icon: ShieldCheck, iconColor: "info", key: "total", label: "Total Pending" },
     { icon: RotateCcw, iconColor: "warning", key: "autoClosed", label: "Auto-closed" },
     { icon: FileText, iconColor: "secondary", key: "manual", label: "Manual" },
   ];
