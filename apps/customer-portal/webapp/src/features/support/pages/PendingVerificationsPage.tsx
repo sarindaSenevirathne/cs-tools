@@ -107,6 +107,21 @@ export default function PendingVerificationsPage(): JSX.Element {
     [recordTypes, debouncedSearchTerm],
   );
 
+  // Unverified-only, same filters, limit 1 — not used for any rows, only for
+  // its server-computed total/autoClosedCount/manualCount, which (unlike the
+  // main fetch above) are true full-backlog counts against the current
+  // filters, not scoped to whatever page of ROWS_PER_PAGE happens to be
+  // loaded. Same pattern as SideBar.tsx's own sidebar-badge count query.
+  const statsFilters = useMemo(
+    () => ({
+      recordTypes: recordTypes.length > 0 ? recordTypes : undefined,
+      searchQuery: debouncedSearchTerm || undefined,
+      includeVerified: false,
+    }),
+    [recordTypes, debouncedSearchTerm],
+  );
+  const statsPagination = useMemo(() => ({ limit: 1, offset: 0 }), []);
+
   const pagination = useMemo(
     () => ({ limit: ROWS_PER_PAGE, offset: (page - 1) * ROWS_PER_PAGE }),
     [page],
@@ -128,6 +143,13 @@ export default function PendingVerificationsPage(): JSX.Element {
     projectId || "",
     filters,
     pagination,
+    !!projectId && verificationEnabled,
+  );
+
+  const { data: statsData, isLoading: isStatsLoading } = usePendingVerificationsListSearch(
+    projectId || "",
+    statsFilters,
+    statsPagination,
     !!projectId && verificationEnabled,
   );
 
@@ -180,17 +202,19 @@ export default function PendingVerificationsPage(): JSX.Element {
   const activeFiltersCount = countListSearchAndFilters(searchTerm, { recordTypes });
 
   // Stats describe the pending (unverified) backlog specifically, matching
-  // "Total Pending"/"Auto Marked"/"Manually Marked" — computed client-side
-  // from the unverified subset rather than the server's own totalRecords/
-  // autoClosedCount/manualCount, which (now that the fetch always includes
-  // verified rows too) would otherwise count both.
+  // "Total Pending"/"Auto Marked"/"Manually Marked". Read from statsData's
+  // own totalRecords/autoClosedCount/manualCount (the dedicated
+  // includeVerified:false, limit:1 query above) rather than derived from
+  // unverifiedRecords.length — the latter is scoped to whatever ROWS_PER_PAGE
+  // page happens to be loaded, and would silently undercount once a
+  // project's filtered unverified backlog exceeds that page size.
   const pendingStats = useMemo(
     () => ({
-      total: unverifiedRecords.length,
-      autoClosed: unverifiedRecords.filter((r) => r.addedReason === "auto-closed").length,
-      manual: unverifiedRecords.filter((r) => r.addedReason === "manual").length,
+      total: statsData?.totalRecords ?? 0,
+      autoClosed: statsData?.autoClosedCount ?? 0,
+      manual: statsData?.manualCount ?? 0,
     }),
-    [unverifiedRecords],
+    [statsData],
   );
 
   return (
@@ -201,7 +225,7 @@ export default function PendingVerificationsPage(): JSX.Element {
       />
 
       <ListStatGrid
-        isLoading={isLoading}
+        isLoading={isLoading || isStatsLoading}
         configs={PENDING_VERIFICATION_STAT_CONFIGS}
         stats={pendingStats}
         isError={isError}
