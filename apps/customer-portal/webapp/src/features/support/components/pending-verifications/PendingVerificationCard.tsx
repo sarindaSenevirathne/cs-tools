@@ -14,11 +14,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { alpha, Box, Button, Chip, Paper, Stack, Typography, useTheme } from "@wso2/oxygen-ui";
+import { alpha, Box, Button, Chip, Form, Stack, Typography, useTheme } from "@wso2/oxygen-ui";
 import {
   Calendar,
   CircleCheck,
-  ExternalLink,
   FileText,
   RotateCcw,
   User,
@@ -36,10 +35,10 @@ export interface PendingVerificationCardProps {
 
 /**
  * PendingVerificationCard renders a single pending-verification record —
- * identifier, severity, added-reason, title, note, and footer metadata —
- * with explicit "View Case"/"Mark Verified" actions, matching the Figma
- * design's card layout. Left border is colored by severity (matching
- * "high priority ones have a red vertical line").
+ * identifier, severity, added-reason, title, note, and footer metadata.
+ * The whole card navigates to the record (onViewCase) on click; "Mark
+ * Verified" is a separate action that stops propagation so it doesn't
+ * also trigger navigation.
  *
  * @param {PendingVerificationCardProps} props - Record data and action callbacks.
  * @returns {JSX.Element} The rendered card.
@@ -56,8 +55,8 @@ export default function PendingVerificationCard({
   const TypeIcon = RECORD_TYPE_ICONS[record.recordType];
 
   return (
-    <Paper
-      variant="outlined"
+    <Form.CardButton
+      onClick={() => onViewCase?.(record)}
       sx={{
         p: 3,
         display: "flex",
@@ -159,29 +158,23 @@ export default function PendingVerificationCard({
         </Box>
       </Box>
 
-      <Stack spacing={1} sx={{ flexShrink: 0, alignItems: "stretch" }}>
-        <Button
-          variant="outlined"
-          size="small"
-          startIcon={<ExternalLink size={12} />}
-          onClick={() => onViewCase?.(record)}
-          sx={{ fontSize: "0.7rem", whiteSpace: "nowrap" }}
-        >
-          View Case
-        </Button>
-        {!isVerified && (
+      {!isVerified && (
+        <Stack spacing={1} sx={{ flexShrink: 0, alignItems: "stretch" }}>
           <Button
             variant="contained"
             color="success"
             size="small"
             startIcon={<CircleCheck size={12} />}
-            onClick={() => onMarkVerified?.(record)}
+            onClick={(e) => {
+              e.stopPropagation();
+              onMarkVerified?.(record);
+            }}
             sx={{ fontSize: "0.7rem", whiteSpace: "nowrap" }}
           >
             Mark Verified
           </Button>
-        )}
-      </Stack>
-    </Paper>
+        </Stack>
+      )}
+    </Form.CardButton>
   );
 }
