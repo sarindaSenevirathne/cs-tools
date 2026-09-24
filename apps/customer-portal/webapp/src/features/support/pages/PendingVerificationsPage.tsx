@@ -217,6 +217,16 @@ export default function PendingVerificationsPage(): JSX.Element {
     [statsData],
   );
 
+  // Tab badge counts, same pagination-independence reasoning as pendingStats
+  // above. data.totalRecords (includeVerified:true) is the server's own
+  // COUNT(*) over the full filtered set, run as a separate query from the
+  // LIMIT/OFFSET-ed row fetch (pending_verification_repo.go's Search) — so
+  // it's already a true combined total, not scoped to ROWS_PER_PAGE, and
+  // subtracting statsData's unverified-only total from it gives a true
+  // verified-only total with no extra network call.
+  const unverifiedTabCount = statsData?.totalRecords ?? 0;
+  const verifiedTabCount = Math.max(0, (data?.totalRecords ?? 0) - unverifiedTabCount);
+
   return (
     <Stack spacing={3} sx={{ minWidth: 0 }}>
       <ListPageHeader
@@ -234,8 +244,8 @@ export default function PendingVerificationsPage(): JSX.Element {
 
       <TabBar
         tabs={[
-          { id: "unverified", label: "Unverified", icon: ShieldCheck, count: unverifiedRecords.length },
-          { id: "verified", label: "Verified", icon: CircleCheck, count: verifiedRecords.length, badgeColor: "success.main" },
+          { id: "unverified", label: "Unverified", icon: ShieldCheck, count: unverifiedTabCount },
+          { id: "verified", label: "Verified", icon: CircleCheck, count: verifiedTabCount, badgeColor: "success.main" },
         ]}
         activeTab={activeTab}
         onTabChange={(id) => {
