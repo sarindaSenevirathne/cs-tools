@@ -182,6 +182,7 @@ func buildSearchWhere(f domain.PendingVerificationSearchFilters, includeTypeFilt
 func (r *pendingVerificationRepo) Search(ctx context.Context, req domain.SearchPendingVerificationsRequest) (domain.SearchPendingVerificationsResponse, error) {
 	where, args := buildSearchWhere(req.Filters, true)
 	typeCountsWhere, typeCountsArgs := buildSearchWhere(req.Filters, false)
+	dedupe := req.Filters.VerifiedOnly
 
 	var entries []domain.PendingVerification
 	var total, autoClosedCount, manualCount int
@@ -190,11 +191,30 @@ func (r *pendingVerificationRepo) Search(ctx context.Context, req domain.SearchP
 	eg, egCtx := errgroup.WithContext(ctx)
 
 	eg.Go(func() error {
-		dataQuery := fmt.Sprintf(`
-			SELECT %s %s %s
-			ORDER BY pv.added_on DESC
-			LIMIT $%d OFFSET $%d`,
-			pendingVerificationColumns, pendingVerificationFromJoin, where, len(args)+1, len(args)+2)
+		var dataQuery string
+		if dedupe {
+			// One row per work_item_id — its most-recently-verified entry —
+			// so a case verified more than once (VerifiedOnly's whole reason
+			// to exist: the Verified tab, post re-add-after-verified) shows
+			// as a single card, not one per historical round. DISTINCT ON's
+			// own required ordering picks *which* row wins per group; it
+			// does not control final display order, hence the outer re-sort.
+			dataQuery = fmt.Sprintf(`
+				SELECT * FROM (
+					SELECT DISTINCT ON (pv.work_item_id) %s
+					%s %s
+					ORDER BY pv.work_item_id, pv.verified_on DESC
+				) latest
+				ORDER BY verified_on DESC
+				LIMIT $%d OFFSET $%d`,
+				pendingVerificationColumns, pendingVerificationFromJoin, where, len(args)+1, len(args)+2)
+		} else {
+			dataQuery = fmt.Sprintf(`
+				SELECT %s %s %s
+				ORDER BY pv.added_on DESC
+				LIMIT $%d OFFSET $%d`,
+				pendingVerificationColumns, pendingVerificationFromJoin, where, len(args)+1, len(args)+2)
+		}
 		dataArgs := append(append([]any{}, args...), req.Pagination.Limit, req.Pagination.Offset)
 
 		rows, err := r.db.Query(egCtx, dataQuery, dataArgs...)
@@ -219,11 +239,29 @@ func (r *pendingVerificationRepo) Search(ctx context.Context, req domain.SearchP
 	})
 
 	eg.Go(func() error {
-		countQuery := fmt.Sprintf(`
-			SELECT COUNT(*),
-			       COUNT(*) FILTER (WHERE pv.added_reason = 'AUTO_CLOSED'),
-			       COUNT(*) FILTER (WHERE pv.added_reason = 'MANUAL')
-			%s %s`, pendingVerificationFromJoin, where)
+		var countQuery string
+		if dedupe {
+			// Same one-row-per-work-item set as the data query above, so
+			// total/autoClosedCount/manualCount agree with what the rows
+			// themselves show — each work item's count attributed to its
+			// own latest cycle's own addedReason.
+			countQuery = fmt.Sprintf(`
+				WITH latest AS (
+					SELECT DISTINCT ON (pv.work_item_id) pv.added_reason
+					%s %s
+					ORDER BY pv.work_item_id, pv.verified_on DESC
+				)
+				SELECT COUNT(*),
+				       COUNT(*) FILTER (WHERE added_reason = 'AUTO_CLOSED'),
+				       COUNT(*) FILTER (WHERE added_reason = 'MANUAL')
+				FROM latest`, pendingVerificationFromJoin, where)
+		} else {
+			countQuery = fmt.Sprintf(`
+				SELECT COUNT(*),
+				       COUNT(*) FILTER (WHERE pv.added_reason = 'AUTO_CLOSED'),
+				       COUNT(*) FILTER (WHERE pv.added_reason = 'MANUAL')
+				%s %s`, pendingVerificationFromJoin, where)
+		}
 		if err := r.db.QueryRow(egCtx, countQuery, args...).Scan(&total, &autoClosedCount, &manualCount); err != nil {
 			return fmt.Errorf("count pending_verifications: %w", err)
 		}
@@ -231,10 +269,22 @@ func (r *pendingVerificationRepo) Search(ctx context.Context, req domain.SearchP
 	})
 
 	eg.Go(func() error {
-		typeCountsQuery := fmt.Sprintf(`
-			SELECT wi.type::TEXT, COUNT(*)
-			%s %s
-			GROUP BY wi.type`, pendingVerificationFromJoin, typeCountsWhere)
+		var typeCountsQuery string
+		if dedupe {
+			typeCountsQuery = fmt.Sprintf(`
+				WITH latest AS (
+					SELECT DISTINCT ON (pv.work_item_id) wi.type
+					%s %s
+					ORDER BY pv.work_item_id, pv.verified_on DESC
+				)
+				SELECT type::TEXT, COUNT(*) FROM latest GROUP BY type`,
+				pendingVerificationFromJoin, typeCountsWhere)
+		} else {
+			typeCountsQuery = fmt.Sprintf(`
+				SELECT wi.type::TEXT, COUNT(*)
+				%s %s
+				GROUP BY wi.type`, pendingVerificationFromJoin, typeCountsWhere)
+		}
 		rows, err := r.db.Query(egCtx, typeCountsQuery, typeCountsArgs...)
 		if err != nil {
 			return fmt.Errorf("count pending_verifications by type: %w", err)

@@ -6113,8 +6113,12 @@ components:
           type: boolean
           description: >-
             Overrides includeVerified entirely — narrows to verified rows
-            only. Lets the list page paginate verified and unverified
-            entries independently.
+            only, deduped to the single most-recently-verified row per work
+            item. Lets the list page paginate verified and unverified
+            entries independently, showing one card per case rather than
+            one per historical verification round. A work item's full
+            multi-round history is still available, undeduped, via
+            includeVerified=true.
 
     PendingVerificationSearchRequest:
       type: object

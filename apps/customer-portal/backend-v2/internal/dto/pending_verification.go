@@ -179,6 +179,13 @@ func MapPendingVerificationCreate(r entity.CreatePendingVerificationResponse) Pe
 // POST /pending-verifications/search. RecordTypes takes the doc's display
 // labels ("Security Report", not "SECURITY_REPORT_ANALYSIS") -- translated
 // to entity-service's enum vocabulary by BuildEntitySearchPendingVerificationsRequest.
+// VerifiedOnly, when true, overrides IncludeVerified and narrows to verified
+// rows only, deduped to the single most-recently-verified row per work item
+// -- entity-service's own SearchPendingVerificationsFilters.VerifiedOnly doc
+// comment has the full reasoning (this is what backs the list page's
+// Verified tab: one card per case, not one per historical verification
+// round -- the full multi-round history stays available, undeduped, via
+// IncludeVerified=true).
 type PendingVerificationSearchFilters struct {
 	WorkItemID      *string  `json:"workItemId,omitempty"`
 	RecordTypes     []string `json:"recordTypes,omitempty"`
