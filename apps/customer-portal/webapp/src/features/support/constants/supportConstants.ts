@@ -552,16 +552,20 @@ export const ANNOUNCEMENT_STAT_CONFIGS: SupportStatConfig<AnnouncementStatKey>[]
  * is exposed by the backend, so that stat is deliberately not included here
  * rather than showing a misleading current-page-only number.
  */
-export type PendingVerificationStatKey = "total" | "autoClosed" | "manual";
+export type PendingVerificationStatKey = "total" | "autoClosed" | "manual" | "verified";
 
 /**
  * Configuration for the pending-verification list's statistics cards.
+ * "verified" reads the same deduped, per-case total the Verified tab badge
+ * uses (see 15-dedupe-verified-tab.md) — already fetched regardless of
+ * which tab is active, so this tile costs no extra request.
  */
 export const PENDING_VERIFICATION_STAT_CONFIGS: SupportStatConfig<PendingVerificationStatKey>[] =
   [
-    { icon: ShieldCheck, iconColor: "info", key: "total", label: "Total Pending" },
-    { icon: RotateCcw, iconColor: "warning", key: "autoClosed", label: "Auto-closed Pending" },
-    { icon: FileText, iconColor: "secondary", key: "manual", label: "Manually Added Pending" },
+    { icon: ShieldCheck, iconColor: "info", key: "total", label: "Total Pending Review" },
+    { icon: RotateCcw, iconColor: "warning", key: "autoClosed", label: "Auto-closed Pending Review" },
+    { icon: FileText, iconColor: "secondary", key: "manual", label: "Manual Pending Review" },
+    { icon: CircleCheck, iconColor: "success", key: "verified", label: "Reviewed" },
   ];
 
 /**

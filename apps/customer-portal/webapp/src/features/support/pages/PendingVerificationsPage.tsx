@@ -207,18 +207,22 @@ export default function PendingVerificationsPage(): JSX.Element {
 
   const activeFiltersCount = countListSearchAndFilters(searchTerm, { recordTypes });
 
-  // Stats describe the pending (unverified) backlog specifically, matching
-  // "Total Pending"/"Auto Marked"/"Manually Marked" — read straight from
-  // unverifiedQuery's own totalRecords/autoClosedCount/manualCount, a true
-  // full-backlog count against the current filters regardless of which page
-  // is loaded (see the comment on unverifiedFilters/verifiedFilters above).
+  // total/autoClosed/manual describe the pending (unverified) backlog
+  // specifically, read straight from unverifiedQuery's own totalRecords/
+  // autoClosedCount/manualCount, a true full-backlog count against the
+  // current filters regardless of which page is loaded (see the comment on
+  // unverifiedFilters/verifiedFilters above). verified reads verifiedQuery's
+  // own totalRecords -- already deduped to one entry per case
+  // (15-dedupe-verified-tab.md), and already fetched regardless of which
+  // tab is active, so this tile is free.
   const pendingStats = useMemo(
     () => ({
       total: unverifiedQuery.data?.totalRecords ?? 0,
       autoClosed: unverifiedQuery.data?.autoClosedCount ?? 0,
       manual: unverifiedQuery.data?.manualCount ?? 0,
+      verified: verifiedQuery.data?.totalRecords ?? 0,
     }),
-    [unverifiedQuery.data],
+    [unverifiedQuery.data, verifiedQuery.data],
   );
 
   const unverifiedTabCount = unverifiedQuery.data?.totalRecords ?? 0;
@@ -232,10 +236,10 @@ export default function PendingVerificationsPage(): JSX.Element {
       />
 
       <ListStatGrid
-        isLoading={unverifiedQuery.isLoading}
+        isLoading={unverifiedQuery.isLoading || verifiedQuery.isLoading}
         configs={PENDING_VERIFICATION_STAT_CONFIGS}
         stats={pendingStats}
-        isError={unverifiedQuery.isError}
+        isError={unverifiedQuery.isError || verifiedQuery.isError}
         entityName="pending verifications"
       />
 
