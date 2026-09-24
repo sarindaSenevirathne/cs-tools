@@ -25,7 +25,7 @@ import {
   alpha,
   useTheme,
 } from "@wso2/oxygen-ui";
-import { CircleCheck, ShieldCheck, TriangleAlert } from "@wso2/oxygen-ui-icons-react";
+import { TriangleAlert } from "@wso2/oxygen-ui-icons-react";
 import { useEffect, useRef, useState, type JSX } from "react";
 import { getSeverityLegendColor } from "@features/dashboard/utils/dashboard";
 import {
@@ -34,6 +34,7 @@ import {
   mapSeverityToDisplay,
 } from "@features/support/utils/support";
 import { CaseDetailsHeaderSkeleton } from "@case-details/CaseDetailsSkeleton";
+import VerificationStatusChip from "@features/support/components/case-details/verifications-tab/VerificationStatusChip";
 
 /**
  * Case details header: case number, optional severity, optional status chip, and title.
@@ -172,42 +173,10 @@ export default function CaseDetailsHeader({
             }}
           />
         )}
-        {isPendingVerification && (
-          <Chip
-            icon={<ShieldCheck size={11} />}
-            label="Pending Verification"
-            size="small"
-            variant="outlined"
-            sx={{
-              color: theme.palette.warning.dark,
-              borderColor: alpha(theme.palette.warning.main, 0.5),
-              bgcolor: alpha(theme.palette.warning.light, 0.12),
-              fontWeight: 500,
-              height: 20,
-              fontSize: "0.7rem",
-              "& .MuiChip-icon": { color: theme.palette.warning.main, ml: "4px", mr: "2px" },
-              "& .MuiChip-label": { pl: "4px", pr: "8px" },
-            }}
-          />
-        )}
-        {isCaseVerified && (
-          <Chip
-            icon={<CircleCheck size={11} />}
-            label="Verified"
-            size="small"
-            variant="outlined"
-            sx={{
-              color: theme.palette.success.dark,
-              borderColor: alpha(theme.palette.success.main, 0.5),
-              bgcolor: alpha(theme.palette.success.light, 0.12),
-              fontWeight: 500,
-              height: 20,
-              fontSize: "0.7rem",
-              "& .MuiChip-icon": { color: theme.palette.success.main, ml: "4px", mr: "2px" },
-              "& .MuiChip-label": { pl: "4px", pr: "8px" },
-            }}
-          />
-        )}
+        <VerificationStatusChip
+          isPendingVerification={isPendingVerification}
+          isVerified={isCaseVerified}
+        />
         {assignedEngineerLabel ? (
           <>
             <Divider orientation="vertical" flexItem />

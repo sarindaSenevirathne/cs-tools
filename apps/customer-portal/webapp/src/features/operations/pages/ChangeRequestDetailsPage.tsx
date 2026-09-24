@@ -52,6 +52,11 @@ import { useSuccessBanner } from "@context/success-banner/SuccessBannerContext";
 import ApiErrorState from "@components/error/ApiErrorState";
 import useGetChangeRequestDetails from "@features/operations/api/useGetChangeRequestDetails";
 import { usePatchChangeRequest } from "@features/operations/api/usePatchChangeRequest";
+import useGetProjectDetails from "@api/useGetProjectDetails";
+import { usePendingVerificationsSearch } from "@features/support/api/usePendingVerificationsSearch";
+import VerificationActionButtons from "@features/support/components/case-details/verifications-tab/VerificationActionButtons";
+import VerificationStatusChip from "@features/support/components/case-details/verifications-tab/VerificationStatusChip";
+import CaseVerificationsPanel from "@features/support/components/case-details/verifications-tab/CaseVerificationsPanel";
 import ScheduledMaintenanceWindowCard from "@features/operations/components/change-requests/ScheduledMaintenanceWindowCard";
 import ProposeNewImplementationTimeModal from "@features/operations/components/change-requests/ProposeNewImplementationTimeModal";
 import ChangeRequestDetailsLoadingSkeleton from "@features/operations/components/change-requests/ChangeRequestDetailsLoadingSkeleton";
@@ -93,6 +98,26 @@ export default function ChangeRequestDetailsPage(): JSX.Element {
     isFetching,
   } = useGetChangeRequestDetails(changeRequestId || "");
   const patchChangeRequest = usePatchChangeRequest(changeRequestId || "");
+
+  const { data: projectDetails } = useGetProjectDetails(projectId || "");
+  const verificationEnabled = !!projectDetails?.verificationEnabled;
+  const isChangeRequestClosed =
+    changeRequest?.state?.label === ChangeRequestStates.CLOSED;
+  const { data: verificationData } = usePendingVerificationsSearch(
+    projectId || "",
+    changeRequestId || "",
+    !!projectId && !!changeRequestId && verificationEnabled,
+  );
+  const verificationRecords = verificationData?.pendingVerifications ?? [];
+  const unverifiedVerificationRecord = verificationRecords.find((r) => !r.verifiedAt);
+  const hasVerifiedRecord = verificationRecords.some((r) => !!r.verifiedAt);
+  const isPendingVerification = verificationEnabled && !!unverifiedVerificationRecord;
+  const isChangeRequestVerified =
+    !isPendingVerification && verificationEnabled && hasVerifiedRecord;
+  const hasNoVerificationRecord =
+    verificationEnabled &&
+    verificationData !== undefined &&
+    verificationRecords.length === 0;
 
   const { workflowStages, currentStateIndex } = useMemo(
     () => buildChangeRequestWorkflowStages(changeRequest),
@@ -387,6 +412,10 @@ export default function ChangeRequestDetailsPage(): JSX.Element {
                         }}
                       />
                     )}
+                  <VerificationStatusChip
+                    isPendingVerification={isPendingVerification}
+                    isVerified={isChangeRequestVerified}
+                  />
                 </Box>
               </Box>
               <Box
@@ -512,6 +541,16 @@ export default function ChangeRequestDetailsPage(): JSX.Element {
                       {rejectLabel}
                     </Button>
                   </Stack>
+                )}
+                {verificationEnabled && (
+                  <VerificationActionButtons
+                    projectId={projectId || ""}
+                    workItemId={changeRequestId || ""}
+                    isRecordClosed={isChangeRequestClosed}
+                    hasNoVerificationRecord={hasNoVerificationRecord}
+                    isPendingVerification={isPendingVerification}
+                    pendingVerificationId={unverifiedVerificationRecord?.id ?? null}
+                  />
                 )}
               </Box>
             </Box>
@@ -762,6 +801,20 @@ export default function ChangeRequestDetailsPage(): JSX.Element {
               </Stack>
             </Box>
           </Paper>
+
+          {/* Verification Card — CaseVerificationsPanel already renders its
+              own icon/title/description header, so this card adds no
+              second title of its own. */}
+          {verificationEnabled && (
+            <Paper variant="outlined">
+              <Box sx={{ px: 3, py: 3 }}>
+                <CaseVerificationsPanel
+                  projectId={projectId || ""}
+                  caseId={changeRequestId || ""}
+                />
+              </Box>
+            </Paper>
+          )}
         </Box>
 
         {/* Right Column - Workflow (Fixed Width, Scrollable) */}

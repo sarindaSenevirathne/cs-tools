@@ -240,7 +240,7 @@ export default function CaseVerificationsPanel({ projectId, caseId }: Props): JS
             Verifications
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            Full history of verification actions taken on this case.
+            Full history of verification actions taken on this record.
           </Typography>
         </Box>
       </Stack>
@@ -257,7 +257,7 @@ export default function CaseVerificationsPanel({ projectId, caseId }: Props): JS
         >
           <ShieldCheck size={32} color={theme.palette.text.disabled} />
           <Typography variant="body2" color="text.secondary">
-            No verification history for this case yet.
+            No verification history for this record yet.
           </Typography>
         </Box>
       ) : (

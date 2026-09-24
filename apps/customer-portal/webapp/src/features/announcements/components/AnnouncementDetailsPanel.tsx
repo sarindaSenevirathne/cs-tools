@@ -28,6 +28,10 @@ import { ArrowLeft, Calendar, FileText } from "@wso2/oxygen-ui-icons-react";
 import { INLINE_COMMENT_HTML_PURIFY } from "@features/support/utils/support";
 import type { JSX } from "react";
 import CaseDetailsActionRow from "@features/support/components/case-details/header/CaseDetailsActionRow";
+import VerificationStatusChip from "@features/support/components/case-details/verifications-tab/VerificationStatusChip";
+import CaseVerificationsPanel from "@features/support/components/case-details/verifications-tab/CaseVerificationsPanel";
+import useGetProjectDetails from "@api/useGetProjectDetails";
+import { usePendingVerificationsSearch } from "@features/support/api/usePendingVerificationsSearch";
 import {
   getStatusColor,
   resolveColorFromTheme,
@@ -65,6 +69,14 @@ export default function AnnouncementDetailsPanel({
 }: AnnouncementDetailsPanelProps): JSX.Element {
   const theme = useTheme();
   const isDarkMode = useDarkMode();
+
+  const { data: projectDetails } = useGetProjectDetails(projectId);
+  const verificationEnabled = !!projectDetails?.verificationEnabled;
+  const { data: verificationData } = usePendingVerificationsSearch(
+    projectId,
+    caseId,
+    !!projectId && !!caseId && verificationEnabled,
+  );
 
   if (isLoading) {
     return (
@@ -115,6 +127,19 @@ export default function AnnouncementDetailsPanel({
   const statusColorPath = getStatusColor(statusLabel ?? undefined);
   const resolvedStatusColor = resolveColorFromTheme(statusColorPath, theme);
   const updatedOnLabel = formatAnnouncementDateDisplay(data.updatedOn);
+  const isClosed = statusLabel?.toLowerCase() === "closed";
+
+  const verificationRecords = verificationData?.pendingVerifications ?? [];
+  const unverifiedRecord = verificationRecords.find((r) => !r.verifiedAt);
+  const hasVerifiedRecord = verificationRecords.some((r) => !!r.verifiedAt);
+  const isPendingVerification = verificationEnabled && !!unverifiedRecord;
+  const isVerified = !isPendingVerification && verificationEnabled && hasVerifiedRecord;
+  const hasNoVerificationRecord =
+    verificationEnabled &&
+    verificationData !== undefined &&
+    verificationRecords.length === 0;
+  const showVerificationActions =
+    verificationEnabled && (hasNoVerificationRecord || isPendingVerification);
 
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -182,12 +207,20 @@ export default function AnnouncementDetailsPanel({
                   </Typography>
                 </Box>
               )}
+              <VerificationStatusChip
+                isPendingVerification={isPendingVerification}
+                isVerified={isVerified}
+              />
             </Box>
-            {data.status?.label?.toLowerCase() !== "closed" && (
+            {(!isClosed || showVerificationActions) && (
               <CaseDetailsActionRow
                 projectId={projectId}
                 caseId={caseId}
                 statusLabel={data.status?.label}
+                isCaseClosed={isClosed}
+                hasNoVerificationRecord={hasNoVerificationRecord}
+                isPendingVerification={isPendingVerification}
+                pendingVerificationId={unverifiedRecord?.id ?? null}
                 assignedEngineer={data.assignedEngineer}
                 engineerInitials={
                   typeof data.assignedEngineer === "object" &&
@@ -311,6 +344,12 @@ export default function AnnouncementDetailsPanel({
           </Typography>
         )}
       </Paper>
+
+      {verificationEnabled && projectId && caseId && (
+        <Paper variant="outlined" elevation={0} sx={{ p: 4 }}>
+          <CaseVerificationsPanel projectId={projectId} caseId={caseId} />
+        </Paper>
+      )}
     </Box>
   );
 }
