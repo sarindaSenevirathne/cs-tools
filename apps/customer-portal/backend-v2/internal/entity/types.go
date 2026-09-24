@@ -155,6 +155,9 @@ type ProjectDetailsView struct {
 	OnboardingExpiryDate     *time.Time `json:"onboardingExpiryDate"`
 	OnboardingStatus         *string    `json:"onboardingStatus"`
 	ProjectClosureFields
+	// VerificationEnabled gates the Pending Verification feature for this
+	// project.
+	VerificationEnabled bool `json:"verificationEnabled"`
 }
 
 // --- project metadata/stats ---
@@ -219,6 +222,9 @@ type UpdateProjectRequest struct {
 	// HasKbReferences controls whether the assistant cites knowledge-base
 	// articles in its answers.
 	HasKbReferences *bool `json:"hasKbReferences,omitempty"`
+	// VerificationEnabled turns the Pending Verification feature on or off
+	// for the project.
+	VerificationEnabled *bool `json:"verificationEnabled,omitempty"`
 }
 
 // FieldCount reports how many settings the request actually sets. The upstream
@@ -230,6 +236,9 @@ func (r UpdateProjectRequest) FieldCount() int {
 		n++
 	}
 	if r.HasKbReferences != nil {
+		n++
+	}
+	if r.VerificationEnabled != nil {
 		n++
 	}
 	return n
@@ -244,10 +253,11 @@ type UpdateProjectResponse struct {
 // UpdatedProjectRef is the project as it stands after the patch. Only the
 // fields the caller needs to confirm the change; entity-service returns more.
 type UpdatedProjectRef struct {
-	ID              string `json:"id"`
-	Name            string `json:"name"`
-	HasAgent        *bool  `json:"hasAgent,omitempty"`
-	HasKbReferences *bool  `json:"hasKbReferences,omitempty"`
+	ID                  string `json:"id"`
+	Name                string `json:"name"`
+	HasAgent            *bool  `json:"hasAgent,omitempty"`
+	HasKbReferences     *bool  `json:"hasKbReferences,omitempty"`
+	VerificationEnabled *bool  `json:"verificationEnabled,omitempty"`
 }
 
 // ProjectMetadataResponse is entity-service's response for GET /projects/{id}/metadata.

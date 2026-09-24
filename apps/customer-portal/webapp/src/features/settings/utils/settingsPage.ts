@@ -34,6 +34,7 @@ export function resolveSettingsPageTabId(activeTab: string): SettingsPageTabId {
   switch (activeTab) {
     case SettingsPageTabId.USERS:
     case SettingsPageTabId.AI:
+    case SettingsPageTabId.VERIFICATION:
     case SettingsPageTabId.REGISTRY_TOKENS:
     case SettingsPageTabId.DISPLAY:
       return activeTab;

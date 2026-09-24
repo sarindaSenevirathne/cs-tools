@@ -22,6 +22,7 @@ import useGetProjectDetails from "@api/useGetProjectDetails";
 import useCustomerPermissions from "@hooks/useCustomerPermissions";
 import TabBar from "@components/tab-bar/TabBar";
 import SettingsAiAssistant from "@features/settings/components/SettingsAiAssistant";
+import SettingsVerification from "@features/settings/components/SettingsVerification";
 import SettingsDisplay from "@features/settings/components/SettingsDisplay";
 import SettingsUserManagement from "@features/settings/components/SettingsUserManagement";
 import SettingsRegistryTokens from "@features/settings/components/SettingsRegistryTokens";
@@ -131,6 +132,9 @@ export default function SettingsPage(): JSX.Element {
       )}
       {displayTab === SettingsPageTabId.AI && (
         <SettingsAiAssistant projectId={projectId} canEdit={canUpdateProject} />
+      )}
+      {displayTab === SettingsPageTabId.VERIFICATION && (
+        <SettingsVerification projectId={projectId} canEdit={canUpdateProject} />
       )}
       {displayTab === SettingsPageTabId.REGISTRY_TOKENS && (
         <SettingsRegistryTokens

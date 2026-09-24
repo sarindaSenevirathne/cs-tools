@@ -24,6 +24,7 @@ import type { RegistryTokenType } from "@features/settings/types/registryTokens"
 export enum SettingsPageTabId {
   USERS = "users",
   AI = "ai",
+  VERIFICATION = "verification",
   REGISTRY_TOKENS = "registryTokens",
   DISPLAY = "display",
 }
@@ -88,6 +89,11 @@ export type SettingsRegistryTokensProps = {
 };
 
 export type SettingsAiAssistantProps = {
+  projectId: string;
+  canEdit?: boolean;
+};
+
+export type SettingsVerificationProps = {
   projectId: string;
   canEdit?: boolean;
 };

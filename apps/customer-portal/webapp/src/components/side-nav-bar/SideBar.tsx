@@ -70,7 +70,7 @@ export default function SideBar({
     projectId || "",
     { includeVerified: false },
     { limit: 1, offset: 0 },
-    !!projectId,
+    !!projectId && !!projectDetails?.verificationEnabled,
   );
   const pendingVerificationCount = pendingVerificationData?.totalRecords ?? 0;
 
@@ -113,6 +113,12 @@ export default function SideBar({
       items = items.filter((item: AppShellNavItem) => item.id !== "updates");
     }
 
+    if (!projectDetails?.verificationEnabled) {
+      items = items.filter(
+        (item: AppShellNavItem) => item.id !== "verifications",
+      );
+    }
+
     // Feature flags alone, as before RBAC: the security_admin permission had
     // no holder, so including it hid Security Center from everyone.
     if (
@@ -136,6 +142,7 @@ export default function SideBar({
     permissions.hasComponentAnalysis,
     permissions.hasUsageMetrics,
     usageMetricsEnabled,
+    projectDetails?.verificationEnabled,
   ]);
 
   return (

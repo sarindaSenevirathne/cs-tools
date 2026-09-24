@@ -706,6 +706,11 @@ type Project struct {
 	EndDate          *time.Time       `json:"endDate"`
 	CreatedOn        time.Time        `json:"createdOn"`
 	UpdatedOn        time.Time        `json:"updatedOn"`
+	// VerificationEnabled gates the Pending Verification feature for this
+	// project. Nullable BOOLEAN column with no default (migration 000084),
+	// coalesced to false when NULL -- same convention as
+	// ProjectAccountRef.AgentEnabled/KbReferencesEnabled.
+	VerificationEnabled bool `json:"verificationEnabled"`
 }
 
 // ProjectAccountRef is the embedded account summary returned in project detail responses.
@@ -806,17 +811,25 @@ type ProjectDetailsView struct {
 	// onboarding-enabled projects have one. Currently populated only from
 	// the ServiceNow data source.
 	OnboardingOwner *PersonRef `json:"onboardingOwner"`
+	// VerificationEnabled gates the Pending Verification feature for this
+	// project -- see domain.Project.VerificationEnabled's own doc comment.
+	VerificationEnabled bool `json:"verificationEnabled"`
 }
 
-// ProjectUpdateRequest is the input for PATCH /projects/{id} (ServiceNow data
-// source only — no Postgres equivalent). All fields are optional; at least
-// one must be provided. Note: ClosureState itself is not settable — it is
-// derived automatically from the three closure sub-state fields below by an
-// SN business rule, so setting one of those and re-fetching the project is
-// how a caller observes the resulting overall status.
+// ProjectUpdateRequest is the input for PATCH /projects/{id}. All fields
+// except VerificationEnabled are ServiceNow data source only — no Postgres
+// equivalent. Note: ClosureState itself is not settable — it is derived
+// automatically from the three closure sub-state fields below by an SN
+// business rule, so setting one of those and re-fetching the project is how
+// a caller observes the resulting overall status. All fields are optional;
+// at least one must be provided. VerificationEnabled is the one field
+// supported on the Postgres data source, and the Postgres UpdateProject
+// implementation rejects a request that sets it alongside any other,
+// SN-only field.
 type ProjectUpdateRequest struct {
 	HasAgent                        *bool           `json:"hasAgent,omitempty"`
 	HasKbReferences                 *bool           `json:"hasKbReferences,omitempty"`
+	VerificationEnabled             *bool           `json:"verificationEnabled,omitempty"`
 	EndDateClosureState             *string         `json:"endDateClosureState,omitempty"`
 	InvoiceDueDateClosureState      *string         `json:"invoiceDueDateClosureState,omitempty"`
 	ComplianceViolationClosureState *string         `json:"complianceViolationClosureState,omitempty"`

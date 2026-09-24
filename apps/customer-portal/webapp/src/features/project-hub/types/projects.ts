@@ -85,6 +85,7 @@ export type ProjectDetails = {
   onboardingStatus?: string | null;
   suspensionReasons?: string[];
   outstandingCount?: number | null;
+  verificationEnabled?: boolean;
 };
 
 // Response type for project search responses.
@@ -185,4 +186,5 @@ export type ProjectFeatures = {
 export type PatchProjectRequest = {
   hasAgent?: boolean;
   hasKbReferences?: boolean;
+  verificationEnabled?: boolean;
 };

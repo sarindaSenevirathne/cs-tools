@@ -54,6 +54,9 @@ type ProjectRepository interface {
 	// or a NotFoundError if no such project exists OR it exists but scope
 	// excludes it (existence is never revealed to a caller who can't see it).
 	GetProjectByID(ctx context.Context, id string, scope SearchScope) (domain.ProjectDetailsView, error)
+	// UpdateProject sets verification_enabled and stamps updated_on/updated_by,
+	// returning the updated row, or a NotFoundError if no such project exists.
+	UpdateProject(ctx context.Context, id string, verificationEnabled bool, updatedBy string) (domain.Project, error)
 }
 
 type projectRepo struct {
@@ -234,7 +237,7 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope Searc
 	// are nullable BOOLEAN columns, but ProjectAccountRef.AgentEnabled/
 	// KbReferencesEnabled are plain (non-pointer) bool -- scan into *bool
 	// and treat a NULL column as false, not an error.
-	var agentEnabled, kbReferencesEnabled *bool
+	var agentEnabled, kbReferencesEnabled, verificationEnabled *bool
 	// project.name is a nullable column; scan into a *string local and
 	// default to "" on NULL, same pattern SearchProjects uses.
 	var name *string
@@ -265,7 +268,7 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope Searc
 		        p.start_date, p.end_date, p.created_on, p.updated_on,
 		        a.id, a.name, a.activation_date, a.region,
 		        a.ai_gen_response_enabled, a.smart_knowledge_base_suggestions_enabled,
-		        pt.name
+		        pt.name, p.verification_enabled
 		 FROM project p
 		 LEFT JOIN account a ON p.account_id = a.id
 		 LEFT JOIN project_type pt ON pt.id = p.project_type_id
@@ -275,7 +278,7 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope Searc
 		&v.StartDate, &v.EndDate, &v.CreatedOn, &v.UpdatedOn,
 		&aID, &aName, &v.Account.ActivationDate, &v.Account.Region,
 		&agentEnabled, &kbReferencesEnabled,
-		&projectTypeName,
+		&projectTypeName, &verificationEnabled,
 	)
 	v.Name = stringOrEmpty(name)
 	// v.Account.Tier still has no real column -- see this repository's own
@@ -294,10 +297,35 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope Searc
 	}
 	v.Account.AgentEnabled = agentEnabled != nil && *agentEnabled
 	v.Account.KbReferencesEnabled = kbReferencesEnabled != nil && *kbReferencesEnabled
+	v.VerificationEnabled = verificationEnabled != nil && *verificationEnabled
 	if projectTypeName != nil {
 		v.SubscriptionType = projectTypeNameToSubscriptionType(*projectTypeName)
 	}
 	return v, nil
+}
+
+// UpdateProject implements ProjectRepository.
+func (r *projectRepo) UpdateProject(ctx context.Context, id string, verificationEnabled bool, updatedBy string) (domain.Project, error) {
+	var p domain.Project
+	var name *string
+	err := r.db.QueryRow(ctx,
+		`UPDATE project
+		 SET verification_enabled = $1, updated_on = NOW(), updated_by = $2
+		 WHERE id = $3
+		 RETURNING id, account_id, sf_id, name, key, start_date, end_date, created_on, updated_on`,
+		verificationEnabled, updatedBy, id,
+	).Scan(
+		&p.ID, &p.AccountID, &p.SfID, &name, &p.Key,
+		&p.StartDate, &p.EndDate, &p.CreatedOn, &p.UpdatedOn,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Project{}, &apierror.NotFoundError{Msg: "project not found"}
+	}
+	if err != nil {
+		return domain.Project{}, fmt.Errorf("update project: %w", err)
+	}
+	p.Name = stringOrEmpty(name)
+	return p, nil
 }
 
 // projectTypeNameToSubscriptionType converts a project_type.name label (e.g.

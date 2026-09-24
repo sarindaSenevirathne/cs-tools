@@ -14,7 +14,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { useMemo, useState, type JSX } from "react";
+import { useEffect, useMemo, useState, type JSX } from "react";
 import { useParams } from "react-router";
 import {
   Box,
@@ -30,6 +30,7 @@ import {
 import { ShieldCheck, CircleCheck } from "@wso2/oxygen-ui-icons-react";
 import { useModifierAwareNavigate } from "@hooks/useModifierAwareNavigate";
 import { useDebouncedValue } from "@hooks/useDebouncedValue";
+import useGetProjectDetails from "@api/useGetProjectDetails";
 import { usePendingVerificationsListSearch } from "@features/support/api/usePendingVerificationsListSearch";
 import { useVerifyPendingVerification } from "@features/support/api/useVerifyPendingVerification";
 import { useErrorBanner } from "@context/error-banner/ErrorBannerContext";
@@ -111,11 +112,23 @@ export default function PendingVerificationsPage(): JSX.Element {
     [page],
   );
 
+  const { data: projectDetails } = useGetProjectDetails(projectId || "");
+  const verificationEnabled = !!projectDetails?.verificationEnabled;
+
+  // Guards direct URL access even with the sidebar item hidden — mirrors
+  // CaseDetailsPage's own redirect-on-misroute useEffect.
+  useEffect(() => {
+    if (!projectId || !projectDetails) return;
+    if (!verificationEnabled) {
+      navigate(`/projects/${projectId}/dashboard`, { replace: true });
+    }
+  }, [projectId, projectDetails, verificationEnabled, navigate]);
+
   const { data, isLoading, isError } = usePendingVerificationsListSearch(
     projectId || "",
     filters,
     pagination,
-    !!projectId,
+    !!projectId && verificationEnabled,
   );
 
   const allRecords = useMemo(() => data?.pendingVerifications ?? [], [data?.pendingVerifications]);

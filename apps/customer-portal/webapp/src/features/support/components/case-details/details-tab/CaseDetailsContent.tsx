@@ -25,6 +25,7 @@ import { consumePendingCaseDetailsTab } from "@features/settings/utils/settingsS
 import { useGetCaseAttachments } from "@features/support/api/useGetCaseAttachments";
 import { useGetCallRequests } from "@features/support/api/useGetCallRequests";
 import useGetProjectFilters from "@api/useGetProjectFilters";
+import useGetProjectDetails from "@api/useGetProjectDetails";
 import useGetAIChatHistory from "@features/support/api/useGetAIChatHistory";
 import { useConversationRecommendationsSearch } from "@features/support/api/useConversationRecommendationsSearch";
 import { buildRecommendationRequestFromCase } from "@features/support/utils/recommendations";
@@ -235,19 +236,23 @@ export default function CaseDetailsContent({
   // and independently re-fetched by CaseVerificationsPanel (same query key, so
   // React Query dedupes both to one network call) for the tab's own timeline.
   const isCaseClosed = !!data?.closedOn || statusLabel === "Closed";
+  const { data: projectDetails } = useGetProjectDetails(resolvedProjectId);
+  const verificationEnabled = !!projectDetails?.verificationEnabled;
   const { data: verificationData } = usePendingVerificationsSearch(
     resolvedProjectId,
     caseId,
-    !!resolvedProjectId && !!caseId,
+    !!resolvedProjectId && !!caseId && verificationEnabled,
   );
   const verificationRecords = verificationData?.pendingVerifications ?? [];
   const verificationsCount = verificationData ? verificationRecords.length : undefined;
   const unverifiedRecord = verificationRecords.find((r) => !r.verifiedAt);
   const hasVerifiedRecord = verificationRecords.some((r) => !!r.verifiedAt);
-  const isPendingVerification = !!unverifiedRecord;
-  const isCaseVerified = !isPendingVerification && hasVerifiedRecord;
+  const isPendingVerification = verificationEnabled && !!unverifiedRecord;
+  const isCaseVerified = !isPendingVerification && verificationEnabled && hasVerifiedRecord;
   const hasNoVerificationRecord =
-    verificationData !== undefined && verificationRecords.length === 0;
+    verificationEnabled &&
+    verificationData !== undefined &&
+    verificationRecords.length === 0;
 
   const visibleTabs = useMemo(
     () => [
@@ -258,9 +263,15 @@ export default function CaseDetailsContent({
       ...(hideKnowledgeBaseTab ? [] : [4]),
       ...(hideRelatedChangeRequestsTab ? [] : [5]),
       ...(hideEscalationTab ? [] : [6]),
-      7,
+      ...(verificationEnabled ? [7] : []),
     ],
-    [hideCallsTab, hideKnowledgeBaseTab, hideRelatedChangeRequestsTab, hideEscalationTab],
+    [
+      hideCallsTab,
+      hideKnowledgeBaseTab,
+      hideRelatedChangeRequestsTab,
+      hideEscalationTab,
+      verificationEnabled,
+    ],
   );
   const clampedActiveTab = Math.min(
     activeTab,

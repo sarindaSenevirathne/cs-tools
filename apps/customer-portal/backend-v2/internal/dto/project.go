@@ -166,6 +166,10 @@ type ProjectDetails struct {
 	GoLivePlanDate           *string  `json:"goLivePlanDate,omitempty"`
 	OnboardingExpiryDate     *string  `json:"onboardingExpiryDate,omitempty"`
 	OnboardingStatus         *string  `json:"onboardingStatus,omitempty"`
+
+	// VerificationEnabled gates the Pending Verification feature for this
+	// project.
+	VerificationEnabled bool `json:"verificationEnabled"`
 }
 
 // MapProjectDetails builds the portal response from entity-service's ProjectDetailsView.
@@ -205,16 +209,19 @@ func MapProjectDetails(p entity.ProjectDetailsView) ProjectDetails {
 		GoLivePlanDate:           DateOnly(p.GoLivePlanDate),
 		OnboardingExpiryDate:     DateOnly(p.OnboardingExpiryDate),
 		OnboardingStatus:         p.OnboardingStatus,
+
+		VerificationEnabled: p.VerificationEnabled,
 	}
 }
 
 // UpdatedProject is the portal's response to PATCH /projects/{id}: the project
 // as it stands after its AI chat assistant settings were changed.
 type UpdatedProject struct {
-	ID              string `json:"id"`
-	Name            string `json:"name"`
-	HasAgent        *bool  `json:"hasAgent,omitempty"`
-	HasKbReferences *bool  `json:"hasKbReferences,omitempty"`
+	ID                  string `json:"id"`
+	Name                string `json:"name"`
+	HasAgent            *bool  `json:"hasAgent,omitempty"`
+	HasKbReferences     *bool  `json:"hasKbReferences,omitempty"`
+	VerificationEnabled *bool  `json:"verificationEnabled,omitempty"`
 }
 
 // MapUpdatedProject converts entity-service's project to the portal's shape,
@@ -222,9 +229,10 @@ type UpdatedProject struct {
 // whatever entity-service happens to return.
 func MapUpdatedProject(p entity.UpdatedProjectRef) UpdatedProject {
 	return UpdatedProject{
-		ID:              p.ID,
-		Name:            p.Name,
-		HasAgent:        p.HasAgent,
-		HasKbReferences: p.HasKbReferences,
+		ID:                  p.ID,
+		Name:                p.Name,
+		HasAgent:            p.HasAgent,
+		HasKbReferences:     p.HasKbReferences,
+		VerificationEnabled: p.VerificationEnabled,
 	}
 }

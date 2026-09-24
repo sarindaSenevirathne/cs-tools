@@ -292,10 +292,18 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 	}
 	projectContactHandler := handler.NewProjectContactHandler(activeProjectContactSvc)
 
-	var projectUpdateHandler *handler.ProjectUpdateHandler
+	// activeProjectUpdateSvc picks the same way activeProjectSvc does above.
+	// pgProjectSvc (concrete type *projectService, behind the ProjectService
+	// interface) also implements ProjectUpdateService -- Go interfaces are
+	// structural, so no second service instance is needed, just a type
+	// assertion to the narrower interface.
+	var activeProjectUpdateSvc service.ProjectUpdateService
 	if cfg.DataSource == config.DataSourceServiceNow {
-		projectUpdateHandler = handler.NewProjectUpdateHandler(service.NewServiceNowProjectUpdateService(serviceNowIntegrationServiceClient))
+		activeProjectUpdateSvc = service.NewServiceNowProjectUpdateService(serviceNowIntegrationServiceClient)
+	} else {
+		activeProjectUpdateSvc = pgProjectSvc.(service.ProjectUpdateService)
 	}
+	projectUpdateHandler := handler.NewProjectUpdateHandler(activeProjectUpdateSvc)
 
 	// referenceDataRepo backs GET /projects/{id}/metadata and GET /metadata's
 	// Postgres-mode choice lists (project_type rows, enum labels) -- see
@@ -874,11 +882,9 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, service.Even
 	}
 	mux.HandleFunc("GET /projects/{id}", projectHandler.GetProject)
 	mux.HandleFunc("POST /projects/search", projectHandler.SearchProjects)
+	mux.HandleFunc("PATCH /projects/{id}", projectUpdateHandler.UpdateProject)
 	mux.HandleFunc("POST /projects/{id}/contacts/search", projectContactHandler.SearchProjectContacts)
 	mux.HandleFunc("GET /projects/{id}/contacts/{contactId}", projectContactHandler.GetProjectContact)
-	if projectUpdateHandler != nil {
-		mux.HandleFunc("PATCH /projects/{id}", projectUpdateHandler.UpdateProject)
-	}
 	mux.HandleFunc("GET /projects/{id}/metadata", projectMetadataHandler.GetProjectMetadata)
 	mux.HandleFunc("GET /projects/{id}/cases/stats", projectCaseStatsHandler.GetProjectCaseStats)
 	mux.HandleFunc("GET /projects/{id}/stats", projectStatsHandler.GetProjectStats)
