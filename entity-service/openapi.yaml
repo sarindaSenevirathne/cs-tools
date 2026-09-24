@@ -449,6 +449,119 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /pending-verifications:
+    post:
+      summary: >-
+        Add a work item to a project's Pending Verification list — a closed
+        Case/Engagement/Security Report Analysis/Service Request/Announcement/
+        Change Request flagged as needing formal customer sign-off. Has no
+        ServiceNow equivalent — always backed by Postgres. addedBy is never
+        accepted from the caller; it is resolved server-side from the
+        caller's own authenticated identity.
+      operationId: createPendingVerification
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePendingVerificationRequest'
+      responses:
+        "201":
+          description: Entry created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatePendingVerificationResponse'
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /pending-verifications/search:
+    post:
+      summary: >-
+        Search a project's Pending Verification entries, newest first.
+        filters.includeVerified adds verified rows alongside unverified ones
+        (there is no way to combine that with verified-only);
+        filters.verifiedOnly overrides includeVerified entirely and narrows
+        to verified rows only, letting a caller paginate verified and
+        unverified entries independently of each other.
+      operationId: searchPendingVerifications
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchPendingVerificationsRequest'
+      responses:
+        "200":
+          description: Entries matching the filters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchPendingVerificationsResponse'
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /pending-verifications/{id}:
+    patch:
+      summary: >-
+        Mark a Pending Verification entry verified. Not idempotent —
+        verifying an already-verified entry, or an unknown id, is a 404.
+        verifiedBy is never accepted from the caller; it is resolved
+        server-side from the caller's own authenticated identity.
+      operationId: verifyPendingVerification
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Entry verified successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifyPendingVerificationResponse'
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: Entry not found, or already verified.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /sla-status:
     get:
       summary: >-
@@ -17545,6 +17658,164 @@ components:
           $ref: '#/components/schemas/Pagination'
         filters:
           $ref: '#/components/schemas/SearchEventPublishFailuresFilters'
+
+    PendingVerification:
+      description: >
+        A single entry in a project's Pending Verification list — a work item
+        (Case, Engagement, Security Report, Service Request, Announcement, or
+        Change Request) flagged as needing formal customer sign-off before
+        being considered done. Has no ServiceNow equivalent — always backed
+        by Postgres.
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        workItemId:
+          type: string
+          format: uuid
+        recordNumber:
+          type: string
+        recordTitle:
+          type: string
+        severity:
+          type: string
+          nullable: true
+          description: Bare code (e.g. "S1") — only ever set for Case-like record types.
+        recordType:
+          type: string
+          enum: [CASE, ENGAGEMENT, SECURITY_REPORT_ANALYSIS, SERVICE_REQUEST, ANNOUNCEMENT, CHANGE_REQUEST]
+        addedReason:
+          type: string
+          enum: [AUTO_CLOSED, MANUAL]
+        previousStatus:
+          type: string
+          enum: [SOLUTION_PROPOSED, AWAITING_INFO]
+          nullable: true
+          description: Set iff addedReason is AUTO_CLOSED.
+        addedOn:
+          type: string
+          format: date-time
+        addedBy:
+          type: string
+          description: Email, resolved server-side — never caller-supplied.
+        verifiedOn:
+          type: string
+          format: date-time
+          nullable: true
+        verifiedBy:
+          type: string
+          nullable: true
+          description: Email, resolved server-side — never caller-supplied.
+        note:
+          type: string
+          nullable: true
+
+    CreatePendingVerificationRequest:
+      type: object
+      required: [workItemId, addedReason]
+      properties:
+        workItemId:
+          type: string
+          format: uuid
+        addedReason:
+          type: string
+          enum: [AUTO_CLOSED, MANUAL]
+        previousStatus:
+          type: string
+          enum: [SOLUTION_PROPOSED, AWAITING_INFO]
+          description: Required iff addedReason is AUTO_CLOSED, must be omitted when MANUAL.
+        note:
+          type: string
+
+    CreatePendingVerificationResponse:
+      type: object
+      properties:
+        message:
+          type: string
+        pendingVerification:
+          $ref: '#/components/schemas/PendingVerification'
+
+    VerifyPendingVerificationResponse:
+      type: object
+      properties:
+        message:
+          type: string
+        pendingVerification:
+          $ref: '#/components/schemas/PendingVerification'
+
+    PendingVerificationSearchFilters:
+      type: object
+      required: [projectId]
+      properties:
+        projectId:
+          type: string
+          format: uuid
+        workItemId:
+          type: string
+          format: uuid
+          description: Narrows to a single record's own entries.
+        workItemTypes:
+          type: array
+          items:
+            type: string
+            enum: [CASE, ENGAGEMENT, SECURITY_REPORT_ANALYSIS, SERVICE_REQUEST, ANNOUNCEMENT, CHANGE_REQUEST]
+        searchQuery:
+          type: string
+        includeVerified:
+          type: boolean
+          description: >-
+            false (default): unverified only. true: adds verified rows
+            alongside unverified ones — there is no way to ask for verified
+            only via this field; use verifiedOnly instead.
+        verifiedOnly:
+          type: boolean
+          description: >-
+            Overrides includeVerified entirely — narrows to verified rows
+            only. Added so a caller (the customer portal's list page) can
+            paginate verified and unverified entries independently.
+
+    SearchPendingVerificationsRequest:
+      type: object
+      properties:
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+        filters:
+          $ref: '#/components/schemas/PendingVerificationSearchFilters'
+
+    PendingVerificationTypeCount:
+      type: object
+      properties:
+        recordType:
+          type: string
+        count:
+          type: integer
+
+    SearchPendingVerificationsResponse:
+      type: object
+      properties:
+        pendingVerifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/PendingVerification'
+        total:
+          type: integer
+          description: Computed against the current filters (not a global count).
+        autoClosedCount:
+          type: integer
+        manualCount:
+          type: integer
+        typeCounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/PendingVerificationTypeCount'
+          description: Computed against every filter except workItemTypes itself.
+        limit:
+          type: integer
+        offset:
+          type: integer
+        hasMore:
+          type: boolean
 
     SLAStatus:
       description: >
