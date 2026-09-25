@@ -562,10 +562,10 @@ export type PendingVerificationStatKey = "total" | "autoClosed" | "manual" | "ve
  */
 export const PENDING_VERIFICATION_STAT_CONFIGS: SupportStatConfig<PendingVerificationStatKey>[] =
   [
-    { icon: ShieldCheck, iconColor: "info", key: "total", label: "Total Pending Review" },
-    { icon: RotateCcw, iconColor: "warning", key: "autoClosed", label: "Auto-closed Pending Review" },
-    { icon: FileText, iconColor: "secondary", key: "manual", label: "Manual Pending Review" },
-    { icon: CircleCheck, iconColor: "success", key: "verified", label: "Reviewed" },
+    { icon: ShieldCheck, iconColor: "info", key: "total", label: "Total Pending Verification" },
+    { icon: RotateCcw, iconColor: "warning", key: "autoClosed", label: "Auto-closed Pending Verification" },
+    { icon: FileText, iconColor: "secondary", key: "manual", label: "Manual Pending Verification" },
+    { icon: CircleCheck, iconColor: "success", key: "verified", label: "Verified" },
   ];
 
 /**
