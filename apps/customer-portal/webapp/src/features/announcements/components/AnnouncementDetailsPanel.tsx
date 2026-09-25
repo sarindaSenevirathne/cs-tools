@@ -17,6 +17,7 @@
 import {
   Box,
   Button,
+  Chip,
   Paper,
   Skeleton,
   Stack,
@@ -140,6 +141,13 @@ export default function AnnouncementDetailsPanel({
   const showVerificationActions =
     verificationEnabled && (canAddToVerification || isPendingVerification);
 
+  // Matches the CSM portal's own SECURITY_ANNOUNCEMENT_TAG_LABEL constant --
+  // the two apps have no shared code to import it from, so it's duplicated
+  // here as a literal, same as every other cross-app label match in this file.
+  const isSecurityAnnouncement = (data.tags ?? []).some(
+    (t) => t.label.toLowerCase() === "security announcement",
+  );
+
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 2 }}>
       <Button
@@ -234,13 +242,14 @@ export default function AnnouncementDetailsPanel({
           </Box>
         )}
 
-        <Typography
-          variant="h6"
-          color="text.primary"
-          sx={{ mb: 1, fontWeight: 500 }}
-        >
-          {data.title || "--"}
-        </Typography>
+        <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1 }}>
+          <Typography variant="h6" color="text.primary" sx={{ fontWeight: 500 }}>
+            {data.title || "--"}
+          </Typography>
+          {isSecurityAnnouncement && (
+            <Chip size="small" color="warning" label="Security" sx={{ flexShrink: 0 }} />
+          )}
+        </Box>
 
         <Stack
           direction="row"

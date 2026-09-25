@@ -43,7 +43,7 @@ func (r *recordingProjectRepo) GetProjectByID(context.Context, string, repositor
 	panic("GetProjectByID: not exercised by these tests")
 }
 
-func (r *recordingProjectRepo) UpdateProject(context.Context, string, bool, string) (domain.Project, error) {
+func (r *recordingProjectRepo) UpdateProject(context.Context, string, domain.ProjectUpdateRequest, string) (domain.ProjectUpdateResult, error) {
 	panic("UpdateProject: not exercised by these tests")
 }
 

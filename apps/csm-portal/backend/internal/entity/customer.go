@@ -155,6 +155,12 @@ func (c *CustomerEntityClient) SearchUsers(ctx context.Context, body []byte) ([]
 	return c.do(ctx, http.MethodPost, "/users/search", body)
 }
 
+// CreateUser calls POST /users on the entity service.
+// Response is returned as raw JSON; typed response structs are deferred.
+func (c *CustomerEntityClient) CreateUser(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/users", body)
+}
+
 // GetProjectContact calls GET /projects/{id}/contacts/{contactId} on the entity service.
 // Response is returned as raw JSON.
 func (c *CustomerEntityClient) GetProjectContact(ctx context.Context, projectID, contactID string) ([]byte, error) {
@@ -184,6 +190,13 @@ func (c *CustomerEntityClient) SearchAccounts(ctx context.Context, body []byte) 
 // Response is returned as raw JSON; typed response structs are deferred.
 func (c *CustomerEntityClient) SearchAccountContacts(ctx context.Context, accountID string, body []byte) ([]byte, error) {
 	return c.do(ctx, http.MethodPost, fmt.Sprintf("/accounts/%s/contacts/search", url.PathEscape(accountID)), body)
+}
+
+// UpdateAccountTeams calls PATCH /accounts/{id} on the entity service to update an
+// account's CRE team and/or SRE team assignment.
+// Response is returned as raw JSON; typed response structs are deferred.
+func (c *CustomerEntityClient) UpdateAccountTeams(ctx context.Context, id string, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPatch, fmt.Sprintf("/accounts/%s", url.PathEscape(id)), body)
 }
 
 // GetProject calls GET /projects/{id} on the entity service.

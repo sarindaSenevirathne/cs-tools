@@ -40,6 +40,8 @@ import (
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/handler"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/notifications"
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/plg"
+	plgconfig "github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/plg/config"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/scim"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/sftpgo"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/updates"
@@ -171,6 +173,7 @@ func main() {
 	accessGuard := handler.NewAccessGuard(loadAccessConfig())
 	usersHandler := handler.NewUsersHandler(scimClient, customerEntityClient, dir, sftpgoAttachmentStorageEnabled).WithAccessGuard(accessGuard)
 	dashboardHandler := handler.NewDashboardHandler(accessGuard)
+	caseHandler = caseHandler.WithAccessGuard(accessGuard)
 
 	authCfg := middleware.Config{
 		JWKSEndpoint:          mustEnv("AUTH_JWKS_ENDPOINT"),
@@ -251,9 +254,14 @@ func main() {
 	route("POST /users/me/saved-filter-views/reorder", handler.PermAuthenticated, usersHandler.ReorderSavedFilterView)
 	route("POST /users/search", handler.PermView, usersHandler.SearchUsers)
 	route("GET /users/{id}", handler.PermView, usersHandler.GetUser)
+	route("POST /users", handler.PermAdmin, usersHandler.CreateUser)
 	route("POST /roles/search", handler.PermView, referenceHandler.SearchRoles)
 	route("POST /teams/search", handler.PermView, referenceHandler.SearchTeams)
 	route("GET /accounts/{id}", handler.PermView, accountHandler.GetAccount)
+	// Admin-only: CRE/SRE team is a temporary override of ServiceNow's own
+	// value (see AccountService.UpdateAccountTeams's doc comment) — no other
+	// staff role should be able to set it.
+	route("PATCH /accounts/{id}", handler.PermAdmin, accountHandler.UpdateAccountTeams)
 	route("POST /accounts/search", handler.PermView, accountHandler.SearchAccounts)
 	route("POST /accounts/{id}/contacts/search", handler.PermView, accountHandler.SearchAccountContacts)
 	route("GET /projects/{id}", handler.PermView, projectHandler.GetProject)
@@ -304,8 +312,8 @@ func main() {
 	route("DELETE /time-cards/{id}", handler.PermTimeCardsAndUpdates, timeCardHandler.DeleteTimeCard)
 	route("POST /catalogs/search", handler.PermView, catalogHandler.SearchCatalogs)
 	route("GET /catalogs/{catalogId}/items/{catalogItemId}/variables", handler.PermView, catalogHandler.GetCatalogItemVariables)
-	route("POST /products/vulnerabilities/search", handler.PermView, productVulnerabilityHandler.SearchProductVulnerabilities)
-	route("GET /products/vulnerabilities/{id}", handler.PermView, productVulnerabilityHandler.GetProductVulnerability)
+	route("POST /products/vulnerabilities/search", handler.PermViewSecurityCenter, productVulnerabilityHandler.SearchProductVulnerabilities)
+	route("GET /products/vulnerabilities/{id}", handler.PermViewSecurityCenter, productVulnerabilityHandler.GetProductVulnerability)
 	route("GET /conversations/{id}/messages", handler.PermView, conversationHandler.GetConversationMessages)
 	route("POST /conversations/search", handler.PermView, conversationHandler.SearchConversations)
 	route("POST /slas/search", handler.PermView, taskSlaHandler.SearchTaskSlas)
@@ -358,6 +366,31 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// PLG Customer Success Portal. Its config, entity-service client, services,
+	// handlers, identity middleware and 26 plg/* routes are all assembled in
+	// internal/plg — this is the only line of csm-portal's own wiring the merge
+	// touches.
+	//
+	// Mounted on the same mux, so PLG runs inside the middleware chain below:
+	// SecurityHeaders, CORS, CorrelationID and — the reason the merge is worth
+	// doing — Auth. PLG's routes are JWT-validated by csm-portal, and the
+	// X-PLG-User header the standalone build trusted no longer exists.
+	//
+	// PLG inherits entity-service's address and credentials rather than keeping
+	// its own copy: it reaches the same service as the same OAuth2 application
+	// as every other upstream client above. PLG_* overrides exist but are not
+	// normally set.
+	if err := plg.Mount(mux, os.Getenv("PLG_CONFIG_FILE"), plgconfig.EntityDefaults{
+		BaseURL:      customerEntityCfg.BaseURL,
+		TokenURL:     oauth2TokenURL,
+		ClientID:     oauth2ClientID,
+		ClientSecret: oauth2ClientSecret,
+		Scope:        os.Getenv("CUSTOMER_ENTITY_SCOPES"),
+	}); err != nil {
+		slog.Error("failed to mount PLG", "err", err)
+		os.Exit(1)
+	}
 
 	addr := ":" + mustPort("PORT", "8080")
 
@@ -597,10 +630,13 @@ func loadAccessConfig() handler.AccessConfig {
 		Escalator:            roles("AUTH_ESCALATOR_ROLES"),
 		AttachmentDownloader: roles("AUTH_ATTACHMENT_DOWNLOADER_ROLES"),
 		UsageMetricsViewer:   roles("AUTH_USAGE_METRICS_VIEWER_ROLES"),
-		SupportEngineer:      roles("AUTH_SUPPORT_ENGINEER_ROLES"),
-		Admin:                roles("AUTH_ADMIN_ROLES"),
-		TimecardApprover:     roles("AUTH_TIMECARD_APPROVER_ROLES"),
-		DashboardDesigner:    roles("AUTH_DASHBOARD_DESIGNER_ROLES"),
+		// The env var name stays AUTH_SUPPORT_ENGINEER_ROLES even though the
+		// portal role itself was renamed to cs_engineer -- see
+		// handler.AccessConfig.CsEngineer's own doc comment for why.
+		CsEngineer:        roles("AUTH_SUPPORT_ENGINEER_ROLES"),
+		Admin:             roles("AUTH_ADMIN_ROLES"),
+		TimecardApprover:  roles("AUTH_TIMECARD_APPROVER_ROLES"),
+		DashboardDesigner: roles("AUTH_DASHBOARD_DESIGNER_ROLES"),
 	}
 	if len(unset) > 0 {
 		slog.Warn("access-control role variables are unset, so no token role grants them", "variables", unset)

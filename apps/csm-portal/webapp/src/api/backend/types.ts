@@ -1679,6 +1679,18 @@ export interface BeUser {
   updatedAt?: string;
 }
 
+/**
+ * `POST /users` request body. At least one of firstName/lastName is
+ * required. `roles` is accepted by the backend but not currently sent by the
+ * webapp — there is no Asgardeo-backed way to browse/assign roles at
+ * account-creation time yet.
+ */
+export interface BeCreateUserPayload {
+  firstName?: string;
+  lastName?: string;
+  email: string;
+}
+
 export interface BeUserSearchFilters {
   /** Case-insensitive match against username and email. */
   searchQuery?: string;
@@ -2818,6 +2830,7 @@ export interface BeItService {
   class?: string | null;
   businessCriticality?: string | null;
   serviceClassification?: string | null;
+  supportGroup?: BeEntityRef | null;
 }
 
 export interface BeItServiceSearchPayload {
@@ -3170,6 +3183,11 @@ export interface BeCreateIncidentPayload {
   additionalComments?: string;
   workNotes?: string;
   parentId?: string;
+  /** Links this incident to another incident as its parent (ServiceNow's
+   * dedicated `parent_incident` self-reference on the Incident table) —
+   * distinct from the generic `parentId` above, which links to a case,
+   * change request, or problem instead. */
+  parentIncidentId?: string;
   changeRequestId?: string;
   problemId?: string;
   causedById?: string;

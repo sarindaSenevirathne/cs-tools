@@ -46,6 +46,15 @@ type UserService interface {
 	// ValidationError is returned for a malformed id and a NotFoundError when no
 	// user has it.
 	GetUser(ctx context.Context, id string) (domain.UserDetail, error)
+	// CreateUser inserts a new "user" row, optionally granting the roles named
+	// in req.Roles. The acting caller is resolved from x-user-id-token, the
+	// same way GetMe resolves its own caller, and stamped as created_by on
+	// every row this writes -- an UnauthorizedError is returned when that
+	// header is missing. A ValidationError is returned for a missing/malformed
+	// email; a ConflictError when a user with that email already exists; a
+	// ServiceUnavailableError naming any requested role not seeded in the role
+	// table.
+	CreateUser(ctx context.Context, req domain.CreateUserRequest) (domain.User, error)
 }
 
 // SavedFilterViewService is the caller's own named list-filter bookmarks
@@ -84,12 +93,42 @@ type AccountService interface {
 	// GetAccountByID returns the account with the given UUID. A ValidationError is
 	// returned for a malformed UUID; a NotFoundError if no account matches.
 	GetAccountByID(ctx context.Context, id string) (domain.AccountDetail, error)
+	// UpdateAccountTeams sets the account's CRE and/or SRE team (Postgres data
+	// source only). A ValidationError is returned for a malformed UUID, if
+	// neither field is provided, or if a provided team ID does not reference
+	// an existing team; a NotFoundError if no account matches.
+	//
+	// This is a temporary override, not a durable value: the ServiceNow-to-
+	// Postgres sync maps u_integration_cs_team/u_sre_team into these same
+	// columns, so a value set here can be silently reverted the next time the
+	// account's ServiceNow record changes for any reason. Intentional, by
+	// product decision — ServiceNow remains authoritative.
+	UpdateAccountTeams(ctx context.Context, req domain.UpdateAccountTeamsRequest) (domain.AccountDetail, error)
 }
 
 // SalesforceEventService handles POST /salesforce/events. Account fetch goes
 // through REST sales/sales-entity-service POST /customer-search, not GraphQL.
 type SalesforceEventService interface {
 	HandleEvent(ctx context.Context, req domain.SalesforceEventRequest) error
+}
+
+// MembershipRegistrationService backs POST /users/me/memberships/register: the Customer Portal
+// calls it on every profile load, and it marks the signed-in user's still
+// un-accepted memberships as REGISTERED in Salesforce. The portal itself
+// therefore never needs Salesforce write access. Postgres-only, and gated on
+// CSM_MIGRATION_MEMBERSHIP_REGISTRATION_ENABLED — see membership_registration_service.go.
+type MembershipRegistrationService interface {
+	// RegisterInvitedMemberships flips every INVITED / RE-INVITED membership of the
+	// caller (resolved from x-user-id-token, exactly like GetMe) to
+	// REGISTERED in Salesforce, re-ingests each one so Postgres matches, and
+	// records the REGISTRATION onboarding step per membership. A caller with
+	// no such membership — almost every call — does nothing at all.
+	//
+	// An UnauthorizedError is returned when the header is missing and a
+	// ValidationError when the token cannot be decoded. One membership
+	// failing never stops the others: an error is only returned when every
+	// membership failed, so a partial success is still a success.
+	RegisterInvitedMemberships(ctx context.Context) error
 }
 
 // EventPublishFailureService defines the operations available on the
@@ -160,6 +199,39 @@ type OnboardingStepService interface {
 	GetByMembership(ctx context.Context, membershipSfID string) (domain.GetOnboardingStepsResponse, error)
 	// Search returns a filtered, paginated list of steps, newest first.
 	Search(ctx context.Context, req domain.SearchOnboardingStepsRequest) (domain.SearchOnboardingStepsResponse, error)
+}
+
+// ProjectMembershipWriteService owns every change to who is a contact on a
+// project: the Customer Portal (a customer admin managing their own users)
+// and the CSM Portal (an account manager doing it for them) both call these
+// same four operations, and each one writes the CSM database and Salesforce
+// together or writes neither.
+//
+// The database is the source of truth; Salesforce is kept in step rather
+// than read from as an authority. See NewProjectMembershipWriteService for
+// the ordering that makes "both or neither" hold without a distributed
+// transaction, and why the database commits last.
+//
+// Every method is restricted to internal callers (AUTH_INTERNAL_CLIENT_IDS).
+// The portal backends decide who may invite whom; this service does not.
+type ProjectMembershipWriteService interface {
+	// Invite adds a contact to a project: state INVITED (RE-INVITED when a
+	// previously deactivated membership is being brought back) in both
+	// systems, and a project_contact.invited event. A ConflictError when the
+	// address is already an active contact on the project.
+	Invite(ctx context.Context, projectID string, req domain.CreateProjectMembershipRequest) (domain.ProjectMembership, error)
+	// UpdateRoles replaces the membership's Salesforce roles, and with them
+	// its project groups. The state is untouched.
+	UpdateRoles(ctx context.Context, projectID, email string, req domain.UpdateProjectMembershipRolesRequest) (domain.ProjectMembership, error)
+	// Deactivate moves the membership to DEACTIVATED in both systems. It
+	// never deletes: DEACTIVATED is a real state in both the Salesforce
+	// picklist and project_contact_state_enum.
+	Deactivate(ctx context.Context, projectID, email string) error
+	// ResendInvitation re-publishes project_contact.invited with a resend
+	// marker so csm-notification-service bypasses its already-sent guard.
+	// Valid only while the membership is INVITED (ConflictError otherwise),
+	// and rate-limited per membership (TooManyRequestsError).
+	ResendInvitation(ctx context.Context, projectID, email string) error
 }
 
 // ScheduledTaskRunService defines the operations available on the
@@ -319,12 +391,19 @@ type ProjectService interface {
 }
 
 // ProjectUpdateService defines the write operations available on a project.
-// All methods require the ServiceNow data source; there is no Postgres fallback.
+// Implemented by snProjectUpdateService (DataSourceServiceNow, the full
+// domain.ProjectUpdateRequest contract) and pgProjectUpdateService
+// (DataSourcePostgres/DataSourcePostgresServiceNowDualWrite -- only the
+// fields with a real Postgres column; see that type's own doc comment for
+// exactly which, and why the rest are rejected rather than silently
+// dropped).
 type ProjectUpdateService interface {
 	// UpdateProject applies the given field changes to the project identified by
-	// id. A ValidationError is returned for a malformed UUID or an empty request;
-	// a NotFoundError if no project matches; an UnauthorizedError if the caller
-	// lacks the required SN role.
+	// id. A ValidationError is returned for a malformed UUID, an empty request,
+	// or (Postgres data sources only) a field with no Postgres column; a
+	// NotFoundError if no project matches; an UnauthorizedError if the caller
+	// lacks the required SN role (ServiceNow data source) or has no resolvable
+	// identity (Postgres data sources).
 	UpdateProject(ctx context.Context, id string, req domain.ProjectUpdateRequest) (domain.ProjectUpdateResponse, error)
 }
 
@@ -384,6 +463,45 @@ type ProjectStatsService interface {
 	GetProjectTimeCardStats(ctx context.Context, projectID, startDate, endDate string) (domain.ProjectTimeCardStatsResponse, error)
 	// GetProjectChangeRequestStats returns the project's change-request statistics.
 	GetProjectChangeRequestStats(ctx context.Context, projectID string) (domain.ProjectChangeRequestStatsResponse, error)
+}
+
+// ProjectConsumptionService defines the operations on a project's
+// product-consumption provisioning state — the resumable sequence that creates
+// a Choreo application for the project, subscribes it to the tracking API and
+// mints the credentials a deployment's license is built from.
+//
+// The two halves need different things, and neither is gated on DATA_SOURCE —
+// staging and production both run DATA_SOURCE=servicenow and need both.
+//
+//   - GetProjectConsumption and UpdateProjectConsumption read and write the
+//     Postgres mirror, so they need a pool. A pool enables them on either
+//     data source.
+//   - ProcessLicenseDownload needs neither. It reads status from ServiceNow
+//     through the configured Choreo subscription operation and touches
+//     Postgres only to mirror what it did, which is best-effort and skipped
+//     entirely when there is no repository.
+//
+// ServiceNow remains the source of truth for the status itself. There it lives
+// on the customer_project record, reached through the product-consumption
+// scripted REST API that the Choreo subscription operation calls directly —
+// neither this service nor the ServiceNow integration service sits in that
+// path at all.
+//
+// Every method is scoped to the caller (see AccessService): the project id
+// comes from the request path, so a caller who cannot see a project can
+// neither read its provisioning state nor drive provisioning for it.
+type ProjectConsumptionService interface {
+	// GetProjectConsumption returns the project's current provisioning state.
+	// A project that has never entered the flow reports status 1 (pending)
+	// rather than a not-found error; an unknown project ID is not found.
+	GetProjectConsumption(ctx context.Context, projectID string) (domain.ProjectConsumptionView, error)
+	// UpdateProjectConsumption records the completion of one provisioning step.
+	// The status may only move forward; a status that is not ahead of what is
+	// stored returns the stored state unchanged instead of failing.
+	UpdateProjectConsumption(ctx context.Context, projectID string, req domain.UpdateProjectConsumptionRequest) (domain.UpdateProjectConsumptionResponse, error)
+	// ProcessLicenseDownload executes the 5-step resumable provisioning sequence
+	// and issues the signed deployment license.
+	ProcessLicenseDownload(ctx context.Context, projectID, deploymentID, email string) (domain.License, error)
 }
 
 // ProjectContactService defines the operations available on project contacts.
@@ -595,6 +713,12 @@ type CaseService interface {
 	// AddCaseTag attaches a free-text label to the case identified by caseID.
 	// A ValidationError is returned for invalid input (e.g. malformed UUID, empty label).
 	AddCaseTag(ctx context.Context, caseID, label string) (domain.Tag, error)
+	// AddCaseTagAs is AddCaseTag for a caller that already knows who is
+	// acting (actorEmail) and has no live x-user-id-token to resolve it
+	// from -- see AnnouncementRequestService.AutoPublish's own doc comment
+	// for why that caller can never have one. Skips the token-based actor
+	// resolution AddCaseTag does; everything else is identical.
+	AddCaseTagAs(ctx context.Context, caseID, label, actorEmail string) (domain.Tag, error)
 	// RemoveCaseTag removes the tag identified by tagID from the case identified by caseID.
 	// A NotFoundError is returned if the tag does not exist on the case.
 	RemoveCaseTag(ctx context.Context, caseID, tagID string) error
