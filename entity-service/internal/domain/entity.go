@@ -1037,6 +1037,7 @@ type ProjectUpdateResult struct {
 	InvoiceDueDateClosureState      *string         `json:"invoiceDueDateClosureState"`
 	ComplianceViolationClosureState *string         `json:"complianceViolationClosureState"`
 	SuspensionProcessState          json.RawMessage `json:"suspensionProcessState"`
+	VerificationEnabled             *bool           `json:"verificationEnabled,omitempty"`
 }
 
 // SearchProjectsRequest is the input for a project search operation.

@@ -10594,11 +10594,14 @@ components:
         At least one field must be provided. hasAgent and hasKbReferences are
         simple toggles; the closure-state fields track sub-states of an
         Account Closure Process and are only applicable to projects sourced
-        from ServiceNow.
+        from ServiceNow; verificationEnabled toggles the Pending Verification
+        feature and is the one field supported on the Postgres data source.
       properties:
         hasAgent:
           type: boolean
         hasKbReferences:
+          type: boolean
+        verificationEnabled:
           type: boolean
         endDateClosureState:
           type: string
@@ -10651,6 +10654,9 @@ components:
         suspensionProcessState:
           type: object
           additionalProperties: true
+          nullable: true
+        verificationEnabled:
+          type: boolean
           nullable: true
 
     SearchProjectContactsRequest:

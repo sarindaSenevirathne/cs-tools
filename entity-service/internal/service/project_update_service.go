@@ -100,7 +100,8 @@ func (s *pgProjectUpdateService) UpdateProject(ctx context.Context, id string, r
 		return domain.ProjectUpdateResponse{}, &apierror.ValidationError{Msg: "suspensionProcessState is not supported for this data source"}
 	}
 	if req.HasAgent == nil && req.HasKbReferences == nil && req.EndDateClosureState == nil &&
-		req.InvoiceDueDateClosureState == nil && req.ComplianceViolationClosureState == nil {
+		req.InvoiceDueDateClosureState == nil && req.ComplianceViolationClosureState == nil &&
+		req.VerificationEnabled == nil {
 		return domain.ProjectUpdateResponse{}, &apierror.ValidationError{Msg: "at least one field must be provided"}
 	}
 

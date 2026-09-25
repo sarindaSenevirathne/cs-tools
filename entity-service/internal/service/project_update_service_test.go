@@ -172,6 +172,46 @@ func TestPgProjectUpdateService_PlainPostgresUpdatesFieldsAndNeverCallsSN(t *tes
 	}
 }
 
+// TestPgProjectUpdateService_AcceptsVerificationEnabledOnly proves a request
+// setting only VerificationEnabled (the field the Pending Verification
+// feature's Settings toggle sends) is not rejected by the "at least one
+// field must be provided" guard, and reaches the repository and back
+// unchanged -- locking in the fix made when this field was folded into the
+// shared pgProjectUpdateService alongside HasAgent/HasKbReferences/the
+// closure-state fields.
+func TestPgProjectUpdateService_AcceptsVerificationEnabledOnly(t *testing.T) {
+	verificationEnabled := true
+	wantResult := domain.ProjectUpdateResult{
+		ID:                  "11111111-1111-1111-1111-111111111111",
+		UpdatedBy:           "jane.doe@example.com",
+		UpdatedOn:           time.Date(2026, 9, 24, 0, 0, 0, 0, time.UTC),
+		VerificationEnabled: &verificationEnabled,
+	}
+	repo := &stubProjectUpdateRepo{
+		updateProject: func(_ context.Context, _ string, _ domain.ProjectUpdateRequest, _ string) (domain.ProjectUpdateResult, error) {
+			return wantResult, nil
+		},
+	}
+	svc := NewProjectUpdateService(repo, testProjectUserRepo())
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+
+	resp, err := svc.UpdateProject(ctx, wantResult.ID, domain.ProjectUpdateRequest{
+		VerificationEnabled: &verificationEnabled,
+	})
+	if err != nil {
+		t.Fatalf("UpdateProject() error = %v", err)
+	}
+	if !repo.called {
+		t.Fatal("UpdateProject() never called the repository")
+	}
+	if repo.gotReq.VerificationEnabled == nil || !*repo.gotReq.VerificationEnabled {
+		t.Fatalf("repo.UpdateProject() req.VerificationEnabled = %v, want true", repo.gotReq.VerificationEnabled)
+	}
+	if resp.Project.VerificationEnabled == nil || !*resp.Project.VerificationEnabled {
+		t.Fatalf("UpdateProject() response.Project.VerificationEnabled = %v, want true", resp.Project.VerificationEnabled)
+	}
+}
+
 // TestPgProjectUpdateService_DualWriteDispatchesExactlyOneMirrorCallOnSuccess
 // proves DATA_SOURCE=postgres-servicenow-dual-write mode dispatches exactly
 // one best-effort ServiceNow mirror write after a successful Postgres write,

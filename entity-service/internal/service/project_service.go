@@ -20,7 +20,6 @@ package service
 import (
 	"context"
 
-	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
 )
@@ -90,43 +89,3 @@ func (s *projectService) GetProjectByID(ctx context.Context, id string) (domain.
 	return s.repo.GetProjectByID(ctx, id, scope)
 }
 
-// UpdateProject implements ProjectUpdateService. Unlike every other
-// ProjectUpdateRequest field (ServiceNow data source only), this Postgres
-// path supports exactly one field, VerificationEnabled — a request setting
-// any other field alongside it, or setting none at all, is rejected
-// explicitly rather than silently ignored, same "reject rather than
-// silently drop an unsupported filter" convention this codebase already
-// uses elsewhere (e.g. SearchDeployedProducts' ProductCategories
-// rejection).
-func (s *projectService) UpdateProject(ctx context.Context, id string, req domain.ProjectUpdateRequest) (domain.ProjectUpdateResponse, error) {
-	if err := validateUUIDs("id", []string{id}); err != nil {
-		return domain.ProjectUpdateResponse{}, err
-	}
-	if req.VerificationEnabled == nil {
-		return domain.ProjectUpdateResponse{}, &apierror.ValidationError{Msg: "verificationEnabled is required"}
-	}
-	if req.HasAgent != nil || req.HasKbReferences != nil ||
-		req.EndDateClosureState != nil || req.InvoiceDueDateClosureState != nil ||
-		req.ComplianceViolationClosureState != nil || req.SuspensionProcessState != nil {
-		return domain.ProjectUpdateResponse{}, &apierror.ValidationError{Msg: "only verificationEnabled is supported on this data source"}
-	}
-
-	email, err := resolveCallerEmail(ctx)
-	if err != nil {
-		return domain.ProjectUpdateResponse{}, err
-	}
-
-	p, err := s.repo.UpdateProject(ctx, id, *req.VerificationEnabled, email)
-	if err != nil {
-		return domain.ProjectUpdateResponse{}, err
-	}
-
-	return domain.ProjectUpdateResponse{
-		Message: "Project updated successfully",
-		Project: domain.ProjectUpdateResult{
-			ID:        p.ID,
-			UpdatedBy: email,
-			UpdatedOn: p.UpdatedOn,
-		},
-	}, nil
-}
