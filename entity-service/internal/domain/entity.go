@@ -7530,13 +7530,19 @@ type VerifyPendingVerificationResponse struct {
 // that by only ever sending the types it's allowed to ask for — this
 // service has no identity/role layer of its own to enforce it independently.
 // VerifiedOnly, when true, overrides IncludeVerified entirely and narrows to
-// verified rows only, DEDUPED to the single most-recently-verified row per
-// work_item_id — added so the list page's Verified tab can paginate
-// independently of the Unverified tab and show one entry per case (its
-// latest verification cycle) rather than one per historical add-and-verify
+// one row per work_item_id — that work item's LATEST verification cycle
+// (by added_on, not verified_on) — INCLUDED only when that latest cycle is
+// itself verified. This is deliberately not "any work item ever verified":
+// a case re-added for a second cycle after already being verified once
+// (re-add-after-verified) must disappear from this set the moment the new
+// cycle starts, even though its earlier, now-superseded cycle is still a
+// verified row in the table — it belongs in the Unverified set until the
+// new cycle is verified too, never in both at once. Added so the list
+// page's Verified tab can paginate independently of the Unverified tab and
+// show one entry per case rather than one per historical add-and-verify
 // round. Every count field (Total/AutoClosedCount/ManualCount/TypeCounts) is
-// computed against that same deduped set. A work item's full multi-round
-// history is still available, undeduped, via IncludeVerified=true (what the
+// computed against that same set. A work item's full multi-round history is
+// still available, undeduped, via IncludeVerified=true (what the
 // Verifications tab history panel uses).
 type PendingVerificationSearchFilters struct {
 	ProjectID       string   `json:"projectId"`

@@ -153,9 +153,14 @@ func buildSearchWhere(f domain.PendingVerificationSearchFilters, includeTypeFilt
 	args := []any{f.ProjectID}
 	argIdx := 2
 
-	if f.VerifiedOnly {
-		where += " AND pv.verified_on IS NOT NULL"
-	} else if !f.IncludeVerified {
+	// VerifiedOnly deliberately does NOT filter on pv.verified_on here -- the
+	// dedupe branches in Search need every row (verified or not) to find each
+	// work item's true latest cycle by added_on, then filter to verified-only
+	// AFTER that, in their own outer query. Filtering here would let an older
+	// verified round win DISTINCT ON's per-work-item slot over a newer,
+	// still-unverified round for the same case (see Search's own doc
+	// comment).
+	if !f.VerifiedOnly && !f.IncludeVerified {
 		where += " AND pv.verified_on IS NULL"
 	}
 	if f.WorkItemID != nil {
@@ -193,18 +198,27 @@ func (r *pendingVerificationRepo) Search(ctx context.Context, req domain.SearchP
 	eg.Go(func() error {
 		var dataQuery string
 		if dedupe {
-			// One row per work_item_id — its most-recently-verified entry —
-			// so a case verified more than once (VerifiedOnly's whole reason
-			// to exist: the Verified tab, post re-add-after-verified) shows
-			// as a single card, not one per historical round. DISTINCT ON's
-			// own required ordering picks *which* row wins per group; it
-			// does not control final display order, hence the outer re-sort.
+			// One row per work_item_id — its LATEST cycle (by added_on, not
+			// by verified_on) — so a case verified more than once (VerifiedOnly's
+			// whole reason to exist: the Verified tab, post
+			// re-add-after-verified) shows as a single card, not one per
+			// historical round. Ordering DISTINCT ON by added_on (rather than
+			// verified_on) is deliberate: it must pick each work item's
+			// current cycle regardless of whether that cycle happens to be
+			// verified yet, so the outer "WHERE verified_on IS NOT NULL" below
+			// can correctly OMIT a case whose latest cycle is still pending —
+			// even though an older, already-verified cycle exists for the
+			// same case. Without this, a case re-added for a second round
+			// would wrongly keep showing in the Verified tab via its stale
+			// first-round row. The outer re-sort by verified_on DESC is then
+			// just display order, unrelated to which row DISTINCT ON picked.
 			dataQuery = fmt.Sprintf(`
 				SELECT * FROM (
 					SELECT DISTINCT ON (pv.work_item_id) %s
 					%s %s
-					ORDER BY pv.work_item_id, pv.verified_on DESC
+					ORDER BY pv.work_item_id, pv.added_on DESC
 				) latest
+				WHERE verified_on IS NOT NULL
 				ORDER BY verified_on DESC
 				LIMIT $%d OFFSET $%d`,
 				pendingVerificationColumns, pendingVerificationFromJoin, where, len(args)+1, len(args)+2)
@@ -241,20 +255,24 @@ func (r *pendingVerificationRepo) Search(ctx context.Context, req domain.SearchP
 	eg.Go(func() error {
 		var countQuery string
 		if dedupe {
-			// Same one-row-per-work-item set as the data query above, so
-			// total/autoClosedCount/manualCount agree with what the rows
+			// Same one-row-per-work-item LATEST-cycle set as the data query
+			// above (see its own doc comment for why DISTINCT ON orders by
+			// added_on, not verified_on), filtered to verified cycles only,
+			// so total/autoClosedCount/manualCount agree with what the rows
 			// themselves show — each work item's count attributed to its
-			// own latest cycle's own addedReason.
+			// own latest cycle's own addedReason, and a case whose latest
+			// cycle isn't verified yet is excluded entirely.
 			countQuery = fmt.Sprintf(`
 				WITH latest AS (
-					SELECT DISTINCT ON (pv.work_item_id) pv.added_reason
+					SELECT DISTINCT ON (pv.work_item_id) pv.added_reason, pv.verified_on
 					%s %s
-					ORDER BY pv.work_item_id, pv.verified_on DESC
+					ORDER BY pv.work_item_id, pv.added_on DESC
 				)
 				SELECT COUNT(*),
 				       COUNT(*) FILTER (WHERE added_reason = 'AUTO_CLOSED'),
 				       COUNT(*) FILTER (WHERE added_reason = 'MANUAL')
-				FROM latest`, pendingVerificationFromJoin, where)
+				FROM latest
+				WHERE verified_on IS NOT NULL`, pendingVerificationFromJoin, where)
 		} else {
 			countQuery = fmt.Sprintf(`
 				SELECT COUNT(*),
@@ -273,11 +291,11 @@ func (r *pendingVerificationRepo) Search(ctx context.Context, req domain.SearchP
 		if dedupe {
 			typeCountsQuery = fmt.Sprintf(`
 				WITH latest AS (
-					SELECT DISTINCT ON (pv.work_item_id) wi.type
+					SELECT DISTINCT ON (pv.work_item_id) wi.type, pv.verified_on
 					%s %s
-					ORDER BY pv.work_item_id, pv.verified_on DESC
+					ORDER BY pv.work_item_id, pv.added_on DESC
 				)
-				SELECT type::TEXT, COUNT(*) FROM latest GROUP BY type`,
+				SELECT type::TEXT, COUNT(*) FROM latest WHERE verified_on IS NOT NULL GROUP BY type`,
 				pendingVerificationFromJoin, typeCountsWhere)
 		} else {
 			typeCountsQuery = fmt.Sprintf(`
