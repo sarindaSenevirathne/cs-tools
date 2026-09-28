@@ -77,23 +77,6 @@ type Config struct {
 	ServiceNowIntegrationServiceClientID     string
 	ServiceNowIntegrationServiceClientSecret string
 	ServiceNowIntegrationServiceScopes       string
-	// ConsumptionOperationBaseURL is the base URL of the Choreo subscription
-	// operation (operations/choreo-subscription-on-project-create), with the
-	// client credentials it is reached with.
-	//
-	// There is deliberately no default. The operation creates Choreo
-	// applications and issues signed licences for real customers, so a
-	// deployment that forgets to configure it must fail to register the
-	// licence route rather than quietly provision against whatever
-	// environment a baked-in default names.
-	ConsumptionOperationBaseURL      string
-	ConsumptionOperationTokenURL     string
-	ConsumptionOperationClientID     string
-	ConsumptionOperationClientSecret string
-	ConsumptionOperationScopes       string
-	// ConsumptionDualWriteEnabled controls whether provisioning state and
-	// artifacts are mirrored into Postgres alongside ServiceNow. Defaults to true.
-	ConsumptionDualWriteEnabled bool
 	// EventHubBroker/EventHubConnectionString/EventHubTopic configure this
 	// service's EventPublisherService (internal/service/
 	// event_publisher_service.go). Optional — gated on EventHubBroker being
@@ -210,6 +193,23 @@ type Config struct {
 	// nothing to do with case state) — the two are read by separate
 	// processes/environments and don't interact.
 	CustomerRoles []string
+	// CSEngineerRole is the ServiceNow role name (e.g. an org-specific
+	// "sn_*" role) whose presence on a case comment's resolved author marks
+	// that comment as a qualifying CS-engineer response — see
+	// sn_case_service.go's applyResponseSLAOnComment, which the CSM-native
+	// SLA engine (internal/service/sla_engine_service.go) uses to complete
+	// a case's "response" SLA clock. Deliberately no committed default:
+	// this is organisation-specific vocabulary, same reasoning
+	// CustomerRoles' own doc comment gives. Left unset, that function
+	// simply can't confirm engineer-authorship and skips (logged) — not
+	// fatal, not required by Validate.
+	CSEngineerRole string
+	// SLARecomputeInterval is how often SLAEngineRecomputeWorker
+	// recomputes every CSM-native "sla" row's elapsed percentage/breach
+	// status (internal/service/sla_engine_recompute_worker.go). Same
+	// envDuration convention as CRNoticePollInterval/GithubOutboundInterval
+	// above.
+	SLARecomputeInterval time.Duration
 	// Auth* configure token validation (internal/auth), always on -- there is
 	// no config flag to disable it. AuthIssuer/AuthJWKSURL/
 	// AuthUserTokenAudiences are required (Validate rejects startup without
@@ -254,6 +254,14 @@ type Config struct {
 	SalesEntityClientID     string
 	SalesEntityClientSecret string
 	SalesEntityScopes       string
+	// M2MTrustedActorEmails is the allowlist of service-account emails an
+	// M2M caller (no x-user-id-token, e.g. UMT via csm-integration-service)
+	// may claim as the acting user via AddCaseTagRequest.ActorEmail. An
+	// unset/empty var means no email is trusted and every such request is
+	// rejected -- this is deliberately not a default-open list, since it
+	// exists specifically to stop an M2M caller from spoofing an arbitrary
+	// actor. Compared case-insensitively in the handler.
+	M2MTrustedActorEmails []string
 }
 
 // Load reads configuration from environment variables and returns a populated
@@ -275,12 +283,6 @@ func Load() *Config {
 		ServiceNowIntegrationServiceClientID:     os.Getenv("SERVICENOW_INTEGRATION_SERVICE_CLIENT_ID"),
 		ServiceNowIntegrationServiceClientSecret: os.Getenv("SERVICENOW_INTEGRATION_SERVICE_CLIENT_SECRET"),
 		ServiceNowIntegrationServiceScopes:       os.Getenv("SERVICENOW_INTEGRATION_SERVICE_SCOPES"),
-		ConsumptionOperationBaseURL:              os.Getenv("PRODUCT_CONSUMPTION_OPERATION_URL"),
-		ConsumptionOperationTokenURL:             os.Getenv("PRODUCT_CONSUMPTION_OPERATION_TOKEN_URL"),
-		ConsumptionOperationClientID:             os.Getenv("PRODUCT_CONSUMPTION_OPERATION_CLIENT_ID"),
-		ConsumptionOperationClientSecret:         os.Getenv("PRODUCT_CONSUMPTION_OPERATION_CLIENT_SECRET"),
-		ConsumptionOperationScopes:               os.Getenv("PRODUCT_CONSUMPTION_OPERATION_SCOPES"),
-		ConsumptionDualWriteEnabled:              getBoolOrDefault("CONSUMPTION_DUAL_WRITE_ENABLED", true),
 		EventHubBroker:                           os.Getenv("EVENT_HUB_BROKER"),
 		EventHubConnectionString:                 os.Getenv("EVENT_HUB_CONNECTION_STRING"),
 		EventHubTopic:                            os.Getenv("EVENT_HUB_TOPIC"),
@@ -308,12 +310,15 @@ func Load() *Config {
 		AuthClockSkew:                                 envDuration("AUTH_CLOCK_SKEW", 30*time.Second),
 		AuthInternalClientIDsRaw:                      os.Getenv("AUTH_INTERNAL_CLIENT_IDS"),
 		CustomerRoles:                                 splitComma(os.Getenv("CUSTOMER_ROLES")),
+		CSEngineerRole:                                os.Getenv("CS_ENGINEER_ROLE"),
+		SLARecomputeInterval:                          envDuration("SLA_RECOMPUTE_INTERVAL", 45*time.Second),
 		SalesEntityBaseURL:                            os.Getenv("SALES_ENTITY_BASE_URL"),
 		SalesEntityTokenURL:                           os.Getenv("SALES_ENTITY_TOKEN_URL"),
 		SalesEntityClientID:                           os.Getenv("SALES_ENTITY_CLIENT_ID"),
 		SalesEntityClientSecret:                       os.Getenv("SALES_ENTITY_CLIENT_SECRET"),
 		SalesEntityScopes:                             os.Getenv("SALES_ENTITY_SCOPES"),
 		CSMMigrationMembershipRegistrationEnabled:     os.Getenv("CSM_MIGRATION_MEMBERSHIP_REGISTRATION_ENABLED") == "true",
+		M2MTrustedActorEmails:                         splitComma(os.Getenv("M2M_TRUSTED_ACTOR_EMAILS")),
 	}
 	cfg.AuthInternalClientIDs = ParseInternalClientIDs(cfg.AuthInternalClientIDsRaw)
 	return cfg

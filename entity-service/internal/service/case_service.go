@@ -20,6 +20,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -70,7 +71,7 @@ type caseService struct {
 // named exactly for what UpdateCase's mirror needs: a bare PATCH with none of
 // snCaseService.UpdateCase's own read-before-write behavior.
 type snFieldPatcher interface {
-	patchCaseFields(ctx context.Context, caseID string, state *domain.CaseState, severity *domain.CaseSeverity, workState *domain.CaseWorkState) (domain.UpdatedCase, error)
+	patchCaseFields(ctx context.Context, caseID string, state *domain.CaseState, severity *domain.CaseSeverity, workState *domain.CaseWorkState, markFixIssued *bool) (domain.UpdatedCase, error)
 }
 
 // snCommentMirror is implemented by *snCaseService (see
@@ -92,9 +93,10 @@ type snWatchListPatcher interface {
 // snAssigneePatcher is implemented by *snCaseService (see patchCaseAssignee's
 // own doc comment). A narrow interface for the same reason snFieldPatcher is
 // one: updateCaseAssignee's mirror needs a bare assignee-only PATCH, not the
-// full CaseService surface.
+// full CaseService surface. assigneeEmail is nil to clear the assignee and
+// non-nil to set it -- an empty string can't carry that distinction.
 type snAssigneePatcher interface {
-	patchCaseAssignee(ctx context.Context, caseID, assigneeEmail string) error
+	patchCaseAssignee(ctx context.Context, caseID string, assigneeEmail *string) error
 }
 
 // snAcknowledgePatcher is implemented by *snCaseService (see
@@ -647,15 +649,6 @@ var validCommentType = map[domain.CommentType]bool{
 
 // CreateCaseComment implements CaseService.
 func (s *caseService) CreateCaseComment(ctx context.Context, req domain.CreateCaseCommentRequest) (domain.CreateCaseCommentResponse, error) {
-	if err := validateUUIDs("caseId", []string{req.CaseID}); err != nil {
-		return domain.CreateCaseCommentResponse{}, err
-	}
-	if !validCommentType[req.Type] {
-		return domain.CreateCaseCommentResponse{}, &apierror.ValidationError{Msg: "type contains invalid value: " + string(req.Type)}
-	}
-	if req.Content == "" {
-		return domain.CreateCaseCommentResponse{}, &apierror.ValidationError{Msg: "content is required"}
-	}
 	token := middleware.UserIDTokenFromContext(ctx)
 	if token == "" {
 		return domain.CreateCaseCommentResponse{}, &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
@@ -668,9 +661,43 @@ func (s *caseService) CreateCaseComment(ctx context.Context, req domain.CreateCa
 	if err != nil {
 		return domain.CreateCaseCommentResponse{}, err
 	}
+	authorName := strings.TrimSpace(user.FirstName + " " + user.LastName)
+	if authorName == "" {
+		authorName = user.Email
+	}
+	return s.createCaseCommentAs(ctx, req, user.Email, authorName)
+}
+
+// CreateCaseCommentAs implements CaseService for a caller that already knows
+// the acting email and has no x-user-id-token to resolve one from -- see the
+// CaseService interface's own doc comment on this method. Mirrors
+// AddCaseTagAs/addCaseTagAs: no GetUserByEmail lookup happens here, since
+// the configured M2M service-account email (config.Config.
+// M2MTrustedActorEmails) is not guaranteed to be a provisioned sys_user-
+// equivalent row -- actorEmail is used directly for both created_by and the
+// published event's author name rather than risking a hard failure over a
+// service account that was never expected to exist as a real user.
+func (s *caseService) CreateCaseCommentAs(ctx context.Context, req domain.CreateCaseCommentRequest, actorEmail string) (domain.CreateCaseCommentResponse, error) {
+	return s.createCaseCommentAs(ctx, req, actorEmail, actorEmail)
+}
+
+// createCaseCommentAs is the shared validation/create logic behind both
+// CreateCaseComment (token-resolved actor) and CreateCaseCommentAs (caller-
+// supplied actor) -- everything past actor resolution is identical between
+// the two.
+func (s *caseService) createCaseCommentAs(ctx context.Context, req domain.CreateCaseCommentRequest, actorEmail, authorName string) (domain.CreateCaseCommentResponse, error) {
+	if err := validateUUIDs("caseId", []string{req.CaseID}); err != nil {
+		return domain.CreateCaseCommentResponse{}, err
+	}
+	if !validCommentType[req.Type] {
+		return domain.CreateCaseCommentResponse{}, &apierror.ValidationError{Msg: "type contains invalid value: " + string(req.Type)}
+	}
+	if req.Content == "" {
+		return domain.CreateCaseCommentResponse{}, &apierror.ValidationError{Msg: "content is required"}
+	}
 	// comment.created_by (migration 000037) is a free-text VARCHAR, not a
 	// UUID FK -- see CaseRepository.CreateCaseComment's own doc comment.
-	req.CreatedBy = user.Email
+	req.CreatedBy = actorEmail
 	c, err := s.repo.CreateCaseComment(ctx, req)
 	if err != nil {
 		return domain.CreateCaseCommentResponse{}, err
@@ -678,7 +705,7 @@ func (s *caseService) CreateCaseComment(ctx context.Context, req domain.CreateCa
 
 	// Event publishing follows the write, not DATA_SOURCE -- see
 	// publishCaseCreatedEvent's own doc comment for why. authorName reuses
-	// the actor already resolved above (user) -- unlike snCaseService's own
+	// the actor already resolved above -- unlike snCaseService's own
 	// version, this data source never needs publishCommentAdded's
 	// SearchCaseComments re-fetch trick, since the create response never
 	// loses the author's identity here in the first place.
@@ -686,10 +713,6 @@ func (s *caseService) CreateCaseComment(ctx context.Context, req domain.CreateCa
 		if cv, err := s.GetCaseByID(ctx, req.CaseID); err != nil {
 			slog.ErrorContext(ctx, "create comment: enrich case for case.comment_added publish failed", "caseId", req.CaseID)
 		} else {
-			authorName := strings.TrimSpace(user.FirstName + " " + user.LastName)
-			if authorName == "" {
-				authorName = user.Email
-			}
 			publishCommentAddedEvent(ctx, s.publisher, cv, req, c.ID, authorName)
 		}
 	}
@@ -708,7 +731,9 @@ func (s *caseService) CreateCaseComment(ctx context.Context, req domain.CreateCa
 	// CreateBareCaseComment's own doc comment). Uses CreateBareCaseComment
 	// specifically (not the full CreateCaseComment) so neither side effect
 	// ever fires twice, or fires against ServiceNow for an outcome only
-	// Postgres actually decided.
+	// Postgres actually decided. Fires identically for both the token-
+	// resolved and M2M actorEmail paths -- the mirror doesn't care how the
+	// author was resolved.
 	// "activity" comments have no ServiceNow counterpart at all
 	// (CreateBareCaseComment rejects the type outright -- see its own doc
 	// comment) -- this is a permanent, 100%-guaranteed incompatibility, not
@@ -733,7 +758,7 @@ func (s *caseService) CreateCaseComment(ctx context.Context, req domain.CreateCa
 		Comment: domain.CaseCommentDetail{
 			ID:        c.ID,
 			CreatedOn: c.CreatedOn,
-			CreatedBy: user.Email,
+			CreatedBy: actorEmail,
 		},
 	}, nil
 }
@@ -798,13 +823,16 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 	if req.WatchList != nil {
 		exclusiveCount++
 	}
-	if req.AssigneeEmail != nil {
+	if len(req.AssigneeEmail) > 0 {
 		exclusiveCount++
 	}
 	if req.ParentID != nil {
 		exclusiveCount++
 	}
 	if req.Acknowledge != nil {
+		exclusiveCount++
+	}
+	if req.MarkFixIssued != nil {
 		exclusiveCount++
 	}
 	combinableCount := 0
@@ -835,14 +863,14 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 	if req.WorkaroundProvided != nil {
 		combinableCount++
 	}
-	const fieldList = "state, severity, workState, watchList, assigneeEmail, parentId, acknowledge, " +
+	const fieldList = "state, severity, workState, watchList, assigneeEmail, parentId, acknowledge, markFixIssued, " +
 		"subject, description, deploymentId, deployedProductId, bestCaseFixEta, mostLikelyFixEta, " +
 		"worstCaseFixEta, relatedCaseId, or workaroundProvided"
 	if exclusiveCount == 0 && combinableCount == 0 {
 		return domain.UpdateCaseResponse{}, &apierror.ValidationError{Msg: "at least one of " + fieldList + " must be provided"}
 	}
 	if exclusiveCount > 1 || (exclusiveCount == 1 && combinableCount > 0) {
-		return domain.UpdateCaseResponse{}, &apierror.ValidationError{Msg: "state, severity, workState, watchList, assigneeEmail, parentId, and acknowledge cannot be combined with each other or with any other field in the same request"}
+		return domain.UpdateCaseResponse{}, &apierror.ValidationError{Msg: "state, severity, workState, watchList, assigneeEmail, parentId, acknowledge, and markFixIssued cannot be combined with each other or with any other field in the same request"}
 	}
 	// resolutionCode/cause/closeNotes ride along with a state change only --
 	// same restriction sn_case_service.go's own UpdateCase enforces
@@ -867,7 +895,7 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 	if req.WatchList != nil {
 		return s.updateCaseWatchList(ctx, req)
 	}
-	if req.AssigneeEmail != nil {
+	if len(req.AssigneeEmail) > 0 {
 		return s.updateCaseAssignee(ctx, req)
 	}
 	if req.ParentID != nil {
@@ -878,6 +906,18 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 			return domain.UpdateCaseResponse{}, &apierror.ValidationError{Msg: "acknowledge only accepts true"}
 		}
 		return s.acknowledgeCase(ctx, req)
+	}
+	// MarkFixIssued is mutually exclusive with every other field (exclusiveCount
+	// above) and has its own persistence path (work_item.fix_issued_on, a
+	// pre-existing base-schema column also csm-sync-service's mapping target
+	// for u_fix_issued) entirely separate from every other UpdateCase branch --
+	// split out into its own branch with an early return for the same reason
+	// WatchList/AssigneeEmail/ParentID/Acknowledge are, just above.
+	if req.MarkFixIssued != nil {
+		if !*req.MarkFixIssued {
+			return domain.UpdateCaseResponse{}, &apierror.ValidationError{Msg: "markFixIssued must be true; unmarking a case's fix as issued is not supported"}
+		}
+		return s.updateCaseMarkFixIssued(ctx, req)
 	}
 	if combinableCount > 0 {
 		return s.updateCaseFields(ctx, req)
@@ -1011,7 +1051,7 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 				s.snWriteback.Dispatch(ctx, "case", req.ID, "update",
 					map[string]any{"id": req.ID, "state": state},
 					func(writeCtx context.Context) error {
-						_, err := patcher.patchCaseFields(writeCtx, req.ID, &state, nil, nil)
+						_, err := patcher.patchCaseFields(writeCtx, req.ID, &state, nil, nil, nil)
 						return err
 					},
 				)
@@ -1020,7 +1060,7 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 				s.snWriteback.Dispatch(ctx, "case", req.ID, "update",
 					map[string]any{"id": req.ID, "severity": severity},
 					func(writeCtx context.Context) error {
-						_, err := patcher.patchCaseFields(writeCtx, req.ID, nil, &severity, nil)
+						_, err := patcher.patchCaseFields(writeCtx, req.ID, nil, &severity, nil, nil)
 						return err
 					},
 				)
@@ -1029,7 +1069,7 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 				s.snWriteback.Dispatch(ctx, "case", req.ID, "update",
 					map[string]any{"id": req.ID, "workState": workState},
 					func(writeCtx context.Context) error {
-						_, err := patcher.patchCaseFields(writeCtx, req.ID, nil, nil, &workState)
+						_, err := patcher.patchCaseFields(writeCtx, req.ID, nil, nil, &workState, nil)
 						return err
 					},
 				)
@@ -1113,13 +1153,27 @@ func (s *caseService) updateCaseWatchList(ctx context.Context, req domain.Update
 // caller-role check to enforce here (no role/permission model exists for
 // Postgres-side case mutations at all yet -- see AccessService's own "not
 // yet wired" list) -- deliberately left unenforced rather than invented.
+//
+// req.AssigneeEmail is json.RawMessage to preserve a third state beyond
+// set/omit: an explicit null clears the assignee (parseAssigneeEmail's
+// isClear), skipping GetUserByEmail entirely (there is no email to
+// resolve) and writing assigned_to_id = NULL via CaseRepository.
+// UpdateCaseAssignee's now-nilable userID parameter.
 func (s *caseService) updateCaseAssignee(ctx context.Context, req domain.UpdateCaseRequest) (domain.UpdateCaseResponse, error) {
-	if *req.AssigneeEmail == "" {
+	isClear, email, err := parseAssigneeEmail(req.AssigneeEmail)
+	if err != nil {
+		return domain.UpdateCaseResponse{}, &apierror.ValidationError{Msg: "assigneeEmail must be a JSON string or null"}
+	}
+	if !isClear && email == "" {
 		return domain.UpdateCaseResponse{}, &apierror.ValidationError{Msg: "assigneeEmail must not be empty"}
 	}
-	assignee, err := s.userRepo.GetUserByEmail(ctx, *req.AssigneeEmail)
-	if err != nil {
-		return domain.UpdateCaseResponse{}, err
+
+	var assignee domain.User
+	if !isClear {
+		assignee, err = s.userRepo.GetUserByEmail(ctx, email)
+		if err != nil {
+			return domain.UpdateCaseResponse{}, err
+		}
 	}
 	actor, err := s.resolveActor(ctx)
 	if err != nil {
@@ -1154,33 +1208,101 @@ func (s *caseService) updateCaseAssignee(ctx context.Context, req domain.UpdateC
 	// a stale "not yet assigned" state and both publish/mirror the same
 	// no-op, sending watchers a duplicate "case assigned" notification
 	// (CodeRabbit finding on PR #1989).
-	updatedOn, changed, err := s.repo.UpdateCaseAssignee(ctx, req.ID, assignee.ID, actor.Email)
+	var userID *string
+	if !isClear {
+		userID = &assignee.ID
+	}
+	updatedOn, changed, err := s.repo.UpdateCaseAssignee(ctx, req.ID, userID, actor.Email)
 	if err != nil {
 		return domain.UpdateCaseResponse{}, err
 	}
 
-	assigneeName := strings.TrimSpace(assignee.FirstName + " " + assignee.LastName)
-	if assigneeName == "" {
-		assigneeName = assignee.Email
+	// assigneeName/assigneeEmail feed the activity log and case.assigned
+	// publish below. On a clear there is no user to derive a name from --
+	// "Unassigned" is a literal, display-only value for the activity feed's
+	// "changed to" entry (matching how AssignEngineerDialog.tsx already
+	// displays a blank assignee); assigneeEmail stays "" so
+	// publishCaseAssigned's own existing `assigneeEmail == ""` guard skips
+	// the publish for free, with no fabricated placeholder in the email slot.
+	assigneeName := "Unassigned"
+	assigneeEmail := ""
+	if !isClear {
+		assigneeName = strings.TrimSpace(assignee.FirstName + " " + assignee.LastName)
+		if assigneeName == "" {
+			assigneeName = assignee.Email
+		}
+		assigneeEmail = assignee.Email
 	}
 
 	// Event publishing/activity-feed logging both follow the write, not
 	// DATA_SOURCE -- see publishCaseCreatedEvent's own doc comment for why.
 	if changed {
-		s.publishCaseAssigned(ctx, req.ID, assigneeName, assignee.Email)
+		s.publishCaseAssigned(ctx, req.ID, assigneeName, assigneeEmail)
 		s.recordFieldChangeActivity(ctx, req.ID, "assigned_to_id", previousAssigneeName, assigneeName, actor.Email)
 	}
 
 	// Best-effort ServiceNow mirror write, DATA_SOURCE=postgres-servicenow-dual-write
 	// only -- same Postgres-first/async posture as updateCaseWatchList's own
-	// mirror above.
+	// mirror above. On a clear, patcher.patchCaseAssignee receives a nil
+	// pointer rather than an empty string, since an empty string is
+	// ambiguous with a genuinely empty value.
 	if s.snWriteback != nil {
 		if patcher, ok := s.snMirror.(snAssigneePatcher); ok {
-			assigneeEmail := *req.AssigneeEmail
+			var mirrorEmail *string
+			if !isClear {
+				e := assignee.Email
+				mirrorEmail = &e
+			}
 			s.snWriteback.Dispatch(ctx, "case", req.ID, "update",
-				map[string]any{"id": req.ID, "assigneeEmail": assigneeEmail},
+				map[string]any{"id": req.ID, "assigneeEmail": mirrorEmail},
 				func(writeCtx context.Context) error {
-					return patcher.patchCaseAssignee(writeCtx, req.ID, assigneeEmail)
+					return patcher.patchCaseAssignee(writeCtx, req.ID, mirrorEmail)
+				},
+			)
+		}
+	}
+
+	resp := domain.UpdateCaseResponse{
+		Message: "Case updated successfully",
+		Case: domain.UpdatedCase{
+			ID:        req.ID,
+			UpdatedOn: updatedOn,
+		},
+	}
+	if !isClear {
+		resp.Case.AssignedTo = &domain.AssignedEngineerRef{ID: assignee.ID, Name: assigneeName, Email: &assignee.Email}
+		resp.Case.AssignedToUser = domain.NewUserReference(assignee.ID, assignee.Email, assigneeName)
+	}
+	return resp, nil
+}
+
+// updateCaseMarkFixIssued implements UpdateCase's MarkFixIssued branch:
+// stamping work_item.fix_issued_on via CaseRepository.MarkCaseFixIssued
+// (first-write-wins -- a case whose fix is already marked issued succeeds as
+// a no-op, echoing the existing timestamp rather than erroring). The
+// ServiceNow mirror write is dispatched only when this call is the one that
+// actually set fix_issued for the first time (alreadySet false) -- a repeat
+// call on an already-marked case changed nothing in Postgres, so there is
+// nothing new to mirror and dispatching again would just be redundant noise
+// in sn_writeback_failures on every retry.
+func (s *caseService) updateCaseMarkFixIssued(ctx context.Context, req domain.UpdateCaseRequest) (domain.UpdateCaseResponse, error) {
+	if !*req.MarkFixIssued {
+		return domain.UpdateCaseResponse{}, &apierror.ValidationError{Msg: "markFixIssued must be true; unmarking a case's fix as issued is not supported"}
+	}
+
+	fixIssued, alreadySet, err := s.repo.MarkCaseFixIssued(ctx, req.ID)
+	if err != nil {
+		return domain.UpdateCaseResponse{}, err
+	}
+
+	if !alreadySet && s.snWriteback != nil {
+		if patcher, ok := s.snMirror.(snFieldPatcher); ok {
+			markFixIssued := true
+			s.snWriteback.Dispatch(ctx, "case", req.ID, "update",
+				map[string]any{"id": req.ID, "markFixIssued": true},
+				func(writeCtx context.Context) error {
+					_, err := patcher.patchCaseFields(writeCtx, req.ID, nil, nil, nil, &markFixIssued)
+					return err
 				},
 			)
 		}
@@ -1189,10 +1311,9 @@ func (s *caseService) updateCaseAssignee(ctx context.Context, req domain.UpdateC
 	return domain.UpdateCaseResponse{
 		Message: "Case updated successfully",
 		Case: domain.UpdatedCase{
-			ID:             req.ID,
-			UpdatedOn:      updatedOn,
-			AssignedTo:     &domain.AssignedEngineerRef{ID: assignee.ID, Name: assigneeName, Email: &assignee.Email},
-			AssignedToUser: domain.NewUserReference(assignee.ID, assignee.Email, assigneeName),
+			ID:        req.ID,
+			UpdatedOn: fixIssued,
+			FixIssued: &fixIssued,
 		},
 	}, nil
 }
@@ -1453,13 +1574,25 @@ func (s *caseService) updateCaseFields(ctx context.Context, req domain.UpdateCas
 	// Best-effort ServiceNow mirror write, DATA_SOURCE=postgres-servicenow-dual-write
 	// only -- same Postgres-first/async posture as every sibling branch
 	// above. The recorded payload carries the actual values patchCaseFieldsBundle
-	// forwards to ServiceNow (only the four fields that backing service
-	// actually supports -- see that method's own doc comment), not a fixed
-	// field-name placeholder, so a manual replay off sn_writeback_failures
-	// has something to replay.
+	// forwards to ServiceNow (every field that backing service actually
+	// supports except Description -- see that method's own doc comment for
+	// why), not a fixed field-name placeholder, so a manual replay off
+	// sn_writeback_failures has something to replay.
 	if s.snWriteback != nil {
 		if patcher, ok := s.snMirror.(snFieldsBundlePatcher); ok {
 			writebackPayload := map[string]any{"id": req.ID}
+			if req.Subject != nil {
+				writebackPayload["subject"] = *req.Subject
+			}
+			if req.DeploymentID != nil {
+				writebackPayload["deploymentId"] = *req.DeploymentID
+			}
+			if req.DeployedProductID != nil {
+				writebackPayload["deployedProductId"] = *req.DeployedProductID
+			}
+			if req.RelatedCaseID != nil {
+				writebackPayload["relatedCaseId"] = *req.RelatedCaseID
+			}
 			if req.BestCaseFixEta != nil {
 				writebackPayload["bestCaseFixEta"] = *req.BestCaseFixEta
 			}
@@ -1597,6 +1730,12 @@ func (s *caseService) SearchCases(ctx context.Context, req domain.SearchCasesReq
 	if err := validateUUIDs("projectId", parsed.ExcludeProjectIDs); err != nil {
 		return domain.SearchCasesResponse{}, err
 	}
+	if err := validateUUIDs("creTeam", parsed.CreTeamIDs); err != nil {
+		return domain.SearchCasesResponse{}, err
+	}
+	if err := validateUUIDs("sreTeam", parsed.SreTeamIDs); err != nil {
+		return domain.SearchCasesResponse{}, err
+	}
 	if parsed.ParentID != nil {
 		if err := validateUUIDs("parentId", []string{*parsed.ParentID}); err != nil {
 			return domain.SearchCasesResponse{}, err
@@ -1651,11 +1790,13 @@ func (s *caseService) SearchCases(ctx context.Context, req domain.SearchCasesReq
 		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: `field "resolvedOn" is not supported by this data source`}
 	}
 
-	// These fields dot-walk into ServiceNow-specific concepts (product family,
-	// project type, integration-CS/SRE team, etc.) that caseRepo.SearchCases has
-	// no query for today. Reject rather than silently drop the predicate and
-	// widen the result set. (tag, projectOnboardingStatus and
-	// taskSLABusinessElapsedPercent are implemented there, so are absent here.)
+	// projectType dot-walks into a ServiceNow-specific concept that
+	// caseRepo.SearchCases has no query for today. Reject rather than
+	// silently drop the predicate and widen the result set. (tag,
+	// projectOnboardingStatus and taskSLABusinessElapsedPercent are
+	// implemented there, so are absent here; product and creTeam/sreTeam
+	// used to be too, but the repository already joins account and "group" --
+	// see caseFieldPredicates/the SearchCases joins block.)
 	// state+in is supported here; state+notIn has no repository query support,
 	// and dropping an exclusion silently would widen the result set.
 	// parentId is also implemented (wi.parent_id, migration 000036 -- the
@@ -1663,17 +1804,8 @@ func (s *caseService) SearchCases(ctx context.Context, req domain.SearchCasesReq
 	if len(parsed.ExcludeStates) > 0 {
 		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: `field "state" (notIn) is not supported by this data source`}
 	}
-	if len(parsed.ProductNames) > 0 {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: `field "product" is not supported by this data source`}
-	}
 	if len(parsed.ProjectTypeNames) > 0 {
 		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: `field "projectType" is not supported by this data source`}
-	}
-	if len(parsed.CreTeamIDs) > 0 {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: `field "creTeam" is not supported by this data source`}
-	}
-	if len(parsed.SreTeamIDs) > 0 {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: `field "sreTeam" is not supported by this data source`}
 	}
 	// accountId+in has no repository query support today either (see
 	// domain.ParsedCaseFilters.AccountIDs); accountId+notIn is rejected the
@@ -2077,17 +2209,39 @@ func (s *caseService) addCaseTagAs(ctx context.Context, caseID, label, actorEmai
 	// directly here through the full CaseService interface rather than a
 	// narrower one, same as snMirror.CreateCase above.
 	//
-	// RemoveCaseTag has NO equivalent mirror (see its own doc comment for
-	// why): it identifies the tag to remove by the Postgres tag id alone,
-	// and there is no stored mapping from that id to ServiceNow's own tag
-	// sys_id to remove there too.
+	// On success, the ServiceNow-side label_entry sys_id this mirror creates
+	// is persisted back onto this specific (caseID, tag.ID) attachment
+	// (migration 000088's work_item_tag.sn_sys_id) -- itself a second
+	// best-effort, asynchronous write: if it fails, the attachment simply has
+	// no ServiceNow mapping yet, the same "not yet mirrorable" state
+	// RemoveCaseTag's mirror already tolerates (see that method's own doc
+	// comment).
 	if s.snWriteback != nil {
-		mirrorCaseID, mirrorLabel, mirrorActorEmail := caseID, label, actorEmail
+		mirrorCaseID, mirrorTagID, mirrorLabel, mirrorActorEmail := caseID, tag.ID, label, actorEmail
 		s.snWriteback.Dispatch(ctx, "case_tag", caseID, "add",
 			map[string]any{"caseId": mirrorCaseID, "label": mirrorLabel},
 			func(writeCtx context.Context) error {
-				_, err := s.snMirror.AddCaseTagAs(writeCtx, mirrorCaseID, mirrorLabel, mirrorActorEmail)
-				return err
+				snTag, err := s.snMirror.AddCaseTagAs(writeCtx, mirrorCaseID, mirrorLabel, mirrorActorEmail)
+				if err != nil {
+					return err
+				}
+				snSysID := uuidToSysid(snTag.ID)
+				if setErr := s.repo.SetCaseTagSNSysID(writeCtx, mirrorCaseID, mirrorTagID, snSysID); setErr != nil {
+					// If the (caseID, tagID) attachment no longer exists,
+					// RemoveCaseTag already ran in the gap between the
+					// mirror create above and this persist -- and, having
+					// found no sn_sys_id stored yet, skipped its own REMOVE
+					// mirror. The ServiceNow tag this callback just created
+					// would otherwise be permanently orphaned, so clean it
+					// up here instead.
+					var notFound *apierror.NotFoundError
+					if errors.As(setErr, &notFound) {
+						return s.snMirror.RemoveCaseTag(writeCtx, mirrorCaseID, snTag.ID)
+					}
+					slog.WarnContext(writeCtx, "sn writeback: case tag added in ServiceNow but persisting its sys_id back onto Postgres failed -- a REMOVE mirror for this attachment will keep skipping until this is fixed",
+						"caseId", mirrorCaseID, "tagId", mirrorTagID, "error", setErr)
+				}
+				return nil
 			},
 		)
 	}
@@ -2157,17 +2311,21 @@ func (s *caseService) detectPatchTagBillableOverride(ctx context.Context, caseID
 
 // RemoveCaseTag implements CaseService.
 //
-// Deliberately NOT mirrored to ServiceNow under
-// DATA_SOURCE=postgres-servicenow-dual-write (unlike AddCaseTag -- see that
-// method's own doc comment): tagID here is the Postgres "tag" table's own
-// primary key, and there is nowhere this schema records the corresponding
-// ServiceNow label-entry sys_id AddCaseTag's mirror created (SN's AddCaseTag
-// response is discarded after firing -- see that mirror's own comment).
-// Resolving one from the other would need either a new mapping column/table
-// (a schema change, out of scope here) or a fragile runtime lookup (list
-// ServiceNow's tags for the case and match by label, which breaks on
-// multiple same-label tags and silently no-ops when the original AddCaseTag
-// mirror itself never landed). Left unmirrored rather than guessed at.
+// Now mirrored to ServiceNow under DATA_SOURCE=postgres-servicenow-dual-write
+// (unlike its own prior state -- tagID here is the Postgres "tag" table's own
+// primary key, which has no relationship to ServiceNow's own label_entry
+// sys_id; migration 000088's work_item_tag.sn_sys_id closes that gap:
+// AddCaseTag's mirror success path now persists it per (caseID, tagID)
+// attachment -- see that method's own doc comment). ServiceNow's own
+// DELETE /cases/{id}/tags/{tagId} (snCaseService.RemoveCaseTag) genuinely
+// needs that sys_id, not the label: unlike AddCaseTag, it cannot be mirrored
+// by label alone. The sys_id lookup happens synchronously, BEFORE the
+// Postgres delete below: RemoveCaseTag deletes the work_item_tag row
+// entirely, taking sn_sys_id with it, so this is the last point it can be
+// read. Postgres deletion is authoritative regardless of whether a
+// ServiceNow mapping was ever stored: a genuinely successful lookup that
+// found no mapping is skipped silently, but a real lookup error is recorded
+// as a failed writeback (sn_writeback_failures) instead of being discarded.
 func (s *caseService) RemoveCaseTag(ctx context.Context, caseID, tagID string) error {
 	if err := validateUUIDs("caseId", []string{caseID}); err != nil {
 		return err
@@ -2179,7 +2337,45 @@ func (s *caseService) RemoveCaseTag(ctx context.Context, caseID, tagID string) e
 	if err != nil {
 		return err
 	}
-	return s.repo.RemoveCaseTag(ctx, caseID, tagID, actor.Email)
+
+	var snSysID *string
+	var snLookupErr error
+	if s.snWriteback != nil {
+		snSysID, snLookupErr = s.repo.GetCaseTagSNSysID(ctx, caseID, tagID)
+	}
+
+	if err := s.repo.RemoveCaseTag(ctx, caseID, tagID, actor.Email); err != nil {
+		return err
+	}
+
+	// Best-effort ServiceNow mirror write, DATA_SOURCE=postgres-servicenow-dual-write
+	// only. Postgres has already committed (the attachment is gone) by this
+	// point; skip silently (not an error) if no ServiceNow mapping was ever
+	// stored for it (snLookupErr == nil, snSysID == nil -- a genuinely
+	// successful lookup that found no mapping). A real lookup error, though,
+	// is recorded as a failed writeback rather than silently discarded: it
+	// means we could not tell whether a ServiceNow mirror needs removing, so
+	// it lands in sn_writeback_failures for manual backfill instead of
+	// vanishing.
+	if s.snWriteback != nil && snLookupErr != nil {
+		lookupErr := snLookupErr
+		s.snWriteback.Dispatch(ctx, "case_tag", caseID, "remove",
+			map[string]any{"caseId": caseID, "tagId": tagID},
+			func(context.Context) error {
+				return lookupErr
+			},
+		)
+	} else if s.snWriteback != nil && snSysID != nil && *snSysID != "" {
+		mirrorCaseID, mirrorTagID := caseID, sysidToUUID(*snSysID)
+		s.snWriteback.Dispatch(ctx, "case_tag", caseID, "remove",
+			map[string]any{"caseId": mirrorCaseID, "tagId": tagID},
+			func(writeCtx context.Context) error {
+				return s.snMirror.RemoveCaseTag(writeCtx, mirrorCaseID, mirrorTagID)
+			},
+		)
+	}
+
+	return nil
 }
 
 // SearchTags implements CaseService.

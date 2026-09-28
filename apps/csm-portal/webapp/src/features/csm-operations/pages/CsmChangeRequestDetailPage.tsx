@@ -46,6 +46,7 @@ import {
   useState,
 } from "react";
 import { useLocation } from "react-router";
+import { ApiQueryKeys } from "@constants/apiConstants";
 import { formatBackendTimestampForDisplay } from "@utils/dateTime";
 import { isBlankHtml, sanitizeRichTextHtml } from "@utils/sanitizeHtml";
 import { BackendApiError } from "@api/backend/client";
@@ -61,6 +62,10 @@ import {
   useGetCsmChangeRequestComments,
   usePostCsmChangeRequestComment,
 } from "@features/csm-operations/api/useCsmChangeRequestComments";
+import {
+  useDeleteComment,
+  usePatchComment,
+} from "@features/csm-cases/api/useCsmCaseComments";
 import ChangeRequestActionBar from "@features/csm-operations/components/ChangeRequestActionBar";
 import ChangeRequestApprovals from "@features/csm-operations/components/ChangeRequestApprovals";
 import ChangeRequestLifecycleStepper from "@features/csm-operations/components/ChangeRequestLifecycleStepper";
@@ -283,6 +288,25 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
     isError: isCommentsError,
   } = useGetCsmChangeRequestComments(id);
   const postComment = usePostCsmChangeRequestComment();
+  const patchComment = usePatchComment();
+  const deleteComment = useDeleteComment();
+  const onEditComment = useCallback(
+    (commentId: string, content: string) =>
+      patchComment.mutateAsync({
+        commentId,
+        content,
+        invalidateQueryKey: [ApiQueryKeys.CHANGE_REQUEST_COMMENTS, id],
+      }),
+    [patchComment, id],
+  );
+  const onDeleteComment = useCallback(
+    (commentId: string) =>
+      deleteComment.mutateAsync({
+        commentId,
+        invalidateQueryKey: [ApiQueryKeys.CHANGE_REQUEST_COMMENTS, id],
+      }),
+    [deleteComment, id],
+  );
   const { data: attachments } = useGetCsmCaseAttachments(id, "change_request");
   const postAttachment = usePostCsmCaseAttachment();
   const downloadAttachment = useDownloadCsmCaseAttachment();
@@ -974,6 +998,8 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
             comments={comments ?? []}
             audit={[]}
             attachments={[]}
+            onEditComment={onEditComment}
+            onDeleteComment={onDeleteComment}
           />
         </Card>
       )}

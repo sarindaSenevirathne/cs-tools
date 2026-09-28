@@ -215,6 +215,8 @@ vi.mock("@features/csm-cases/api/useCsmCaseComments", () => ({
   useGetCsmCaseComments: (id: string | undefined) =>
     useGetCsmCaseCommentsMock(id),
   usePostCsmCaseComment: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  usePatchComment: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useDeleteComment: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
 function defaultCommentsImpl(): unknown {
   return {

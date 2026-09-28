@@ -257,3 +257,146 @@ func TestScanChangeRequestViewAndDetail_FieldParityAdditions(t *testing.T) {
 }
 
 func boolPtrCR(b bool) *bool { return &b }
+
+func strPtrApproval(s string) *string { return &s }
+
+// TestChangeRequestApprovalStagePosition covers the positional fallback
+// derivation exactly -- position 0/1 are STATIC_GROUP labeled Assess/
+// Authorize, everything from position 2 onward is DYNAMIC_CONTACT labeled
+// Customer Approval, matching the real SN adapter's own fallback ordinal
+// scheme (see changeRequestApprovalStagePosition's own doc comment for why
+// this is the fallback only, not the two-hardcoded-sys_id primary path).
+func TestChangeRequestApprovalStagePosition(t *testing.T) {
+	cases := []struct {
+		pos          int
+		wantStage    string
+		wantApprover domain.ChangeRequestApproverType
+	}{
+		{0, "Assess", domain.ChangeRequestApproverTypeStaticGroup},
+		{1, "Authorize", domain.ChangeRequestApproverTypeStaticGroup},
+		{2, "Customer Approval", domain.ChangeRequestApproverTypeDynamicContact},
+		{3, "Customer Approval", domain.ChangeRequestApproverTypeDynamicContact},
+	}
+	for _, c := range cases {
+		gotStage, gotApprover := changeRequestApprovalStagePosition(c.pos)
+		if gotStage != c.wantStage || gotApprover != c.wantApprover {
+			t.Errorf("changeRequestApprovalStagePosition(%d) = (%q, %q), want (%q, %q)",
+				c.pos, gotStage, gotApprover, c.wantStage, c.wantApprover)
+		}
+	}
+}
+
+// TestNormalizeChangeRequestApprovalStatus covers all six real SN
+// sysapproval_approver.state values (migration 000087's own comment),
+// the empty/nil -> UNKNOWN cases, and an unrecognized value falling back to
+// an uppercased passthrough rather than UNKNOWN -- domain.ChangeRequestApprover.
+// Status is deliberately an open string, not a closed enum.
+func TestNormalizeChangeRequestApprovalStatus(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  *string
+		want string
+	}{
+		{"requested", strPtrApproval("requested"), "REQUESTED"},
+		{"approved", strPtrApproval("approved"), "APPROVED"},
+		{"rejected", strPtrApproval("rejected"), "REJECTED"},
+		{"not_required", strPtrApproval("not_required"), "NOT_REQUIRED"},
+		{"cancelled", strPtrApproval("cancelled"), "CANCELLED"},
+		{"no_consensus", strPtrApproval("no_consensus"), "NO_CONSENSUS"},
+		{"nil", nil, "UNKNOWN"},
+		{"empty", strPtrApproval(""), "UNKNOWN"},
+		{"unrecognized value uppercased, not UNKNOWN", strPtrApproval("some_new_state"), "SOME_NEW_STATE"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := normalizeChangeRequestApprovalStatus(c.raw); got != c.want {
+				t.Errorf("normalizeChangeRequestApprovalStatus(%v) = %q, want %q", c.raw, got, c.want)
+			}
+		})
+	}
+}
+
+// TestBuildChangeRequestApprovals_PositionalLabelsAndFirstResponderWinsStatus
+// covers the whole assembly: three stages in created_on order get
+// Assess/Authorize/Customer Approval labels regardless of their real
+// assignment_group_id, and each stage's status is derived first-responder-
+// wins from its own approvers only (a REJECTED in stage 2 must not leak
+// into stage 1's APPROVED-only result).
+func TestBuildChangeRequestApprovals_PositionalLabelsAndFirstResponderWinsStatus(t *testing.T) {
+	stages := []changeRequestApprovalStageRow{
+		{id: "stage-1", assignmentGroupName: strPtrApproval("SRE Team")},
+		{id: "stage-2", assignmentGroupName: strPtrApproval("Change Board")},
+		{id: "stage-3", assignmentGroupName: nil},
+	}
+	updatedOn := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	approvers := []changeRequestApprovalApproverRow{
+		{id: "appr-1", stageID: strPtrApproval("stage-1"), approverName: "Alice", rawStatus: strPtrApproval("approved"), updatedOn: updatedOn},
+		{id: "appr-2", stageID: strPtrApproval("stage-2"), approverName: "Bob", rawStatus: strPtrApproval("requested"), updatedOn: updatedOn},
+		{id: "appr-3", stageID: strPtrApproval("stage-2"), approverName: "Carol", rawStatus: strPtrApproval("rejected"), updatedOn: updatedOn},
+		// stage_id NULL -- must be dropped, not attached to any stage.
+		{id: "appr-4", stageID: nil, approverName: "Orphan", rawStatus: strPtrApproval("requested"), updatedOn: updatedOn},
+	}
+
+	got := buildChangeRequestApprovals(stages, approvers)
+
+	if len(got.Approvals) != 3 {
+		t.Fatalf("got %d approvals, want 3", len(got.Approvals))
+	}
+
+	a0 := got.Approvals[0]
+	if a0.Stage != "Assess" || a0.ApproverType != domain.ChangeRequestApproverTypeStaticGroup {
+		t.Errorf("stage 0 = %q/%q, want Assess/STATIC_GROUP", a0.Stage, a0.ApproverType)
+	}
+	if a0.ApproverName != "SRE Team" {
+		t.Errorf("stage 0 approverName = %q, want %q", a0.ApproverName, "SRE Team")
+	}
+	if a0.Status != domain.ChangeRequestApprovalStatusApproved {
+		t.Errorf("stage 0 status = %q, want APPROVED", a0.Status)
+	}
+	if len(a0.Approvers) != 1 || a0.Approvers[0].RespondedOn == nil {
+		t.Errorf("stage 0 approvers = %+v, want 1 approver with a non-nil RespondedOn", a0.Approvers)
+	}
+
+	a1 := got.Approvals[1]
+	if a1.Stage != "Authorize" || a1.ApproverType != domain.ChangeRequestApproverTypeStaticGroup {
+		t.Errorf("stage 1 = %q/%q, want Authorize/STATIC_GROUP", a1.Stage, a1.ApproverType)
+	}
+	// REJECTED beats REQUESTED regardless of the order the two approvers
+	// appear in -- first-responder-wins, not first-in-list-wins.
+	if a1.Status != domain.ChangeRequestApprovalStatusRejected {
+		t.Errorf("stage 1 status = %q, want REJECTED (a single rejection resolves the stage)", a1.Status)
+	}
+	if len(a1.Approvers) != 2 {
+		t.Fatalf("stage 1 has %d approvers, want 2", len(a1.Approvers))
+	}
+	for _, ap := range a1.Approvers {
+		if ap.Status == "REQUESTED" && ap.RespondedOn != nil {
+			t.Errorf("REQUESTED approver %q has non-nil RespondedOn %v, want nil", ap.Name, *ap.RespondedOn)
+		}
+	}
+
+	a2 := got.Approvals[2]
+	if a2.Stage != "Customer Approval" || a2.ApproverType != domain.ChangeRequestApproverTypeDynamicContact {
+		t.Errorf("stage 2 = %q/%q, want Customer Approval/DYNAMIC_CONTACT", a2.Stage, a2.ApproverType)
+	}
+	if a2.ApproverName != "" {
+		t.Errorf("stage 2 approverName = %q, want empty (nil assignment_group_id)", a2.ApproverName)
+	}
+	if a2.Status != domain.ChangeRequestApprovalStatusPending {
+		t.Errorf("stage 2 status = %q, want PENDING (zero approvers)", a2.Status)
+	}
+	if len(a2.Approvers) != 0 {
+		t.Errorf("stage 2 has %d approvers, want 0 (the NULL-stage_id row must be dropped, not attached here)", len(a2.Approvers))
+	}
+}
+
+// TestBuildChangeRequestApprovals_NoStages covers the zero-stage case:
+// GetChangeRequestApprovals must return an empty (not nil-panicking)
+// ChangeRequestApprovals when a change request has no approval_stage rows
+// yet.
+func TestBuildChangeRequestApprovals_NoStages(t *testing.T) {
+	got := buildChangeRequestApprovals(nil, nil)
+	if len(got.Approvals) != 0 {
+		t.Errorf("got %d approvals, want 0", len(got.Approvals))
+	}
+}

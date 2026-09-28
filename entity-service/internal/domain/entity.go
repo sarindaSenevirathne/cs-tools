@@ -202,10 +202,13 @@ type SaveSavedFilterViewRequest struct {
 }
 
 // ReorderSavedFilterViewRequest is POST /users/me/saved-filter-views/reorder.
+// Direction moves one slot. Position, when set, is the 0-based target index
+// and takes precedence so a drag can jump several slots in one request.
 type ReorderSavedFilterViewRequest struct {
 	ListKey   SavedFilterListKey       `json:"listKey"`
 	Name      string                   `json:"name"`
-	Direction SavedFilterMoveDirection `json:"direction"`
+	Direction SavedFilterMoveDirection `json:"direction,omitempty"`
+	Position  *int                     `json:"position,omitempty"`
 }
 
 // SNUser is the user view returned by the ServiceNow data source.
@@ -530,6 +533,12 @@ const (
 	// DELETED, and this value makes a portal-originated write visible in the
 	// ledger for what it is.
 	PortalMembershipWriteEventType = "PORTAL_WRITE"
+	// SLAEngineActor is created_by/updated_by for every "sla" row the
+	// CSM-native SLA engine writes (source='CSM', migration 000088) --
+	// distinguishes its own rows in the audit columns from the ServiceNow
+	// sync's, which share the same table but never carry this value. See
+	// internal/service/sla_policy_resolver.go.
+	SLAEngineActor = "sla-engine"
 )
 
 // SalesforceEventRequest is the ASB envelope POSTed to /salesforce/events.
@@ -885,10 +894,16 @@ type Project struct {
 	Key              string           `json:"key"`
 	SubscriptionType SubscriptionType `json:"subscriptionType"`
 	ClosureStatus    *ClosureStatus   `json:"closureStatus"`
-	StartDate        *time.Time       `json:"startDate"`
-	EndDate          *time.Time       `json:"endDate"`
-	CreatedOn        time.Time        `json:"createdOn"`
-	UpdatedOn        time.Time        `json:"updatedOn"`
+	// ClosureState mirrors ProjectDetailsView's own field of the same name
+	// (project.wso2_closure_state) -- a distinct concept from ClosureStatus
+	// above despite the similar name: this is the raw enum label
+	// (e.g. "Suspended") SearchProjects' own ProjectView.ClosureState
+	// (ProjectClosureFields, embedded there) is populated from.
+	ClosureState *string    `json:"closureState"`
+	StartDate    *time.Time `json:"startDate"`
+	EndDate      *time.Time `json:"endDate"`
+	CreatedOn    time.Time  `json:"createdOn"`
+	UpdatedOn    time.Time  `json:"updatedOn"`
 	// VerificationEnabled gates the Pending Verification feature for this
 	// project. Nullable BOOLEAN column with no default (migration 000084),
 	// coalesced to false when NULL -- same convention as
@@ -923,7 +938,8 @@ type ProjectAccountRef struct {
 // promotes its fields to the parent's JSON object, so the wire shape is
 // unaffected.
 type ProjectClosureFields struct {
-	// ClosureState is the project's closure/access state (ServiceNow data source only).
+	// ClosureState is the project's closure/access state (project.wso2_closure_state,
+	// migration 000009 -- populated on both data sources).
 	ClosureState *string `json:"closureState"`
 	// EndDateClosureState reflects the closure state driven by the project's end date
 	// (ServiceNow data source only).
@@ -1741,8 +1757,9 @@ type DeployedProductView struct {
 type ProductRef struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
-	// Abbreviation is absent on the Postgres data source, whose products table
-	// has no equivalent column — it is populated only from ServiceNow.
+	// Abbreviation is product.code on the Postgres data source (e.g. "wso2am"
+	// for "WSO2 API Manager") -- the exact vocabulary this field's own doc
+	// comment above describes the product-updates catalogue keying on.
 	Abbreviation *string `json:"abbreviation,omitempty"`
 }
 
@@ -2739,8 +2756,12 @@ type UpdateCaseRequest struct {
 	// accepted and resolved to emails for CSM callers. It is a pointer so an
 	// absent field and an explicitly empty list are distinguishable: nil leaves
 	// the watch list untouched, while an empty list clears it.
-	WatchList      *[]string           `json:"watchList"`
-	AssigneeEmail  *string             `json:"assigneeEmail"`
+	WatchList *[]string `json:"watchList"`
+	// AssigneeEmail uses json.RawMessage to preserve three states: nil/empty = omit,
+	// "null" = clear (unassign), `"value"` = set -- mirroring
+	// UpdateAttachmentRequest.Description, since a plain *string cannot tell an omitted
+	// field apart from an explicit null.
+	AssigneeEmail  json.RawMessage     `json:"assigneeEmail"`
 	ResolutionCode *CaseResolutionCode `json:"resolutionCode"`
 	Cause          *CaseCause          `json:"cause"`
 	CloseNotes     *string             `json:"closeNotes"`
@@ -2809,6 +2830,14 @@ type UpdateCaseRequest struct {
 	// the provider and pauses the case's Workaround SLA clock in the backing data
 	// source; recalling clears both (ServiceNow data source only).
 	WorkaroundProvided *bool `json:"workaroundProvided"`
+	// MarkFixIssued, when true, records that a fix has been issued for the case:
+	// it stamps work_item.fix_issued_on with the current time if it isn't already set,
+	// and otherwise succeeds without changing anything (first-write-wins, same
+	// shape as Acknowledge -- there is no un-mark). Only true is accepted -- like
+	// Acknowledge, there is no unmark path -- and it cannot be combined with any
+	// other field in the same request (Postgres data source only; the mirrored
+	// ServiceNow write happens asynchronously through the dual-write mechanism).
+	MarkFixIssued *bool `json:"markFixIssued"`
 }
 
 // UpdateCaseResponse is the response for PATCH /cases/{id}.
@@ -2872,6 +2901,12 @@ type UpdatedCase struct {
 	// request set it or found it already set. Present only when the update set
 	// acknowledge.
 	AcknowledgedBy *AssignedEngineerRef `json:"acknowledgedBy,omitempty"`
+	// FixIssued echoes the case's fix-issued timestamp back on a successful
+	// markFixIssued update, whether this request just set it (first write) or it
+	// was already set (first-write-wins no-op). Present only when the update set
+	// markFixIssued -- not part of the general read model (CaseView/GetCaseByID/
+	// SearchCases), which is a separate, later piece of work.
+	FixIssued *time.Time `json:"fixIssued,omitempty"`
 	// WorkaroundProvidedOn/WorkaroundProvidedBy are not echoed here: ServiceNow's
 	// Update Case response only ever returns {id, updatedOn, updatedBy} for a plain
 	// field write like this one (same as Subject/Description/the fix-ETA fields
@@ -3013,6 +3048,14 @@ type CreateCaseCommentRequest struct {
 	CreatedBy string      `json:"-"`
 	Type      CommentType `json:"type"`
 	Content   string      `json:"content"`
+	// ActorEmail is set only by an M2M caller that has no x-user-id-token to
+	// resolve an acting user from (e.g. UMT via csm-integration-service).
+	// The handler checks it against a configured allowlist of trusted
+	// service-account emails (config.Config.M2MTrustedActorEmails) before
+	// honoring it -- an arbitrary caller-supplied value is never trusted
+	// as-is, since that would let any caller claim to be any user. Mutually
+	// exclusive with a real x-user-id-token on the same request.
+	ActorEmail *string `json:"actorEmail,omitempty"`
 }
 
 // AddCaseTagRequest is the request body for POST /cases/{id}/tags. SN's tagging is
@@ -3021,6 +3064,14 @@ type CreateCaseCommentRequest struct {
 type AddCaseTagRequest struct {
 	CaseID string `json:"-"`
 	Label  string `json:"label"`
+	// ActorEmail is set only by an M2M caller that has no x-user-id-token to
+	// resolve an acting user from (e.g. UMT via csm-integration-service).
+	// The handler checks it against a configured allowlist of trusted
+	// service-account emails (config.Config.M2MTrustedActorEmails) before
+	// honoring it -- an arbitrary caller-supplied value is never trusted
+	// as-is, since that would let any caller claim to be any user. Mutually
+	// exclusive with a real x-user-id-token on the same request.
+	ActorEmail *string `json:"actorEmail,omitempty"`
 }
 
 // SearchTagsFilters holds the optional filters for a tag search.
@@ -3201,6 +3252,43 @@ type Comment struct {
 	// is populated when the backing data source resolved the author to a real
 	// user record, and null otherwise. See UserReference.
 	CreatedBy *UserReference `json:"createdBy"`
+	// LastEditedOn is set once the comment has been edited at least once via
+	// PATCH /comments/{id} (Postgres data source only -- see
+	// repository.CommentRow.LastEditedAt).
+	LastEditedOn *time.Time `json:"lastEditedOn,omitempty"`
+	// IsDeleted reflects the comment's soft-delete state. Content is only
+	// ever the caller-visible representation of a deleted comment (see
+	// commentService's own visibility rule doc comment): the literal string
+	// "[deleted]" for a non-admin internal caller, the real content for an
+	// admin, and never returned at all to a customer caller (the row itself
+	// is omitted from that caller's results).
+	IsDeleted bool `json:"isDeleted,omitempty"`
+}
+
+// UpdateCommentRequest is the input for PATCH /comments/{id}. ID is populated
+// from the URL path parameter and is not part of the JSON body.
+type UpdateCommentRequest struct {
+	ID      string `json:"-"`
+	Content string `json:"content"`
+}
+
+// UpdateCommentResponse is the response for PATCH /comments/{id}.
+type UpdateCommentResponse struct {
+	Message string  `json:"message"`
+	Comment Comment `json:"comment"`
+}
+
+// CommentEditHistoryEntry is one prior version of a comment's body, newest
+// first, returned by GET /comments/{id}/history.
+type CommentEditHistoryEntry struct {
+	Body     string    `json:"body"`
+	EditedBy string    `json:"editedBy"`
+	EditedOn time.Time `json:"editedOn"`
+}
+
+// GetCommentEditHistoryResponse is the response for GET /comments/{id}/history.
+type GetCommentEditHistoryResponse struct {
+	History []CommentEditHistoryEntry `json:"history"`
 }
 
 // SearchCommentsRequest is the input for POST /comments/search.
@@ -4925,6 +5013,13 @@ type SearchIncidentsFilters struct {
 	// ServiceNow's `number` column, routed as a first-class filter rather
 	// than through the free-text SearchQuery scan.
 	Number *string `json:"number,omitempty"`
+	// CorrelationID filters to the incident whose ServiceNow `correlation_id`
+	// exactly matches (optional). Lets an external system (e.g. a monitoring
+	// integration) look up an incident it previously created by the same
+	// caller-supplied key it passed to CreateIncidentRequest.CorrelationID,
+	// without depending on free-text SearchQuery matching visible fields like
+	// Subject or WorkNotes.
+	CorrelationID *string `json:"correlationId,omitempty"`
 	// Filters is the generic field/op/values filter array. Supported fields:
 	//   - "state" (op in): domain IncidentState enum values (NEW,
 	//     IN_PROGRESS, ON_HOLD, RESOLVED, CLOSED, CANCELLED), translated to
@@ -5154,6 +5249,19 @@ type CreateIncidentRequest struct {
 	ChangeRequestID     *string              `json:"changeRequestId,omitempty"`
 	ProblemID           *string              `json:"problemId,omitempty"`
 	CausedByID          *string              `json:"causedById,omitempty"`
+	// CorrelationID is an optional caller-supplied external-system key, stored
+	// on ServiceNow's stock `correlation_id` field. Lets a monitoring
+	// integration find an incident it already created (SearchIncidentsFilters.
+	// CorrelationID) without depending on free-text search over Subject or
+	// WorkNotes, and without exposing an internal dedup tag in either of
+	// those human-visible fields.
+	CorrelationID *string `json:"correlationId,omitempty"`
+	// Environment is an optional caller-supplied label (e.g. "Staging",
+	// "Production") identifying the environment the source alert fired
+	// against. Maps to ServiceNow's own custom incident.u_enviroment field
+	// (max length 40; name kept as ServiceNow spells it, misspelling
+	// included). Also persisted on this service's own Postgres incident row.
+	Environment *string `json:"environment,omitempty"`
 }
 
 // CreateIncidentResponse is the output for POST /incidents.

@@ -1,0 +1,8 @@
+# Deployment config and secrets; config.toml is supplied via Choreo file mount.
+config.toml
+.env
+/sre-alert-edge-service
+
+# Local notes on unresolved issues.
+OPEN_ISSUES.md
+PLAN.md

@@ -159,8 +159,13 @@ func watchListEmails(
 	}
 	if !allUUID {
 		if firstInvalid != "" {
+			// The invalid entry itself is deliberately not echoed here: a
+			// watch list entry can be a third party's (e.g. a customer's)
+			// email address the requesting agent typed in, not necessarily
+			// the caller's own, and writeServiceError (internal/handler/
+			// decode.go) logs every ValidationError's Msg verbatim.
 			return nil, &apierror.ValidationError{
-				Msg: fmt.Sprintf("%s contains invalid email: %q", field, firstInvalid),
+				Msg: fmt.Sprintf("%s contains an entry that is neither a valid email address nor a valid user identifier", field),
 			}
 		}
 		return nil, &apierror.ValidationError{

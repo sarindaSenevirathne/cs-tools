@@ -465,45 +465,6 @@ type ProjectStatsService interface {
 	GetProjectChangeRequestStats(ctx context.Context, projectID string) (domain.ProjectChangeRequestStatsResponse, error)
 }
 
-// ProjectConsumptionService defines the operations on a project's
-// product-consumption provisioning state — the resumable sequence that creates
-// a Choreo application for the project, subscribes it to the tracking API and
-// mints the credentials a deployment's license is built from.
-//
-// The two halves need different things, and neither is gated on DATA_SOURCE —
-// staging and production both run DATA_SOURCE=servicenow and need both.
-//
-//   - GetProjectConsumption and UpdateProjectConsumption read and write the
-//     Postgres mirror, so they need a pool. A pool enables them on either
-//     data source.
-//   - ProcessLicenseDownload needs neither. It reads status from ServiceNow
-//     through the configured Choreo subscription operation and touches
-//     Postgres only to mirror what it did, which is best-effort and skipped
-//     entirely when there is no repository.
-//
-// ServiceNow remains the source of truth for the status itself. There it lives
-// on the customer_project record, reached through the product-consumption
-// scripted REST API that the Choreo subscription operation calls directly —
-// neither this service nor the ServiceNow integration service sits in that
-// path at all.
-//
-// Every method is scoped to the caller (see AccessService): the project id
-// comes from the request path, so a caller who cannot see a project can
-// neither read its provisioning state nor drive provisioning for it.
-type ProjectConsumptionService interface {
-	// GetProjectConsumption returns the project's current provisioning state.
-	// A project that has never entered the flow reports status 1 (pending)
-	// rather than a not-found error; an unknown project ID is not found.
-	GetProjectConsumption(ctx context.Context, projectID string) (domain.ProjectConsumptionView, error)
-	// UpdateProjectConsumption records the completion of one provisioning step.
-	// The status may only move forward; a status that is not ahead of what is
-	// stored returns the stored state unchanged instead of failing.
-	UpdateProjectConsumption(ctx context.Context, projectID string, req domain.UpdateProjectConsumptionRequest) (domain.UpdateProjectConsumptionResponse, error)
-	// ProcessLicenseDownload executes the 5-step resumable provisioning sequence
-	// and issues the signed deployment license.
-	ProcessLicenseDownload(ctx context.Context, projectID, deploymentID, email string) (domain.License, error)
-}
-
 // ProjectContactService defines the operations available on project contacts.
 // The Postgres-backed implementation (projectContactService) reads from
 // project_contact (migration 000022), joined through account_contact to
@@ -596,12 +557,17 @@ type DeploymentService interface {
 	// project IDs, deployment type keys, and name search query. A ValidationError is
 	// returned for invalid input; any other error indicates an infrastructure failure.
 	SearchDeployments(ctx context.Context, req domain.SearchDeploymentsRequest) (domain.SearchDeploymentsResponse, error)
-	// CreateDeployment creates a new deployment in ServiceNow.
-	// Supported by the ServiceNow data source only.
+	// CreateDeployment creates a new deployment. Supported by the ServiceNow
+	// data source, and by DATA_SOURCE=postgres-servicenow-dual-write (SN-first,
+	// synchronous — see deploymentService.createDeploymentSNFirst). Not
+	// supported by plain DATA_SOURCE=postgres.
 	CreateDeployment(ctx context.Context, req domain.CreateDeploymentRequest) (domain.CreateDeploymentResponse, error)
-	// UpdateDeployment updates a deployment's name, type, description, or deactivates it.
-	// Either detail fields or Active=false must be provided, but not both.
-	// Supported by the ServiceNow data source only.
+	// UpdateDeployment updates a deployment's name, type, description, or
+	// deactivates it. Either detail fields or Active=false must be provided,
+	// but not both. Supported by the ServiceNow data source, and by
+	// DATA_SOURCE=postgres-servicenow-dual-write (Postgres-first, ServiceNow
+	// mirrored asynchronously afterward). Not supported by plain
+	// DATA_SOURCE=postgres.
 	UpdateDeployment(ctx context.Context, req domain.UpdateDeploymentRequest) (domain.UpdateDeploymentResponse, error)
 }
 
@@ -617,13 +583,18 @@ type DeployedProductService interface {
 	// ValidationError is returned for invalid input. Supported by the
 	// ServiceNow data source only.
 	SearchProjectsByProductVersion(ctx context.Context, req domain.SearchProjectsByProductVersionRequest) (domain.SearchProjectsByProductVersionResponse, error)
-	// CreateDeployedProduct creates a new deployed product in ServiceNow.
-	// Supported by the ServiceNow data source only.
+	// CreateDeployedProduct creates a new deployed product. Supported by the
+	// ServiceNow data source, and by DATA_SOURCE=postgres-servicenow-dual-write
+	// (SN-first, synchronous -- see deployedProductService.createDeployedProductSNFirst).
+	// Not supported by plain DATA_SOURCE=postgres.
 	CreateDeployedProduct(ctx context.Context, req domain.CreateDeployedProductRequest) (domain.CreateDeployedProductResponse, error)
 	// UpdateDeployedProduct updates a deployed product's cores, tps, description, update-level
 	// history, or deactivates it. Either detail fields (which now include Updates, a whole-array
 	// replace of the update-level history) or Active=false must be provided, but not both.
-	// Supported by the ServiceNow data source only.
+	// Supported by the ServiceNow data source, and by
+	// DATA_SOURCE=postgres-servicenow-dual-write (Postgres-first, ServiceNow
+	// mirrored asynchronously afterward). Not supported by plain
+	// DATA_SOURCE=postgres.
 	UpdateDeployedProduct(ctx context.Context, req domain.UpdateDeployedProductRequest) (domain.UpdateDeployedProductResponse, error)
 	// SearchDeployedProductMetrics returns core-count metrics for the deployed product
 	// identified by id, charted over req's date range. A ValidationError is returned for
@@ -660,16 +631,33 @@ type CaseService interface {
 	// CreateCaseComment creates a new comment on the case identified by req.CaseID.
 	// A ValidationError is returned for invalid input or constraint violations.
 	CreateCaseComment(ctx context.Context, req domain.CreateCaseCommentRequest) (domain.CreateCaseCommentResponse, error)
+	// CreateCaseCommentAs is CreateCaseComment for a caller that already
+	// knows who is acting (actorEmail) and has no live x-user-id-token to
+	// resolve it from -- see domain.CreateCaseCommentRequest.ActorEmail's
+	// own doc comment. Skips the token-based actor resolution
+	// CreateCaseComment does; everything else is identical.
+	CreateCaseCommentAs(ctx context.Context, req domain.CreateCaseCommentRequest, actorEmail string) (domain.CreateCaseCommentResponse, error)
 	// SearchCaseComments returns a paginated list of comments for the case identified
 	// by req.CaseID. A ValidationError is returned for invalid input.
 	SearchCaseComments(ctx context.Context, req domain.SearchCaseCommentsRequest) (domain.SearchCaseCommentsResponse, error)
-	// UpdateCase updates the state, severity, watch list, assignee, or internal-only
-	// fix-ETA estimate (best-case/most-likely/worst-case) of a case.
+	// UpdateCase updates the state, severity, watch list, assignee, fix-issued mark, or
+	// combinable-field-bundle (subject/description/deployment/deployed product/fix-ETA
+	// estimates/related case/workaround-provided) of a case.
 	// A ValidationError is returned for invalid values or malformed UUID; a NotFoundError if no case matches.
 	// WatchList is supported by both data sources (Postgres via work_item_watcher,
 	// migration 000040) and is mutually exclusive with State/Severity/WorkState.
-	// AssigneeEmail, BestCaseFixEta, MostLikelyFixEta, and WorstCaseFixEta are
-	// only supported for the ServiceNow data source.
+	// BestCaseFixEta/MostLikelyFixEta/WorstCaseFixEta are supported by both data sources
+	// (Postgres via work_item.best_case_eta/most_likely_eta/worst_case_eta, part of the
+	// combinable-field-bundle CaseRepository.UpdateCaseFields writes); any subset of the
+	// three may be combined with the bundle's other fields in one request, but the bundle
+	// as a whole is mutually exclusive with State/Severity/WorkState/WatchList/
+	// MarkFixIssued/Acknowledge/AssigneeEmail/ParentID.
+	// MarkFixIssued (Postgres/postgres-servicenow-dual-write only) is a true-only,
+	// first-write-wins mark of the case's fix-issued timestamp, mutually exclusive with
+	// every other field on this request.
+	// Acknowledge, AssigneeEmail, and ParentID are each their own exclusive branch,
+	// supported on the Postgres data source (not ServiceNow-only, despite this method's
+	// older doc history saying otherwise).
 	// Transitioning State to closed is rejected with a ValidationError if the case has any
 	// open task that is visible to the customer (the authoritative case-close gate).
 	UpdateCase(ctx context.Context, req domain.UpdateCaseRequest) (domain.UpdateCaseResponse, error)
@@ -939,6 +927,20 @@ type CommentService interface {
 	SearchComments(ctx context.Context, req domain.SearchCommentsRequest) (domain.SearchCommentsResponse, error)
 	// CreateComment creates a new comment on the given reference entity.
 	CreateComment(ctx context.Context, req domain.CreateCommentRequest) (domain.CreateCommentResponse, error)
+	// UpdateComment edits an existing comment's content. Only the comment's
+	// original author or a caller holding the "admin" role may call this; see
+	// commentService.UpdateComment's own doc comment for the authorization
+	// rule. Returns a ForbiddenError if the caller may not edit this comment,
+	// a NotFoundError if it doesn't exist, and a ValidationError if it is
+	// already soft-deleted.
+	UpdateComment(ctx context.Context, req domain.UpdateCommentRequest) (domain.UpdateCommentResponse, error)
+	// DeleteComment soft-deletes a comment (content is retained but no longer
+	// generally visible -- see commentService's own visibility rule doc
+	// comment). Same author-or-admin authorization rule as UpdateComment.
+	// Returns a ConflictError if the comment is already deleted.
+	DeleteComment(ctx context.Context, id string) error
+	// GetCommentEditHistory returns a comment's prior versions, newest first.
+	GetCommentEditHistory(ctx context.Context, id string) (domain.GetCommentEditHistoryResponse, error)
 }
 
 // PendingVerificationService defines the operations available on the
@@ -1060,6 +1062,9 @@ type IncidentService interface {
 
 	// UpdateIncident partially updates an existing incident. At least one field must be
 	// provided. A NotFoundError is returned if the incident does not exist.
+	// On DATA_SOURCE=postgres-servicenow-dual-write only WorkNotes and AdditionalComments
+	// are supported -- every other field is rejected with a ValidationError (see
+	// incidentService.UpdateIncident's own doc comment for why).
 	UpdateIncident(ctx context.Context, req domain.UpdateIncidentRequest) (domain.UpdateIncidentResponse, error)
 
 	// SearchIncidentActivities returns a paginated activity feed for an incident.

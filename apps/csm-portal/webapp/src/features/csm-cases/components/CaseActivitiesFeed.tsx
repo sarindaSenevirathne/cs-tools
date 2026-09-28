@@ -109,6 +109,18 @@ interface CaseActivitiesFeedProps {
     previewTarget: CaseAttachment | null;
     onPreviewTargetChange: (attachment: CaseAttachment | null) => void;
   };
+  /**
+   * Edit a comment's content (`PATCH /comments/{id}`). Omit to disable
+   * editing for every comment in this feed — the affordance is additionally
+   * gated per-comment by `CsmCaseCommentBubble`'s own author-or-admin check.
+   * The caller (a case/change-request/incident detail page) owns the actual
+   * mutation and which comments-list query key it invalidates on success —
+   * see `usePatchComment` in `useCsmCaseComments.ts`.
+   */
+  onEditComment?: (commentId: string, content: string) => Promise<unknown>;
+  /** Soft-delete a comment (`DELETE /comments/{id}`). Same
+   * omit-to-disable/per-comment-gating rule as `onEditComment`. */
+  onDeleteComment?: (commentId: string) => Promise<unknown>;
 }
 
 const AUDIT_ICON: Record<CaseAuditEntry["kind"], JSX.Element> = {
@@ -176,6 +188,8 @@ export default function CaseActivitiesFeed({
   callRequests = [],
   onDownloadAttachment,
   preview,
+  onEditComment,
+  onDeleteComment,
 }: CaseActivitiesFeedProps): JSX.Element {
   const [showWorkNotes, setShowWorkNotes] = useState(true);
   const [showLifecycle, setShowLifecycle] = useState(true);
@@ -353,6 +367,16 @@ export default function CaseActivitiesFeed({
                     if (match) setSelectedCallRequest(match);
                   }}
                   onSnLinkClick={(type, id) => setOpenSnLink({ type, id })}
+                  onEditComment={
+                    onEditComment
+                      ? (content) => onEditComment(e.comment.id, content)
+                      : undefined
+                  }
+                  onDeleteComment={
+                    onDeleteComment
+                      ? () => onDeleteComment(e.comment.id)
+                      : undefined
+                  }
                 />
               );
             }

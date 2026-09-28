@@ -198,6 +198,21 @@ type EmailNotifier struct {
 	// production environment, once that's a deliberate decision — not
 	// something to flip casually to "make a test work".
 	AllowNonWSO2Recipients bool
+	// StandingCC is a fixed list of addresses cc'd on every notice this
+	// component sends — internal, customer-facing, and the
+	// no-business-contact nudge alike, subscription and invoice cascades
+	// alike, since none of this varies by notice shape. Confirmed against
+	// every real reference email this project has (both internal and
+	// customer-facing): each one cc's customer-lifecycle-notification@wso2.com
+	// and billing@wso2.com, which this port never sent until this field was
+	// added — a real gap, not a documented simplification. Configurable
+	// (STANDING_CC_RECIPIENTS in main.go) rather than a hardcoded constant
+	// specifically so staging can leave it empty — these are real
+	// production distribution lists that must not receive test traffic,
+	// the same reasoning behind AllowNonWSO2Recipients defaulting false.
+	// Entries still pass through filterRecipients like any other recipient;
+	// this is additive cc, not a bypass of the WSO2-only staging safeguard.
+	StandingCC []string
 }
 
 // Send builds the to/cc recipient lists, converts Body to simple HTML, and
@@ -216,6 +231,7 @@ type EmailNotifier struct {
 // kind.
 func (n *EmailNotifier) Send(ctx context.Context, notice Notice) (bool, error) {
 	to, cc := recipientsToToCC(notice.Recipients)
+	cc = append(cc, n.StandingCC...)
 	to = n.filterRecipients(to)
 	cc = n.filterRecipients(cc)
 

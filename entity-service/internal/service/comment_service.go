@@ -18,6 +18,7 @@ package service
 
 import (
 	"context"
+	"strings"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
@@ -41,6 +42,21 @@ var commentTypeToEnum = map[domain.CommentType]string{
 // override value -- see that field's own doc comment. CreateComment refuses
 // any other non-empty value rather than trusting it at face value.
 const commentCreatedByAgent = "agent"
+
+// commentAdminRoleName is the role.name (migration 000004's seed data, joined
+// through user_role) that grants a caller admin-level access to comment
+// edit/delete/visibility decisions on this data source -- confirmed against
+// this service's own existing role checks (migration 000007's
+// recompute_user_type trigger and user_repo_test.go both use the literal
+// "admin"), not the CSM portal backend's own DefaultRoles vocabulary (a
+// different layer, apps/csm-portal/backend/internal/directory/roles.go),
+// which happens to use the same spelling but is not the source of truth here.
+const commentAdminRoleName = "admin"
+
+// commentDeletedPlaceholder replaces a soft-deleted comment's real content
+// for a non-admin internal caller -- see SearchComments' own doc comment for
+// the full visibility rule.
+const commentDeletedPlaceholder = "[deleted]"
 
 // commentEnumToType is commentTypeToEnum's read-back inverse.
 var commentEnumToType = map[string]domain.CommentType{
@@ -84,10 +100,12 @@ func NewCommentServiceWithSNWriteback(repo repository.CommentRepository, userRep
 
 func commentRowToDomain(row repository.CommentRow) domain.Comment {
 	c := domain.Comment{
-		ID:          row.ID,
-		ReferenceID: row.WorkItemID,
-		Content:     row.Content,
-		CreatedOn:   row.CreatedOn,
+		ID:           row.ID,
+		ReferenceID:  row.WorkItemID,
+		Content:      row.Content,
+		CreatedOn:    row.CreatedOn,
+		LastEditedOn: row.LastEditedAt,
+		IsDeleted:    row.DeletedAt != nil,
 		// comment.created_by (migration 000037) is a free-text VARCHAR, not a
 		// foreign key into "user" -- it mirrors ServiceNow's sys_journal_field
 		// author string, which can be an integration/automation account with
@@ -108,7 +126,65 @@ func commentRowToDomain(row repository.CommentRow) domain.Comment {
 	return c
 }
 
+// commentCallerVisibility is the resolved caller identity SearchComments needs
+// to decide, per comment row, whether a soft-deleted comment's content should
+// be shown, redacted, or the row excluded entirely. See SearchComments' own
+// doc comment for the rule this implements. Zero value (IsCustomer: false,
+// IsAdmin: false) is the "internal, non-admin" behavior -- deliberately also
+// the fallback when no identity can be resolved at all (missing/invalid
+// x-user-id-token, or an email with no matching "user" row): this endpoint
+// has no per-caller access scoping today (see this service's own CLAUDE.md,
+// "Not yet wired"), and a machine-to-machine caller with no end-user token in
+// the loop is far more likely than an actual, unauthenticated customer
+// reaching this endpoint directly -- excluding rows outright for an
+// unresolved identity would be a bigger behavior break for those existing
+// callers than showing a redacted placeholder.
+type commentCallerVisibility struct {
+	IsCustomer bool
+	IsAdmin    bool
+}
+
+// resolveCommentCallerVisibility never returns an error: every failure mode
+// (no token, malformed token, unknown email, repository error) degrades to
+// the conservative zero value rather than failing the whole search -- see
+// commentCallerVisibility's own doc comment for why.
+func (s *commentService) resolveCommentCallerVisibility(ctx context.Context) commentCallerVisibility {
+	token := middleware.UserIDTokenFromContext(ctx)
+	if token == "" {
+		return commentCallerVisibility{}
+	}
+	email, err := emailFromJWT(token)
+	if err != nil {
+		return commentCallerVisibility{}
+	}
+	user, err := s.userRepo.GetUserByEmail(ctx, email)
+	if err != nil {
+		return commentCallerVisibility{}
+	}
+	if user.UserType == domain.UserTypeCustomer || user.UserType == domain.UserTypeExternal {
+		return commentCallerVisibility{IsCustomer: true}
+	}
+	isAdmin := false
+	if roles, err := s.userRepo.GetUserRoles(ctx, user.ID); err == nil {
+		for _, r := range roles {
+			if r == commentAdminRoleName {
+				isAdmin = true
+				break
+			}
+		}
+	}
+	return commentCallerVisibility{IsAdmin: isAdmin}
+}
+
 // SearchComments implements CommentService.
+//
+// Visibility rule for a soft-deleted comment (deleted_at IS NOT NULL): a
+// customer caller never sees the row at all (excluded at the SQL level, via
+// excludeDeleted -- see CommentRepository.SearchComments' own doc comment on
+// why that can't be a post-query filter); a non-admin internal caller sees
+// the row with Content replaced by the literal string "[deleted]"; an admin
+// caller sees the real content. A non-deleted comment is unaffected either
+// way.
 func (s *commentService) SearchComments(ctx context.Context, req domain.SearchCommentsRequest) (domain.SearchCommentsResponse, error) {
 	if err := validateUUIDs("referenceId", []string{req.ReferenceID}); err != nil {
 		return domain.SearchCommentsResponse{}, err
@@ -126,14 +202,20 @@ func (s *commentService) SearchComments(ctx context.Context, req domain.SearchCo
 		typeFilter = &enumType
 	}
 
-	rows, total, err := s.repo.SearchComments(ctx, req.ReferenceID, req.ReferenceType, typeFilter, req.Pagination)
+	vis := s.resolveCommentCallerVisibility(ctx)
+
+	rows, total, err := s.repo.SearchComments(ctx, req.ReferenceID, req.ReferenceType, typeFilter, vis.IsCustomer, req.Pagination)
 	if err != nil {
 		return domain.SearchCommentsResponse{}, err
 	}
 
 	comments := make([]domain.Comment, 0, len(rows))
 	for _, row := range rows {
-		comments = append(comments, commentRowToDomain(row))
+		c := commentRowToDomain(row)
+		if row.DeletedAt != nil && !vis.IsAdmin {
+			c.Content = commentDeletedPlaceholder
+		}
+		comments = append(comments, c)
 	}
 
 	return domain.SearchCommentsResponse{
@@ -226,4 +308,163 @@ func (s *commentService) CreateComment(ctx context.Context, req domain.CreateCom
 			CreatedBy: createdBy,
 		},
 	}, nil
+}
+
+// resolveCommentActor resolves the authenticated caller's email and whether
+// they hold the admin role, for the UpdateComment/DeleteComment authorization
+// check. Unlike resolveCommentCallerVisibility (SearchComments' best-effort,
+// never-fails resolution), a write operation requires a real identity: a
+// missing token is an UnauthorizedError, a malformed one a ValidationError,
+// and an email with no matching "user" row propagates GetUserByEmail's own
+// NotFoundError -- the same posture CreateComment already takes for its own
+// token resolution above.
+func (s *commentService) resolveCommentActor(ctx context.Context) (email string, isAdmin bool, err error) {
+	token := middleware.UserIDTokenFromContext(ctx)
+	if token == "" {
+		return "", false, &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
+	}
+	email, err = emailFromJWT(token)
+	if err != nil {
+		return "", false, &apierror.ValidationError{Msg: "x-user-id-token: " + err.Error()}
+	}
+	user, err := s.userRepo.GetUserByEmail(ctx, email)
+	if err != nil {
+		return "", false, err
+	}
+	roles, err := s.userRepo.GetUserRoles(ctx, user.ID)
+	if err != nil {
+		return "", false, err
+	}
+	for _, r := range roles {
+		if r == commentAdminRoleName {
+			isAdmin = true
+			break
+		}
+	}
+	return user.Email, isAdmin, nil
+}
+
+// authorizeCommentActor is the shared UpdateComment/DeleteComment rule:
+// allowed when the caller's resolved email case-insensitively matches the
+// comment's own created_by, or the caller holds the admin role.
+func authorizeCommentActor(actorEmail string, isAdmin bool, comment repository.CommentRow) error {
+	if isAdmin || strings.EqualFold(actorEmail, comment.CreatedBy) {
+		return nil
+	}
+	return &apierror.ForbiddenError{Msg: "only the comment's author or an admin may modify it"}
+}
+
+// UpdateComment implements CommentService. Deliberately NOT mirrored to
+// ServiceNow under DATA_SOURCE=postgres-servicenow-dual-write, unlike
+// CreateComment: ServiceNow's sys_journal_field is append-only, and
+// snCommentSearchService.UpdateComment (the would-be mirror target) already
+// unconditionally returns a ServiceUnavailableError documented as a
+// permanent platform limitation, not a gap -- "stock ServiceNow does not let
+// an agent edit or delete a journal entry either" (see
+// commentEditDeleteUnsupportedOnSNMsg's own doc comment). Dispatching a
+// mirror here would only ever record a guaranteed sn_writeback_failures row
+// on every single edit, forever, which is not useful signal -- there is
+// nothing an operator could ever fix on the ServiceNow side to make it
+// succeed. This is the comment analogue of Part A's conversation finding:
+// no real path exists, so no dead-end plumbing was built for it. Postgres
+// remains fully authoritative for comment edits regardless.
+func (s *commentService) UpdateComment(ctx context.Context, req domain.UpdateCommentRequest) (domain.UpdateCommentResponse, error) {
+	if err := validateUUIDs("id", []string{req.ID}); err != nil {
+		return domain.UpdateCommentResponse{}, err
+	}
+	if req.Content == "" {
+		return domain.UpdateCommentResponse{}, &apierror.ValidationError{Msg: "content is required"}
+	}
+
+	actorEmail, isAdmin, err := s.resolveCommentActor(ctx)
+	if err != nil {
+		return domain.UpdateCommentResponse{}, err
+	}
+
+	existing, err := s.repo.GetCommentByID(ctx, req.ID)
+	if err != nil {
+		return domain.UpdateCommentResponse{}, err
+	}
+	if err := authorizeCommentActor(actorEmail, isAdmin, existing); err != nil {
+		return domain.UpdateCommentResponse{}, err
+	}
+
+	row, err := s.repo.UpdateComment(ctx, req.ID, req.Content, actorEmail)
+	if err != nil {
+		return domain.UpdateCommentResponse{}, err
+	}
+
+	return domain.UpdateCommentResponse{
+		Message: "Comment updated successfully",
+		Comment: commentRowToDomain(row),
+	}, nil
+}
+
+// DeleteComment implements CommentService. Deliberately NOT mirrored to
+// ServiceNow under DATA_SOURCE=postgres-servicenow-dual-write -- same
+// reasoning as UpdateComment's own doc comment above.
+func (s *commentService) DeleteComment(ctx context.Context, id string) error {
+	if err := validateUUIDs("id", []string{id}); err != nil {
+		return err
+	}
+
+	actorEmail, isAdmin, err := s.resolveCommentActor(ctx)
+	if err != nil {
+		return err
+	}
+
+	existing, err := s.repo.GetCommentByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := authorizeCommentActor(actorEmail, isAdmin, existing); err != nil {
+		return err
+	}
+
+	return s.repo.SoftDeleteComment(ctx, id, actorEmail)
+}
+
+// GetCommentEditHistory implements CommentService. Gated by the same
+// author-or-admin rule as UpdateComment/DeleteComment: only the comment's
+// author or an admin may view its edit history. Prior comment bodies can
+// carry the same sensitive content the current body does, and this is the
+// only place WORK_NOTE/internal comment content isn't otherwise scoped by
+// case/work_item membership at this layer -- an unrestricted read here would
+// let any authenticated caller (including a customer-role one) read the full
+// edit history of any comment on the platform just by knowing or enumerating
+// its UUID.
+func (s *commentService) GetCommentEditHistory(ctx context.Context, id string) (domain.GetCommentEditHistoryResponse, error) {
+	if err := validateUUIDs("id", []string{id}); err != nil {
+		return domain.GetCommentEditHistoryResponse{}, err
+	}
+
+	actorEmail, isAdmin, err := s.resolveCommentActor(ctx)
+	if err != nil {
+		return domain.GetCommentEditHistoryResponse{}, err
+	}
+
+	// Also confirms the comment exists at all, so a bad id is a 404 rather
+	// than a silently empty history list.
+	existing, err := s.repo.GetCommentByID(ctx, id)
+	if err != nil {
+		return domain.GetCommentEditHistoryResponse{}, err
+	}
+	if err := authorizeCommentActor(actorEmail, isAdmin, existing); err != nil {
+		return domain.GetCommentEditHistoryResponse{}, err
+	}
+
+	rows, err := s.repo.GetCommentEditHistory(ctx, id)
+	if err != nil {
+		return domain.GetCommentEditHistoryResponse{}, err
+	}
+
+	history := make([]domain.CommentEditHistoryEntry, 0, len(rows))
+	for _, row := range rows {
+		history = append(history, domain.CommentEditHistoryEntry{
+			Body:     row.Body,
+			EditedBy: row.EditedBy,
+			EditedOn: row.EditedAt,
+		})
+	}
+	return domain.GetCommentEditHistoryResponse{History: history}, nil
 }

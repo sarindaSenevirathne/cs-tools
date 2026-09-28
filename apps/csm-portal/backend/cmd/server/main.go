@@ -33,6 +33,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/csmintegration"
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/csmnotification"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/dashboard"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/directory"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/entity"
@@ -85,15 +87,19 @@ func main() {
 	// forwarding to the entity service. It authenticates as the same shared
 	// OAuth2 app as every other upstream; only its base URL and scopes are its
 	// own. Unset keeps the entity-service path exactly as it was.
+	// engineeringEntityClient is also read by GET /health/dependencies below,
+	// nil the same way it's unset here when ENGINEERING_ENTITY_BASE_URL is unset.
+	var engineeringEntityClient *entity.EngineeringEntityClient
 	if engineeringBaseURL := strings.TrimSpace(os.Getenv("ENGINEERING_ENTITY_BASE_URL")); engineeringBaseURL != "" {
 		engineeringBaseURL = mustHTTPSBaseURL("ENGINEERING_ENTITY_BASE_URL", engineeringBaseURL)
-		caseHandler.WithEngineeringClient(entity.NewEngineeringEntityClient(entity.EngineeringEntityConfig{
+		engineeringEntityClient = entity.NewEngineeringEntityClient(entity.EngineeringEntityConfig{
 			BaseURL:      engineeringBaseURL,
 			TokenURL:     oauth2TokenURL,
 			ClientID:     oauth2ClientID,
 			ClientSecret: oauth2ClientSecret,
 			Scopes:       splitComma(os.Getenv("ENGINEERING_ENTITY_SCOPES")),
-		}))
+		})
+		caseHandler.WithEngineeringClient(engineeringEntityClient)
 		slog.Info("GitHub issues are created through the engineering entity service")
 	}
 	metadataHandler := handler.NewMetadataHandler()
@@ -123,6 +129,7 @@ func main() {
 	incidentTaskHandler := handler.NewIncidentTaskHandler(customerEntityClient)
 	alertHandler := handler.NewAlertHandler(customerEntityClient)
 	outageHandler := handler.NewOutageHandler(customerEntityClient)
+	commentHandler := handler.NewCommentHandler(customerEntityClient)
 
 	// Google Chat is not yet configured for every deployment, so its spaces
 	// are read with os.Getenv (never mustEnv) — a missing or malformed value
@@ -168,6 +175,48 @@ func main() {
 		Scopes:       splitComma(os.Getenv("SCIM_SCOPES")),
 	}
 	scimClient := scim.NewClient(scimCfg)
+
+	// csm-notification-service and csm-integration-service are only used
+	// today to back GET /health/dependencies below — this backend has no
+	// other reason to call either directly (notifications and Event Hub
+	// publishing both live in entity-service/csm-notification-service now,
+	// see this file's own "Upstream service modules" note in CLAUDE.md).
+	// Both base URLs are optional, same as ENGINEERING_ENTITY_BASE_URL above:
+	// an environment that hasn't wired one yet just reports that dependency
+	// as "not_configured" rather than failing startup.
+	var notificationPinger handler.HealthPinger
+	if v := strings.TrimSpace(os.Getenv("CSM_NOTIFICATION_SERVICE_BASE_URL")); v != "" {
+		v = mustHTTPSBaseURL("CSM_NOTIFICATION_SERVICE_BASE_URL", v)
+		notificationPinger = csmnotification.NewClient(csmnotification.Config{
+			BaseURL:      v,
+			TokenURL:     oauth2TokenURL,
+			ClientID:     oauth2ClientID,
+			ClientSecret: oauth2ClientSecret,
+			Scopes:       splitComma(os.Getenv("CSM_NOTIFICATION_SERVICE_SCOPES")),
+		})
+	}
+	var integrationPinger handler.HealthPinger
+	if v := strings.TrimSpace(os.Getenv("CSM_INTEGRATION_SERVICE_BASE_URL")); v != "" {
+		v = mustHTTPSBaseURL("CSM_INTEGRATION_SERVICE_BASE_URL", v)
+		integrationPinger = csmintegration.NewClient(csmintegration.Config{
+			BaseURL:      v,
+			TokenURL:     oauth2TokenURL,
+			ClientID:     oauth2ClientID,
+			ClientSecret: oauth2ClientSecret,
+			Scopes:       splitComma(os.Getenv("CSM_INTEGRATION_SERVICE_SCOPES")),
+		})
+	}
+	// engineeringPinger is declared as the interface type directly (never a
+	// *entity.EngineeringEntityClient variable passed straight through) so a
+	// nil engineeringEntityClient yields a true nil interface here, not a
+	// non-nil interface boxing a nil pointer — the same typed-nil pitfall
+	// noted on notificationPinger/integrationPinger above.
+	var engineeringPinger handler.HealthPinger
+	if engineeringEntityClient != nil {
+		engineeringPinger = engineeringEntityClient
+	}
+	healthHandler := handler.NewHealthHandler(scimClient, updatesClient, notificationPinger, integrationPinger, engineeringPinger)
+
 	// One guard authorises every route below and also backs the permissions
 	// GET /users/me reports, so the two cannot drift apart.
 	accessGuard := handler.NewAccessGuard(loadAccessConfig())
@@ -185,8 +234,9 @@ func main() {
 
 	// Every route goes through route(), which takes the permission it needs as
 	// a required argument: there is no default, so a new route cannot be
-	// registered without someone deciding who may call it. /health is the one
-	// exception and is exempt in the Auth middleware too.
+	// registered without someone deciding who may call it. /health and
+	// /health/dependencies are the two exceptions and are exempt in the Auth
+	// middleware too.
 	mux := http.NewServeMux()
 	route := func(pattern string, perm handler.Permission, h http.HandlerFunc) {
 		mux.HandleFunc(pattern, accessGuard.Require(perm, h))
@@ -194,6 +244,10 @@ func main() {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+	// GET /health/dependencies is a second, exempt-from-auth probe alongside
+	// GET /health above, not a route requiring a permission — see
+	// HealthHandler's own doc comment for why the two are kept separate.
+	mux.HandleFunc("GET /health/dependencies", healthHandler.GetHealthDependencies)
 	route("POST /cases", handler.PermWrite, caseHandler.CreateCase)
 	route("GET /cases/{id}", handler.PermView, caseHandler.GetCase)
 	route("PATCH /cases/{id}", handler.PermWrite, caseHandler.PatchCase)
@@ -201,6 +255,13 @@ func main() {
 	route("POST /cases/{id}/request-update", handler.PermWrite, caseHandler.RequestCaseUpdate)
 	route("GET /case-update-request-templates", handler.PermView, caseHandler.GetCaseUpdateRequestTemplates)
 	route("POST /cases/{id}/comments/search", handler.PermView, caseHandler.SearchCaseComments)
+	// Generic comment edit/delete — applies to a comment by id regardless of
+	// which aggregate (case, change request, incident, ...) it was created
+	// under. Case, incident and change-request comments are PermWrite (see
+	// backend CLAUDE.md's Access control section); this is the same
+	// underlying resource.
+	route("PATCH /comments/{id}", handler.PermWrite, commentHandler.UpdateComment)
+	route("DELETE /comments/{id}", handler.PermWrite, commentHandler.DeleteComment)
 	route("POST /cases/{id}/activities/search", handler.PermView, caseHandler.SearchCaseActivities)
 	route("GET /cases/{id}/escalations", handler.PermView, caseHandler.GetCaseEscalations)
 	route("POST /cases/{id}/escalations", handler.PermEscalate, caseHandler.CreateCaseEscalation)
@@ -285,6 +346,14 @@ func main() {
 	route("GET /announcement-requests/{id}/deliveries", handler.PermView, announcementRequestHandler.ListAnnouncementRequestDeliveries)
 	route("POST /projects/{id}/contacts/search", handler.PermView, projectHandler.SearchProjectContacts)
 	route("GET /projects/{id}/contacts/{contactId}", handler.PermView, projectHandler.GetProjectContact)
+	// Customer-onboarding status per project contact — off by default (see
+	// loadOnboardingStatusEnabled). When off the handler is not constructed
+	// and the route is not registered, so the path 404s like any unknown one
+	// and nothing else in this backend changes.
+	if loadOnboardingStatusEnabled() {
+		onboardingStepHandler := handler.NewOnboardingStepHandler(customerEntityClient)
+		route("GET /projects/{id}/onboarding-steps", handler.PermView, onboardingStepHandler.GetProjectOnboardingSteps)
+	}
 	route("PATCH /projects/{id}", handler.PermWrite, projectHandler.UpdateProject)
 	route("POST /products/search", handler.PermView, productHandler.SearchProducts)
 	route("POST /products/{id}/versions/search", handler.PermView, productHandler.SearchProductVersions)
@@ -755,6 +824,37 @@ func validateAnnouncementDataSourceCompatibility(dataSource string, excludedProj
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
+}
+
+// onboardingStatusFlag is the env var gating GET /projects/{id}/onboarding-steps.
+const onboardingStatusFlag = "CSM_MIGRATION_ONBOARDING_STATUS_ENABLED"
+
+// loadOnboardingStatusEnabled resolves the customer-onboarding status feature
+// flag:
+//
+//	CSM_MIGRATION_ONBOARDING_STATUS_ENABLED  Exactly "true" (after trimming
+//	                                         whitespace) turns the feature on.
+//	                                         Off by default — unset, empty, or
+//	                                         any other value (including "1",
+//	                                         "TRUE", "yes") keeps it dark and
+//	                                         changes nothing else in this
+//	                                         backend. Deliberately stricter
+//	                                         than the strconv.ParseBool
+//	                                         parsing SFTPGO_* uses: every
+//	                                         CSM_MIGRATION_* flag is a
+//	                                         cutover switch that must not
+//	                                         flip on by accident.
+func loadOnboardingStatusEnabled() bool {
+	enabled := onboardingStatusEnabled(os.Getenv(onboardingStatusFlag))
+	if enabled {
+		slog.Info(onboardingStatusFlag + " is on: GET /projects/{id}/onboarding-steps is registered")
+	}
+	return enabled
+}
+
+// onboardingStatusEnabled is the pure parse behind loadOnboardingStatusEnabled.
+func onboardingStatusEnabled(raw string) bool {
+	return strings.TrimSpace(raw) == "true"
 }
 
 // loadSftpgoConfig resolves the SFTPGo-backed attachment-storage feature

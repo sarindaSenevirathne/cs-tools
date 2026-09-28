@@ -19,13 +19,16 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/auth"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/middleware"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
@@ -279,6 +282,15 @@ func (s *userService) GetMe(ctx context.Context) (domain.GetUserMeResponse, erro
 	}
 	user, err := s.repo.GetUserByEmail(ctx, email)
 	if err != nil {
+		var nfe *apierror.NotFoundError
+		if errors.As(err, &nfe) {
+			// callerId, not email — see user_repo.go's GetUserByEmail for why
+			// no log line on this path may carry the caller's email address.
+			// UserID is Asgardeo's own stable per-account identifier (the
+			// validated x-user-id-token's "userid" claim), already resolved
+			// into context by auth.Middleware earlier in the chain.
+			slog.WarnContext(ctx, "get me: no user found for caller", "callerId", auth.IdentityFromContext(ctx).UserID)
+		}
 		return domain.GetUserMeResponse{}, err
 	}
 	roles, err := s.repo.GetUserRoles(ctx, user.ID)

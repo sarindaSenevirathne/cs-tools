@@ -229,6 +229,38 @@ loop's `offset := 0` line. This is what backs safe testing against a single
 dedicated project without risk of touching every open project in an
 environment.
 
+## No runs on weekends
+
+No emails may go out on Saturday or Sunday (business requirement). `main`
+checks `isWeekend(time.Now())` right after the startup log line and exits 0
+before building any client — no reads, no writes, no sends. "Weekend" is
+judged in UTC+05:30 (`operationsZone`), not Choreo's UTC clock; a fixed
+offset rather than a named zone, so the container needs no tzdata. This
+applies to every run, including `TEST_PROJECT_ID`-scoped ones — there's no
+override flag.
+
+The whole run is skipped, deliberately, rather than running and only
+holding back the sends:
+
+- **Skipping the run loses nothing.** Notice windows and suspension are
+  threshold-based (`daysRemaining <= window`, see `closure.Decide`), so
+  Monday's run sends whatever came due over the weekend. The windows are at
+  least 7 days apart, so a two-day gap can never skip past a whole window.
+  The trade-off, accepted explicitly: a day 0 that lands on a weekend
+  suspends on Monday, so the customer gets up to two extra days.
+- **Holding back only the sends would break the cascade.** A Saturday
+  day-0 run would still suspend the project, and Monday's run would then
+  seed `alreadyClosed` from the now-closed project and skip its suspension
+  notice for good (see "Cross-cascade ordering" above). Suspending on
+  schedule while emailing later would need the notify/suspend coupling
+  reworked. Don't attempt it without revisiting this.
+
+The Choreo cron should also be set to weekdays only (`30 9 * * 1-5`, i.e.
+09:30 Mon–Fri — Choreo evaluates this component's cron in UTC+05:30, which
+is why the original daily `30 9 */1 * *` fired at 09:30 local, not UTC) so
+weekend invocations don't happen at all. This
+guard is defence in depth for a manual trigger or a mis-edited cron.
+
 ## EXCLUDED_PROJECT_IDS — deliberate exclusion, not a bug workaround
 
 `Run`'s `excludedProjectIDs` parameter (backed by the `EXCLUDED_PROJECT_IDS`
@@ -499,6 +531,20 @@ plain authenticated HTTP call.
   notice) all populated internal recipients go in `to`. This is a design
   decision made in this codebase, not something Rashmika's API dictates —
   reconsider if it turns out wrong in practice.
+- **`StandingCC` (`STANDING_CC_RECIPIENTS`) cc's a fixed address list on
+  every notice**, uniformly — internal, customer-facing, and the
+  no-business-contact nudge alike, subscription and invoice cascades alike,
+  added in `Send` right after `recipientsToToCC` and before filtering. This
+  was a real gap in the initial port, caught late: every real legacy
+  reference email this project has (both internal and customer-facing) cc's
+  `customer-lifecycle-notification@wso2.com` and `billing@wso2.com`, and
+  this component never sent to either until this field existed. Deliberately
+  env-configurable rather than a hardcoded constant like `wso2LogoURL` —
+  these are real production distribution lists, and staging/dev must leave
+  this empty for the same reason `EMAIL_SERVICE_ALLOW_NON_WSO2_RECIPIENTS`
+  defaults false: real people/teams must not receive test traffic. Entries
+  still pass through `filterRecipients` like any other recipient — this is
+  additive cc, not a bypass of the WSO2-only staging safeguard.
 - **The WSO2-only staging safeguard is a hard requirement from Rashmika's
   team**, not a suggestion: "make sure emails aren't being sent in staging
   environment for any non-wso2 emails." `EMAIL_SERVICE_ALLOW_NON_WSO2_RECIPIENTS`

@@ -42,6 +42,7 @@ import { useLocation } from "react-router";
 import { formatBackendTimestampForDisplay } from "@utils/dateTime";
 import { BackendApiError } from "@api/backend/client";
 import ExportPdfButton from "@components/ExportPdfButton";
+import { ApiQueryKeys } from "@constants/apiConstants";
 import { useErrorBanner } from "@context/error-banner/ErrorBannerContext";
 import { useCurrentUser } from "@context/current-user/CurrentUserContext";
 import { usePortalAccess } from "@context/current-user/usePortalAccess";
@@ -54,6 +55,10 @@ import {
   useGetCsmIncidentComments,
   usePostCsmIncidentComment,
 } from "@features/csm-operations/api/useCsmIncidentComments";
+import {
+  useDeleteComment,
+  usePatchComment,
+} from "@features/csm-cases/api/useCsmCaseComments";
 import { useGetCsmIncidentActivities } from "@features/csm-operations/api/useCsmIncidentActivities";
 import EditIncidentDialog from "@features/csm-operations/components/EditIncidentDialog";
 import EntityRefLink from "@features/csm-operations/components/EntityRefLink";
@@ -248,6 +253,25 @@ export default function CsmIncidentDetailPage(): JSX.Element {
     isLoading: isCommentsLoading,
     isError: isCommentsError,
   } = useGetCsmIncidentComments(id);
+  const patchComment = usePatchComment();
+  const deleteComment = useDeleteComment();
+  const onEditComment = useCallback(
+    (commentId: string, content: string) =>
+      patchComment.mutateAsync({
+        commentId,
+        content,
+        invalidateQueryKey: [ApiQueryKeys.INCIDENT_COMMENTS, id],
+      }),
+    [patchComment, id],
+  );
+  const onDeleteComment = useCallback(
+    (commentId: string) =>
+      deleteComment.mutateAsync({
+        commentId,
+        invalidateQueryKey: [ApiQueryKeys.INCIDENT_COMMENTS, id],
+      }),
+    [deleteComment, id],
+  );
   const {
     data: activityAudit,
     isLoading: isActivityLoading,
@@ -844,6 +868,8 @@ export default function CsmIncidentDetailPage(): JSX.Element {
               previewTarget,
               onPreviewTargetChange: setPreviewTarget,
             }}
+            onEditComment={onEditComment}
+            onDeleteComment={onDeleteComment}
           />
         </Card>
       )}

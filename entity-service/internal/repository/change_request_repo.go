@@ -68,9 +68,17 @@ import (
 // CreateChangeRequest has no Postgres implementation at all: work_item.number
 // has no DB default and no backing sequence anywhere in migrations/, the
 // same blocker CaseRepository.CreateCase has -- see that method's own doc
-// comment. GetChangeRequestApprovals/DecideChangeRequestApproval also have
-// none: they need per-stage, per-approver approval records, and this schema
-// only has one summary change_request.approval column.
+// comment.
+//
+// GetChangeRequestApprovals/DecideChangeRequestApproval ARE implemented
+// against approval_stage/approval_stage_approver (migration 000087), which
+// mirror ServiceNow's generic sysapproval_group/sysapproval_approver tables
+// -- see that migration's own comment. Stage label/approverType have no
+// backing column (ServiceNow derives them from two hardcoded group sys_ids
+// that were never synced into this schema as a lookup) and are instead
+// derived positionally in buildChangeRequestApprovals; see that function's
+// own doc comment for exactly what is and isn't replicated from
+// ChangeRequestUtils.getChangeRequestApprovals.
 //
 // CreateChangeRequestFromServiceNow (below) is the exception, same as
 // CaseRepository.CreateCaseFromServiceNow/IncidentRepository.CreateIncidentFromServiceNow:
@@ -150,6 +158,30 @@ type ChangeRequestRepository interface {
 	// req.Comment/req.WorkNote (ServiceNow journal entries, no backing
 	// column).
 	CreateChangeRequestFromServiceNow(ctx context.Context, req domain.CreateChangeRequestRequest, id, number, createdBy string) (domain.CreateChangeRequestResponse, error)
+	// GetChangeRequestApprovals returns every approval stage for the change
+	// request identified by id (approval_stage rows with work_item_id = id,
+	// ordered by created_on ascending) together with each stage's approvers
+	// (approval_stage_approver, matched by stage_id). Stage label/approverType
+	// are derived positionally in Go from this ordering -- see
+	// buildChangeRequestApprovals' own doc comment. Returns an empty
+	// domain.ChangeRequestApprovals{} (not a NotFoundError) if id has no
+	// approval_stage rows: a change request legitimately has zero stages
+	// before ServiceNow's workflow creates its first one, and this method
+	// does not separately check work_item existence -- same "no rows is not
+	// an error" convention as SearchChangeRequests.
+	GetChangeRequestApprovals(ctx context.Context, id string) (domain.ChangeRequestApprovals, error)
+	// DecideChangeRequestApproval flips the ONE approval_stage_approver row
+	// matching work_item_id = id AND approver_user_id = approverUserID AND
+	// status = 'requested' to decision ("approved"/"rejected", validated by
+	// the caller before this is reached), stamping actorEmail as updated_by,
+	// and returns that row's id. Returns a NotFoundError if no such row
+	// exists -- covers id not existing, the caller having no approval on
+	// this change request, and the caller's approval already being decided,
+	// all in the one WHERE clause (mirrors ServiceNow's decideApproval
+	// restriction that only the caller's own PENDING approval can be acted
+	// on -- see sn_change_request_service.go's DecideChangeRequestApproval
+	// doc comment).
+	DecideChangeRequestApproval(ctx context.Context, id, approverUserID, decision, actorEmail string) (string, error)
 }
 
 type changeRequestRepo struct {
@@ -1006,4 +1038,255 @@ func (r *changeRequestRepo) CreateChangeRequestFromServiceNow(ctx context.Contex
 	resp.ChangeRequest.CreatedOn = outCreatedOn.UTC().Format(time.RFC3339)
 	resp.ChangeRequest.CreatedBy = outCreatedBy
 	return resp, nil
+}
+
+// changeRequestApprovalStagesQuery backs GetChangeRequestApprovals' first of
+// two flat queries -- see that method's own doc comment for why this isn't
+// one three-way join. Ordered by created_on (then id as a stable tie-break
+// for rows inserted in the same instant, e.g. a backfill) since
+// buildChangeRequestApprovals' positional stage-label derivation depends
+// entirely on this ordering.
+const changeRequestApprovalStagesQuery = `
+	SELECT ast.id, g.name
+	FROM approval_stage ast
+	LEFT JOIN "group" g ON g.id = ast.assignment_group_id
+	WHERE ast.work_item_id = $1
+	ORDER BY ast.created_on ASC, ast.id ASC`
+
+// changeRequestApprovalApproversQuery backs GetChangeRequestApprovals'
+// second flat query. approver_name reuses comment_repo.go's
+// display-name COALESCE convention (resolved_name), not
+// user_repo.go's userSortColumns one, since there's no user_name fallback
+// need here -- an approver with no resolvable name still reads as "" rather
+// than falling back to a login handle. Filtered by work_item_id (denormalized
+// onto approval_stage_approver, migration 000087's own comment on why)
+// rather than joining through approval_stage, same reasoning as that
+// column's own comment.
+const changeRequestApprovalApproversQuery = `
+	SELECT asa.id, asa.stage_id,
+	       COALESCE(NULLIF(TRIM(u.name), ''), NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''), '') AS approver_name,
+	       asa.status, asa.updated_on
+	FROM approval_stage_approver asa
+	LEFT JOIN "user" u ON u.id = asa.approver_user_id
+	WHERE asa.work_item_id = $1
+	ORDER BY asa.created_on ASC, asa.id ASC`
+
+// changeRequestApprovalStageRow is one row of changeRequestApprovalStagesQuery.
+type changeRequestApprovalStageRow struct {
+	id                  string
+	assignmentGroupName *string
+}
+
+// changeRequestApprovalApproverRow is one row of
+// changeRequestApprovalApproversQuery. rawStatus/stageID are nullable
+// pointers because both approval_stage_approver.status and .stage_id are
+// (migration 000087's own comment on nullable FKs throughout, plus status
+// having no NOT NULL/DEFAULT).
+type changeRequestApprovalApproverRow struct {
+	id           string
+	stageID      *string
+	approverName string
+	rawStatus    *string
+	updatedOn    time.Time
+}
+
+// GetChangeRequestApprovals implements ChangeRequestRepository.
+func (r *changeRequestRepo) GetChangeRequestApprovals(ctx context.Context, id string) (domain.ChangeRequestApprovals, error) {
+	stageRows, err := r.db.Query(ctx, changeRequestApprovalStagesQuery, id)
+	if err != nil {
+		return domain.ChangeRequestApprovals{}, fmt.Errorf("get change request approvals: query stages: %w", err)
+	}
+	var stages []changeRequestApprovalStageRow
+	for stageRows.Next() {
+		var st changeRequestApprovalStageRow
+		if err := stageRows.Scan(&st.id, &st.assignmentGroupName); err != nil {
+			stageRows.Close()
+			return domain.ChangeRequestApprovals{}, fmt.Errorf("get change request approvals: scan stage: %w", err)
+		}
+		stages = append(stages, st)
+	}
+	stageRows.Close()
+	if err := stageRows.Err(); err != nil {
+		return domain.ChangeRequestApprovals{}, fmt.Errorf("get change request approvals: stages: %w", err)
+	}
+
+	approverRows, err := r.db.Query(ctx, changeRequestApprovalApproversQuery, id)
+	if err != nil {
+		return domain.ChangeRequestApprovals{}, fmt.Errorf("get change request approvals: query approvers: %w", err)
+	}
+	var approvers []changeRequestApprovalApproverRow
+	for approverRows.Next() {
+		var ap changeRequestApprovalApproverRow
+		if err := approverRows.Scan(&ap.id, &ap.stageID, &ap.approverName, &ap.rawStatus, &ap.updatedOn); err != nil {
+			approverRows.Close()
+			return domain.ChangeRequestApprovals{}, fmt.Errorf("get change request approvals: scan approver: %w", err)
+		}
+		approvers = append(approvers, ap)
+	}
+	approverRows.Close()
+	if err := approverRows.Err(); err != nil {
+		return domain.ChangeRequestApprovals{}, fmt.Errorf("get change request approvals: approvers: %w", err)
+	}
+
+	return buildChangeRequestApprovals(stages, approvers), nil
+}
+
+// changeRequestApprovalStagePosition maps a stage's zero-based position
+// (ordered by approval_stage.created_on) to its label and approver type.
+// This is the POSITIONAL-ONLY subset of ChangeRequestUtils.
+// getChangeRequestApprovals' real ServiceNow logic: the real script include
+// primarily keys stage label/approverType off two hardcoded ServiceNow
+// group sys_ids (falling back to this same ordinal scheme only when a
+// stage's group matches neither), but those sys_ids are ServiceNow-internal
+// values that were never synced into this schema as a lookup anywhere --
+// there is no group.sn_sys_id-shaped column, or equivalent, to match
+// against. Replicating the fallback ordinal scheme unconditionally (0 =
+// Assess, 1 = Authorize, 2+ = Customer Approval) is therefore the closest
+// available approximation, not a full reimplementation.
+func changeRequestApprovalStagePosition(pos int) (string, domain.ChangeRequestApproverType) {
+	switch pos {
+	case 0:
+		return "Assess", domain.ChangeRequestApproverTypeStaticGroup
+	case 1:
+		return "Authorize", domain.ChangeRequestApproverTypeStaticGroup
+	default:
+		return "Customer Approval", domain.ChangeRequestApproverTypeDynamicContact
+	}
+}
+
+// changeRequestApprovalStatusByRaw normalizes approval_stage_approver.status
+// (a ServiceNow sysapproval_approver.state passthrough -- migration 000087's
+// own comment) to the UPPER_SNAKE_CASE values domain.ChangeRequestApprover.
+// Status already carries for the ServiceNow data source (see
+// snChangeRequestService.GetChangeRequestApprovals, which passes ServiceNow's
+// own already-uppercase values straight through) -- this is the Postgres
+// equivalent of that pass-through, applied to SN's raw lowercase state
+// strings instead.
+var changeRequestApprovalStatusByRaw = map[string]string{
+	"requested":    "REQUESTED",
+	"approved":     "APPROVED",
+	"rejected":     "REJECTED",
+	"not_required": "NOT_REQUIRED",
+	"cancelled":    "CANCELLED",
+	"no_consensus": "NO_CONSENSUS",
+}
+
+// normalizeChangeRequestApprovalStatus applies changeRequestApprovalStatusByRaw,
+// falling back to an uppercased passthrough for any value outside that set
+// (so an as-yet-unseen ServiceNow state string still reads sensibly instead
+// of silently vanishing -- domain.ChangeRequestApprover.Status is
+// deliberately an open string, not a closed enum, for exactly this reason)
+// and "UNKNOWN" only for a nil/empty raw value.
+func normalizeChangeRequestApprovalStatus(raw *string) string {
+	if raw == nil || *raw == "" {
+		return "UNKNOWN"
+	}
+	if v, ok := changeRequestApprovalStatusByRaw[*raw]; ok {
+		return v
+	}
+	return strings.ToUpper(*raw)
+}
+
+// buildChangeRequestApprovals assembles the nested domain.ChangeRequestApprovals
+// shape from the two flat result sets GetChangeRequestApprovals queries
+// separately (a single three-way join fanned out across stage and approver
+// would need de-duplicating stage columns per approver row in Go anyway, so
+// two flat queries scan more simply for no real cost -- this table is
+// per-change-request, never more than a handful of rows).
+//
+// Approvers whose stage_id is NULL (the schema allows it -- migration
+// 000087's own comment on nullable FKs throughout) are dropped: they have
+// no stage to attach to, and ChangeRequestApprovals' response shape has no
+// stage-less bucket to put them in.
+func buildChangeRequestApprovals(stages []changeRequestApprovalStageRow, approvers []changeRequestApprovalApproverRow) domain.ChangeRequestApprovals {
+	approversByStage := make(map[string][]changeRequestApprovalApproverRow, len(stages))
+	for _, ap := range approvers {
+		if ap.stageID == nil {
+			continue
+		}
+		approversByStage[*ap.stageID] = append(approversByStage[*ap.stageID], ap)
+	}
+
+	result := make([]domain.ChangeRequestApproval, 0, len(stages))
+	for pos, st := range stages {
+		label, approverType := changeRequestApprovalStagePosition(pos)
+
+		stageApprovers := approversByStage[st.id]
+		domainApprovers := make([]domain.ChangeRequestApprover, 0, len(stageApprovers))
+		sawApproved, sawRejected := false, false
+		for _, ap := range stageApprovers {
+			status := normalizeChangeRequestApprovalStatus(ap.rawStatus)
+			switch status {
+			case "APPROVED":
+				sawApproved = true
+			case "REJECTED":
+				sawRejected = true
+			}
+
+			// RespondedOn has no dedicated column. approval_stage_approver.
+			// updated_on changes whenever DecideChangeRequestApproval (below)
+			// or csm-sync-service's own mapper moves status away from
+			// "requested", so it doubles as the response timestamp once a
+			// decision exists -- left nil while still REQUESTED (updated_on
+			// is just the row's sync/insert watermark then) or UNKNOWN
+			// (nothing meaningful to date).
+			var respondedOn *string
+			if status != "REQUESTED" && status != "UNKNOWN" {
+				s := ap.updatedOn.UTC().Format(time.RFC3339)
+				respondedOn = &s
+			}
+
+			domainApprovers = append(domainApprovers, domain.ChangeRequestApprover{
+				ID:          ap.id,
+				Name:        ap.approverName,
+				Status:      status,
+				RespondedOn: respondedOn,
+			})
+		}
+
+		// First-responder-wins over the stage's approvers, mirroring
+		// ChangeRequestUtils._deriveStageStatus (see approval_stage.raw_status'
+		// own migration comment) -- a single REJECTED beats any number of
+		// APPROVED, and a single APPROVED (once nobody has rejected) is
+		// enough to resolve the stage; anything else leaves it PENDING.
+		stageStatus := domain.ChangeRequestApprovalStatusPending
+		if sawRejected {
+			stageStatus = domain.ChangeRequestApprovalStatusRejected
+		} else if sawApproved {
+			stageStatus = domain.ChangeRequestApprovalStatusApproved
+		}
+
+		result = append(result, domain.ChangeRequestApproval{
+			Stage:        label,
+			ApproverType: approverType,
+			ApproverName: stringOrEmpty(st.assignmentGroupName),
+			Status:       stageStatus,
+			Approvers:    domainApprovers,
+		})
+	}
+
+	return domain.ChangeRequestApprovals{Approvals: result}
+}
+
+// decideChangeRequestApprovalQuery backs DecideChangeRequestApproval. The
+// WHERE clause's status = 'requested' is the entire enforcement of "only the
+// caller's own PENDING approval can be decided" -- see that method's own
+// doc comment.
+const decideChangeRequestApprovalQuery = `
+	UPDATE approval_stage_approver
+	SET status = $3, updated_on = NOW(), updated_by = $4
+	WHERE work_item_id = $1 AND approver_user_id = $2 AND status = 'requested'
+	RETURNING id`
+
+// DecideChangeRequestApproval implements ChangeRequestRepository.
+func (r *changeRequestRepo) DecideChangeRequestApproval(ctx context.Context, id, approverUserID, decision, actorEmail string) (string, error) {
+	var approvalID string
+	err := r.db.QueryRow(ctx, decideChangeRequestApprovalQuery, id, approverUserID, decision, actorEmail).Scan(&approvalID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", &apierror.NotFoundError{Msg: "no pending approval found for this change request and caller"}
+	}
+	if err != nil {
+		return "", fmt.Errorf("decide change request approval: %w", err)
+	}
+	return approvalID, nil
 }

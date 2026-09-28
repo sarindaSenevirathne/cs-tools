@@ -281,6 +281,21 @@ type CaseRepository interface {
 	// not exist (the tag might exist but not be on this case, or not exist
 	// at all -- both are "not found" from the caller's perspective).
 	RemoveCaseTag(ctx context.Context, caseID, tagID, callerEmail string) error
+	// SetCaseTagSNSysID best-effort persists ServiceNow's own label_entry
+	// sys_id for the (caseID, tagID) attachment on work_item_tag (migration
+	// 000088) -- called from AddCaseTag's async ServiceNow mirror success
+	// path, never from the synchronous request path. Returns
+	// *apierror.NotFoundError if the pairing does not exist (e.g. it was
+	// removed concurrently before the mirror finished), so the caller can
+	// react by cleaning up the ServiceNow tag this call failed to map.
+	SetCaseTagSNSysID(ctx context.Context, caseID, tagID, snSysID string) error
+	// GetCaseTagSNSysID returns the ServiceNow label_entry sys_id previously
+	// stored for the (caseID, tagID) attachment by SetCaseTagSNSysID, or nil
+	// if none is stored yet. Returns a NotFoundError if the pairing does not
+	// exist -- callers that need this before a REMOVE (which deletes the
+	// work_item_tag row entirely, taking sn_sys_id with it) must call this
+	// first, synchronously, while the row still exists.
+	GetCaseTagSNSysID(ctx context.Context, caseID, tagID string) (*string, error)
 	// SearchTags returns tags (not scoped to any case) whose name matches
 	// searchQuery case-insensitively (all tags when searchQuery is empty),
 	// most recently created first, capped at limit. callerEmail is threaded
@@ -313,10 +328,15 @@ type CaseRepository interface {
 	// the same case to the same engineer can't both observe "unchanged" and
 	// both publish/mirror the same no-op write -- see CaseService.
 	// updateCaseAssignee's own doc comment for why that race mattered
-	// (CodeRabbit finding on PR #1989). changed reports whether this call
+	// (CodeRabbit finding on PR #1989). userID is nil to clear the assignee
+	// (assigned_to_id UUID REFERENCES "user"(id) ON DELETE SET NULL, migration
+	// 000036, is already nullable) and non-nil to set it -- pgx binds a nil
+	// *string parameter as SQL NULL automatically, and the query's own
+	// IS DISTINCT FROM already treats NULL correctly on both sides, so the SQL
+	// itself needs no change for this. changed reports whether this call
 	// was the one that wrote it; updatedOn is the row's current value
 	// either way. Returns a NotFoundError if caseID does not exist.
-	UpdateCaseAssignee(ctx context.Context, caseID, userID, callerEmail string) (updatedOn time.Time, changed bool, err error)
+	UpdateCaseAssignee(ctx context.Context, caseID string, userID *string, callerEmail string) (updatedOn time.Time, changed bool, err error)
 	// AcknowledgeCase atomically claims the case for actorID if nobody has
 	// acknowledged it yet (work_item.acknowledged_by_user_id IS NULL), or
 	// leaves it untouched if someone already has -- the same idempotent
@@ -363,6 +383,16 @@ type CaseRepository interface {
 	// this itself just returns whatever error occurs, with no special
 	// handling of its own.
 	RecordCaseFieldChangeActivity(ctx context.Context, caseID, fieldName, oldValue, newValue, actorEmail string) error
+	// MarkCaseFixIssued stamps work_item.fix_issued_on with the current time
+	// (a pre-existing base-schema column, csm-sync-service's designated
+	// target for ServiceNow's u_fix_issued -- see this method's own doc
+	// comment for the source), first-write-wins: a case whose fix_issued_on
+	// is already set is left untouched and alreadySet is returned true with
+	// the existing timestamp, rather than being treated as an error. The
+	// WHERE fix_issued_on IS NULL guard on the UPDATE makes this atomic on
+	// its own -- no explicit row lock or transaction is needed, unlike
+	// SetCaseWatchList. Returns a NotFoundError if caseID does not exist.
+	MarkCaseFixIssued(ctx context.Context, caseID string) (fixIssued time.Time, alreadySet bool, err error)
 	// SearchCaseActivities returns a paginated, newest-first feed combining
 	// the case's comments (comment, migration 000037) and complete
 	// attachments (case_attachment, migration 000043) into one merged
@@ -944,11 +974,24 @@ func (r *caseRepo) GetCaseByID(ctx context.Context, id string, scope SearchScope
 		rc := caseResolutionCodeFromEnum[*resolutionCode]
 		cv.ResolutionCode = &rc
 	}
+	// A freshly created case has NULL current_escalation_level/is_escalated
+	// (case creation sets neither), but ServiceNow's own case response always
+	// carries a real value for both from the moment a case exists -- level
+	// "0"/EL0, isEscalated false -- confirmed live: GET /cases/{id} silently
+	// omitted both keys entirely for such a case instead. Default NULL to
+	// that same "never escalated" state here, matching the semantic
+	// SearchCases' own escalation filter already gives NULL (this file's
+	// "escalation (isEmpty / isNotEmpty)" comment: "A row with no ... has no
+	// escalation, so it satisfies isEmpty").
 	if escalationLevel != nil {
 		el := caseEscalationLevelFromEnum(*escalationLevel)
 		cv.EscalationLevel = &el
+	} else {
+		el := caseEscalationLevelFromEnum("EL0")
+		cv.EscalationLevel = &el
 	}
-	cv.IsEscalated = isEscalated
+	isEscalatedOrFalse := isEscalated != nil && *isEscalated
+	cv.IsEscalated = &isEscalatedOrFalse
 	cv.ResolvedOn = resolvedOn
 	if caseType != nil {
 		lower := strings.ToLower(*caseType)
@@ -1796,6 +1839,30 @@ func (r *caseRepo) SearchCases(ctx context.Context, req domain.SearchCasesReques
 		where += " AND EXISTS (SELECT 1 FROM sla tsla WHERE " + slaWhere + ")"
 	}
 
+	// product: matched on the deployed product's own catalog name (prod is
+	// the LEFT JOIN below) -- exact match against the same prod.name value
+	// SearchCases already selects into each row's ProductName.
+	if len(req.Parsed.ProductNames) > 0 {
+		where += fmt.Sprintf(" AND prod.name = ANY($%d::text[])", argIdx)
+		filterArgs = append(filterArgs, req.Parsed.ProductNames)
+		argIdx++
+	}
+
+	// creTeam/sreTeam: the parent account's CRE/SRE-owning "group" (a and
+	// cre/sre are the LEFT JOINs below) -- the same account.cre_team_id/
+	// sre_team_id -> "group" path GetCaseByID already resolves for its own
+	// CreTeam/SreTeam fields.
+	if len(req.Parsed.CreTeamIDs) > 0 {
+		where += fmt.Sprintf(" AND cre.id = ANY($%d::uuid[])", argIdx)
+		filterArgs = append(filterArgs, req.Parsed.CreTeamIDs)
+		argIdx++
+	}
+	if len(req.Parsed.SreTeamIDs) > 0 {
+		where += fmt.Sprintf(" AND sre.id = ANY($%d::uuid[])", argIdx)
+		filterArgs = append(filterArgs, req.Parsed.SreTeamIDs)
+		argIdx++
+	}
+
 	// escalation (isEmpty / isNotEmpty): whether the case itself carries an active
 	// escalation, matched on "case".is_escalated -- the flag the case detail
 	// exposes as isEscalated. A row with no "case" row (a non-case work item) has
@@ -1849,6 +1916,9 @@ func (r *caseRepo) SearchCases(ctx context.Context, req domain.SearchCasesReques
 	joins := `LEFT JOIN "case" c ON c.id = wi.id
 		 ` + caseLikeJoins + `
 		 LEFT JOIN project p ON p.id = wi.project_id
+		 LEFT JOIN account a ON a.id = wi.account_id
+		 LEFT JOIN "group" cre ON cre.id = a.cre_team_id
+		 LEFT JOIN "group" sre ON sre.id = a.sre_team_id
 		 LEFT JOIN deployment d ON d.id = wi.deployment_id
 		 LEFT JOIN deployed_product dp ON dp.id = wi.deployed_product_id
 		 LEFT JOIN product prod ON prod.id = dp.product_id
@@ -2153,7 +2223,7 @@ const updateCaseAssigneeQuery = `
 	WHERE wi.id = $1`
 
 // UpdateCaseAssignee implements CaseRepository.
-func (r *caseRepo) UpdateCaseAssignee(ctx context.Context, caseID, userID, callerEmail string) (time.Time, bool, error) {
+func (r *caseRepo) UpdateCaseAssignee(ctx context.Context, caseID string, userID *string, callerEmail string) (time.Time, bool, error) {
 	var updatedOn time.Time
 	var changed bool
 	err := r.db.QueryRow(ctx, updateCaseAssigneeQuery, caseID, userID, callerEmail).Scan(&updatedOn, &changed)
@@ -2164,6 +2234,40 @@ func (r *caseRepo) UpdateCaseAssignee(ctx context.Context, caseID, userID, calle
 		return time.Time{}, false, fmt.Errorf("update case assignee: %w", err)
 	}
 	return updatedOn, changed, nil
+}
+
+// MarkCaseFixIssued implements CaseRepository.
+//
+// Writes work_item.fix_issued_on, not a new column -- this column already
+// exists in the base schema (migration 000016_work_item_table) and is the
+// csm-sync-service mapping's designated target for ServiceNow's
+// u_fix_issued (configs/mappings/sn_customerservice_case.yaml), confirmed
+// against that file directly. A separate "case".fix_issued column was
+// briefly added and then dropped once this was found -- see lesson 124.
+func (r *caseRepo) MarkCaseFixIssued(ctx context.Context, caseID string) (time.Time, bool, error) {
+	var fixIssued time.Time
+	err := r.db.QueryRow(ctx,
+		`UPDATE work_item SET fix_issued_on = NOW() WHERE id = $1 AND fix_issued_on IS NULL RETURNING fix_issued_on`,
+		caseID,
+	).Scan(&fixIssued)
+	if err == nil {
+		return fixIssued, false, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, false, fmt.Errorf("mark case fix issued: %w", err)
+	}
+
+	// No row updated: either the case doesn't exist, or fix_issued_on was
+	// already set (first-write-wins no-op) -- distinguish the two with a
+	// follow-up read.
+	err = r.db.QueryRow(ctx, `SELECT fix_issued_on FROM work_item WHERE id = $1`, caseID).Scan(&fixIssued)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, false, &apierror.NotFoundError{Msg: "case not found"}
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("mark case fix issued: read existing: %w", err)
+	}
+	return fixIssued, true, nil
 }
 
 // UpdateCaseParent implements CaseRepository.
@@ -2449,6 +2553,41 @@ func (r *caseRepo) RemoveCaseTag(ctx context.Context, caseID, tagID, _ string) e
 		return &apierror.NotFoundError{Msg: "tag not found on this case"}
 	}
 	return nil
+}
+
+// SetCaseTagSNSysID implements CaseRepository. Returns *apierror.NotFoundError
+// if the (caseID, tagID) attachment no longer exists -- e.g. RemoveCaseTag
+// deleted it concurrently, in the gap between AddCaseTag's mirror creating
+// the ServiceNow tag and this call persisting its sys_id back -- so the
+// AddCaseTag writeback callback can react by cleaning up the now-orphaned
+// ServiceNow tag instead of silently discarding its id.
+func (r *caseRepo) SetCaseTagSNSysID(ctx context.Context, caseID, tagID, snSysID string) error {
+	result, err := r.db.Exec(ctx,
+		`UPDATE work_item_tag SET sn_sys_id = $1 WHERE work_item_id = $2 AND tag_id = $3`,
+		snSysID, caseID, tagID)
+	if err != nil {
+		return fmt.Errorf("set case tag sn sys id: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return &apierror.NotFoundError{Msg: "tag not found on this case"}
+	}
+	return nil
+}
+
+// GetCaseTagSNSysID implements CaseRepository.
+func (r *caseRepo) GetCaseTagSNSysID(ctx context.Context, caseID, tagID string) (*string, error) {
+	var snSysID *string
+	err := r.db.QueryRow(ctx,
+		`SELECT sn_sys_id FROM work_item_tag WHERE work_item_id = $1 AND tag_id = $2`,
+		caseID, tagID,
+	).Scan(&snSysID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, &apierror.NotFoundError{Msg: "tag not found on this case"}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get case tag sn sys id: %w", err)
+	}
+	return snSysID, nil
 }
 
 // SearchTags implements CaseRepository.

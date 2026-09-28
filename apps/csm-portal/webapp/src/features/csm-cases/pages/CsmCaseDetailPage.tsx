@@ -48,6 +48,7 @@ import {
 } from "@wso2/oxygen-ui-icons-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type JSX } from "react";
 import { useLocation } from "react-router";
+import { ApiQueryKeys } from "@constants/apiConstants";
 import { useGetCsmCaseDetail } from "@features/csm-cases/api/useGetCsmCaseDetail";
 import { useCurrentUser } from "@context/current-user/CurrentUserContext";
 import { usePortalAccess } from "@context/current-user/usePortalAccess";
@@ -71,7 +72,9 @@ import { beStateFromUi, priorityFromSeverity } from "@api/backend/mappers";
 import type { Severity } from "@features/csm-dashboard/types/abtDashboard";
 import { BackendApiError } from "@api/backend/client";
 import {
+  useDeleteComment,
   useGetCsmCaseComments,
+  usePatchComment,
   usePostCsmCaseComment,
 } from "@features/csm-cases/api/useCsmCaseComments";
 import { useGetCsmConversationMessages } from "@features/csm-cases/api/useCsmConversationMessages";
@@ -308,6 +311,9 @@ type CaseTabId =
   | "call-requests"
   | "tasks";
 
+// Paused product-wide pending an upstream Task data-model decision. Flip to
+// true to restore; nothing else needs to change.
+const TASKS_FEATURE_ENABLED = false;
 
 const TAB_DEFS: Array<{
   id: CaseTabId;
@@ -540,6 +546,25 @@ export default function CsmCaseDetailPage(): JSX.Element {
     isFetching: isFetchingChat,
   } = useGetCsmConversationMessages(data?.conversationId);
   const postComment = usePostCsmCaseComment();
+  const patchComment = usePatchComment();
+  const deleteComment = useDeleteComment();
+  const onEditComment = useCallback(
+    (commentId: string, content: string) =>
+      patchComment.mutateAsync({
+        commentId,
+        content,
+        invalidateQueryKey: [ApiQueryKeys.CSM_CASE_COMMENTS, caseId],
+      }),
+    [patchComment, caseId],
+  );
+  const onDeleteComment = useCallback(
+    (commentId: string) =>
+      deleteComment.mutateAsync({
+        commentId,
+        invalidateQueryKey: [ApiQueryKeys.CSM_CASE_COMMENTS, caseId],
+      }),
+    [deleteComment, caseId],
+  );
   const {
     data: attachments,
     isLoading: isAttachmentsLoading,
@@ -566,7 +591,7 @@ export default function CsmCaseDetailPage(): JSX.Element {
     isFetching: isFetchingCallRequests,
   } = useGetCsmCaseCallRequests(isAnnouncement ? undefined : caseId);
   const { data: caseTasks } = useSearchCaseTasks(
-    isAnnouncement ? undefined : caseId,
+    TASKS_FEATURE_ENABLED && !isAnnouncement ? caseId : undefined,
   );
   // The backend only serves time cards to roles that can use them, so the query
   // is skipped (undefined id disables it) rather than left to 403.
@@ -1530,19 +1555,33 @@ export default function CsmCaseDetailPage(): JSX.Element {
     proceedLifecycleTransition(action, targetState);
   }, [noPublicCommentConfirm, proceedLifecycleTransition]);
 
-  // Assign the case to the chosen engineer via PATCH { assigneeEmail }. The
-  // detail query is invalidated by the hook, so the assignee display refreshes
-  // on success. (ServiceNow-source only; the BE rejects it for PG cases.)
+  // Assign the case to the chosen engineer via PATCH { assigneeEmail }, or
+  // clear the assignee via PATCH { assigneeEmail: null }. The detail query is
+  // invalidated by the hook, so the assignee display refreshes on success.
+  // Supported for both data sources on this branch (the Postgres path has
+  // its own native assignee handling, see entity-service's updateCaseAssignee).
   const onAssign = useCallback(
-    (email: string) => {
+    (email: string | null) => {
       patchCase.mutate(
         { assigneeEmail: email },
         {
           onSuccess: () => {
             setAssignOpen(false);
-            showSuccess("Case reassigned.");
+            showSuccess(email === null ? "Case unassigned." : "Case reassigned.");
           },
-          onError: (err) => showError("Could not reassign the case.", err),
+          onError: (err) => {
+            // SN can reject a clear/reassign for state reasons (e.g. "cannot
+            // be changed for Work In Progress - Ongoing") — surface that
+            // 4xx message verbatim rather than the generic fallback, same
+            // treatment as every other 4xx on this page.
+            const msg =
+              err instanceof BackendApiError && err.status < 500 && err.message
+                ? err.message
+                : email === null
+                  ? "Could not unassign the case."
+                  : "Could not reassign the case.";
+            showError(msg, err);
+          },
         },
       );
     },
@@ -2190,6 +2229,9 @@ export default function CsmCaseDetailPage(): JSX.Element {
   // more than the real (server-side) gate is likely to. This is UI-only — the
   // entity-service enforces the authoritative close gate, and a rejection
   // still surfaces via showError even if this signal is stale or absent.
+  // While TASKS_FEATURE_ENABLED is false, `caseTasks` is always undefined, so
+  // this advisory never fires — the closure UI just falls silent on it,
+  // rather than misleadingly claiming "no open tasks".
   const hasOpenTask = (caseTasks?.tasks ?? []).some((t) => t.state === "OPEN");
   const closeBlockedReason = hasOpenTask
     ? "This case has an open task. Closing may be rejected until it's resolved or closed."
@@ -2703,6 +2745,8 @@ export default function CsmCaseDetailPage(): JSX.Element {
                     previewTarget,
                     onPreviewTargetChange: setPreviewTarget,
                   }}
+                  onEditComment={onEditComment}
+                  onDeleteComment={onDeleteComment}
                 />
               </>
             )}
@@ -2989,7 +3033,7 @@ export default function CsmCaseDetailPage(): JSX.Element {
         </Box>
       )}
 
-      {activeTab === "tasks" && caseId && (
+      {TASKS_FEATURE_ENABLED && activeTab === "tasks" && caseId && (
         <Box sx={{ display: "grid", gap: 2, gridTemplateColumns: "1fr" }}>
           <TasksWidget caseId={caseId} />
         </Box>
@@ -3144,7 +3188,7 @@ export default function CsmCaseDetailPage(): JSX.Element {
         />
       )}
 
-      {createTaskOpen && (
+      {TASKS_FEATURE_ENABLED && createTaskOpen && (
         <CreateTaskDialog
           isSaving={createTask.isPending}
           onClose={() => setCreateTaskOpen(false)}

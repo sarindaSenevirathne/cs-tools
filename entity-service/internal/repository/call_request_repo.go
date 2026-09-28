@@ -189,6 +189,19 @@ type CallRequestRepository interface {
 	// unchanged). Returns a NotFoundError if no call request matches (or, when
 	// req.CaseID is set, none belongs to that case).
 	UpdateCallRequest(ctx context.Context, req domain.UpdateCallRequestRequest, assigneeID *string, callerEmail string) (domain.UpdateCallRequestResponse, error)
+	// SetCallRequestSNSysID best-effort persists ServiceNow's own sys_id for
+	// the call request identified by id (migration 000088) -- called from
+	// CreateCallRequest's async ServiceNow mirror success path, never from
+	// the synchronous request path. A no-op (returns nil) if id does not
+	// exist: the row may have raced with a concurrent delete, and this is
+	// itself a best-effort follow-up to an already-succeeded mirror write,
+	// not something that should surface as a dispatcher failure.
+	SetCallRequestSNSysID(ctx context.Context, id, snSysID string) error
+	// GetCallRequestSNSysID returns the ServiceNow sys_id previously stored
+	// for id by SetCallRequestSNSysID, or nil if none is stored yet (the
+	// CREATE mirror hasn't run, hasn't finished, or failed -- see
+	// sn_writeback_failures). Returns a NotFoundError if id does not exist.
+	GetCallRequestSNSysID(ctx context.Context, id string) (*string, error)
 }
 
 type callRequestRepo struct {
@@ -504,4 +517,26 @@ func (r *callRequestRepo) UpdateCallRequest(ctx context.Context, req domain.Upda
 	resp.CallRequest.UpdatedOn = updatedOn.UTC().Format(time.RFC3339)
 	resp.CallRequest.UpdatedBy = callerEmail
 	return resp, nil
+}
+
+// SetCallRequestSNSysID implements CallRequestRepository.
+func (r *callRequestRepo) SetCallRequestSNSysID(ctx context.Context, id, snSysID string) error {
+	_, err := r.db.Exec(ctx, `UPDATE customer_call SET sn_sys_id = $1 WHERE id = $2::text::uuid`, snSysID, id)
+	if err != nil {
+		return fmt.Errorf("set call request sn sys id: %w", err)
+	}
+	return nil
+}
+
+// GetCallRequestSNSysID implements CallRequestRepository.
+func (r *callRequestRepo) GetCallRequestSNSysID(ctx context.Context, id string) (*string, error) {
+	var snSysID *string
+	err := r.db.QueryRow(ctx, `SELECT sn_sys_id FROM customer_call WHERE id = $1::text::uuid`, id).Scan(&snSysID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, &apierror.NotFoundError{Msg: "call request not found"}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get call request sn sys id: %w", err)
+	}
+	return snSysID, nil
 }

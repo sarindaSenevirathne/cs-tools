@@ -43,6 +43,11 @@ import (
 
 type changeRequestService struct {
 	repo repository.ChangeRequestRepository
+	// userRepo resolves the calling user's UUID from their x-user-id-token
+	// for DecideChangeRequestApproval -- approval_stage_approver.
+	// approver_user_id is a "user".id FK, not an email, so the JWT's email
+	// alone isn't enough to match a row. See currentUser's own doc comment.
+	userRepo repository.UserRepository
 	// snMirror is nil in every mode except DATA_SOURCE=postgres-servicenow-dual-write
 	// (config.DataSourcePostgresServiceNowDualWrite) -- see
 	// NewChangeRequestServiceWithSNMirror's own doc comment. When set,
@@ -63,12 +68,13 @@ type changeRequestService struct {
 }
 
 // NewChangeRequestService constructs a ChangeRequestService backed by
-// Postgres. CreateChangeRequest, GetChangeRequestApprovals, and
-// DecideChangeRequestApproval always return a ServiceUnavailableError --
-// see ChangeRequestRepository's own package doc comment for exactly why
-// (no number-generation sequence; no approval-stage/approver tables).
-func NewChangeRequestService(repo repository.ChangeRequestRepository) ChangeRequestService {
-	return &changeRequestService{repo: repo}
+// Postgres. CreateChangeRequest always returns a ServiceUnavailableError --
+// see ChangeRequestRepository's own package doc comment for exactly why (no
+// number-generation sequence). GetChangeRequestApprovals/
+// DecideChangeRequestApproval are fully implemented against Postgres in
+// every mode -- see their own doc comments below.
+func NewChangeRequestService(repo repository.ChangeRequestRepository, userRepo repository.UserRepository) ChangeRequestService {
+	return &changeRequestService{repo: repo, userRepo: userRepo}
 }
 
 // NewChangeRequestServiceWithSNMirror is NewChangeRequestService plus the
@@ -84,8 +90,8 @@ func NewChangeRequestService(repo repository.ChangeRequestRepository) ChangeRequ
 // NewServiceNowChangeRequestService) whose CreateChangeRequest performs the
 // real ServiceNow POST. It is never made the active ChangeRequestService
 // here -- reads always stay on Postgres in this mode.
-func NewChangeRequestServiceWithSNMirror(repo repository.ChangeRequestRepository, mirror ChangeRequestService) ChangeRequestService {
-	return &changeRequestService{repo: repo, snMirror: mirror}
+func NewChangeRequestServiceWithSNMirror(repo repository.ChangeRequestRepository, userRepo repository.UserRepository, mirror ChangeRequestService) ChangeRequestService {
+	return &changeRequestService{repo: repo, userRepo: userRepo, snMirror: mirror}
 }
 
 // NewChangeRequestServiceWithSNWriteback is NewChangeRequestServiceWithSNMirror
@@ -96,8 +102,27 @@ func NewChangeRequestServiceWithSNMirror(repo repository.ChangeRequestRepository
 // NewChangeRequestServiceWithSNMirror's own signature: several existing
 // tests construct that one directly with dispatcher/writeback out of scope,
 // and keeping it as-is means they keep working unchanged.
-func NewChangeRequestServiceWithSNWriteback(repo repository.ChangeRequestRepository, mirror ChangeRequestService, dispatcher *SNWritebackDispatcher) ChangeRequestService {
-	return &changeRequestService{repo: repo, snMirror: mirror, snWriteback: dispatcher}
+func NewChangeRequestServiceWithSNWriteback(repo repository.ChangeRequestRepository, userRepo repository.UserRepository, mirror ChangeRequestService, dispatcher *SNWritebackDispatcher) ChangeRequestService {
+	return &changeRequestService{repo: repo, userRepo: userRepo, snMirror: mirror, snWriteback: dispatcher}
+}
+
+// currentUser resolves the caller's full user record from their
+// x-user-id-token -- same mechanism as timeCardService.currentUserID
+// (case_service.go's CreateCaseComment originates it), except this returns
+// the whole domain.User rather than just the id: DecideChangeRequestApproval
+// needs both the id (to match approval_stage_approver.approver_user_id) and
+// the email (to stamp updated_by, matching PatchChangeRequest's own
+// actorEmail convention) from a single lookup.
+func (s *changeRequestService) currentUser(ctx context.Context) (domain.User, error) {
+	token := middleware.UserIDTokenFromContext(ctx)
+	if token == "" {
+		return domain.User{}, &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
+	}
+	email, err := emailFromJWT(token)
+	if err != nil {
+		return domain.User{}, &apierror.ValidationError{Msg: "x-user-id-token: " + err.Error()}
+	}
+	return s.userRepo.GetUserByEmail(ctx, email)
 }
 
 func validateChangeRequestFilters(f domain.SearchChangeRequestsFilters) error {
@@ -329,18 +354,82 @@ func (s *changeRequestService) createChangeRequestSNFirst(ctx context.Context, r
 	return resp, nil
 }
 
-// GetChangeRequestApprovals implements ChangeRequestService. Not supported
-// by the Postgres data source: ChangeRequestApprovals models multiple
-// approval stages, each with multiple approvers and per-approver status,
-// and this schema has only one summary change_request.approval column --
-// there is no approval-stage or approver table to serve this from.
+// GetChangeRequestApprovals implements ChangeRequestService. Reads always
+// stay on Postgres regardless of data source -- config.go's own doc comment
+// on config.DataSourcePostgresServiceNowDualWrite says "ServiceNow is never
+// read from in this mode", and changeRequestService's other read path
+// (GetChangeRequest) already follows that same rule -- so there is no
+// snMirror branching here, unlike CreateChangeRequest.
 func (s *changeRequestService) GetChangeRequestApprovals(ctx context.Context, id string) (domain.ChangeRequestApprovals, error) {
-	return domain.ChangeRequestApprovals{}, &apierror.ServiceUnavailableError{Msg: "change request approval stages are only supported for the ServiceNow data source"}
+	if err := validateUUIDs("id", []string{id}); err != nil {
+		return domain.ChangeRequestApprovals{}, err
+	}
+	return s.repo.GetChangeRequestApprovals(ctx, id)
 }
 
-// DecideChangeRequestApproval implements ChangeRequestService. Same
-// limitation as GetChangeRequestApprovals: there is no per-approver
-// approval record to decide on in this schema.
+// DecideChangeRequestApproval implements ChangeRequestService.
+//
+// Postgres-FIRST, with a best-effort ASYNCHRONOUS ServiceNow mirror under
+// DATA_SOURCE=postgres-servicenow-dual-write (snWriteback != nil) --
+// deliberately the opposite ordering from CreateChangeRequest's
+// createChangeRequestSNFirst. A synchronous SN-first approach was
+// considered (matching CREATE's reasoning that an orphan is worse than a
+// stale mirror) and rejected: unlike CREATE, ServiceNow's own decideApproval
+// has cascade side effects on the change request's overall state (its
+// business rule may move the change request out of "assess"/"authorize"
+// entirely once the last approver in a stage responds), and this platform
+// has no visibility into that cascade from here -- a synchronous call would
+// have to either duplicate ServiceNow's own state machine to know what
+// changed, or block the response on a round trip whose result this method
+// can't fully act on anyway. Postgres-first accepts the same drift window
+// PatchChangeRequest already accepts (a mirror failure leaves ServiceNow's
+// row stale until sn_writeback_failures is backfilled) rather than take on
+// that larger, harder-to-scope risk.
 func (s *changeRequestService) DecideChangeRequestApproval(ctx context.Context, id, decision string) (domain.ChangeRequestApprovalDecisionResponse, error) {
-	return domain.ChangeRequestApprovalDecisionResponse{}, &apierror.ServiceUnavailableError{Msg: "change request approval decisions are only supported for the ServiceNow data source"}
+	if err := validateUUIDs("id", []string{id}); err != nil {
+		return domain.ChangeRequestApprovalDecisionResponse{}, err
+	}
+	// changeRequestApprovalDecisions (sn_change_request_service.go) is
+	// reused directly rather than redeclared: both data sources accept
+	// exactly the same two request-level values ("approved"/"rejected"),
+	// and approval_stage_approver.status stores those same raw strings
+	// verbatim (migration 000087's own comment), so there is no separate
+	// translation table to keep in lockstep here.
+	if !changeRequestApprovalDecisions[decision] {
+		return domain.ChangeRequestApprovalDecisionResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("invalid decision %q", decision)}
+	}
+
+	user, err := s.currentUser(ctx)
+	if err != nil {
+		return domain.ChangeRequestApprovalDecisionResponse{}, err
+	}
+
+	approvalID, err := s.repo.DecideChangeRequestApproval(ctx, id, user.ID, decision, user.Email)
+	if err != nil {
+		return domain.ChangeRequestApprovalDecisionResponse{}, err
+	}
+
+	// Best-effort ServiceNow mirror write, DATA_SOURCE=postgres-servicenow-dual-write
+	// only (snWriteback is nil otherwise) -- exact same shape as
+	// PatchChangeRequest's own dispatch above: Postgres has already
+	// committed by this point, this fires after, asynchronously, and never
+	// affects this response. Safe to mirror by id for the same reason
+	// PatchChangeRequest's dispatch is (see changeRequestService's own doc
+	// comment on snWriteback): change request CREATE is ServiceNow-first
+	// under this data source, so id round-trips to the real ServiceNow
+	// sys_id via uuidToSysid.
+	if s.snWriteback != nil {
+		mirrorID, mirrorDecision := id, decision
+		s.snWriteback.Dispatch(ctx, "change_request", id, "approval_decision", decision,
+			func(writeCtx context.Context) error {
+				_, err := s.snMirror.DecideChangeRequestApproval(writeCtx, mirrorID, mirrorDecision)
+				return err
+			},
+		)
+	}
+
+	return domain.ChangeRequestApprovalDecisionResponse{
+		ID:    approvalID,
+		State: decision,
+	}, nil
 }

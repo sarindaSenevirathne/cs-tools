@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/directory"
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/entity"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/scim"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/updates"
@@ -596,6 +597,19 @@ func (m *mockEntityProjectClient) UpdateProject(ctx context.Context, id string, 
 	return []byte(`{}`), nil
 }
 
+// ----- mock entity onboarding step client -----
+
+type mockEntityOnboardingStepClient struct {
+	searchOnboardingStepsFn func(ctx context.Context, req entity.OnboardingStepSearchRequest) (entity.OnboardingStepSearchResponse, error)
+}
+
+func (m *mockEntityOnboardingStepClient) SearchOnboardingSteps(ctx context.Context, req entity.OnboardingStepSearchRequest) (entity.OnboardingStepSearchResponse, error) {
+	if m.searchOnboardingStepsFn != nil {
+		return m.searchOnboardingStepsFn(ctx, req)
+	}
+	return entity.OnboardingStepSearchResponse{Steps: []entity.OnboardingStep{}}, nil
+}
+
 // ----- mock entity product client -----
 
 type mockEntityProductClient struct {
@@ -1162,4 +1176,25 @@ func (m *mockEntityTaskClient) UpdateTask(ctx context.Context, id string, body [
 		return m.updateTaskFn(ctx, id, body)
 	}
 	return []byte(`{"id":"11111111-1111-1111-1111-111111111111"}`), nil
+}
+
+// ----- mock entity comment client -----
+
+type mockEntityCommentClient struct {
+	updateCommentFn func(ctx context.Context, id string, body []byte) ([]byte, error)
+	deleteCommentFn func(ctx context.Context, id string) ([]byte, error)
+}
+
+func (m *mockEntityCommentClient) UpdateComment(ctx context.Context, id string, body []byte) ([]byte, error) {
+	if m.updateCommentFn != nil {
+		return m.updateCommentFn(ctx, id, body)
+	}
+	return []byte(`{"id":"` + id + `","content":"updated"}`), nil
+}
+
+func (m *mockEntityCommentClient) DeleteComment(ctx context.Context, id string) ([]byte, error) {
+	if m.deleteCommentFn != nil {
+		return m.deleteCommentFn(ctx, id)
+	}
+	return nil, nil
 }
