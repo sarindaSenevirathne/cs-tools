@@ -74,6 +74,16 @@ const pendingVerificationFromJoin = `
 	JOIN work_item wi ON pv.work_item_id = wi.id
 	LEFT JOIN "case" c ON wi.id = c.id`
 
+// pendingVerificationCountFromJoin is pendingVerificationFromJoin without the
+// "case" join -- used by the count and type-count queries in Search below,
+// neither of which ever selects c.severity (only the data query does). The
+// "case" join is a no-op for them: paying for it per row, including every
+// pre-dedup row the VerifiedOnly/DISTINCT ON branches scan before collapsing
+// to one row per work_item_id, buys nothing.
+const pendingVerificationCountFromJoin = `
+	FROM pending_verification pv
+	JOIN work_item wi ON pv.work_item_id = wi.id`
+
 func scanPendingVerification(row pgx.Row) (domain.PendingVerification, error) {
 	var pv domain.PendingVerification
 	var severity *string
@@ -272,13 +282,13 @@ func (r *pendingVerificationRepo) Search(ctx context.Context, req domain.SearchP
 				       COUNT(*) FILTER (WHERE added_reason = 'AUTO_CLOSED'),
 				       COUNT(*) FILTER (WHERE added_reason = 'MANUAL')
 				FROM latest
-				WHERE verified_on IS NOT NULL`, pendingVerificationFromJoin, where)
+				WHERE verified_on IS NOT NULL`, pendingVerificationCountFromJoin, where)
 		} else {
 			countQuery = fmt.Sprintf(`
 				SELECT COUNT(*),
 				       COUNT(*) FILTER (WHERE pv.added_reason = 'AUTO_CLOSED'),
 				       COUNT(*) FILTER (WHERE pv.added_reason = 'MANUAL')
-				%s %s`, pendingVerificationFromJoin, where)
+				%s %s`, pendingVerificationCountFromJoin, where)
 		}
 		if err := r.db.QueryRow(egCtx, countQuery, args...).Scan(&total, &autoClosedCount, &manualCount); err != nil {
 			return fmt.Errorf("count pending_verifications: %w", err)
@@ -296,12 +306,12 @@ func (r *pendingVerificationRepo) Search(ctx context.Context, req domain.SearchP
 					ORDER BY pv.work_item_id, pv.added_on DESC
 				)
 				SELECT type::TEXT, COUNT(*) FROM latest WHERE verified_on IS NOT NULL GROUP BY type`,
-				pendingVerificationFromJoin, typeCountsWhere)
+				pendingVerificationCountFromJoin, typeCountsWhere)
 		} else {
 			typeCountsQuery = fmt.Sprintf(`
 				SELECT wi.type::TEXT, COUNT(*)
 				%s %s
-				GROUP BY wi.type`, pendingVerificationFromJoin, typeCountsWhere)
+				GROUP BY wi.type`, pendingVerificationCountFromJoin, typeCountsWhere)
 		}
 		rows, err := r.db.Query(egCtx, typeCountsQuery, typeCountsArgs...)
 		if err != nil {
