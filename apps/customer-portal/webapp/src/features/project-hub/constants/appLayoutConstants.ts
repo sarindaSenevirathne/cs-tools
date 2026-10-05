@@ -21,10 +21,10 @@ import {
   FolderOpen,
   Headset,
   LayoutDashboard,
+  ListChecks,
   Megaphone,
   RefreshCw,
   Shield,
-  ShieldCheck,
 } from "@wso2/oxygen-ui-icons-react";
 import type { AppShellNavItem } from "@features/project-hub/types/appLayout";
 
@@ -63,7 +63,7 @@ export const APP_SHELL_NAV_ITEMS: AppShellNavItem[] = [
     id: "verifications",
     label: "Pending Verification",
     path: "verifications",
-    icon: ShieldCheck,
+    icon: ListChecks,
   },
 ];
 

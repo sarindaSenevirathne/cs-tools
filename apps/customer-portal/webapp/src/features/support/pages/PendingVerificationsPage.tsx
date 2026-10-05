@@ -15,7 +15,7 @@
 // under the License.
 
 import { useEffect, useMemo, useState, type JSX } from "react";
-import { useParams } from "react-router";
+import { useLocation, useParams } from "react-router";
 import {
   Box,
   Checkbox,
@@ -80,6 +80,7 @@ const ROWS_PER_PAGE = 50;
  */
 export default function PendingVerificationsPage(): JSX.Element {
   const navigate = useModifierAwareNavigate();
+  const location = useLocation();
   const { projectId } = useParams<{ projectId: string }>();
   const { showSuccess } = useSuccessBanner();
   const { showError } = useErrorBanner();
@@ -311,7 +312,9 @@ export default function PendingVerificationsPage(): JSX.Element {
         hasListRefinement={hasListRefinement}
         onViewCase={(record) => {
           if (!projectId) return;
-          navigate(buildPendingVerificationRecordPath(projectId, record));
+          navigate(buildPendingVerificationRecordPath(projectId, record), {
+            state: { returnTo: location.pathname + location.search },
+          });
         }}
         onMarkVerified={(record) => setConfirmingRecord(record)}
       />

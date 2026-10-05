@@ -19,6 +19,7 @@ import {
   Calendar,
   CircleCheck,
   FileText,
+  History,
   RotateCcw,
   User,
 } from "@wso2/oxygen-ui-icons-react";
@@ -96,6 +97,15 @@ export default function PendingVerificationCard({
             variant="outlined"
             sx={{ height: 20, fontSize: "0.75rem" }}
           />
+          {isAutoClosed && record.previousStatus && (
+            <Chip
+              size="small"
+              icon={<History size={11} />}
+              label={`From ${record.previousStatus}`}
+              variant="outlined"
+              sx={{ height: 20, fontSize: "0.75rem", color: "text.secondary" }}
+            />
+          )}
           {isVerified && (
             <Chip
               icon={<CircleCheck size={11} />}
