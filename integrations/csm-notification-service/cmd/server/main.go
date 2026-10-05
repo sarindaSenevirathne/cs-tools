@@ -36,13 +36,13 @@ import (
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/dispatch"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/entity"
+	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/escalation"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/eventbus"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/middleware"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/notifications"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/recipientlinks"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/scim"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/slaengine"
-	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/timecardengine"
 )
 
 func main() {
@@ -68,12 +68,19 @@ func main() {
 		ClientSecret: os.Getenv("OAUTH2_CLIENT_SECRET"),
 		Scopes:       splitComma(os.Getenv("EMAIL_SCOPES")),
 		FromAddress:  os.Getenv("EMAIL_FROM_ADDRESS"),
+		ReplyTo:      splitComma(emailReplyTo()),
 	})
 
 	// Google Chat is likewise optional per deployment; a missing or malformed
 	// value logs a warning and yields no spaces rather than failing startup.
+	// GOOGLE_CHAT_SPACES is audience-keyed (team name, or a standing
+	// audience like "Incident Monitor") — the only Chat routing config this
+	// service has; there is no product-based alternative any more.
+	if os.Getenv("GOOGLE_CHAT_AUDIENCE_SPACES") != "" {
+		slog.Warn("GOOGLE_CHAT_AUDIENCE_SPACES is set but no longer read; it was renamed to GOOGLE_CHAT_SPACES, which is now the only Google Chat routing config")
+	}
 	googleChatClient := notifications.NewGoogleChatClient(notifications.GoogleChatConfig{
-		Spaces: parseGoogleChatSpaces(os.Getenv("GOOGLE_CHAT_SPACES")),
+		AudienceSpaces: parseGoogleChatAudienceSpaces(os.Getenv("GOOGLE_CHAT_SPACES")),
 	})
 
 	// Twilio (the call channel, used by incident.created) is likewise
@@ -88,6 +95,29 @@ func main() {
 		Language:            os.Getenv("TWILIO_LANGUAGE"),
 		APIBaseURL:          os.Getenv("TWILIO_API_BASE_URL"),
 	})
+
+	// The frustration-detection escalation client (dispatch.checkFrustration,
+	// case.comment_added only) is likewise optional per deployment: an unset
+	// ESCALATION_DETECTOR_BASE_URL means WithFrustrationDetection below is
+	// simply never called, and checkFrustration's own nil-frustrationDetector
+	// check skips the step entirely rather than erroring on every comment.
+	//
+	// Shares the same OAuth2 client credentials app as emailClient/
+	// customerEntityClient above (OAUTH2_CLIENT_ID/OAUTH2_CLIENT_SECRET/
+	// OAUTH2_TOKEN_URL) rather than getting its own -- only BaseURL/Scopes
+	// are specific to this client.
+	var escalationClient *escalation.Client
+	if baseURL := os.Getenv("ESCALATION_DETECTOR_BASE_URL"); baseURL != "" {
+		escalationClient = escalation.New(escalation.Config{
+			BaseURL:      baseURL,
+			TokenURL:     os.Getenv("OAUTH2_TOKEN_URL"),
+			ClientID:     os.Getenv("OAUTH2_CLIENT_ID"),
+			ClientSecret: os.Getenv("OAUTH2_CLIENT_SECRET"),
+			Scopes:       splitComma(os.Getenv("ESCALATION_DETECTOR_SCOPES")),
+		})
+	} else {
+		slog.Warn("ESCALATION_DETECTOR_BASE_URL not set; frustration detection on case.comment_added is disabled")
+	}
 
 	// The customer entity service backs per-recipient portal-link resolution
 	// (internal/recipientlinks) — optional per deployment like the channel
@@ -180,6 +210,23 @@ func main() {
 	crDLQProducer := eventbus.NewProducer(crDLQCfg)
 	defer crDLQProducer.Close()
 
+	// The two outage emails ride their own topic as well, for the same
+	// reason: entity-service's outage notice drainer publishes them there
+	// (OUTAGE_EVENT_HUB_TOPIC there), and its own DLQ keeps a stuck outage
+	// email out of the case and change-request dead-letter topics.
+	outageCfg := eventbus.Config{
+		Broker:           eventBusCfg.Broker,
+		ConnectionString: eventBusCfg.ConnectionString,
+		Topic:            envOrDefault("OUTAGE_EVENT_HUB_TOPIC", "outage-events"),
+	}
+	outageDLQCfg := eventbus.Config{
+		Broker:           eventBusCfg.Broker,
+		ConnectionString: eventBusCfg.ConnectionString,
+		Topic:            envOrDefault("OUTAGE_EVENT_HUB_DLQ_TOPIC", "outage-events-dlq"),
+	}
+	outageDLQProducer := eventbus.NewProducer(outageDLQCfg)
+	defer outageDLQProducer.Close()
+
 	// The onboarding events ride their own topic too, for the same reason
 	// the change-request notices do: a separate consumer group isolates
 	// processing, only a separate topic isolates volume. An invitation
@@ -210,6 +257,10 @@ func main() {
 	crDLQConsumerGroup := envOrDefault("CR_DLQ_CONSUMER_GROUP", "csm-notification-service-cr-dlq")
 	crConsumerCount := envInt("CR_CONSUMER_COUNT", 1)
 	crDLQConsumerCount := envInt("CR_DLQ_CONSUMER_COUNT", 1)
+	outageConsumerGroup := envOrDefault("OUTAGE_CONSUMER_GROUP", "csm-notification-service-outage")
+	outageDLQConsumerGroup := envOrDefault("OUTAGE_DLQ_CONSUMER_GROUP", "csm-notification-service-outage-dlq")
+	outageConsumerCount := envInt("OUTAGE_CONSUMER_COUNT", 1)
+	outageDLQConsumerCount := envInt("OUTAGE_DLQ_CONSUMER_COUNT", 1)
 	projectConsumerGroup := envOrDefault("PROJECT_CONSUMER_GROUP", "csm-notification-service-project")
 	projectDLQConsumerGroup := envOrDefault("PROJECT_DLQ_CONSUMER_GROUP", "csm-notification-service-project-dlq")
 	projectConsumerCount := envInt("PROJECT_CONSUMER_COUNT", 1)
@@ -258,16 +309,31 @@ func main() {
 		slog.Warn("CALL_SENDING_ENABLED=false; incident.created calls will be logged, not placed")
 	}
 
-	// Fallback Google Chat product (case.created and incident.created alike)
-	// and on-call number (incident.created's call only) for when a publisher
-	// (e.g. entity-service) can't determine which Chat space or on-call
-	// number applies and omits them from the payload — see
-	// dispatch.Dispatcher.defaultChatProduct/defaultOnCallNumber.
-	defaultChatProduct := os.Getenv("DEFAULT_CHAT_PRODUCT")
+	// Fallback on-call number (incident.created's call only) for when a
+	// publisher (e.g. entity-service) can't determine which on-call number
+	// applies and omits it from the payload — see
+	// dispatch.Dispatcher.defaultOnCallNumber.
 	defaultOnCallNumber := os.Getenv("INCIDENT_DEFAULT_CALL_TO")
 
-	dispatcher := dispatch.NewDispatcher(emailClient, googleChatClient, twilioClient, linkResolver, emailSendingEnabled, emailDebugMode, emailDebugRecipients, callSendingEnabled, defaultChatProduct, defaultOnCallNumber).
+	// DEFAULT_CSM_EMAIL_CC is CC'd on every case.* email's CSM-portal-link
+	// group only (never the customer-portal group, never during
+	// EMAIL_DEBUG_MODE) — see dispatch.Dispatcher.defaultCSMEmailCC's own
+	// doc comment.
+	defaultCSMEmailCC := splitComma(os.Getenv("DEFAULT_CSM_EMAIL_CC"))
+
+	dispatcher := dispatch.NewDispatcher(emailClient, googleChatClient, twilioClient, linkResolver, emailSendingEnabled, emailDebugMode, emailDebugRecipients, callSendingEnabled, defaultOnCallNumber, defaultCSMEmailCC).
 		WithOnboarding(loadOnboardingConfig(customerEntityClient, emailClient))
+	// escalationClient is a *escalation.Client, not the escalationDetector
+	// interface itself -- passing it through WithFrustrationDetection
+	// unconditionally when nil would store a non-nil interface wrapping a
+	// nil pointer (the same "nil pointer in an interface is non-nil" trap
+	// entity-service's own health handler guards against), making
+	// checkFrustration's own frustrationDetector != nil check always true
+	// and then panicking on DetectEscalation. Only chain it in when a real
+	// client was constructed.
+	if escalationClient != nil {
+		dispatcher = dispatcher.WithFrustrationDetection(escalationClient)
+	}
 
 	// The main consumer's OnExhausted: publish the exhausted record to the
 	// dead-letter topic instead of just logging and dropping it. The DLQ's
@@ -290,6 +356,15 @@ func main() {
 		slog.WarnContext(ctx, "eventbus: handler exhausted retries, publishing to dead-letter topic",
 			append(attrs, deadLetterErrAttrs(handleErr)...)...)
 		return crDLQProducer.Publish(ctx, record.Key, record.Value)
+	}
+
+	// And for the outage consumer.
+	outageToDeadLetter := func(ctx context.Context, record eventbus.Record, handleErr error) error {
+		attrs := []any{"topic", record.Topic, "partition", record.Partition,
+			"offset", record.Offset, "dlqTopic", outageDLQCfg.Topic}
+		slog.WarnContext(ctx, "eventbus: handler exhausted retries, publishing to dead-letter topic",
+			append(attrs, deadLetterErrAttrs(handleErr)...)...)
+		return outageDLQProducer.Publish(ctx, record.Key, record.Value)
 	}
 
 	// Same again for the onboarding consumer: a stuck invitation cannot
@@ -347,8 +422,56 @@ func main() {
 	// Same dispatcher as the case consumers: it already routes on the
 	// envelope's Type, and these two only ever receive change_request.* since
 	// that is all their topic carries.
-	crConsumers := startConsumers(ctx, "cr", crCfg, crConsumerGroup, crConsumerCount, dispatcher.Handle, crToDeadLetter)
-	crDLQConsumers := startConsumers(ctx, "cr-dlq", crDLQCfg, crDLQConsumerGroup, crDLQConsumerCount, dispatcher.Handle, nil)
+	//
+	// sre-events: ONE topic for the operations notifications (change-request
+	// notices and outage emails today), routed by event type like every
+	// topic here. Off unless SRE_EVENT_HUB_TOPIC is set, so a deployment
+	// that does not set it runs exactly the consumers it did before. When set,
+	// see planSREConsumers for which consumers it replaces and which group it
+	// reads with.
+	plan := planSREConsumers(os.Getenv("SRE_EVENT_HUB_TOPIC"), os.Getenv("SRE_CONSUMER_GROUP"),
+		os.Getenv("SRE_EVENT_HUB_DLQ_TOPIC"), os.Getenv("SRE_DLQ_CONSUMER_GROUP"),
+		consumerTarget{crCfg.Topic, crConsumerGroup}, consumerTarget{crDLQCfg.Topic, crDLQConsumerGroup},
+		consumerTarget{outageCfg.Topic, outageConsumerGroup}, consumerTarget{outageDLQCfg.Topic, outageDLQConsumerGroup})
+	if err := validateSREPlan(plan, eventBusCfg.Topic, projectCfg.Topic); err != nil {
+		slog.Error("invalid sre-events configuration", "err", err)
+		os.Exit(1)
+	}
+	var crConsumers, crDLQConsumers, outageConsumers, outageDLQConsumers, sreConsumers, sreDLQConsumers []*eventbus.Consumer
+	if plan.StartCR {
+		crConsumers = startConsumers(ctx, "cr", crCfg, crConsumerGroup, crConsumerCount, dispatcher.Handle, crToDeadLetter)
+	}
+	if plan.StartCRDLQ {
+		crDLQConsumers = startConsumers(ctx, "cr-dlq", crDLQCfg, crDLQConsumerGroup, crDLQConsumerCount, dispatcher.Handle, nil)
+	}
+	if plan.StartOutage {
+		outageConsumers = startConsumers(ctx, "outage", outageCfg, outageConsumerGroup, outageConsumerCount, dispatcher.Handle, outageToDeadLetter)
+	}
+	if plan.StartOutageDLQ {
+		outageDLQConsumers = startConsumers(ctx, "outage-dlq", outageDLQCfg, outageDLQConsumerGroup, outageDLQConsumerCount, dispatcher.Handle, nil)
+	}
+	if plan.Enabled {
+		sreCfg := eventbus.Config{Broker: eventBusCfg.Broker, ConnectionString: eventBusCfg.ConnectionString, Topic: plan.SRE.Topic}
+		sreDLQCfg := eventbus.Config{Broker: eventBusCfg.Broker, ConnectionString: eventBusCfg.ConnectionString, Topic: plan.SREDLQ.Topic}
+		sreDLQProducer := eventbus.NewProducer(sreDLQCfg)
+		defer sreDLQProducer.Close()
+		sreToDeadLetter := func(ctx context.Context, record eventbus.Record, handleErr error) error {
+			attrs := []any{"topic", record.Topic, "partition", record.Partition,
+				"offset", record.Offset, "dlqTopic", sreDLQCfg.Topic}
+			slog.WarnContext(ctx, "eventbus: handler exhausted retries, publishing to dead-letter topic",
+				append(attrs, deadLetterErrAttrs(handleErr)...)...)
+			return sreDLQProducer.Publish(ctx, record.Key, record.Value)
+		}
+		// HandleShared, not Handle: an event type this service does not
+		// handle is someone else's on a shared topic, not a broken record.
+		sreConsumers = startConsumers(ctx, "sre", sreCfg, plan.SRE.Group,
+			envInt("SRE_CONSUMER_COUNT", 1), dispatcher.HandleShared, sreToDeadLetter)
+		sreDLQConsumers = startConsumers(ctx, "sre-dlq", sreDLQCfg, plan.SREDLQ.Group,
+			envInt("SRE_DLQ_CONSUMER_COUNT", 1), dispatcher.HandleShared, nil)
+		slog.Info("sre-events consumer enabled", "topic", plan.SRE.Topic, "group", plan.SRE.Group,
+			"dlqTopic", plan.SREDLQ.Topic, "dlqGroup", plan.SREDLQ.Group,
+			"replacesCRConsumer", !plan.StartCR, "replacesOutageConsumer", !plan.StartOutage)
+	}
 	// And the same for project_contact.invited: the one dispatcher routes
 	// on the envelope's Type already, and these two only ever receive the
 	// onboarding events since that is all their topic carries.
@@ -438,7 +561,7 @@ func main() {
 		// exists.
 		slaProducer = eventbus.NewProducer(eventBusCfg)
 
-		slaEngine := slaengine.NewEngine(slaEntityClient, slaengine.NewTierStore(redisClient), slaProducer, googleChatClient, linkResolver, defaultChatProduct)
+		slaEngine := slaengine.NewEngine(slaEntityClient, slaengine.NewTierStore(redisClient), slaProducer, googleChatClient, linkResolver, emailClient, emailSendingEnabled, emailDebugMode, emailDebugRecipients)
 
 		// SLA_TICK_INTERVAL defaults far above the old wake-index engine's
 		// 15s: that interval made sense for firing a precomputed due date
@@ -452,19 +575,6 @@ func main() {
 		tickInterval := envDuration("SLA_TICK_INTERVAL", 5*time.Minute)
 		go slaEngine.RunTicker(ctx, tickInterval)
 	}
-
-	// timecardengine has no Redis/state dependency at all (unlike slaEngine
-	// above) — it's a plain Kafka consumer, so it's started unconditionally,
-	// not gated behind the REDIS_URL/REDIS_ADDR check. Its own dedicated
-	// consumer group, not dispatcher's — see that package's own doc comment
-	// for why. Its Handle is currently log-only (see the package doc
-	// comment): entity-service's own Publish call for events.
-	// TypeCaseBillableStatusChanged is itself still commented out, so this
-	// consumer group exists ahead of having anything to actually do yet.
-	timeCardEngine := timecardengine.NewEngine()
-	timeCardConsumerGroup := envOrDefault("TIME_CARD_CONSUMER_GROUP", "csm-notification-service-time-card")
-	timeCardConsumerCount := envInt("TIME_CARD_CONSUMER_COUNT", 1)
-	timeCardConsumers := startConsumers(ctx, "time-card", eventBusCfg, timeCardConsumerGroup, timeCardConsumerCount, timeCardEngine.Handle, toDeadLetter)
 
 	<-ctx.Done()
 	stop()
@@ -481,13 +591,22 @@ func main() {
 	for _, c := range crDLQConsumers {
 		c.Close()
 	}
+	for _, c := range outageConsumers {
+		c.Close()
+	}
+	for _, c := range outageDLQConsumers {
+		c.Close()
+	}
+	for _, c := range sreConsumers {
+		c.Close()
+	}
+	for _, c := range sreDLQConsumers {
+		c.Close()
+	}
 	for _, c := range projectConsumers {
 		c.Close()
 	}
 	for _, c := range projectDLQConsumers {
-		c.Close()
-	}
-	for _, c := range timeCardConsumers {
 		c.Close()
 	}
 	if slaProducer != nil {
@@ -568,6 +687,7 @@ func loadOnboardingConfig(steps *entity.CustomerEntityClient, emailClient *notif
 		EmailEnabled:    emailEnabled,
 		PortalURL:       portalURL,
 		EmailFrom:       emailFrom,
+		ReplyTo:         emailClient.ReplyTo(),
 	}
 }
 
@@ -625,6 +745,15 @@ func envBool(key string, def bool) bool {
 	default:
 		return def
 	}
+}
+
+// emailReplyTo reads EMAIL_REPLY_TO: unset means support@wso2.com, set but
+// empty means no Reply-To.
+func emailReplyTo() string {
+	if v, ok := os.LookupEnv("EMAIL_REPLY_TO"); ok {
+		return v
+	}
+	return "support@wso2.com"
 }
 
 func envOrDefault(key, def string) string {
@@ -733,19 +862,39 @@ func splitComma(s string) []string {
 	return result
 }
 
-// parseGoogleChatSpaces decodes GOOGLE_CHAT_SPACES, a JSON array of
-// {"product":"...","webhookUrl":"..."} objects — one per Google Chat space.
-// A missing or malformed value logs a warning and yields no spaces rather
-// than failing startup, since this channel is not required for every
-// deployment.
-func parseGoogleChatSpaces(raw string) []notifications.GoogleChatSpace {
+// parseGoogleChatAudienceSpaces decodes GOOGLE_CHAT_SPACES, a JSON array of
+// {"audience":"...","webhookUrl":"..."} objects — one per Chat audience (a
+// team's own space, or a standing audience like "Incident Monitor"; see
+// internal/chataudience). This is the only Google Chat routing config this
+// service has — there is no product-based alternative. A missing or
+// malformed value logs a warning and yields no spaces rather than failing
+// startup, since this channel is not required for every deployment.
+//
+// Decodes with DisallowUnknownFields specifically so a deployment that
+// still carries the old product-keyed shape ({"product","webhookUrl"})
+// fails loudly here instead of silently: a plain json.Unmarshal would
+// ignore the unknown "product" key, decode every entry with an empty
+// Audience, and NewGoogleChatClient would then silently drop every one of
+// them (see its own doc comment) — dropping every Chat alert with nothing
+// but a per-send warning, and no indication at startup that the rename
+// needs a config change. An entry that decodes fine but still has an empty
+// audience (e.g. a hand-edited config missing the field) gets its own
+// explicit error log for the same reason.
+func parseGoogleChatAudienceSpaces(raw string) []notifications.GoogleChatAudienceSpace {
 	if raw == "" {
 		return nil
 	}
-	var spaces []notifications.GoogleChatSpace
-	if err := json.Unmarshal([]byte(raw), &spaces); err != nil {
+	var spaces []notifications.GoogleChatAudienceSpace
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&spaces); err != nil {
 		slog.Error("failed to parse GOOGLE_CHAT_SPACES; Google Chat alerts will be unavailable", "err", err)
 		return nil
+	}
+	for i, s := range spaces {
+		if strings.TrimSpace(s.Audience) == "" {
+			slog.Error("GOOGLE_CHAT_SPACES entry has no audience and will be skipped", "index", i)
+		}
 	}
 	return spaces
 }

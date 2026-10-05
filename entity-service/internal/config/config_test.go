@@ -16,7 +16,12 @@
 
 package config
 
-import "testing"
+import (
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+)
 
 // baseValidConfig returns a minimally valid postgres-backed Config so each
 // test only needs to override the field(s) under test.
@@ -440,6 +445,87 @@ func TestParseInternalClientIDs(t *testing.T) {
 	}
 }
 
+// TestConfig_Validate_CSMPortalBackendClientIDAndDomainAllOrNothing pins the pairing
+// requirement: CSM_PORTAL_BACKEND_CLIENT_ID and CSM_PORTAL_USER_DOMAIN are only
+// meaningful together (ResolveScope's domain check needs both), so a
+// deployment setting only one almost certainly meant to set both.
+func TestConfig_Validate_CSMPortalBackendClientIDAndDomainAllOrNothing(t *testing.T) {
+	c := baseValidConfig()
+	c.CSMPortalBackendClientID = "csm-portal"
+	if err := c.Validate(); err == nil {
+		t.Error("CSMPortalBackendClientID with no CSMPortalUserDomain: want an error, got nil")
+	}
+
+	c = baseValidConfig()
+	c.CSMPortalUserDomain = "wso2.com"
+	if err := c.Validate(); err == nil {
+		t.Error("CSMPortalUserDomain with no CSMPortalBackendClientID: want an error, got nil")
+	}
+
+	c = baseValidConfig()
+	c.CSMPortalBackendClientID = "csm-portal"
+	c.CSMPortalUserDomain = "wso2.com"
+	if err := c.Validate(); err != nil {
+		t.Errorf("both set together: unexpected error: %v", err)
+	}
+}
+
+// TestConfig_Validate_RejectsSameClientIDForCSMAndCustomerPortal pins the
+// guard against the one config value that can't be resolved by ResolveScope's
+// own ordering: CSMPortalBackendClientID and CustomerPortalBackendClientID being equal would
+// mean a single client id is both "unrestricted given a matching domain" and
+// "never unrestricted, full stop" at once -- a copy-paste mistake, not a
+// valid deployment.
+func TestConfig_Validate_RejectsSameClientIDForCSMAndCustomerPortal(t *testing.T) {
+	c := baseValidConfig()
+	c.CSMPortalBackendClientID = "shared-id"
+	c.CSMPortalUserDomain = "wso2.com"
+	c.CustomerPortalBackendClientID = "shared-id"
+	if err := c.Validate(); err == nil {
+		t.Error("CSMPortalBackendClientID == CustomerPortalBackendClientID: want an error, got nil")
+	}
+}
+
+// TestConfig_Validate_DistinctCSMAndCustomerPortalBackendClientIDsAreValid guards
+// against the above check being too broad and rejecting the normal case.
+func TestConfig_Validate_DistinctCSMAndCustomerPortalBackendClientIDsAreValid(t *testing.T) {
+	c := baseValidConfig()
+	c.CSMPortalBackendClientID = "csm-portal"
+	c.CSMPortalUserDomain = "wso2.com"
+	c.CustomerPortalBackendClientID = "customer-portal"
+	if err := c.Validate(); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestLoad_CSMPortalUserDomain pins CSM_PORTAL_USER_DOMAIN's one bit of
+// normalization: a value typed with a leading "@" (an easy mistake, since
+// email addresses are usually written that way) is accepted the same as one
+// without, so isCSMPortalUserDomain's own "@"+domain suffix match is never
+// built from a doubled "@@".
+func TestLoad_CSMPortalUserDomain(t *testing.T) {
+	t.Setenv("CSM_PORTAL_USER_DOMAIN", "@wso2.com")
+	if got := Load().CSMPortalUserDomain; got != "wso2.com" {
+		t.Errorf("CSMPortalUserDomain = %q, want %q (leading @ stripped)", got, "wso2.com")
+	}
+
+	t.Setenv("CSM_PORTAL_USER_DOMAIN", "wso2.com")
+	if got := Load().CSMPortalUserDomain; got != "wso2.com" {
+		t.Errorf("CSMPortalUserDomain = %q, want %q (unchanged)", got, "wso2.com")
+	}
+}
+
+// TestLoad_M2MClientIDsFieldName guards against M2M_CLIENT_IDS silently
+// going unread after the AUTH_INTERNAL_CLIENT_IDS rename -- a stale env var
+// name here would leave every M2M caller unexpectedly unauthorized.
+func TestLoad_M2MClientIDsFieldName(t *testing.T) {
+	t.Setenv("M2M_CLIENT_IDS", "svc-a,svc-b")
+	got := Load().M2MClientIDs
+	if !got["svc-a"] || !got["svc-b"] || len(got) != 2 {
+		t.Errorf("M2MClientIDs = %v, want {svc-a, svc-b}", got)
+	}
+}
+
 // TestLoad_CSMMigrationPortalWritesEnabled pins the kill switch's parsing:
 // only the exact string "true" turns the portal membership writes on, so a
 // typo, a "1", or a "TRUE" leaves them off rather than half-enabling a write
@@ -489,10 +575,16 @@ func TestConfig_HasPortalMembershipWrites(t *testing.T) {
 	if c := complete(); !c.HasPortalMembershipWrites() {
 		t.Error("a complete configuration with the flag on must enable the writes")
 	}
+	// Dual-write serves memberships from Postgres too; ServiceNow gets them
+	// from Salesforce directly, so the writes run there as well.
+	dualWrite := complete()
+	dualWrite.DataSource = DataSourcePostgresServiceNowDualWrite
+	if !dualWrite.HasPortalMembershipWrites() {
+		t.Error("dual-write with the flag on must enable the writes")
+	}
 	for name, mod := range map[string]func(*Config){
 		"flag off":               func(c *Config) { c.CSMMigrationPortalWritesEnabled = false },
 		"servicenow data source": func(c *Config) { c.DataSource = DataSourceServiceNow },
-		"dual-write data source": func(c *Config) { c.DataSource = DataSourcePostgresServiceNowDualWrite },
 		"no sales entity base":   func(c *Config) { c.SalesEntityBaseURL = "" },
 		"no sales entity secret": func(c *Config) { c.SalesEntityClientSecret = "" },
 		"no sales entity at all": func(c *Config) {
@@ -526,5 +618,161 @@ func TestConfig_Validate_Auth(t *testing.T) {
 		if err := c.Validate(); err == nil {
 			t.Errorf("%s: want a startup error", name)
 		}
+	}
+}
+
+// TestConfig_Validate_EscalationGroupIDsOptional confirms every
+// Escalation*GroupID stays optional -- a completely unset set must still
+// validate, since not every deployment configures every tier on day one.
+func TestConfig_Validate_EscalationGroupIDsOptional(t *testing.T) {
+	c := baseValidConfig()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("unexpected error with every Escalation*GroupID unset: %v", err)
+	}
+}
+
+// TestConfig_Validate_EscalationGroupIDsMustBeUUIDsIfSet confirms a SET
+// Escalation*GroupID is checked for being a well-formed UUID -- a typo'd
+// group id would otherwise silently resolve zero recipients at request time
+// instead of failing loudly at startup.
+func TestConfig_Validate_EscalationGroupIDsMustBeUUIDsIfSet(t *testing.T) {
+	validID := "11111111-1111-1111-1111-111111111111"
+	c := baseValidConfig()
+	c.EscalationEL1AmericasTLGroupID = validID
+	if err := c.Validate(); err != nil {
+		t.Fatalf("a well-formed group id must not be rejected: %v", err)
+	}
+
+	c = baseValidConfig()
+	c.EscalationEL5CEOGroupID = "not-a-uuid"
+	if err := c.Validate(); err == nil {
+		t.Fatal("want a startup error for a malformed group id")
+	}
+}
+
+// TestConfig_PostgresAuthoritative: the onboarding features run wherever
+// PostgreSQL is the system of record, and nowhere else.
+func TestConfig_PostgresAuthoritative(t *testing.T) {
+	for ds, want := range map[DataSource]bool{
+		DataSourcePostgres:                    true,
+		DataSourcePostgresServiceNowDualWrite: true,
+		DataSourceServiceNow:                  false,
+		"":                                    false,
+	} {
+		c := Config{DataSource: ds}
+		if got := c.PostgresAuthoritative(); got != want {
+			t.Errorf("DataSource %q: PostgresAuthoritative() = %v, want %v", ds, got, want)
+		}
+	}
+}
+
+// TestLoad_SalesforceIngestRetryInterval pins the one interval that can be
+// switched off: unset is the 5m default, an explicit zero disables the retry
+// job, and a typo or a negative value costs the override, not the default.
+func TestLoad_SalesforceIngestRetryInterval(t *testing.T) {
+	for value, want := range map[string]time.Duration{
+		"": 5 * time.Minute, "0": 0, "0s": 0, "0m": 0, "2m": 2 * time.Minute, "90s": 90 * time.Second,
+		// Invalid values fail closed: disabled, not the default.
+		"bogus": 0, "off": 0, "-1m": 0,
+	} {
+		t.Setenv("SALESFORCE_INGEST_RETRY_INTERVAL", value)
+		if got := Load().SalesforceIngestRetryInterval; got != want {
+			t.Errorf("SALESFORCE_INGEST_RETRY_INTERVAL=%q -> %v, want %v", value, got, want)
+		}
+	}
+}
+
+func TestConfig_Validate_CustomerEngagementFirefightingTypeID(t *testing.T) {
+	c := baseValidConfig()
+	c.CSMMigrationCustomerEngagementIngestEnabled = true
+	if err := c.Validate(); err != nil {
+		t.Fatalf("an unset type id must not fail startup: %v", err)
+	}
+	c.CustomerEngagementFirefightingTypeID = "fc7f2d171b81f910d64e64a2604bcb9b"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	c.CustomerEngagementFirefightingTypeID = "not-a-sys-id"
+	if c.Validate() == nil {
+		t.Error("Validate() = nil for a malformed type id")
+	}
+	if !c.HasCustomerEngagementIngest() {
+		t.Error("HasCustomerEngagementIngest() = false on a Postgres config")
+	}
+	c.DataSource = DataSourceServiceNow
+	if c.HasCustomerEngagementIngest() {
+		t.Error("HasCustomerEngagementIngest() = true on a ServiceNow config")
+	}
+}
+
+// dsnSearchPath extracts the search_path value DSN embedded in its "options"
+// query parameter, so a test can assert on the schema alone rather than the
+// whole connection string.
+func dsnSearchPath(t *testing.T, dsn string) string {
+	t.Helper()
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse DSN %q: %v", dsn, err)
+	}
+	return strings.TrimPrefix(u.Query().Get("options"), "-c search_path=")
+}
+
+// TestConfig_DSN_SchemaFallsBackToDBUserPlusPublic pins DSN's search_path
+// behavior: an explicit DBSchema wins verbatim (no "public" appended — an
+// operator who set one is assumed to mean it), and an empty one falls back
+// to "DBUser,public" (no space — see DSN's own doc comment on why), Postgres'
+// own default search_path. "public"
+// must survive the fallback: entity-service's migrations create every table
+// unqualified, so every deployment's real tables live there, and an explicit
+// search_path replaces Postgres' own default rather than extending it — a
+// fallback of DBUser alone would make every one of those tables unresolvable.
+func TestConfig_DSN_SchemaFallsBackToDBUserPlusPublic(t *testing.T) {
+	base := baseValidConfig()
+	base.DBHost = "localhost"
+	base.DBPort = "5432"
+
+	t.Run("explicit schema wins, verbatim", func(t *testing.T) {
+		c := base
+		c.DBSchema = "csm"
+		if got := dsnSearchPath(t, c.DSN()); got != "csm" {
+			t.Errorf("search_path = %q, want %q", got, "csm")
+		}
+	})
+
+	t.Run("unset schema falls back to DBUser, public", func(t *testing.T) {
+		c := base
+		c.DBSchema = ""
+		want := c.DBUser + ",public"
+		if got := dsnSearchPath(t, c.DSN()); got != want {
+			t.Errorf("search_path = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("unset schema and unset DBUser falls back to public alone", func(t *testing.T) {
+		c := base
+		c.DBSchema = ""
+		c.DBUser = ""
+		if got := dsnSearchPath(t, c.DSN()); got != "public" {
+			t.Errorf("search_path = %q, want %q", got, "public")
+		}
+	})
+}
+
+func TestSREEventHubTopicMovesBothOperationsPublishers(t *testing.T) {
+	t.Setenv("CR_EVENT_HUB_TOPIC", "cr-events")
+	t.Setenv("OUTAGE_EVENT_HUB_TOPIC", "outage-events")
+
+	t.Setenv("SRE_EVENT_HUB_TOPIC", "")
+	if c := Load(); c.CREventHubTopic != "cr-events" || c.OutageEventHubTopic != "outage-events" {
+		t.Errorf("unset SRE topic changed the publishers: cr=%q outage=%q", c.CREventHubTopic, c.OutageEventHubTopic)
+	}
+
+	t.Setenv("SRE_EVENT_HUB_TOPIC", " sre-events ")
+	c := Load()
+	if c.CREventHubTopic != "sre-events" || c.OutageEventHubTopic != "sre-events" {
+		t.Errorf("SRE topic set: cr=%q outage=%q, want both sre-events", c.CREventHubTopic, c.OutageEventHubTopic)
+	}
+	if c.EventHubTopic == "sre-events" {
+		t.Error("the case-events topic must not move")
 	}
 }

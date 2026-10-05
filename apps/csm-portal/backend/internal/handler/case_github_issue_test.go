@@ -27,7 +27,6 @@ import (
 
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/entity"
-	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/githubissue"
 )
 
 type createIssueCall struct {
@@ -48,10 +47,6 @@ func (m *mockEngineeringClient) CreateGitIssue(_ context.Context, orgName, owner
 
 func TestCreateCaseGithubIssue_ViaEngineering(t *testing.T) {
 	const caseID = "11111111-1111-1111-1111-111111111111"
-	githubissue.SetActive([]githubissue.RepoOption{
-		{Value: "alpha", DisplayLabel: "Alpha", Owner: "example-org", Repo: "alpha-repo", GithubLabel: "Alpha"},
-	})
-	t.Cleanup(func() { githubissue.SetActive(nil) })
 
 	post := func(t *testing.T, h *CaseHandler, body string) *httptest.ResponseRecorder {
 		t.Helper()
@@ -62,6 +57,16 @@ func TestCreateCaseGithubIssue_ViaEngineering(t *testing.T) {
 		return w
 	}
 	newHandler := func(eng *mockEngineeringClient, entityClient *mockEntityCaseClient) *CaseHandler {
+		if entityClient.getCaseFn == nil {
+			entityClient.getCaseFn = func(context.Context, string) ([]byte, error) {
+				return []byte(`{"deployedProduct":{"product":{"name":"Alpha"}}}`), nil
+			}
+		}
+		if entityClient.getProductRepoMappingFn == nil {
+			entityClient.getProductRepoMappingFn = func(context.Context, string) ([]byte, error) {
+				return []byte(`{"productName":"Alpha","owner":"example-org","repository":"alpha-repo","githubLabel":"Alpha"}`), nil
+			}
+		}
 		return NewCaseHandler(entityClient).WithEngineeringClient(eng)
 	}
 	const base = `"title":"Crash on startup","description":"It fails.","repoOverride":{"owner":"example-org","repo":"alpha-repo"}`
@@ -88,8 +93,8 @@ func TestCreateCaseGithubIssue_ViaEngineering(t *testing.T) {
 		if c.orgName != "example-org" || c.owner != "example-org" || c.repo != "alpha-repo" || c.title != "Crash on startup" || c.body != "It fails." {
 			t.Errorf("call = %+v", c)
 		}
-		if !slices.Equal(c.labels, []string{"Alpha"}) {
-			t.Errorf("labels = %v, want the repo option's own label", c.labels)
+		if !slices.Equal(c.labels, []string{"Origin/CS", "Alpha"}) {
+			t.Errorf("labels = %v, want Origin/CS and the repo option's own label", c.labels)
 		}
 		type resp struct {
 			Message string `json:"message"`
@@ -105,38 +110,65 @@ func TestCreateCaseGithubIssue_ViaEngineering(t *testing.T) {
 		}
 	})
 
-	t.Run("the owner and repo match the catalogue case-insensitively", func(t *testing.T) {
+	t.Run("writes the issue URL back onto the case", func(t *testing.T) {
+		eng := &mockEngineeringClient{issue: entity.GitHubIssue{Number: 42}}
+		var note []byte
+		entityClient := &mockEntityCaseClient{
+			createCaseCommentFn: func(_ context.Context, id string, body []byte) ([]byte, error) {
+				if id != caseID {
+					t.Errorf("work note case = %s, want %s", id, caseID)
+				}
+				note = body
+				return []byte(`{}`), nil
+			},
+		}
+		w := post(t, newHandler(eng, entityClient), "{"+base+"}")
+		assertStatus(t, w, http.StatusCreated)
+		if !strings.Contains(string(note), `"type":"work_note"`) || !strings.Contains(string(note), "https://github.com/example-org/alpha-repo/issues/42") {
+			t.Errorf("work note = %s", note)
+		}
+	})
+
+	t.Run("files in the mapped repository and ignores repoOverride", func(t *testing.T) {
 		eng := &mockEngineeringClient{issue: entity.GitHubIssue{Number: 1}}
-		w := post(t, newHandler(eng, &mockEntityCaseClient{}), `{"title":"t","description":"d","repoOverride":{"owner":"EXAMPLE-ORG","repo":"Alpha-Repo"}}`)
+		w := post(t, newHandler(eng, &mockEntityCaseClient{}), `{"title":"t","description":"d","repoOverride":{"owner":"someone-else","repo":"not-the-mapped-repo"}}`)
 		assertStatus(t, w, http.StatusCreated)
 		if len(eng.calls) != 1 || eng.calls[0].owner != "example-org" || eng.calls[0].repo != "alpha-repo" {
-			t.Errorf("calls = %+v, want the catalogue's spelling", eng.calls)
+			t.Errorf("calls = %+v, want the mapping, not the request body", eng.calls)
 		}
 	})
 
 	t.Run("builds the body and labels from the optional fields", func(t *testing.T) {
 		eng := &mockEngineeringClient{issue: entity.GitHubIssue{Number: 1}}
-		w := post(t, newHandler(eng, &mockEntityCaseClient{}), "{"+base+`,"updateLevel":"U12","publicIssueUrl":"https://example.com/i/1","hotFixRequired":true,"regression":true,"issueTypeLabel":"Type/Incident","priorityLevel":"Priority/High"}`)
+		w := post(t, newHandler(eng, &mockEntityCaseClient{}), "{"+base+`,"updateLevel":"U12","publicIssueUrl":"https://example.com/i/1","hotFixRequired":true,"regression":true,"reason":"migration","onboardingInProgress":true,"issueTypeLabel":"Type/Discussion","priorityLevel":"Priority/High"}`)
 		assertStatus(t, w, http.StatusCreated)
 		c := eng.calls[0]
 		wantBody := "It fails.\n\nUpdate Level : U12\n\nPublic Issue : https://example.com/i/1\n\nHotfix Required : Yes"
 		if c.body != wantBody {
 			t.Errorf("body = %q, want %q", c.body, wantBody)
 		}
-		if want := []string{"Alpha", "Type/Incident", "Priority/High", "regression"}; !slices.Equal(c.labels, want) {
+		if want := []string{"Origin/CS", "U12", "Alpha", "Priority/High", "Require/Hotfix", "regression", "Affected/Migration", "Onboarding/affected"}; !slices.Equal(c.labels, want) {
 			t.Errorf("labels = %v, want %v", c.labels, want)
 		}
 	})
 
-	t.Run("a priority only applies to an incident, and labels are not duplicated", func(t *testing.T) {
+	t.Run("patch adds its labels and discussion is what carries priority", func(t *testing.T) {
 		eng := &mockEngineeringClient{issue: entity.GitHubIssue{Number: 1}}
 		post(t, newHandler(eng, &mockEntityCaseClient{}), "{"+base+`,"issueTypeLabel":"Type/Patch","priorityLevel":"Priority/High","regression":true}`)
-		post(t, newHandler(eng, &mockEntityCaseClient{}), "{"+base+`,"issueTypeLabel":"alpha"}`)
-		if want := []string{"Alpha", "Type/Patch", "regression"}; !slices.Equal(eng.calls[0].labels, want) {
+		post(t, newHandler(eng, &mockEntityCaseClient{}), "{"+base+`,"issueTypeLabel":"Type/Discussion","priorityLevel":"Priority/Critical"}`)
+		if want := []string{"Origin/CS", "Alpha", "Type/Patch", "patch", "regression"}; !slices.Equal(eng.calls[0].labels, want) {
 			t.Errorf("labels = %v, want %v", eng.calls[0].labels, want)
 		}
-		if want := []string{"Alpha"}; !slices.Equal(eng.calls[1].labels, want) {
-			t.Errorf("labels = %v, want %v (a repeat of the repo label, ignoring case, is dropped)", eng.calls[1].labels, want)
+		if want := []string{"Origin/CS", "Alpha", "Priority/Critical"}; !slices.Equal(eng.calls[1].labels, want) {
+			t.Errorf("labels = %v, want %v", eng.calls[1].labels, want)
+		}
+	})
+
+	t.Run("a priority string in the update level is not applied as a label", func(t *testing.T) {
+		eng := &mockEngineeringClient{issue: entity.GitHubIssue{Number: 1}}
+		post(t, newHandler(eng, &mockEntityCaseClient{}), "{"+base+`,"issueTypeLabel":"Type/Patch","updateLevel":"Priority/Critical"}`)
+		if want := []string{"Origin/CS", "Alpha", "Type/Patch", "patch"}; !slices.Equal(eng.calls[0].labels, want) {
+			t.Errorf("labels = %v, want %v", eng.calls[0].labels, want)
 		}
 	})
 
@@ -148,9 +180,6 @@ func TestCreateCaseGithubIssue_ViaEngineering(t *testing.T) {
 			{"missing title", `{"description":"d","repoOverride":{"owner":"example-org","repo":"alpha-repo"}}`, errMsgGitHubTitleInvalid},
 			{"blank title", `{"title":"   ","repoOverride":{"owner":"example-org","repo":"alpha-repo"}}`, errMsgGitHubTitleInvalid},
 			{"title too long", `{"title":"` + strings.Repeat("x", 257) + `","repoOverride":{"owner":"example-org","repo":"alpha-repo"}}`, errMsgGitHubTitleInvalid},
-			{"no target repository", `{"title":"t","description":"d"}`, errMsgGitHubRepoRequired},
-			{"blank owner", `{"title":"t","repoOverride":{"owner":" ","repo":"alpha-repo"}}`, errMsgGitHubRepoRequired},
-			{"repository outside the catalogue", `{"title":"t","repoOverride":{"owner":"example-org","repo":"other-repo"}}`, errMsgGitHubRepoNotAllowed},
 			{"description too long", `{"title":"t","description":"` + strings.Repeat("x", 65537) + `","repoOverride":{"owner":"example-org","repo":"alpha-repo"}}`, errMsgGitHubBodyTooLong},
 		}
 		for _, tc := range tests {
@@ -171,15 +200,34 @@ func TestCreateCaseGithubIssue_ViaEngineering(t *testing.T) {
 		}
 	})
 
-	t.Run("with no catalogue configured, every repository is rejected", func(t *testing.T) {
-		githubissue.SetActive(nil)
-		t.Cleanup(func() {
-			githubissue.SetActive([]githubissue.RepoOption{{Value: "alpha", Owner: "example-org", Repo: "alpha-repo", GithubLabel: "Alpha"}})
-		})
+	t.Run("a product with no mapping is not filed", func(t *testing.T) {
 		eng := &mockEngineeringClient{}
-		w := post(t, newHandler(eng, &mockEntityCaseClient{}), "{"+base+"}")
+		entityClient := &mockEntityCaseClient{
+			getProductRepoMappingFn: func(context.Context, string) ([]byte, error) {
+				return nil, &apierror.Error{StatusCode: http.StatusNotFound}
+			},
+		}
+		w := post(t, newHandler(eng, entityClient), "{"+base+"}")
 		assertStatus(t, w, http.StatusBadRequest)
-		assertErrorMessage(t, w, errMsgGitHubRepoNotAllowed)
+		assertErrorMessage(t, w, errMsgGitHubRepoNotMapped)
+		if len(eng.calls) != 0 {
+			t.Errorf("CreateGitIssue calls = %d, want 0", len(eng.calls))
+		}
+	})
+
+	t.Run("a case with no product is not filed", func(t *testing.T) {
+		eng := &mockEngineeringClient{}
+		entityClient := &mockEntityCaseClient{
+			getCaseFn: func(context.Context, string) ([]byte, error) {
+				return []byte(`{}`), nil
+			},
+		}
+		w := post(t, newHandler(eng, entityClient), "{"+base+"}")
+		assertStatus(t, w, http.StatusBadRequest)
+		assertErrorMessage(t, w, errMsgGitHubRepoNotMapped)
+		if len(eng.calls) != 0 {
+			t.Errorf("CreateGitIssue calls = %d, want 0", len(eng.calls))
+		}
 	})
 
 	t.Run("a case the caller cannot see is not filed against", func(t *testing.T) {

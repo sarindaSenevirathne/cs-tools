@@ -268,7 +268,7 @@ func (s *timeCardService) CreateTimeCard(ctx context.Context, req domain.CreateT
 	// only (snWriteback/snMirror are both nil otherwise -- see
 	// timeCardService's own doc comment). Postgres has already committed by
 	// this point. On success, the ServiceNow-side id this mirror creates is
-	// persisted back onto the Postgres row (migration 000088's
+	// persisted back onto the Postgres row (migration 0135's
 	// time_card.sn_sys_id) -- itself a second best-effort, asynchronous
 	// write: if it fails, the row simply has no id yet, the same "not yet
 	// mirrorable" state Update/DeleteTimeCard's mirrors already tolerate.

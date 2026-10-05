@@ -40,62 +40,84 @@ type Alert struct {
 	Source           string `json:"source"`
 	UniqueIdentifier string `json:"unique_identifier"`
 	Description      string `json:"description"`
+	// ReceivedAt is when ingestion stored the alert (alerts.created_at); dedup windows are measured on it, not on processing time, so a backlog still splits into correct incidents.
+	ReceivedAt time.Time `json:"-"`
 }
 
-// Incident dedups alerts by fingerprint; Severity is numeric (1=Critical..5=OK); db tags drive gocqlx binding.
+// EventTime is ReceivedAt, or now when the alert carries no arrival time.
+func (a Alert) EventTime() time.Time {
+	if a.ReceivedAt.IsZero() {
+		return time.Now().UTC()
+	}
+	return a.ReceivedAt.UTC()
+}
+
+// Incident is one generation of a fingerprint: it absorbs that fingerprint's alerts until dedupWindow after FirstSeen; db tags drive pgx.RowToStructByName.
 type Incident struct {
+	ID          int64  `json:"id" db:"id"`
 	Fingerprint string `json:"fingerprint" db:"fingerprint"`
 	// IncidentID is CSM's UUID for PATCH; empty until confirmed. IncidentNumber is the human-readable display id.
-	IncidentID     string   `json:"incident_id" db:"incident_id"`
-	IncidentNumber string   `json:"incident_number" db:"incident_number"`
-	Status         string   `json:"status" db:"status"`
-	Severity       int      `json:"severity" db:"severity"`
-	Impact         string   `json:"impact" db:"impact"`
-	Urgency        string   `json:"urgency" db:"urgency"`
-	Service        string   `json:"service" db:"service"`
-	MetricName     string   `json:"metric_name" db:"metric_name"`
-	Description    string   `json:"description" db:"description"`
-	Category       string   `json:"category" db:"category"`
-	Environment    string   `json:"environment" db:"environment"`
-	Source         string   `json:"source" db:"source"`
-	AlertIDs       []string `json:"alert_ids" db:"alert_ids"`
-	AlertCount     int      `json:"alert_count" db:"alert_count"`
-	WorkNotes      []string `json:"work_notes" db:"work_notes"`
-	// PendingNotes is the FIFO subset not yet confirmed by CSM; kept separate because WorkNotes is tail-trimmed.
-	PendingNotes []string  `json:"pending_notes" db:"pending_notes"`
-	FirstSeen    time.Time `json:"first_seen" db:"first_seen"`
-	LastSeen     time.Time `json:"last_seen" db:"last_seen"`
-	// StateCheckedAt throttles CSM refresh calls to avoid excessive round trips during alert storms.
+	IncidentID     string    `json:"incident_id" db:"incident_id"`
+	IncidentNumber string    `json:"incident_number" db:"incident_number"`
+	Status         string    `json:"status" db:"status"`
+	Severity       int       `json:"severity" db:"severity"`
+	Impact         string    `json:"impact" db:"impact"`
+	Urgency        string    `json:"urgency" db:"urgency"`
+	Service        string    `json:"service" db:"service"`
+	MetricName     string    `json:"metric_name" db:"metric_name"`
+	Category       string    `json:"category" db:"category"`
+	Environment    string    `json:"environment" db:"environment"`
+	Source         string    `json:"source" db:"source"`
+	AlertCount     int       `json:"alert_count" db:"alert_count"`
+	FirstSeen      time.Time `json:"first_seen" db:"first_seen"`
+	LastSeen       time.Time `json:"last_seen" db:"last_seen"`
+	// StateCheckedAt throttles CSM status refreshes to one per state_check_interval.
 	StateCheckedAt time.Time `json:"state_checked_at" db:"state_checked_at"`
 	// Fallback and CSMConfirmed are independent delivery obligations tracked separately.
-	Fallback     bool `json:"fallback" db:"fallback"`
-	CSMConfirmed bool `json:"csm_confirmed" db:"csm_confirmed"`
-	// CSMAttempts and CSMPermanentlyFailed track retry limits to prevent permanently-rejected payloads from being rescanned.
-	CSMAttempts          int  `json:"csm_attempts" db:"csm_attempts"`
-	CSMPermanentlyFailed bool `json:"csm_permanently_failed" db:"csm_permanently_failed"`
-	// CSMLastAttemptAt backs CSMRetryDue's exponential backoff, so RetrySweep doesn't hit CSM every sweep during an outage.
-	CSMLastAttemptAt time.Time `json:"csm_last_attempt_at" db:"csm_last_attempt_at"`
+	Fallback             bool      `json:"fallback" db:"fallback"`
+	CSMConfirmed         bool      `json:"csm_confirmed" db:"csm_confirmed"`
+	CSMAttempts          int       `json:"csm_attempts" db:"csm_attempts"`
+	CSMPermanentlyFailed bool      `json:"csm_permanently_failed" db:"csm_permanently_failed"`
+	CSMLastAttemptAt     time.Time `json:"csm_last_attempt_at" db:"csm_last_attempt_at"`
+	// CreatedAt is when the row was inserted (database clock); the Chat fallback grace period counts from it, not from FirstSeen, so a backlog still gives CSM its grace.
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+	// FoldVersion bumps on every fold, so delivery can tell new notes arrived while it ran.
+	FoldVersion int64 `json:"-" db:"fold_version"`
 }
 
-// CSMRetryDue reports whether enough time has passed since the last CSM attempt to try again,
-// growing the wait exponentially (base, base*mult, base*mult^2, ...) capped at maxDelay, so a
-// prolonged CSM outage doesn't get hit every sweep interval forever.
+// Note kinds recorded in incident_notes.
+const (
+	NoteCreated   = "created"
+	NoteDuplicate = "duplicate"
+	NoteOK        = "ok"
+)
+
+// Note is one alert folded into an incident; ID is zero until stored.
+type Note struct {
+	ID          int64  `db:"id"`
+	AlertID     string `db:"alert_id"`
+	Kind        string `db:"kind"`
+	Text        string `db:"note"`
+	CSMPending  bool   `db:"csm_pending"`
+	ChatPending bool   `db:"chat_pending"`
+}
+
+// CSMRetryDue reports whether enough time has passed since the last CSM attempt, growing the wait exponentially (base, base*mult, ...) capped at maxDelay.
 func (i Incident) CSMRetryDue(now time.Time, base time.Duration, multiplier float64, maxDelay time.Duration) bool {
+	return !now.Before(i.NextCSMRetry(base, multiplier, maxDelay))
+}
+
+// NextCSMRetry is when CSMRetryDue next becomes true.
+func (i Incident) NextCSMRetry(base time.Duration, multiplier float64, maxDelay time.Duration) time.Time {
 	if i.CSMAttempts == 0 {
-		return true // never attempted yet
+		return time.Time{}
 	}
 	delay := time.Duration(float64(base) * math.Pow(multiplier, float64(i.CSMAttempts-1)))
-	if delay > maxDelay {
-		delay = maxDelay
-	}
-	return now.Sub(i.CSMLastAttemptAt) >= delay
+	return i.CSMLastAttemptAt.Add(min(delay, maxDelay))
 }
 
-// IsOpen reports open status; false if permanently-failed, older than dedupWindow, or CSM-confirmed as closed.
+// IsOpen reports whether an alert at now still folds into this incident: within dedupWindow of FirstSeen and not closed on CSM.
 func (i Incident) IsOpen(now time.Time, dedupWindow time.Duration) bool {
-	if i.CSMPermanentlyFailed {
-		return false
-	}
 	if now.Sub(i.FirstSeen) >= dedupWindow {
 		return false
 	}
@@ -188,13 +210,31 @@ func ImpactUrgency(severityNum int) (impact, urgency string) {
 	}
 }
 
-// BuildWorkNote formats a work note as HTML, referencing the alert by id rather than instance URL.
-// The workNotes field is HTML-sourced, so plain "\n" newlines render as a single unbroken line.
+// BuildWorkNote formats a work note as HTML (referencing the alert by id), since workNotes is HTML-sourced and plain "\n" would render as one unbroken line.
 func BuildWorkNote(kind, alertID, metricName, source string) string {
 	metricName = firstNonEmpty(metricName, "N/A")
 	source = firstNonEmpty(source, "N/A")
 	return fmt.Sprintf("%s alert received.<br>Alert: %s<br>Metric: %s<br>Source: %s",
 		html.EscapeString(kind), html.EscapeString(alertID), html.EscapeString(metricName), html.EscapeString(source))
+}
+
+// BuildChatDigest summarises the Duplicate/OK alerts folded since the last Chat reply, so a storm costs one Chat message per delivery sweep instead of one per alert.
+func BuildChatDigest(duplicates, oks int, metricName, source string) string {
+	metricName = firstNonEmpty(metricName, "N/A")
+	source = firstNonEmpty(source, "N/A")
+	var lines []string
+	if duplicates == 1 {
+		lines = append(lines, "<b>Duplicate alert received.</b>")
+	} else if duplicates > 1 {
+		lines = append(lines, fmt.Sprintf("<b>%d duplicate alerts received.</b>", duplicates))
+	}
+	if oks == 1 {
+		lines = append(lines, "<b>OK alert received.</b>")
+	} else if oks > 1 {
+		lines = append(lines, fmt.Sprintf("<b>%d OK alerts received.</b>", oks))
+	}
+	lines = append(lines, "Metric: "+html.EscapeString(metricName), "Source: "+html.EscapeString(source))
+	return strings.Join(lines, "<br>")
 }
 
 // kv preserves field order in HTML tables (Go map iteration is random).
@@ -255,7 +295,7 @@ func fieldsToHTMLTable(fields []kv) string {
 	return b.String()
 }
 
-// BuildCreationNote formats the initial CSM note with alert traceability and HTML table.
+// BuildCreationNote formats the work note sent with CSM's CreateIncident, with alert traceability and an HTML table.
 func BuildCreationNote(alertID string, a Alert) string {
 	fields := []kv{
 		{"service", a.Service},

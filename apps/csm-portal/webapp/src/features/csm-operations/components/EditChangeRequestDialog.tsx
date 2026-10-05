@@ -19,6 +19,7 @@ import {
   Alert,
   Box,
   Button,
+  Checkbox,
   DatePickers,
   Dialog,
   DialogActions,
@@ -28,6 +29,7 @@ import {
   FormHelperText,
   Switch,
   TextField,
+  Tooltip,
   Typography,
 } from "@wso2/oxygen-ui";
 import { useCallback, useMemo, useState, type JSX } from "react";
@@ -42,11 +44,18 @@ import type {
 import AsyncEntitySelect from "@components/AsyncEntitySelect";
 import Editor from "@components/rich-text-editor/Editor";
 import {
+  backendUtcToZonedInput,
   formatDateTimeLocal,
-  isPastDateTime,
+  isPastZonedInput,
   parseDateTimeLocal,
+  zonedInputToBackendUtc,
 } from "@utils/dateTime";
 import { isBlankHtml, sanitizeRichTextHtml } from "@utils/sanitizeHtml";
+import { userLabel } from "@features/csm-operations/utils/incidentFormOptions";
+import {
+  customerApprovalLockedReason,
+  customerReviewLockedReason,
+} from "@features/csm-operations/utils/changeRequests";
 
 const { DateTimePicker, LocalizationProvider } = DatePickers;
 
@@ -64,26 +73,6 @@ interface EditChangeRequestDialogProps {
   onClose: () => void;
   /** Submit only the changed fields (`PATCH /change-requests/{id}`). */
   onSave: (patch: BePatchChangeRequestPayload) => void;
-}
-
-/**
- * Convert a backend timestamp (`YYYY-MM-DD HH:MM:SS`, or ISO `T`-separated) to
- * the `YYYY-MM-DDTHH:MM` shape this form's state (and the DateTimePicker via
- * {@link parseDateTimeLocal}) uses. The value is treated as plain wall-clock
- * text so no timezone shift is applied.
- */
-function toDateTimeLocal(raw?: string | null): string {
-  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/.exec(raw?.trim() ?? "");
-  return m ? `${m[1]}T${m[2]}` : "";
-}
-
-/** Convert a `datetime-local` value back to the BE's `YYYY-MM-DD HH:MM:SS`. */
-function toBackendDateTime(local: string): string {
-  return `${local.replace("T", " ")}:00`;
-}
-
-function userLabel(u: BeUser): string {
-  return [u.firstName, u.lastName].filter(Boolean).join(" ").trim() || u.email || u.id || "";
 }
 
 /** One long-form plan field, edited as rich text. */
@@ -199,11 +188,11 @@ export default function EditChangeRequestDialog({
   onSave,
 }: EditChangeRequestDialogProps): JSX.Element {
   const initialPlannedStart = useMemo(
-    () => toDateTimeLocal(cr.plannedStartOn),
+    () => backendUtcToZonedInput(cr.plannedStartOn),
     [cr.plannedStartOn],
   );
   const initialPlannedEnd = useMemo(
-    () => toDateTimeLocal(cr.plannedEndOn),
+    () => backendUtcToZonedInput(cr.plannedEndOn),
     [cr.plannedEndOn],
   );
   const initialAssignedTeamId = cr.assignedTeam?.id ?? "";
@@ -212,6 +201,12 @@ export default function EditChangeRequestDialog({
   const initialRequestedById = cr.requestedBy?.id ?? "";
   const initialRollbackDurationText = cr.rollbackDurationText ?? "";
   const initialIsPlanningVisibleToCustomers = cr.isPlanningVisibleToCustomers ?? false;
+  const initialCustomerApprovalRequired = cr.customerApprovalRequired ?? false;
+  const initialCustomerReviewRequired = cr.customerReviewRequired ?? false;
+  // Once the gate a checkbox controls has passed the backend refuses the edit
+  // (400), so the control is disabled up front with the reason.
+  const customerApprovalLocked = customerApprovalLockedReason(cr.state);
+  const customerReviewLocked = customerReviewLockedReason(cr.state);
   const [plannedStart, setPlannedStart] = useState(initialPlannedStart);
   const [plannedEnd, setPlannedEnd] = useState(initialPlannedEnd);
   const [assignedTeamId, setAssignedTeamId] = useState(initialAssignedTeamId);
@@ -221,6 +216,12 @@ export default function EditChangeRequestDialog({
   const [rollbackDurationText, setRollbackDurationText] = useState(initialRollbackDurationText);
   const [isPlanningVisibleToCustomers, setIsPlanningVisibleToCustomers] = useState(
     initialIsPlanningVisibleToCustomers,
+  );
+  const [customerApprovalRequired, setCustomerApprovalRequired] = useState(
+    initialCustomerApprovalRequired,
+  );
+  const [customerReviewRequired, setCustomerReviewRequired] = useState(
+    initialCustomerReviewRequired,
   );
   const rollbackPlan = useRichTextPlanField(cr.rollbackPlan);
   const testPlan = useRichTextPlanField(cr.testPlan);
@@ -239,11 +240,15 @@ export default function EditChangeRequestDialog({
 
   const patch = useMemo<BePatchChangeRequestPayload>(() => {
     const next: BePatchChangeRequestPayload = {};
+    // The form holds wall-clock values in the user's timezone (seeded from the
+    // record's UTC value above); the BE takes UTC.
     if (plannedStart !== initialPlannedStart && plannedStart) {
-      next.plannedStartOn = toBackendDateTime(plannedStart);
+      const utc = zonedInputToBackendUtc(plannedStart);
+      if (utc) next.plannedStartOn = utc;
     }
     if (plannedEnd !== initialPlannedEnd && plannedEnd) {
-      next.plannedEndOn = toBackendDateTime(plannedEnd);
+      const utc = zonedInputToBackendUtc(plannedEnd);
+      if (utc) next.plannedEndOn = utc;
     }
     if (assignedTeamId !== initialAssignedTeamId && assignedTeamId) {
       next.assignedTeamId = assignedTeamId;
@@ -271,6 +276,12 @@ export default function EditChangeRequestDialog({
     }
     if (isPlanningVisibleToCustomers !== initialIsPlanningVisibleToCustomers) {
       next.isPlanningVisibleToCustomers = isPlanningVisibleToCustomers;
+    }
+    if (!customerApprovalLocked && customerApprovalRequired !== initialCustomerApprovalRequired) {
+      next.customerApprovalRequired = customerApprovalRequired;
+    }
+    if (!customerReviewLocked && customerReviewRequired !== initialCustomerReviewRequired) {
+      next.customerReviewRequired = customerReviewRequired;
     }
     return next;
   }, [
@@ -300,13 +311,19 @@ export default function EditChangeRequestDialog({
     initialRequestedById,
     isPlanningVisibleToCustomers,
     initialIsPlanningVisibleToCustomers,
+    customerApprovalRequired,
+    initialCustomerApprovalRequired,
+    customerApprovalLocked,
+    customerReviewRequired,
+    initialCustomerReviewRequired,
+    customerReviewLocked,
   ]);
 
   const hasChanges = Object.keys(patch).length > 0;
   // Non-blocking: editing a CR's planned start to a past instant is unusual
   // but not forbidden (e.g. recording when it actually started), so this
   // only warns.
-  const plannedStartIsPast = isPastDateTime(startDate);
+  const plannedStartIsPast = isPastZonedInput(plannedStart);
 
   // Rich-text plan field. The editor takes no `id`/native label, so the
   // visible label is a separate Typography tied to the control via
@@ -340,6 +357,51 @@ export default function EditChangeRequestDialog({
       <FormHelperText id={`${id}-help`}>{helperText}</FormHelperText>
     </Box>
   );
+
+  // One of the two customer-step checkboxes. When locked it is disabled and
+  // the lock reason replaces the helper line (which the input references via
+  // aria-describedby, so assistive tech announces it) and also rides on a
+  // tooltip for pointer users.
+  const renderCustomerStepCheckbox = (
+    id: string,
+    label: string,
+    helperText: string,
+    checked: boolean,
+    onChange: (next: boolean) => void,
+    lockedReason: string | null,
+  ): JSX.Element => {
+    const control = (
+      <FormControlLabel
+        sx={{ alignItems: "flex-start", m: 0 }}
+        disabled={isSaving || !!lockedReason}
+        control={
+          <Checkbox
+            size="small"
+            checked={checked}
+            onChange={(e) => onChange(e.target.checked)}
+            inputProps={{ "aria-label": label, "aria-describedby": `${id}-desc` }}
+          />
+        }
+        label={
+          <Box>
+            <Typography variant="body1">{label}</Typography>
+            <Typography id={`${id}-desc`} variant="body2" color="text.secondary">
+              {lockedReason ?? helperText}
+            </Typography>
+          </Box>
+        }
+      />
+    );
+    return lockedReason ? (
+      <Tooltip title={lockedReason}>
+        <Box component="span" sx={{ display: "block" }}>
+          {control}
+        </Box>
+      </Tooltip>
+    ) : (
+      control
+    );
+  };
 
   return (
     <Dialog open onClose={onClose} maxWidth="sm" fullWidth>
@@ -413,7 +475,7 @@ export default function EditChangeRequestDialog({
             getId={(g) => g.id}
             getLabel={(g) => g.name}
             knownLabel={cr.assignedTeam?.name}
-            helperText="Required before approval can be requested."
+            helperText="Required before moving to Assess — its members become the Assess-stage approvers."
           />
           <AsyncEntitySelect<BeUser>
             id="cr-edit-assigned-engineer"
@@ -451,6 +513,22 @@ export default function EditChangeRequestDialog({
             getLabel={(g) => g.name}
             knownLabel={cr.customerGroup?.name}
           />
+          {renderCustomerStepCheckbox(
+            "cr-edit-customer-approval",
+            "Customer Approval",
+            "Adds a customer approval step after internal approval, before scheduling.",
+            customerApprovalRequired,
+            setCustomerApprovalRequired,
+            customerApprovalLocked,
+          )}
+          {renderCustomerStepCheckbox(
+            "cr-edit-customer-review",
+            "Customer Review",
+            "Adds a customer review step after Review, before closing.",
+            customerReviewRequired,
+            setCustomerReviewRequired,
+            customerReviewLocked,
+          )}
           <TextField
             label="Rollback duration"
             value={rollbackDurationText}

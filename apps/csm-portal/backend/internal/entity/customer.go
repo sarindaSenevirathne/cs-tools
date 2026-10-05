@@ -35,6 +35,15 @@ func (c *CustomerEntityClient) SearchCases(ctx context.Context, body []byte) ([]
 	return c.do(ctx, http.MethodPost, "/cases/search", body)
 }
 
+// SearchAnnouncementRegistryCases calls POST /announcements/registry/cases on
+// the entity service: every announcement case matching the filters in one
+// response (the registry groups the whole set, so paging /cases/search 50 rows
+// at a time cost about 100 slow requests). Entity services that predate the
+// route answer 404; callers fall back to paging /cases/search.
+func (c *CustomerEntityClient) SearchAnnouncementRegistryCases(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/announcements/registry/cases", body)
+}
+
 // AggregateCases calls POST /cases/aggregate on the entity service: a
 // server-side aggregation of cases by a single field (e.g. account, state),
 // capped to the top maxGroups buckets with the remainder folded into
@@ -64,6 +73,11 @@ func (c *CustomerEntityClient) AggregateFeedback(ctx context.Context, body []byt
 // Response is returned as raw JSON; typed response structs are deferred.
 func (c *CustomerEntityClient) GetCase(ctx context.Context, caseID string) ([]byte, error) {
 	return c.do(ctx, http.MethodGet, fmt.Sprintf("/cases/%s", url.PathEscape(caseID)), nil)
+}
+
+// GetProductRepoMapping calls GET /products/github-repo?name= on the entity service.
+func (c *CustomerEntityClient) GetProductRepoMapping(ctx context.Context, name string) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, "/products/github-repo?name="+url.QueryEscape(name), nil)
 }
 
 // PatchCase calls PATCH /cases/{id} on the entity service to update case state.
@@ -96,6 +110,12 @@ func (c *CustomerEntityClient) SearchCaseEscalations(ctx context.Context, caseID
 // as raw JSON; typed response structs are deferred.
 func (c *CustomerEntityClient) CreateCaseEscalation(ctx context.Context, caseID string, body []byte) ([]byte, error) {
 	return c.do(ctx, http.MethodPost, fmt.Sprintf("/cases/%s/escalations", url.PathEscape(caseID)), body)
+}
+
+// GetTeamMembers calls GET /teams/{id}/members on the entity service.
+// Response is returned as raw JSON; typed response structs are deferred.
+func (c *CustomerEntityClient) GetTeamMembers(ctx context.Context, teamID string) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, fmt.Sprintf("/teams/%s/members", url.PathEscape(teamID)), nil)
 }
 
 // SearchCaseActivities calls POST /cases/{id}/activities/search on the entity service.
@@ -166,6 +186,16 @@ func (c *CustomerEntityClient) CreateUser(ctx context.Context, body []byte) ([]b
 func (c *CustomerEntityClient) GetProjectContact(ctx context.Context, projectID, contactID string) ([]byte, error) {
 	return c.do(ctx, http.MethodGet, fmt.Sprintf("/projects/%s/contacts/%s",
 		url.PathEscape(projectID), url.PathEscape(contactID)), nil)
+}
+
+// ResendProjectContactInvitation calls
+// POST /projects/{id}/contacts/{email}/resend-invitation on the entity
+// service, sending a fresh invitation email to a project contact. No
+// request body; entity service returns 204 No Content on success, so the
+// []byte result is always empty -- callers care only about the error.
+func (c *CustomerEntityClient) ResendProjectContactInvitation(ctx context.Context, projectID, email string) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, fmt.Sprintf("/projects/%s/contacts/%s/resend-invitation",
+		url.PathEscape(projectID), url.PathEscape(email)), nil)
 }
 
 // GetUser calls GET /users/{id} on the entity service.
@@ -383,6 +413,48 @@ func (c *CustomerEntityClient) PatchDeployedProduct(ctx context.Context, deploye
 	return c.do(ctx, http.MethodPatch, fmt.Sprintf("/deployed-products/%s", url.PathEscape(deployedProductID)), body)
 }
 
+// SearchDeployedProductMetrics calls POST /deployed-products/{id}/metrics/search on the entity service.
+// Response is returned as raw JSON; field filtering to the portal shape is deferred.
+func (c *CustomerEntityClient) SearchDeployedProductMetrics(ctx context.Context, deployedProductID string, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, fmt.Sprintf("/deployed-products/%s/metrics/search", url.PathEscape(deployedProductID)), body)
+}
+
+// SearchDeployedProductUsageCounts calls POST /deployed-products/{id}/metrics/usage-counts/search on the entity service.
+// Response is returned as raw JSON; field filtering to the portal shape is deferred.
+func (c *CustomerEntityClient) SearchDeployedProductUsageCounts(ctx context.Context, deployedProductID string, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, fmt.Sprintf("/deployed-products/%s/metrics/usage-counts/search", url.PathEscape(deployedProductID)), body)
+}
+
+// SearchInstances calls POST /instances/search on the entity service.
+// Response is returned as raw JSON; field filtering to the portal shape is deferred.
+func (c *CustomerEntityClient) SearchInstances(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/instances/search", body)
+}
+
+// SearchInstanceMetrics calls POST /instances/metrics/search on the entity service.
+// Response is returned as raw JSON; field filtering to the portal shape is deferred.
+func (c *CustomerEntityClient) SearchInstanceMetrics(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/instances/metrics/search", body)
+}
+
+// SearchInstanceMetricsStats calls POST /instances/metrics/stats/search on the entity service.
+// Response is returned as raw JSON; field filtering to the portal shape is deferred.
+func (c *CustomerEntityClient) SearchInstanceMetricsStats(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/instances/metrics/stats/search", body)
+}
+
+// SearchInstanceUsage calls POST /instances/usages/search on the entity service.
+// Response is returned as raw JSON; field filtering to the portal shape is deferred.
+func (c *CustomerEntityClient) SearchInstanceUsage(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/instances/usages/search", body)
+}
+
+// SearchInstanceUsageStats calls POST /instances/usages/stats/search on the entity service.
+// Response is returned as raw JSON; field filtering to the portal shape is deferred.
+func (c *CustomerEntityClient) SearchInstanceUsageStats(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/instances/usages/stats/search", body)
+}
+
 // SearchChangeRequests calls POST /change-requests/search on the entity service.
 // Response is returned as raw JSON; typed response structs are deferred.
 func (c *CustomerEntityClient) SearchChangeRequests(ctx context.Context, body []byte) ([]byte, error) {
@@ -581,6 +653,35 @@ func (c *CustomerEntityClient) SearchGroups(ctx context.Context, body []byte) ([
 	return c.do(ctx, http.MethodPost, "/groups/search", body)
 }
 
+// GetScheduleCatalogue calls GET /team-schedule/catalogue on the entity service.
+// The Team Schedule zones, windows and absence kinds, in one payload: a client
+// needs all three to draw a single day. Response is returned as raw JSON.
+func (c *CustomerEntityClient) GetScheduleCatalogue(ctx context.Context) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, "/team-schedule/catalogue", nil)
+}
+
+// SearchScheduleAssignments calls POST /team-schedule/assignments/search on the
+// entity service. Response is returned as raw JSON.
+func (c *CustomerEntityClient) SearchScheduleAssignments(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/team-schedule/assignments/search", body)
+}
+
+// SearchScheduleAbsences calls POST /team-schedule/absences/search on the entity
+// service. Response is returned as raw JSON.
+func (c *CustomerEntityClient) SearchScheduleAbsences(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/team-schedule/absences/search", body)
+}
+
+// GetScheduleOnDuty calls GET /team-schedule/on-duty on the entity service, passing
+// the optional `at` instant through unchanged. Response is raw JSON.
+func (c *CustomerEntityClient) GetScheduleOnDuty(ctx context.Context, at string) ([]byte, error) {
+	path := "/team-schedule/on-duty"
+	if at != "" {
+		path += "?at=" + url.QueryEscape(at)
+	}
+	return c.do(ctx, http.MethodGet, path, nil)
+}
+
 // SearchConfigurationItems calls POST /configuration-items/search on the entity service.
 // Response is returned as raw JSON.
 func (c *CustomerEntityClient) SearchConfigurationItems(ctx context.Context, body []byte) ([]byte, error) {
@@ -680,6 +781,103 @@ func (c *CustomerEntityClient) RemoveCaseTag(ctx context.Context, caseID, tagID 
 // The request body is forwarded verbatim; the response is returned as raw JSON.
 func (c *CustomerEntityClient) SearchTags(ctx context.Context, body []byte) ([]byte, error) {
 	return c.do(ctx, http.MethodPost, "/tags/search", body)
+}
+
+// CreateKBArticle calls POST /kb-articles on the entity service.
+// Response is returned as raw JSON; typed response structs are deferred.
+func (c *CustomerEntityClient) CreateKBArticle(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/kb-articles", body)
+}
+
+// GetKBArticle calls GET /kb-articles/{id} on the entity service.
+// Response is returned as raw JSON; typed response structs are deferred.
+func (c *CustomerEntityClient) GetKBArticle(ctx context.Context, id string) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, fmt.Sprintf("/kb-articles/%s", url.PathEscape(id)), nil)
+}
+
+// SearchKBArticles calls POST /kb-articles/search on the entity service.
+// Response is returned as raw JSON; typed response structs are deferred.
+func (c *CustomerEntityClient) SearchKBArticles(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/kb-articles/search", body)
+}
+
+// PatchKBArticleState calls PATCH /kb-articles/{id}/state on the entity service.
+// Response is returned as raw JSON; typed response structs are deferred.
+func (c *CustomerEntityClient) PatchKBArticleState(ctx context.Context, id string, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPatch, fmt.Sprintf("/kb-articles/%s/state", url.PathEscape(id)), body)
+}
+
+// SearchKBManagerUsers calls POST /kb-manager-users/search on the entity service.
+func (c *CustomerEntityClient) SearchKBManagerUsers(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/kb-manager-users/search", body)
+}
+
+// SearchKBManagerGroups calls POST /kb-manager-groups/search on the entity service.
+func (c *CustomerEntityClient) SearchKBManagerGroups(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/kb-manager-groups/search", body)
+}
+
+// PatchKBArticleContent calls PATCH /kb-articles/{id} on the entity service.
+func (c *CustomerEntityClient) PatchKBArticleContent(ctx context.Context, id string, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPatch, fmt.Sprintf("/kb-articles/%s", url.PathEscape(id)), body)
+}
+
+// ListKnowledgeBases calls GET /knowledge-bases on the entity service.
+func (c *CustomerEntityClient) ListKnowledgeBases(ctx context.Context) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, "/knowledge-bases", nil)
+}
+
+// DeleteKBArticle calls DELETE /kb-articles/{id} on the entity service.
+func (c *CustomerEntityClient) DeleteKBArticle(ctx context.Context, id string) error {
+	_, err := c.do(ctx, http.MethodDelete, fmt.Sprintf("/kb-articles/%s", url.PathEscape(id)), nil)
+	return err
+}
+
+// ListKBArticleHistory calls GET /kb-articles/{id}/history on the entity service.
+func (c *CustomerEntityClient) ListKBArticleHistory(ctx context.Context, id string) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, fmt.Sprintf("/kb-articles/%s/history", url.PathEscape(id)), nil)
+}
+
+// GetUsersByIDs calls POST /users/by-ids on the entity service.
+func (c *CustomerEntityClient) GetUsersByIDs(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/users/by-ids", body)
+}
+
+// CreateKnowledgeBase calls POST /knowledge-bases on the entity service.
+func (c *CustomerEntityClient) CreateKnowledgeBase(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/knowledge-bases", body)
+}
+
+// UpdateKnowledgeBaseName calls PATCH /knowledge-bases/{id} on the entity service.
+func (c *CustomerEntityClient) UpdateKnowledgeBaseName(ctx context.Context, id string, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPatch, fmt.Sprintf("/knowledge-bases/%s", url.PathEscape(id)), body)
+}
+
+// SetKnowledgeBaseActive calls PATCH /knowledge-bases/{id}/active on the entity service.
+func (c *CustomerEntityClient) SetKnowledgeBaseActive(ctx context.Context, id string, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPatch, fmt.Sprintf("/knowledge-bases/%s/active", url.PathEscape(id)), body)
+}
+
+// CreateKBManagerUser calls POST /kb-manager-users on the entity service.
+func (c *CustomerEntityClient) CreateKBManagerUser(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/kb-manager-users", body)
+}
+
+// DeleteKBManagerUser calls DELETE /kb-manager-users on the entity service.
+func (c *CustomerEntityClient) DeleteKBManagerUser(ctx context.Context, body []byte) error {
+	_, err := c.do(ctx, http.MethodDelete, "/kb-manager-users", body)
+	return err
+}
+
+// CreateKBManagerGroup calls POST /kb-manager-groups on the entity service.
+func (c *CustomerEntityClient) CreateKBManagerGroup(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/kb-manager-groups", body)
+}
+
+// DeleteKBManagerGroup calls DELETE /kb-manager-groups on the entity service.
+func (c *CustomerEntityClient) DeleteKBManagerGroup(ctx context.Context, body []byte) error {
+	_, err := c.do(ctx, http.MethodDelete, "/kb-manager-groups", body)
+	return err
 }
 
 // GetAlert calls GET /alerts/{id} on the entity service.
@@ -812,4 +1010,81 @@ func (c *CustomerEntityClient) RecordAnnouncementRequestDeliveries(ctx context.C
 // Response is returned as raw JSON; typed response structs are deferred.
 func (c *CustomerEntityClient) ListAnnouncementRequestDeliveries(ctx context.Context, id string) ([]byte, error) {
 	return c.do(ctx, http.MethodGet, fmt.Sprintf("/announcement-requests/%s/deliveries", url.PathEscape(id)), nil)
+}
+
+// CreateScheduleAssignment calls POST /team-schedule/assignments on the entity
+// service. Lead edit; the entity service enforces that the caller leads the team.
+func (c *CustomerEntityClient) CreateScheduleAssignment(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/team-schedule/assignments", body)
+}
+
+// UpdateScheduleAssignment calls PATCH /team-schedule/assignments/{id}.
+func (c *CustomerEntityClient) UpdateScheduleAssignment(ctx context.Context, id string, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPatch, "/team-schedule/assignments/"+url.PathEscape(id), body)
+}
+
+// DeleteScheduleAssignment calls DELETE /team-schedule/assignments/{id}, passing
+// the optional note through unchanged.
+func (c *CustomerEntityClient) DeleteScheduleAssignment(ctx context.Context, id, note string) ([]byte, error) {
+	path := "/team-schedule/assignments/" + url.PathEscape(id)
+	if note != "" {
+		path += "?note=" + url.QueryEscape(note)
+	}
+	return c.do(ctx, http.MethodDelete, path, nil)
+}
+
+// GetScheduleActivity calls GET /team-schedule/activity for one team and window.
+func (c *CustomerEntityClient) GetScheduleActivity(ctx context.Context, teamKey, from, to string) ([]byte, error) {
+	q := url.Values{}
+	q.Set("teamKey", teamKey)
+	q.Set("from", from)
+	q.Set("to", to)
+	return c.do(ctx, http.MethodGet, "/team-schedule/activity?"+q.Encode(), nil)
+}
+
+// GetMyLeadTeams calls GET /team-schedule/my-lead-teams on the entity service.
+func (c *CustomerEntityClient) GetMyLeadTeams(ctx context.Context) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, "/team-schedule/my-lead-teams", nil)
+}
+
+// ApplyScheduleRange calls POST /team-schedule/assignments/apply on the entity
+// service -- how the roster's picker edits a span of days in one call.
+func (c *CustomerEntityClient) ApplyScheduleRange(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/team-schedule/assignments/apply", body)
+}
+
+// ApplyScheduleAbsence calls POST /team-schedule/absences/apply on the entity
+// service -- the picker marking somebody away, or bringing them back.
+func (c *CustomerEntityClient) ApplyScheduleAbsence(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/team-schedule/absences/apply", body)
+}
+
+// DeleteScheduleAbsence calls DELETE /team-schedule/absences/{id} on the
+// entity service -- one absence removed whole, open-ended ones included.
+func (c *CustomerEntityClient) DeleteScheduleAbsence(ctx context.Context, id, note string) ([]byte, error) {
+	path := "/team-schedule/absences/" + url.PathEscape(id)
+	if note != "" {
+		path += "?note=" + url.QueryEscape(note)
+	}
+	return c.do(ctx, http.MethodDelete, path, nil)
+}
+
+// CreateScheduleAbsenceKind calls POST /team-schedule/absence-kinds on the
+// entity service -- a lead adding a shared leave or allocation tag.
+func (c *CustomerEntityClient) CreateScheduleAbsenceKind(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/team-schedule/absence-kinds", body)
+}
+
+// DeleteScheduleAbsenceKind calls DELETE /team-schedule/absence-kinds/{code}
+// on the entity service -- a lead deleting a tag a lead added.
+func (c *CustomerEntityClient) DeleteScheduleAbsenceKind(ctx context.Context, code string) ([]byte, error) {
+	return c.do(ctx, http.MethodDelete, "/team-schedule/absence-kinds/"+url.PathEscape(code), nil)
+}
+
+// GetScheduleEditMarkers calls GET /team-schedule/edit-markers on the entity
+// service -- which roster cells a person has changed, in a window.
+func (c *CustomerEntityClient) GetScheduleEditMarkers(ctx context.Context, from, to string) ([]byte, error) {
+	return c.do(ctx, http.MethodGet,
+		fmt.Sprintf("/team-schedule/edit-markers?from=%s&to=%s",
+			url.QueryEscape(from), url.QueryEscape(to)), nil)
 }

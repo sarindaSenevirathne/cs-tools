@@ -24,14 +24,13 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
 )
 
-// TaskSlaRepository defines the read operations for sla (migration 000052),
-// joined against sla_policy (migration 000051) and work_item for the task
+// TaskSlaRepository defines the read operations for sla (migration 0048),
+// joined against sla_policy (migration 0047) and work_item for the task
 // reference. BusinessTimeLeft/BusinessElapsedTime/TaskSlaDefinitionDetail.Duration
 // are rendered from real INTERVAL columns via formatDurationSeconds -- safe to
 // invent a display format for, unlike change_request_repo.go's calendar_duration
@@ -41,7 +40,7 @@ import (
 // left"/"{value} elapsed"), so any clear human-readable rendering is safe.
 // ScheduleSource/Flow/Workflow/IsEnableLogging/DurationType/ResetCondition on
 // the definition detail remain nil: sla_policy has no backing column for any
-// of them (confirmed against the live schema, migration 000051's full column
+// of them (confirmed against the live schema, migration 0047's full column
 // list), and -- for ResetCondition specifically -- the column that does exist
 // is resume_condition, a different concept from the reset_action enum this
 // field would need to derive from.
@@ -56,11 +55,14 @@ type TaskSlaRepository interface {
 }
 
 type taskSlaRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewTaskSlaRepository constructs a TaskSlaRepository backed by the given connection pool.
-func NewTaskSlaRepository(db *pgxpool.Pool) TaskSlaRepository {
+// NewTaskSlaRepository constructs a TaskSlaRepository backed by the given
+// Scoped connection. Migration 0153 disables RLS on sla, so access is
+// enforced by internalOnly on every task-SLA route; this repository applies
+// no project filtering of its own.
+func NewTaskSlaRepository(db *Scoped) TaskSlaRepository {
 	return &taskSlaRepo{db: db}
 }
 

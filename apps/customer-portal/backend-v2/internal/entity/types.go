@@ -48,6 +48,33 @@ type GetUserMeResponse struct {
 	Roles     []string `json:"roles"`
 }
 
+// SearchUsersFilters mirrors entity-service's own filter struct field-for-field,
+// but this backend only ever sets Emails — used to resolve a set of watch-list
+// email addresses (from the project-contact onboarding service, a different
+// identity space) to entity-service's own "user" table ids before they're
+// forwarded to CreateCase/UpdateCase, which require real UUIDs.
+type SearchUsersFilters struct {
+	Emails []string `json:"emails,omitempty"`
+}
+
+// SearchUsersRequest is the request body for POST /users/search.
+type SearchUsersRequest struct {
+	Pagination Pagination         `json:"pagination"`
+	Filters    SearchUsersFilters `json:"filters"`
+}
+
+// UserSummary is the subset of entity-service's user search result this
+// backend actually needs (id + email, for the watch-list resolution above).
+type UserSummary struct {
+	ID    string `json:"id"`
+	Email string `json:"email"`
+}
+
+// SearchUsersResponse is entity-service's paginated response for POST /users/search.
+type SearchUsersResponse struct {
+	Users []UserSummary `json:"users"`
+}
+
 // PatchUserMeRequest is the request body for PATCH /users/me.
 type PatchUserMeRequest struct {
 	TimeZone string `json:"timeZone"`
@@ -275,6 +302,8 @@ type ProjectMetadataResponse struct {
 	CaseTypes                   []ReferenceTableItem `json:"caseTypes"`
 	EngagementTypes             []ChoiceListItem     `json:"engagementTypes"`
 	EngagementPaymentTypes      []ChoiceListItem     `json:"engagementPaymentTypes"`
+	ResolutionCodes             []ChoiceListItem     `json:"resolutionCodes"`
+	Causes                      []ChoiceListItem     `json:"causes"`
 	Features                    ProjectFeatures      `json:"features"`
 }
 
@@ -725,6 +754,12 @@ type WatchListUser struct {
 	UserName string `json:"userName"`
 	Name     string `json:"name,omitempty"`
 	Email    string `json:"email,omitempty"`
+	// Locked mirrors entity-service's own domain.WatchListUser.Locked: true
+	// when this watcher is one of the case's account's four named
+	// stakeholders, which entity-service always re-adds on the next write
+	// regardless of what a caller submits -- see dto.CaseWatchListUser.Locked
+	// for what the frontend does with this.
+	Locked bool `json:"locked"`
 }
 
 // UpdatedCase carries the case fields entity-service returns after a
@@ -853,6 +888,10 @@ type CaseView struct {
 	Duration        *string `json:"duration"`
 	EscalationLevel *string `json:"escalationLevel"`
 	IsEscalated     *bool   `json:"isEscalated"`
+	// AnnouncementType is only meaningful when Type is "announcement" --
+	// "GENERAL" or "SECURITY" (entity-service's announcement.announcement_type
+	// column). Nil for every other case-like type.
+	AnnouncementType *string `json:"announcementType"`
 }
 
 // --- deployments ---
@@ -1033,10 +1072,13 @@ type DeployedProductFilters struct {
 }
 
 // SearchDeployedProductsRequest is the input for POST /deployed-products/search.
-// DeploymentIDs scopes results to the given deployments; it is the only filter besides pagination.
+// DeploymentIDs scopes results to the given deployments. ProductCategories optionally narrows
+// them by product category (e.g. "pdp"); the entity service combines it with DeploymentIDs and
+// normalizes the case itself.
 type SearchDeployedProductsRequest struct {
-	Pagination    Pagination `json:"pagination"`
-	DeploymentIDs []string   `json:"deploymentIds,omitempty"`
+	Pagination        Pagination `json:"pagination"`
+	DeploymentIDs     []string   `json:"deploymentIds,omitempty"`
+	ProductCategories []string   `json:"productCategories,omitempty"`
 }
 
 // DeployedProductVersionRef is the version sub-object in a DeployedProductView.
@@ -2374,16 +2416,23 @@ type CaseFeedback struct {
 
 // AttachmentDetails is entity-service's response for GET /attachments/{id}.
 type AttachmentDetails struct {
-	ID          string    `json:"id"`
-	ReferenceID string    `json:"referenceId"`
-	Name        string    `json:"name"`
-	Type        string    `json:"type"`
-	SizeBytes   int       `json:"sizeBytes"`
-	Description *string   `json:"description"`
-	CreatedBy   string    `json:"createdBy"`
-	CreatedOn   time.Time `json:"createdOn"`
-	DownloadURL *string   `json:"downloadUrl"`
-	PreviewURL  *string   `json:"previewUrl"`
+	ID          string `json:"id"`
+	ReferenceID string `json:"referenceId"`
+	// ReferenceType identifies which entity type ReferenceID points at. Nil
+	// when entity-service's own lookup doesn't report one -- a caller
+	// authorizing access per referenced resource must treat a nil value as
+	// unknown and fail closed (see entity-service's own
+	// domain.AttachmentDetails.ReferenceType doc comment, and
+	// authorizeAttachmentAccess in internal/handler/attachments.go).
+	ReferenceType *ReferenceType `json:"referenceType"`
+	Name          string         `json:"name"`
+	Type          string         `json:"type"`
+	SizeBytes     int            `json:"sizeBytes"`
+	Description   *string        `json:"description"`
+	CreatedBy     string         `json:"createdBy"`
+	CreatedOn     time.Time      `json:"createdOn"`
+	DownloadURL   *string        `json:"downloadUrl"`
+	PreviewURL    *string        `json:"previewUrl"`
 	// Content is nil for a CSM-native (Postgres) data source attachment:
 	// entity-service holds no bytes for it, only its storage key. Always
 	// non-nil for ServiceNow-sourced attachments.

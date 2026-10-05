@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -577,6 +578,74 @@ func TestSNChangeRequestService_PatchChangeRequest_RejectsEmptyJournalFields(t *
 	}
 }
 
+// TestSNChangeRequestService_CreateChangeRequest_RejectsNonNewState guards
+// against the regression reported live: the CSM Portal's own create form used
+// to let a caller pick Assess or Authorize directly as a change request's
+// starting state, skipping the workflow's own assess/authorize gates
+// entirely. Every state but New must now be rejected before create even
+// reaches ServiceNow.
+func TestSNChangeRequestService_CreateChangeRequest_RejectsNonNewState(t *testing.T) {
+	svc := NewServiceNowChangeRequestService(nil)
+	normalType := domain.ChangeRequestTypeNormal
+
+	for _, s := range []domain.ChangeRequestState{
+		domain.ChangeRequestStateAssess,
+		domain.ChangeRequestStateAuthorize,
+		domain.ChangeRequestStateImplement,
+		domain.ChangeRequestStateClosed,
+	} {
+		state := s
+		_, err := svc.CreateChangeRequest(contextWithUserIDToken("token"), domain.CreateChangeRequestRequest{
+			Subject: "subject",
+			Type:    &normalType,
+			State:   &state,
+		})
+		if _, ok := err.(*apierror.ValidationError); !ok {
+			t.Fatalf("state %q: expected *apierror.ValidationError, got %T: %v", state, err, err)
+		}
+	}
+}
+
+// TestSNChangeRequestService_CreateChangeRequest_RequiresType: the type decides
+// the approval flow, so a create without one (or with anything but standard/
+// normal/emergency) is refused before ServiceNow is called.
+func TestSNChangeRequestService_CreateChangeRequest_RequiresType(t *testing.T) {
+	svc := NewServiceNowChangeRequestService(nil)
+	azure := domain.ChangeRequestTypeAzure
+	for name, typ := range map[string]*domain.ChangeRequestType{"missing": nil, "azure": &azure} {
+		_, err := svc.CreateChangeRequest(contextWithUserIDToken("token"), domain.CreateChangeRequestRequest{Subject: "subject", Type: typ})
+		ve, ok := err.(*apierror.ValidationError)
+		if !ok {
+			t.Fatalf("%s: expected *apierror.ValidationError, got %T: %v", name, err, err)
+		}
+		if !strings.Contains(ve.Msg, "standard, normal or emergency") {
+			t.Errorf("%s: message %q should name the three allowed types", name, ve.Msg)
+		}
+	}
+}
+
+// TestWithoutManualScheduled: ServiceNow's own offered next states never reach
+// the portal with "scheduled" in them -- Scheduled is reached by CAB/ECAB
+// approval, there is no Schedule action -- except from Customer Approval, where
+// "scheduled" is the action that records the customer's approval.
+func TestWithoutManualScheduled(t *testing.T) {
+	str := func(s string) *string { return &s }
+	got := withoutManualScheduled([]string{"scheduled", "implement", "Scheduled", "canceled"}, str("assess"))
+	if strings.Join(got, ",") != "implement,canceled" {
+		t.Fatalf("withoutManualScheduled = %v, want [implement canceled]", got)
+	}
+	if withoutManualScheduled(nil, nil) != nil {
+		t.Fatal("nil must stay nil")
+	}
+	if got := withoutManualScheduled([]string{"scheduled", "canceled"}, nil); strings.Join(got, ",") != "canceled" {
+		t.Fatalf("withoutManualScheduled with unknown state = %v, want [canceled]", got)
+	}
+	got = withoutManualScheduled([]string{"scheduled", "canceled"}, str("customer_approval"))
+	if strings.Join(got, ",") != "scheduled,canceled" {
+		t.Fatalf("withoutManualScheduled from customer_approval = %v, want [scheduled canceled] (records the customer's approval)", got)
+	}
+}
+
 // TestSNChangeRequestService_PatchChangeRequest_RejectsInvalidPriorityAndCategory
 // verifies the new priority/category writable keys are validated the same way
 // the pre-existing create-path enums are.
@@ -619,8 +688,10 @@ func TestSNChangeRequestService_CreateChangeRequest_SendsNewCreateFields(t *test
 
 	duration := 21600
 	planningVisible := true
+	normalType := domain.ChangeRequestTypeNormal
 	req := domain.CreateChangeRequestRequest{
 		Subject:                      "subject",
+		Type:                         &normalType,
 		AffectedServicesText:         strPtr("services"),
 		AffectedComponentsText:       strPtr("components"),
 		RollbackDurationText:         strPtr("2 hours"),
@@ -652,12 +723,45 @@ func TestSNChangeRequestService_CreateChangeRequest_SendsNewCreateFields(t *test
 	}
 }
 
+// TestSNChangeRequestService_CreateChangeRequest_ExplicitNewStateAccepted
+// verifies a caller explicitly asking for New (the only state create ever
+// permits) still succeeds, and that the outgoing payload never carries a
+// stateKey at all -- ServiceNow's own default is what actually sets it.
+func TestSNChangeRequestService_CreateChangeRequest_ExplicitNewStateAccepted(t *testing.T) {
+	var gotBody map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("/change-requests", func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"message": "Change request created", "changeRequest": {"id": "` + uuidToSysid(testCaseUUID) + `", "number": "CHG0001", "createdOn": "2026-01-01 00:00:00", "createdBy": "engineer@example.com"}}`))
+	})
+
+	client := newTestSNClient(t, mux)
+	svc := NewServiceNowChangeRequestService(client)
+
+	newState := domain.ChangeRequestStateNew
+	normalType := domain.ChangeRequestTypeNormal
+	req := domain.CreateChangeRequestRequest{Subject: "subject", Type: &normalType, State: &newState}
+
+	if _, err := svc.CreateChangeRequest(contextWithUserIDToken("token"), req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := gotBody["stateKey"]; ok {
+		t.Errorf("stateKey: got %v present in payload, want it absent entirely", gotBody["stateKey"])
+	}
+}
+
 func TestSNChangeRequestService_CreateChangeRequest_DurationInputMustMatchPlannedWindow(t *testing.T) {
 	svc := NewServiceNowChangeRequestService(nil)
 
 	duration := 3600
+	normalType := domain.ChangeRequestTypeNormal
 	req := domain.CreateChangeRequestRequest{
 		Subject:          "subject",
+		Type:             &normalType,
 		PlannedStartDate: strPtr("2026-01-01 00:00:00"),
 		PlannedEndDate:   strPtr("2026-01-01 06:00:00"),
 		DurationInput:    &duration,
@@ -673,8 +777,10 @@ func TestSNChangeRequestService_CreateChangeRequest_DurationInputRequiresBothPla
 	svc := NewServiceNowChangeRequestService(nil)
 
 	duration := 21600
+	normalType := domain.ChangeRequestTypeNormal
 	req := domain.CreateChangeRequestRequest{
 		Subject:          "subject",
+		Type:             &normalType,
 		PlannedStartDate: strPtr("2026-01-01 00:00:00"),
 		DurationInput:    &duration,
 	}

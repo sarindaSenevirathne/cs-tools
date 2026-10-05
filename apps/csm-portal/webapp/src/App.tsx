@@ -36,6 +36,7 @@ import {
   firstEnabledDestination,
 } from "@config/featureFlags";
 import { usePortalAccess } from "@context/current-user/usePortalAccess";
+import { usePortalView } from "@context/current-user/usePortalView";
 import {
   POST_LOGIN_REDIRECT_KEY,
   PostLoginRedirectConsumer,
@@ -94,6 +95,7 @@ import CsmCustomersLayout from "@features/csm-customers/pages/CsmCustomersLayout
 import CsmAccountsPage from "@features/csm-accounts/pages/CsmAccountsPage";
 import CsmAccountDetailPage from "@features/csm-accounts/pages/CsmAccountDetailPage";
 import CsmProjectsPage from "@features/csm-projects/pages/CsmProjectsPage";
+import CsmTeamSchedulePage from "@features/csm-team-schedule/pages/CsmTeamSchedulePage";
 import CsmProjectDetailPage from "@features/csm-projects/pages/CsmProjectDetailPage";
 import ConversationDetailPage from "@features/csm-projects/pages/ConversationDetailPage";
 import CsmUpdatesPage from "@features/updates/pages/CsmUpdatesPage";
@@ -106,6 +108,28 @@ import CsmTimeCardsPage from "@features/csm-timecards/pages/CsmTimeCardsPage";
 import CsmAnnouncementsPage from "@features/csm-announcements/pages/CsmAnnouncementsPage";
 import CsmAnnouncementCreatePage from "@features/csm-announcements/pages/CsmAnnouncementCreatePage";
 import HelpPage from "@features/help/pages/HelpPage";
+import CsmKBArticlesLayout from "@features/csm-kb-articles/pages/CsmKBArticlesLayout";
+import CsmKBArticlesAllPage from "@features/csm-kb-articles/pages/CsmKBArticlesAllPage";
+import CsmKBArticlesListPage from "@features/csm-kb-articles/pages/CsmKBArticlesListPage";
+import CsmKBArticleEditorPage from "@features/csm-kb-articles/pages/CsmKBArticleEditorPage";
+import CsmKBArticleHistoryDetailPage from "@features/csm-kb-articles/pages/CsmKBArticleHistoryDetailPage";
+import CsmKBReviewQueuePage from "@features/csm-kb-articles/pages/CsmKBReviewQueuePage";
+import CsmKBAdminPage from "@features/csm-kb-articles/pages/CsmKBAdminPage";
+import RouteGuard from "@features/spl/pages/RouteGuard";
+import CasesPage from "@features/spl/cases/pages/CasesPage";
+import CaseDetailPage from "@features/spl/cases/pages/CaseDetailPage";
+import AccountsPage from "@features/spl/accounts/pages/AccountsPage";
+import AccountDetailPage from "@features/spl/accounts/pages/AccountDetailPage";
+import ProjectsPage from "@features/spl/projects/pages/ProjectsPage";
+import ProjectDetailPage from "@features/spl/projects/pages/ProjectDetailPage";
+import SlaReportPage from "@features/spl/reports/pages/SlaReportPage";
+import CsReportPage from "@features/spl/reports/pages/CsReportPage";
+import TimelogsReportPage from "@features/spl/reports/pages/TimelogsReportPage";
+import TeamSchedulePage from "@features/spl/schedule/pages/TeamSchedulePage";
+import UserScanPage from "@features/spl/user-scan/pages/UserScanPage";
+import UsageMetricsPage from "@features/spl/usage-metrics/pages/UsageMetricsPage";
+import CustomerHealthDashboardPage from "@features/spl/customer-health/pages/CustomerHealthDashboardPage";
+import CustomerHealthDetailPage from "@features/spl/customer-health/pages/CustomerHealthDetailPage";
 
 /**
  * Landing for `/`. Defers to AuthGuard's post-login deep-link restore when a
@@ -137,7 +161,12 @@ function RootLanding(): JSX.Element | null {
   const hasDeepLinkSearch = ["goto", "q"].some((key) =>
     Boolean(searchParams.get(key)?.trim()),
   );
-  return pending || hasDeepLinkSearch ? null : <Navigate to="/dashboard" replace />;
+  // The Sales/SA view has no dashboard (SPL never had one) — its landing
+  // page is Cases, same as the standalone app's own index redirect. See
+  // usePortalView.ts.
+  const view = usePortalView();
+  const landing = view === "sales-sa" ? "/spl/cases" : "/dashboard";
+  return pending || hasDeepLinkSearch ? null : <Navigate to={landing} replace />;
 }
 
 /**
@@ -291,6 +320,7 @@ export default function App(): JSX.Element {
                     <Route path="accounts" element={<CsmAccountsPage />} />
                     <Route path="projects" element={<CsmProjectsPage />} />
                   </Route>
+                  <Route path="team-schedule" element={<CsmTeamSchedulePage />} />
                   <Route
                     path="customers/accounts/:id"
                     element={<CsmAccountDetailPage />}
@@ -608,6 +638,74 @@ export default function App(): JSX.Element {
                       than its own route, so unlike Customers/Settings above
                       there is nothing to redirect an index route to. */}
                   <Route path="help" element={<HelpPage />} />
+
+                  <Route path="knowledge" element={<CsmKBArticlesLayout />}>
+                    <Route index element={<Navigate to="all" replace />} />
+                    <Route path="all" element={<CsmKBArticlesAllPage />} />
+                    <Route path="my-articles" element={<CsmKBArticlesListPage />} />
+                    <Route path="my-articles/new" element={<CsmKBArticleEditorPage />} />
+                    <Route path="my-articles/:id" element={<CsmKBArticleEditorPage />} />
+                    <Route path="my-articles/:id/history" element={<CsmKBArticleHistoryDetailPage />} />
+                    <Route path="to-review" element={<CsmKBReviewQueuePage />} />
+                    <Route path="admin" element={<CsmKBAdminPage />} />
+                  </Route>
+
+                  {/* Support Portal Lite — ported from the former standalone
+                      apps/support-portal-lite/webapp. RouteGuard is the
+                      real enforcement point (an audience-gate 403, not just
+                      a hidden nav entry) and also mounts
+                      PermissionProvider for every screen below it. */}
+                  <Route path="spl" element={<RouteGuard />}>
+                    <Route path="cases" element={<CasesPage />} />
+                    <Route path="cases/:caseId" element={<CaseDetailPage />} />
+
+                    {/* AccountsPage reads the path leaf itself to decide
+                        all-accounts vs my-accounts — same component, two
+                        routes. Only "accounts" has a csmNavItems.ts entry;
+                        "my-accounts" is reachable from within the page
+                        itself (a toggle), same as the source app. */}
+                    <Route path="accounts" element={<AccountsPage />} />
+                    <Route path="my-accounts" element={<AccountsPage />} />
+                    <Route path="accounts/:accountId" element={<AccountDetailPage />} />
+
+                    <Route path="projects" element={<ProjectsPage />} />
+                    {/* ProjectDetailPage only reads :projectId — reachable
+                        both directly and nested under its account, matching
+                        both links the source app's own components use. */}
+                    <Route path="projects/:projectId" element={<ProjectDetailPage />} />
+                    <Route
+                      path="accounts/:accountId/projects/:projectId"
+                      element={<ProjectDetailPage />}
+                    />
+                    <Route
+                      path="projects/:projectId/sla-report/:sysId"
+                      element={<SlaReportPage />}
+                    />
+                    <Route
+                      path="projects/:projectId/cs-report/:sysId"
+                      element={<CsReportPage />}
+                    />
+                    <Route
+                      path="projects/:projectId/timelogs-report"
+                      element={<TimelogsReportPage />}
+                    />
+
+                    <Route path="team-schedule" element={<TeamSchedulePage />} />
+                    <Route path="team-schedule/:sysId" element={<TeamSchedulePage />} />
+
+                    <Route path="user-scan" element={<UserScanPage />} />
+
+                    <Route path="usage-metrics" element={<UsageMetricsPage />} />
+
+                    <Route
+                      path="customer-health"
+                      element={<CustomerHealthDashboardPage />}
+                    />
+                    <Route
+                      path="customer-health/account/:accountId"
+                      element={<CustomerHealthDetailPage />}
+                    />
+                  </Route>
                 </Route>
               </Route>
 

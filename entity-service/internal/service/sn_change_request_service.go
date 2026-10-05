@@ -27,6 +27,7 @@ import (
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/middleware"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
 	integrationservice "github.com/wso2-open-operations/cs-tools/entity-service/internal/servicenow-integration-service"
 )
 
@@ -518,7 +519,16 @@ func (s *snChangeRequestService) AggregateChangeRequests(ctx context.Context, re
 	return resp, nil
 }
 
-// snCreateChangeRequestPayload is the Choreo POST /change-requests request body.
+// snCreateChangeRequestPayload is the Choreo POST /change-requests request
+// body. Deliberately has no stateKey field: the org's own Change Management
+// process flow confirms every change request begins at New unconditionally
+// (no branch at creation decides otherwise), and ServiceNow already defaults
+// a fresh record to New on its own. An earlier revision of this payload
+// accepted and forwarded a caller-chosen create-time state (New/Assess/
+// Authorize) -- a real reported bug: the CSM Portal's own create form let a
+// user pick Assess or Authorize directly, skipping the workflow's own
+// assess/authorize gates entirely. CreateChangeRequest below now rejects any
+// req.State other than New before this payload is even built.
 type snCreateChangeRequestPayload struct {
 	Subject             string  `json:"subject"`
 	CategoryKey         *string `json:"categoryKey,omitempty"`
@@ -528,7 +538,6 @@ type snCreateChangeRequestPayload struct {
 	PriorityKey         *string `json:"priorityKey,omitempty"`
 	ImpactKey           *string `json:"impactKey,omitempty"`
 	TypeKey             *string `json:"typeKey,omitempty"`
-	StateKey            *string `json:"stateKey,omitempty"`
 	GroupID             *string `json:"groupId,omitempty"`
 	AssignedEngineerID  *string `json:"assignedEngineerId,omitempty"`
 	RiskKey             *string `json:"riskKey,omitempty"`
@@ -563,21 +572,6 @@ type snCreateChangeRequestResponse struct {
 		CreatedOn string `json:"createdOn"`
 		CreatedBy string `json:"createdBy"`
 	} `json:"changeRequest"`
-}
-
-// snCRCreateStateIDMap maps domain ChangeRequestState enums to SN string state IDs for create.
-var snCRCreateStateIDMap = map[domain.ChangeRequestState]string{
-	domain.ChangeRequestStateNew:              "-5",
-	domain.ChangeRequestStateAssess:           "-4",
-	domain.ChangeRequestStateAuthorize:        "-3",
-	domain.ChangeRequestStateCustomerApproval: "5",
-	domain.ChangeRequestStateScheduled:        "-2",
-	domain.ChangeRequestStateImplement:        "-1",
-	domain.ChangeRequestStateReview:           "0",
-	domain.ChangeRequestStateCustomerReview:   "1",
-	domain.ChangeRequestStateRollback:         "2",
-	domain.ChangeRequestStateClosed:           "3",
-	domain.ChangeRequestStateCanceled:         "4",
 }
 
 // snCRCreateTypeIDMap maps domain ChangeRequestType enums to SN string type IDs for create.
@@ -729,15 +723,24 @@ func (s *snChangeRequestService) CreateChangeRequest(ctx context.Context, req do
 			return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("invalid category %q", *req.Category)}
 		}
 	}
-	if req.Type != nil {
-		if _, ok := snCRCreateTypeIDMap[*req.Type]; !ok {
-			return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("invalid type %q", *req.Type)}
-		}
+	// The type is mandatory and must be standard/normal/emergency -- it decides
+	// the approval flow ServiceNow runs (Standard: none; Normal: approvals;
+	// Emergency: expedited).
+	if err := repository.ValidateCreateChangeRequestType(req.Type); err != nil {
+		return domain.CreateChangeRequestResponse{}, err
 	}
-	if req.State != nil {
-		if _, ok := snCRCreateStateIDMap[*req.State]; !ok {
-			return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("invalid state %q", *req.State)}
-		}
+	if _, ok := snCRCreateTypeIDMap[*req.Type]; !ok {
+		return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("invalid type %q", *req.Type)}
+	}
+	// A change request can only ever be created at New -- see
+	// snCreateChangeRequestPayload's own doc comment for why. req.State is
+	// still accepted (rather than removed from CreateChangeRequestRequest
+	// entirely) so a caller that explicitly asks for New gets the same 200 it
+	// always has; anything else is rejected outright rather than silently
+	// downgraded to New, since silently ignoring a caller's explicit request
+	// would look like success while doing something else.
+	if req.State != nil && *req.State != domain.ChangeRequestStateNew {
+		return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("a change request can only be created in the New state, not %q", *req.State)}
 	}
 	if req.Risk != nil {
 		if _, ok := snCRRiskIDMap[*req.Risk]; !ok {
@@ -848,10 +851,8 @@ func (s *snChangeRequestService) CreateChangeRequest(ctx context.Context, req do
 		v := snCRCreateTypeIDMap[*req.Type]
 		payload.TypeKey = &v
 	}
-	if req.State != nil {
-		v := snCRCreateStateIDMap[*req.State]
-		payload.StateKey = &v
-	}
+	// req.State is validated above but never forwarded -- payload has no
+	// stateKey field at all, see snCreateChangeRequestPayload's own comment.
 	if req.Risk != nil {
 		v := snCRRiskIDMap[*req.Risk]
 		payload.RiskKey = &v
@@ -1521,7 +1522,7 @@ func mapSNChangeRequestDetailToView(cr snChangeRequestDetail) domain.ChangeReque
 		HasCustomerApproved:     cr.HasCustomerApproved,
 		HasCustomerReviewed:     cr.HasCustomerReviewed,
 		ApprovedOn:              cr.ApprovedOn,
-		LegalNextStates:         cr.LegalNextStates,
+		LegalNextStates:         withoutManualScheduled(cr.LegalNextStates, view.State),
 
 		// Field-parity additions.
 		ImplementationPlan:           cr.ImplementationPlan,
@@ -1588,4 +1589,28 @@ func mapSNChangeRequestDetailToView(cr snChangeRequestDetail) domain.ChangeReque
 	}
 
 	return result
+}
+
+// withoutManualScheduled drops "scheduled" from the next states ServiceNow
+// offers. There is no manual "Schedule" action in the CSM flow: a change
+// becomes Scheduled when its CAB (or, for Emergency, ECAB) approval is granted,
+// so the portal must never be handed it as something to click -- the same rule
+// the PostgreSQL data source applies (legalChangeRequestNextStates). The one
+// exception is a change sitting in Customer Approval, where "scheduled" is the
+// action that records the customer's approval (also as on PostgreSQL).
+func withoutManualScheduled(states []string, state *string) []string {
+	if states == nil {
+		return nil
+	}
+	if state != nil && strings.EqualFold(*state, string(domain.ChangeRequestStateCustomerApproval)) {
+		return states
+	}
+	out := make([]string, 0, len(states))
+	for _, st := range states {
+		if strings.EqualFold(st, string(domain.ChangeRequestStateScheduled)) {
+			continue
+		}
+		out = append(out, st)
+	}
+	return out
 }

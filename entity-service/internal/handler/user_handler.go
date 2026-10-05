@@ -65,6 +65,21 @@ func (h *UserHandler) GetMe(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// PatchMe handles PATCH /users/me for the postgres data source.
+func (h *UserHandler) PatchMe(w http.ResponseWriter, r *http.Request) {
+	var req domain.PatchUserMeRequest
+	if !decodeRequest(w, r, &req) {
+		return
+	}
+	resp, err := h.svc.PatchMe(r.Context(), req)
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
 // GetUser handles GET /users/{id} for the PostgreSQL data source.
 func (h *UserHandler) GetUser(w http.ResponseWriter, r *http.Request) {
 	resp, err := h.svc.GetUser(r.Context(), r.PathValue("id"))
@@ -147,6 +162,31 @@ func (h *SNUserHandler) PatchMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp, err := h.svc.PatchMe(r.Context(), req)
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// getUsersByIDsRequest is the request body for POST /users/by-ids.
+type getUsersByIDsRequest struct {
+	IDs []string `json:"ids"`
+}
+
+// GetUsersByIDs handles POST /users/by-ids for the postgres data source.
+func (h *UserHandler) GetUsersByIDs(w http.ResponseWriter, r *http.Request) {
+	var req getUsersByIDsRequest
+	if !decodeRequest(w, r, &req) {
+		return
+	}
+	if len(req.IDs) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(domain.GetUsersByIDsResponse{})
+		return
+	}
+	resp, err := h.svc.GetUsersByIDs(r.Context(), req.IDs)
 	if err != nil {
 		writeServiceError(w, r, err)
 		return

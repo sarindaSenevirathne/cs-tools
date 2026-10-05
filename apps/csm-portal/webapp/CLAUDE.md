@@ -41,10 +41,45 @@ gating on top of a real server-side gate, by explicit choice rather than by the 
 default. If a future admin-only action is added, default to the show-and-reject norm unless there's a
 specific reason (as here) to also hide it.
 
-`AddUserDialog.tsx` deliberately has no role picker: the backend's `POST /users` accepts an optional
-`roles` array end-to-end (entity-service → `apps/csm-portal/backend` → here), but there is no
-Asgardeo-backed way to browse/assign roles at account-creation time yet, so the field is simply
-omitted from the form for now rather than half-built.
+`AddUserDialog.tsx` has two independent role-shaped controls that must not be confused with each
+other. One narrower, required control: **"User type" (Internal/External)**. entity-service's `user_type` has no plain settable
+column — it's derived by a DB trigger from role membership (`recompute_user_type`, migration 0011) —
+so this selector works by sending exactly one of `roles: ["internal"]`/`["external"]` on submit, not a
+`type` field on the wire; `external` (not `customer`/`partner`/...) is the role every
+externally-onboarded contact actually holds, so that's the one this form sends for "External" rather
+than a finer-grained refinement it has no way to know at creation time. This was added because the
+form previously sent no `roles` at all, so every user it created resolved to `user_type =
+NOT_AVAILABLE` (entity-service's trigger fallback) — a real, silent data-quality gap, not a
+hypothetical one.
+
+**Selecting "Internal" requires a `@wso2.com` email** — the form blocks submission and shows the
+constraint inline (`internalEmailViolation` in `AddUserDialog.tsx`) rather than letting the request
+round-trip to find out. This is a display-consistency check only, the same relationship the inline-image
+redaction section below describes for its own frontend mitigation: entity-service's `userService.CreateUser`
+enforces the identical rule server-side (see that repo's own `CLAUDE.md`), and is what actually
+protects the database regardless of what this form does or doesn't check.
+
+**"External" is temporarily disabled** (`USER_TYPE_OPTIONS`'s own `disabled: true`, rendered via
+`MenuItem`'s `disabled` prop with "— currently unavailable" appended to the label) — both
+entity-service and `apps/csm-portal/backend` reject creating an external-type user regardless of what
+this form sends, so there is currently only one real, selectable choice in this dropdown. This is
+meant to come out once external-type creation is ready; see entity-service's own `CLAUDE.md` for the
+full reasoning.
+
+The second, independent control is **"Portal roles"** — a checkbox per role `GET /roles/grantable`
+reports, rendered only when that list is non-empty (`useGetGrantableRoles`, fetched only while the
+dialog is open). Selected keys go out as `grantRoles` on submit, a completely separate field from
+`roles` above: `roles` only ever shapes entity-service's `user_type`, `grantRoles` only ever grants
+Asgardeo-backed portal permissions (`cs_engineer`, `escalator`, ...) via SCIM, once the user already
+exists — see `apps/csm-portal/backend`'s own `CLAUDE.md`, "Granting portal roles on user creation", for
+the full backend mechanism. This frontend never learns the real identity-provider role name/id behind
+a key; `grantableRoleLabels.ts` maps each key to its own display label (falling back to a title-cased
+version of the raw key for one this map hasn't been updated for yet, rather than hiding it). Protected
+the same way the rest of this dialog already is: **admin-only on both ends** — `GET /roles/grantable`
+and `POST /users` share the identical `PermAdmin` gate on the backend, and on this frontend the section
+only ever renders inside `AddUserDialog`, which `CsmUsersPage.tsx`'s own `canCreateUser` check already
+keeps out of a non-admin's reach entirely (see the "Add User" exception at the top of this section) —
+no second, redundant permission check was added inside the dialog itself.
 
 ## Code organization
 
@@ -201,6 +236,7 @@ pnpm run lint      # eslint .
 - **No `eval`, `new Function`, or dynamic `<script>` injection** anywhere in `src/` — keep it that way; there's no legitimate use case for it in this app.
 - **Never carry data from a user-shared screenshot into a test file, doc comment, or any other committed content** — not the real names, case numbers, company/product names, or example text visible in it. A screenshot is shared to show a bug, not as source material to copy from; even a name or sentence that looks harmless can be a real customer's data. Write test fixtures and examples with clearly generic, made-up content instead (e.g. "Jane Doe", "Acme Corp", "First paragraph."/"Second paragraph.").
 - **Never reference an issue tracker, ticket number, or repo name in code, comments, or this file** — a doc comment or `CLAUDE.md` entry should stand on its own ("reported live: ...", "fixed because ..."), not point at an external, mutable system that this codebase has no lasting connection to. Explain the *why* directly in the comment instead of citing where it was reported.
+- **A raw base64-embedded `<img>` in comment/description HTML is now redacted server-side too, not just hidden on screen.** `useResolvedInlineImageHtml`'s `.iix`-referenced images were already correctly permission-gated (the browser never even requests one without `canDownloadAttachment`), but content authored before/without `SFTPGO_ATTACHMENT_STORAGE_ENABLED` never gets extracted into a real attachment at all — the image stays as `data:image/...;base64,...` directly inside the comment `content`/case `description` (found live: a `viewer`/`escalator` role, neither of which holds `canDownloadAttachment`, could see a pasted screenshot in a comment). `replaceInlineImageSrcs`'s `denyRawBase64` parameter (`inlineImages.ts`) still hides these behind the same "no permission" placeholder as a `.iix` denial — but the actual confidentiality fix is in `apps/csm-portal/backend` (`internal/handler/inline_image_redact.go`, see that repo's own `CLAUDE.md`): `redactRawBase64Images` strips the base64 payload out of the raw JSON response itself for a caller lacking `PermDownloadAttachment`, before it ever reaches this frontend, so `denyRawBase64` is now a display-consistency measure (the redacted placeholder src still starts with `data:image/`, so this hook still recognizes and hides it) rather than the only thing standing between a denied caller and the real bytes.
 
 ---
 

@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -35,7 +36,7 @@ import (
 )
 
 // UserRepository defines the persistence operations for the "user" table
-// (migration 000001).
+// (migration 0002).
 type UserRepository interface {
 	// SearchUsers returns a filtered, paginated slice of users together with
 	// the total count of rows that match the filter (before pagination).
@@ -46,8 +47,11 @@ type UserRepository interface {
 	// GetUserByEmail returns the user with the given email address, or a
 	// NotFoundError if no matching user exists.
 	GetUserByEmail(ctx context.Context, email string) (domain.User, error)
+	// GetUsersByIDs returns every user matching the given ids. Unlike
+	// SearchUsers, this is not gated to the ServiceNow data source.
+	GetUsersByIDs(ctx context.Context, ids []string) ([]domain.User, error)
 	// GetUserRoles returns the role names assigned to userID via user_role
-	// (migration 000006), empty if none.
+	// (migration 0010), empty if none.
 	GetUserRoles(ctx context.Context, userID string) ([]string, error)
 	// GetUserDetail returns the user with the given id (name, active flag and
 	// type; no roles/groups/access), or a NotFoundError.
@@ -56,7 +60,7 @@ type UserRepository interface {
 	// with its project, linked contact record and project roles.
 	GetUserProjectAccess(ctx context.Context, email string) ([]domain.UserContactAccess, error)
 	// GetUserGroups returns every team userID belongs to via team_member
-	// (migration 000028), empty if none.
+	// (migration 0033), empty if none.
 	GetUserGroups(ctx context.Context, userID string) ([]domain.UserGroupRef, error)
 	// CreateUser inserts a new "user" row (user_name = lower(email), matching
 	// the Salesforce membership ingest's own convention) and, if req.Roles is
@@ -66,6 +70,13 @@ type UserRepository interface {
 	// use (user_name is UNIQUE), a ServiceUnavailableError naming any
 	// requested role not seeded in the role table.
 	CreateUser(ctx context.Context, req domain.CreateUserRequest, actor string) (domain.User, error)
+	// UpdateUserTimeZone sets "user".timezone for userID (PATCH /users/me's
+	// own write) and returns the new updated_on. A free-text column (no
+	// FK/enum constraint tying it to the timezone reference table), so any
+	// non-empty value is accepted as-is -- validated against that table only
+	// if a caller ever asks for it. Returns a NotFoundError if userID does
+	// not exist.
+	UpdateUserTimeZone(ctx context.Context, userID, timezone string) (time.Time, error)
 }
 
 type userRepo struct {
@@ -78,13 +89,15 @@ func NewUserRepository(db *pgxpool.Pool) UserRepository {
 }
 
 // userColumns is the column list shared by GetUserByEmail and SearchUsers.
-// The "user" table (migration 000001) has no phone/timezone column at all --
-// unlike account.phone, there is nothing to select for domain.User's Phone/
-// Timezone fields, so both are simply left nil (Go's pointer zero value)
-// rather than queried. Postgres-backed PatchMe/TimeZone support does not
-// exist today regardless (UserService has no PatchMe method at all -- only
-// the ServiceNow-backed SNUserService does).
-const userColumns = `id, user_name, first_name, last_name, email, user_type::TEXT, created_on, updated_on`
+// The "user" table (migration 0002) has no phone column -- unlike
+// account.phone, there is nothing to select for domain.User's Phone field,
+// so it is simply left nil (Go's pointer zero value) rather than queried.
+// timezone (not declared in this repo's own migrations/ -- confirmed
+// directly against the live database, same "built outside this directory"
+// class as the timezone reference table CLAUDE.md's "GET /metadata and
+// GET /projects/{id}/metadata" section documents) backs Timezone/
+// PATCH /users/me's own write.
+const userColumns = `id, user_name, first_name, last_name, email, user_type::TEXT, created_on, updated_on, timezone`
 
 // prefixUserColumns is userColumns qualified with the "u" alias SearchUsers'
 // query uses (needed once EXISTS subqueries reference u.id for role
@@ -117,10 +130,10 @@ func userOrderBy(s domain.UserSortBy) string {
 	return col + " " + dir + ", u.id"
 }
 
-const prefixUserColumns = `u.id, u.user_name, u.first_name, u.last_name, u.email, u.user_type::TEXT, u.created_on, u.updated_on`
+const prefixUserColumns = `u.id, u.user_name, u.first_name, u.last_name, u.email, u.user_type::TEXT, u.created_on, u.updated_on, u.timezone`
 
 // userTypeFromEnum maps "user".user_type's real user_type_enum labels
-// (migration 000007) to domain.UserType. EXTERNAL becomes UserTypeCustomer,
+// (migration 0011) to domain.UserType. EXTERNAL becomes UserTypeCustomer,
 // not UserTypeExternal -- see UserTypeExternal's own doc comment: "the
 // postgres source emits customer, ServiceNow emits external" for the same
 // underlying concept. NOT_AVAILABLE (recompute_user_type's fallback when a
@@ -135,14 +148,15 @@ var userTypeFromEnum = map[string]domain.UserType{
 func scanUser(row interface{ Scan(...any) error }) (domain.User, error) {
 	var u domain.User
 	var firstName, lastName, email, userType *string
-	err := row.Scan(&u.ID, &u.UserName, &firstName, &lastName, &email, &userType, &u.CreatedOn, &u.UpdatedOn)
+	err := row.Scan(&u.ID, &u.UserName, &firstName, &lastName, &email, &userType, &u.CreatedOn, &u.UpdatedOn, &u.Timezone)
 	if err != nil {
 		return domain.User{}, err
 	}
-	// first_name/last_name/email/user_type (migration 000001/000007) all
+	// first_name/last_name/email/user_type (migration 0002/0011) all
 	// have no NOT NULL constraint; the domain.User fields they fill are
 	// required (non-pointer), so a NULL column becomes "" rather than
-	// failing the scan.
+	// failing the scan. Timezone is already a pointer field, so a NULL
+	// column (no preference saved yet) scans straight through as nil.
 	u.FirstName = stringOrEmpty(firstName)
 	u.LastName = stringOrEmpty(lastName)
 	u.Email = stringOrEmpty(email)
@@ -200,7 +214,7 @@ func (r *userRepo) SearchUsers(ctx context.Context, req domain.SearchUsersReques
 	}
 
 	if len(req.Filters.RoleIDs) > 0 {
-		// RoleIDs holds role NAMEs (role.name, migration 000004), not UUIDs,
+		// RoleIDs holds role NAMEs (role.name, migration 0008), not UUIDs,
 		// despite the field's name -- see domain.UserRole's own doc comment
 		// ("deliberately an open string type"). Matches if the user holds
 		// ANY of the given roles (OR semantics), via user_role (migration
@@ -320,6 +334,35 @@ func (r *userRepo) SearchUsers(ctx context.Context, req domain.SearchUsersReques
 	return users, total, nil
 }
 
+// GetUsersByIDs returns every user matching the given ids, in Postgres
+// mode. Unlike SearchUsers, this is not gated to ServiceNow -- ids are
+// this platform's own identifiers, so an id-based lookup is always safe
+// regardless of data source.
+func (r *userRepo) GetUsersByIDs(ctx context.Context, ids []string) ([]domain.User, error) {
+	// userColumns + scanUser rather than a hand-written projection: the
+	// "user" table has no phone/timezone columns, and first_name,
+	// last_name, email and user_type are all nullable -- scanning them
+	// into non-pointer fields fails the whole batch on one NULL.
+	rows, err := r.db.Query(ctx,
+		fmt.Sprintf(`SELECT %s FROM "user" WHERE id = ANY($1)`, userColumns),
+		ids,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get users by ids: %w", err)
+	}
+	defer rows.Close()
+
+	users := make([]domain.User, 0, len(ids))
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan user: %w", err)
+		}
+		users = append(users, u)
+	}
+	return users, rows.Err()
+}
+
 // attachRoles fills in each user's Roles from user_role in ONE query for the
 // whole page (not one per user), so the search stays a fixed number of round
 // trips whatever the page size. DISTINCT because user_role has no unique
@@ -370,6 +413,7 @@ func assignRoles(users []domain.User, byUser map[string][]string) {
 		users[i].Roles = []string{}
 	}
 }
+
 
 // GetUserRoles implements UserRepository.
 func (r *userRepo) GetUserRoles(ctx context.Context, userID string) ([]string, error) {
@@ -515,7 +559,7 @@ func (r *userRepo) CreateUser(ctx context.Context, req domain.CreateUserRequest,
 		return domain.User{}, err
 	}
 
-	// user_type is trigger-derived from role membership (migration 000007),
+	// user_type is trigger-derived from role membership (migration 0011),
 	// so the value RETURNING read above -- before any role was granted -- can
 	// already be stale once grantRoles has run. Only worth a second read when
 	// a role was actually granted; with none, nothing could have changed it.
@@ -535,7 +579,23 @@ func (r *userRepo) CreateUser(ctx context.Context, req domain.CreateUserRequest,
 	return u, nil
 }
 
-// grantRoles resolves each of names (role.name, migration 000004) to its id
+// UpdateUserTimeZone implements UserRepository.
+func (r *userRepo) UpdateUserTimeZone(ctx context.Context, userID, timezone string) (time.Time, error) {
+	var updatedOn time.Time
+	err := r.db.QueryRow(ctx,
+		`UPDATE "user" SET timezone = $1, updated_on = NOW() WHERE id = $2 RETURNING updated_on`,
+		timezone, userID,
+	).Scan(&updatedOn)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, &apierror.NotFoundError{Msg: "user not found"}
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("update user timezone: %w", err)
+	}
+	return updatedOn, nil
+}
+
+// grantRoles resolves each of names (role.name, migration 0008) to its id
 // and inserts a user_role row for it, all inside tx. Every name must exist in
 // role before anything is inserted -- a partially-granted set on an unseeded
 // role name would be a confusing half-success. Returns the granted names,

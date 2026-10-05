@@ -68,6 +68,10 @@ The detail page shows:
     labels. Most of these are read-only with no edit control anywhere yet —
     they're shown for context. "Implementation Plan visible to customers"
     is the exception: it's editable from Create/Edit (see below).
+  - Planned start and end times you enter when creating or editing a change
+    are in your own time zone (the one on your profile, or your browser's if
+    none is set) and are stored as UTC, so they mean the same instant to
+    everyone.
 
 From the detail page a CS engineer can:
 
@@ -105,7 +109,7 @@ device/browser.
 
 A **Create incident** button (or a case's own **Create incident from case…**
 action) opens a form for Caller, Service, and a classification (category,
-subcategory, contact type, impact, urgency — Priority is computed live from
+subcategory (optional), channel, impact, urgency — Priority is computed live from
 impact × urgency and not itself editable). **Assignment group** is not a
 manual pick here: it's shown read-only, auto-filled from the selected
 Service's ServiceNow support group, and blank with a hint if that service
@@ -117,7 +121,7 @@ The detail page shows:
   created by, and last updated.
 - Tabs for **Activities**, **Details**, **Related**, **Watchers**, and
   **Attachments**.
-  - **Details** covers classification (category, subcategory, contact type,
+  - **Details** covers classification (category, subcategory, channel,
     impact, urgency) and service/configuration-item information.
   - **Related** shows linked records (parent incident, change request,
     problem, and any linked service requests), plus a "caused by" reference
@@ -221,6 +225,10 @@ time, and an optional end time (leave it blank for an outage that's still
 ongoing; close it later from the detail page). You can optionally link a
 configuration item and a related incident, and seed the first external and/or
 internal communication entries.
+
+Begin, end, and close times are entered in your own time zone (the one on
+your profile, or your browser's if none is set) and stored as UTC, so they
+mean the same instant to everyone.
 
 **Linking a configuration item is the one choice that can make an outage
 public.** If the item you pick is tracked on a monitored cloud's status

@@ -14,7 +14,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import ChangeRequestActionBar from "@features/csm-operations/components/ChangeRequestActionBar";
@@ -121,10 +121,10 @@ describe("ChangeRequestActionBar — exactly one primary button", () => {
   });
 
   it("puts every non-promoted target behind the Change state menu", () => {
-    renderBar({ state: "new", legalNextStates: ["assess", "scheduled", "canceled"] });
+    renderBar({ state: "new", legalNextStates: ["assess", "implement", "canceled"] });
     expect(screen.getByRole("button", { name: /request approval/i })).toBeInTheDocument();
     openMenu();
-    expect(screen.getByRole("menuitem", { name: /^schedule$/i })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /start implementation/i })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /cancel change/i })).toBeInTheDocument();
   });
 
@@ -153,8 +153,7 @@ describe("ChangeRequestActionBar — exactly one primary button", () => {
 
 describe("ChangeRequestActionBar — labels are the action, not the destination", () => {
   it.each([
-    ["assess", /request approval/i],
-    ["scheduled", /^schedule$/i],
+    ["assess", /^request approval$/i],
     ["implement", /start implementation/i],
     ["review", /mark implemented/i],
     ["customer_review", /send for customer review/i],
@@ -234,6 +233,41 @@ describe("ChangeRequestActionBar — states the bar never offers", () => {
     });
     expect(container).toBeEmptyDOMElement();
   });
+
+  /**
+   * Authorize must only ever be reached as the automatic side effect of an
+   * approver approving in the Approvers section (`ChangeRequestApprovals.tsx`)
+   * — never via a direct click here, even from Assess, where it would
+   * otherwise be the obvious next forward move. Same exclusion mechanism as
+   * rollback/customer_approval above, for a different reason (a human
+   * decision made elsewhere in the UI, not automation).
+   */
+  it("never offers authorize from Assess, as a button or a menu item", () => {
+    renderBar({
+      state: "assess",
+      legalNextStates: ["authorize", "canceled"],
+    });
+    expect(screen.queryByRole("button", { name: /^authorize$/i })).not.toBeInTheDocument();
+    openMenu();
+    expect(screen.queryByRole("menuitem", { name: /^authorize$/i })).not.toBeInTheDocument();
+  });
+
+  it("excludes authorize even when it would otherwise render through the generic fallback", () => {
+    // `authorize` has no curated action label, so without the exclusion it
+    // would still be renderable via `DEFAULT_TARGET_CONFIG`.
+    renderBar({ state: "assess", legalNextStates: ["authorize", "awaiting_vendor"] });
+    openMenu();
+    expect(screen.getByRole("menuitem", { name: /^awaiting vendor$/i })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /^authorize$/i })).not.toBeInTheDocument();
+  });
+
+  it("renders no bar at all from Assess when authorize is the only legal target", () => {
+    const { container } = renderBar({
+      state: "assess",
+      legalNextStates: ["authorize"],
+    });
+    expect(container).toBeEmptyDOMElement();
+  });
 });
 
 describe("ChangeRequestActionBar — pending state", () => {
@@ -248,6 +282,10 @@ describe("ChangeRequestActionBar — pending state", () => {
   });
 });
 
+/**
+ * "Request Approval" (New -> Assess) requires an assigned team: its members
+ * are who the Peer Approval stage is provisioned for.
+ */
 describe("ChangeRequestActionBar — per-target blocked reasons", () => {
   it("disables the assess transition when the CR has no assigned team", () => {
     const { onAction } = renderBar({
@@ -269,7 +307,7 @@ describe("ChangeRequestActionBar — per-target blocked reasons", () => {
     expect(focusTarget).not.toBeNull();
     expect(focusTarget).toHaveAttribute(
       "aria-label",
-      "Request approval: Set an assigned team before requesting approval",
+      "Request Approval: Set an assigned team before requesting approval",
     );
   });
 
@@ -280,16 +318,157 @@ describe("ChangeRequestActionBar — per-target blocked reasons", () => {
 
   it("blocks only the target with the unmet prerequisite, leaving the others clickable", () => {
     // `assess` is blocked *and* is first in FORWARD_ORDER, so it stays the
-    // promoted (disabled) primary while `scheduled` stays usable behind the
+    // promoted (disabled) primary while `canceled` stays usable behind the
     // menu — a blocked target must not take the rest of the bar down with it.
     const { onAction } = renderBar({
       state: "new",
-      legalNextStates: ["scheduled", "assess"],
+      legalNextStates: ["canceled", "assess"],
       assignedTeam: null,
     });
     expect(screen.getByRole("button", { name: /request approval/i })).toBeDisabled();
     openMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: /^schedule$/i }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /cancel change/i }));
+    expect(onAction).toHaveBeenCalledWith("canceled");
+  });
+});
+
+/**
+ * CAB (or ECAB) approval moves a CR to Scheduled automatically, and a Standard
+ * change goes straight there from Request Approval -- there is no manual
+ * "Schedule" button. The backend no longer lists `scheduled` in
+ * `legalNextStates`; the bar also filters it defensively.
+ */
+describe("ChangeRequestActionBar — Request Approval flow, no manual Schedule", () => {
+  it("shows 'Request Approval' and never 'Move to Assess' for a new CR", () => {
+    renderBar({ state: "new", legalNextStates: ["assess", "canceled"] });
+    expect(screen.getByRole("button", { name: "Request Approval" })).toBeInTheDocument();
+    expect(screen.queryByText(/move to assess/i)).not.toBeInTheDocument();
+  });
+
+  it("never offers Schedule, as a button or menu item, even if the backend lists scheduled", () => {
+    renderBar({ state: "authorize", legalNextStates: ["scheduled", "canceled"] });
+    expect(screen.queryByRole("button", { name: /schedule/i })).not.toBeInTheDocument();
+    openMenu();
+    expect(screen.queryByRole("menuitem", { name: /schedule/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /cancel change/i })).toBeInTheDocument();
+  });
+
+  it("renders no bar at all when scheduled is the only legal target", () => {
+    const { container } = renderBar({ state: "authorize", legalNextStates: ["scheduled"] });
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("offers no Schedule for an Assess-stage CR (approval pending), only Cancel", () => {
+    renderBar({ state: "assess", legalNextStates: ["authorize", "scheduled", "canceled"] });
+    openMenu();
+    expect(screen.queryByRole("menuitem", { name: /schedule|authorize/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /cancel change/i })).toBeInTheDocument();
+  });
+
+  it("from Scheduled, the forward move is Start implementation (the CR got there automatically)", () => {
+    renderBar({ state: "scheduled", legalNextStates: ["implement", "canceled"] });
+    expect(screen.getByRole("button", { name: /start implementation/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /schedule/i })).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * Customer Approval / Customer Review gates. `scheduled` is a manual target in
+ * exactly one place: leaving `customer_approval`, where it records the
+ * customer's approval. `legalNextStates` stays the single source of truth for
+ * which of Close / Send for customer review the Review state offers.
+ */
+describe("ChangeRequestActionBar — customer approval and customer review gates", () => {
+  it("from customer_approval offers 'Record customer approval' (primary) and Cancel", () => {
+    const { onAction } = renderBar({
+      state: "customer_approval",
+      customerApprovalRequired: true,
+      legalNextStates: ["scheduled", "canceled"],
+    });
+    const record = screen.getByRole("button", { name: "Record customer approval" });
+    expect(record).toBeInTheDocument();
+    openMenu();
+    expect(screen.getByRole("menuitem", { name: /cancel change/i })).toBeInTheDocument();
+    // Cancel and Record are the only actions; no Schedule wording.
+    expect(screen.queryByText(/^schedule/i)).not.toBeInTheDocument();
+    fireEvent.click(record);
+    // Sent as a plain PATCH {state:"scheduled"} by the caller.
     expect(onAction).toHaveBeenCalledWith("scheduled");
+  });
+
+  it("never offers the customer_approval state itself as an action, even when listed", () => {
+    renderBar({
+      state: "authorize",
+      legalNextStates: ["customer_approval", "canceled"],
+    });
+    expect(screen.queryByRole("button", { name: /customer approval/i })).not.toBeInTheDocument();
+    openMenu();
+    expect(screen.queryByRole("menuitem", { name: /customer approval/i })).not.toBeInTheDocument();
+  });
+
+  it("offers no Record customer approval outside customer_approval, even if scheduled is listed", () => {
+    for (const state of ["new", "assess", "authorize", "scheduled", "implement", "review", "customer_review"]) {
+      const { container } = renderBar({
+        state,
+        legalNextStates: ["scheduled"],
+      });
+      expect(container).toBeEmptyDOMElement();
+      expect(screen.queryByText(/record customer approval/i)).not.toBeInTheDocument();
+      cleanup();
+    }
+  });
+
+  it("offers no button or menu item labelled Schedule/Scheduled in any state", () => {
+    for (const state of ["new", "assess", "authorize", "customer_approval", "scheduled", "implement", "review", "customer_review"]) {
+      renderBar({
+        state,
+        legalNextStates: ["assess", "scheduled", "implement", "review", "customer_review", "closed", "canceled"],
+      });
+      expect(screen.queryByRole("button", { name: /schedul/i })).not.toBeInTheDocument();
+      const trigger = screen.queryByRole("button", { name: /change state/i });
+      if (trigger) {
+        fireEvent.click(trigger);
+        expect(screen.queryByRole("menuitem", { name: /schedul/i })).not.toBeInTheDocument();
+      }
+      cleanup();
+    }
+  });
+
+  it("Review with customer review NOT required offers Close and Cancel, and no customer review", () => {
+    renderBar({
+      state: "review",
+      customerReviewRequired: false,
+      legalNextStates: ["closed", "canceled"],
+    });
+    expect(screen.getByRole("button", { name: "Close" })).toBeInTheDocument();
+    expect(screen.queryByText(/send for customer review/i)).not.toBeInTheDocument();
+    openMenu();
+    expect(screen.queryByRole("menuitem", { name: /customer review/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /cancel change/i })).toBeInTheDocument();
+  });
+
+  it("Review with customer review required offers Send for customer review and Cancel, and no Close", () => {
+    renderBar({
+      state: "review",
+      customerReviewRequired: true,
+      legalNextStates: ["customer_review", "canceled"],
+    });
+    expect(screen.getByRole("button", { name: "Send for customer review" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Close" })).not.toBeInTheDocument();
+    openMenu();
+    expect(screen.queryByRole("menuitem", { name: /^close$/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /cancel change/i })).toBeInTheDocument();
+  });
+
+  it("customer_review offers Close and Cancel", () => {
+    renderBar({
+      state: "customer_review",
+      customerReviewRequired: true,
+      legalNextStates: ["closed", "canceled"],
+    });
+    expect(screen.getByRole("button", { name: "Close" })).toBeInTheDocument();
+    expect(screen.queryByText(/send for customer review/i)).not.toBeInTheDocument();
+    openMenu();
+    expect(screen.getByRole("menuitem", { name: /cancel change/i })).toBeInTheDocument();
   });
 });

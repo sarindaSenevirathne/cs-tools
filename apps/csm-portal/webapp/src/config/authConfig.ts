@@ -14,6 +14,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import type { TopBannerItem } from "@config/topBannersConfig";
+
 // Extend window interface to include our config
 declare global {
   interface Window {
@@ -23,6 +25,36 @@ declare global {
       CSM_PORTAL_AUTH_SIGN_IN_REDIRECT_URL: string;
       CSM_PORTAL_AUTH_SIGN_OUT_REDIRECT_URL: string;
       CSM_PORTAL_BACKEND_BASE_URL: string;
+      /**
+       * TEMPORARY / LOCAL DEV ONLY. Real Asgardeo sign-in still happens —
+       * this does not touch authentication — it only bypasses the
+       * post-sign-in *authorization* checks that currently show "You don't
+       * have access to this portal yet" for an account the real staging
+       * backend hasn't provisioned a portal role for yet: AuthGuard's
+       * GET /users/me role check, portalAccess.ts's per-section
+       * capabilities (Operations, Time Cards, Escalate, Download, Write),
+       * and the SPL section's own Asgardeo-groups audience gate. Grep for
+       * `devBypassAccessCheck` to find every call site. Never set this in a
+       * committed config.js — see @config/devFlags.ts's export for the
+       * full explanation.
+       */
+      CSM_PORTAL_DEV_BYPASS_ACCESS_CHECK?: boolean;
+      /**
+       * TEMPORARY / LOCAL DEV ONLY. Forces which of the two independent
+       * views ("cs-abt" or "sales-sa") the app renders, bypassing the real
+       * Asgardeo-groups detection usePortalView otherwise defers to (the
+       * same signal useAccess already uses to gate /spl/* routes) —
+       * until real role separation lands (see the Asgardeo Role Catalogue
+       * memory note). "cs-abt" shows CSM Portal's own left nav (Dashboard,
+       * Support, Operations, ...); "sales-sa" shows only the Support
+       * Portal Lite nav (Cases, Accounts, Projects, Team schedule, User
+       * scan, Customer health, Usage metrics) as the entire left rail
+       * instead. The top bar (title, search, header controls) is identical
+       * in both — only CsmSideBar's contents and RootLanding's default
+       * destination change. Grep for `devViewOverride` for every call
+       * site. Never set this in a committed config.js.
+       */
+      CSM_PORTAL_DEV_VIEW_OVERRIDE?: "cs-abt" | "sales-sa";
       /**
        * Base URL for the case-activity SSE stream (csm-portal-backend's
        * dedicated :9092 listener, exposed as its own Choreo REST endpoint).
@@ -54,8 +86,17 @@ declare global {
       CSM_PORTAL_MAINTENANCE_BANNER_ACTION_URL?: string;
       CSM_PORTAL_CHATBOT_WEBSOCKET_URL?: string;
       CSM_PORTAL_FLOATING_NOVERA_ENABLED?: boolean;
+      /** Legacy single banner: gates CSM_PORTAL_TOP_BANNER_HTML when it is a string. */
       CSM_PORTAL_TOP_BANNER_ENABLED?: boolean;
-      CSM_PORTAL_TOP_BANNER_HTML?: string;
+      /**
+       * Legacy single banner. A raw HTML string (shown only when
+       * CSM_PORTAL_TOP_BANNER_ENABLED is true; has no start or expiry) or a banner
+       * object (honours its own startsAt and expiresAt).
+       * Prefer CSM_PORTAL_TOP_BANNERS.
+       */
+      CSM_PORTAL_TOP_BANNER_HTML?: string | TopBannerItem;
+      /** Ordered banners rendered above the header. Default: []. */
+      CSM_PORTAL_TOP_BANNERS?: TopBannerItem[];
       CSM_PORTAL_ANNOUNCEMENT_BANNER_VISIBLE?: boolean;
       CSM_PORTAL_ANNOUNCEMENT_BANNER_STORAGE_KEY?: string;
       CSM_PORTAL_ANNOUNCEMENT_BANNER_HTML?: string;
@@ -130,3 +171,7 @@ const getAuthConfig = (): AuthConfig => {
 };
 
 export const authConfig = getAuthConfig();
+
+// devBypassAccessCheck and devViewOverride (the values for the two
+// CSM_PORTAL_DEV_* keys declared above) live in devFlags.ts, not here — see
+// that file's own doc comment for why.

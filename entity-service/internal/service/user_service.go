@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
@@ -32,13 +33,47 @@ import (
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/middleware"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/validate"
 )
-
-var uuidRE = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // emailRE matches the Ballerina `Email` constraint used by the Customer Portal
 // backend (`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`).
 var emailRE = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
+
+// internalUserTypeRoles are the role names recompute_user_type's trigger
+// (migration 0011_users_add_user_type.sql) resolves to user_type = INTERNAL.
+var internalUserTypeRoles = []string{"admin", "internal"}
+
+// requestsInternalUserType reports whether granting roles at user creation
+// would resolve the new user's user_type to INTERNAL via that trigger.
+func requestsInternalUserType(roles []domain.UserRole) bool {
+	for _, role := range roles {
+		for _, internal := range internalUserTypeRoles {
+			if strings.EqualFold(string(role), internal) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// externalUserTypeRoles are the role names recompute_user_type's trigger
+// resolves to user_type = EXTERNAL. Creating an EXTERNAL-type user via this
+// endpoint is temporarily disabled -- see requestsExternalUserType.
+var externalUserTypeRoles = []string{"external", "partner", "customer", "partner_admin", "customer_admin"}
+
+// requestsExternalUserType reports whether granting roles at user creation
+// would resolve the new user's user_type to EXTERNAL via that trigger.
+func requestsExternalUserType(roles []domain.UserRole) bool {
+	for _, role := range roles {
+		for _, external := range externalUserTypeRoles {
+			if strings.EqualFold(string(role), external) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // validateEmail returns a ValidationError unless email is present and matches
 // emailRE. Used where a caller-supplied address is documented as
@@ -58,7 +93,7 @@ func validateEmail(email string) error {
 // validateUUIDs returns a ValidationError if any element of ids is not a valid UUID.
 func validateUUIDs(field string, ids []string) error {
 	for _, id := range ids {
-		if !uuidRE.MatchString(id) {
+		if !validate.IsUUID(id) {
 			return &apierror.ValidationError{Msg: fmt.Sprintf("%s contains invalid UUID: %q", field, id)}
 		}
 	}
@@ -264,7 +299,7 @@ func (s *userService) SearchUsers(ctx context.Context, req domain.SearchUsersReq
 // matching row. See case_service.go's identical pattern for CreateCase /
 // CreateCaseComment.
 //
-// Postgres has role/user_role tables (migrations 000004/000006 -- see
+// Postgres has role/user_role tables (migrations 0008/0010 -- see
 // SearchUsers' roleIds filter, which does query them) and no group-membership
 // table at all. GetMe doesn't resolve either here: Roles is left empty rather
 // than queried, since no caller has asked for it on this path yet, and Groups
@@ -316,6 +351,54 @@ func (s *userService) GetMe(ctx context.Context) (domain.GetUserMeResponse, erro
 	}, nil
 }
 
+// GetUsersByIDs implements UserService.
+func (s *userService) GetUsersByIDs(ctx context.Context, ids []string) (domain.GetUsersByIDsResponse, error) {
+	if len(ids) == 0 {
+		return domain.GetUsersByIDsResponse{Users: []domain.User{}}, nil
+	}
+	users, err := s.repo.GetUsersByIDs(ctx, ids)
+	if err != nil {
+		return domain.GetUsersByIDsResponse{}, err
+	}
+	return domain.GetUsersByIDsResponse{Users: users}, nil
+}
+
+// PatchMe implements UserService. Resolves the caller the same way GetMe
+// does (x-user-id-token's email claim -> GetUserByEmail), so there is no
+// caller-supplied id to trust -- a user can only ever update their own
+// timezone through this endpoint.
+func (s *userService) PatchMe(ctx context.Context, req domain.PatchUserMeRequest) (domain.PatchUserMeResponse, error) {
+	if req.TimeZone == "" {
+		return domain.PatchUserMeResponse{}, &apierror.ValidationError{Msg: "timeZone is required"}
+	}
+	token := middleware.UserIDTokenFromContext(ctx)
+	if token == "" {
+		return domain.PatchUserMeResponse{}, &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
+	}
+	email, err := emailFromJWT(token)
+	if err != nil {
+		return domain.PatchUserMeResponse{}, &apierror.ValidationError{Msg: "x-user-id-token: " + err.Error()}
+	}
+	user, err := s.repo.GetUserByEmail(ctx, email)
+	if err != nil {
+		return domain.PatchUserMeResponse{}, err
+	}
+
+	updatedOn, err := s.repo.UpdateUserTimeZone(ctx, user.ID, req.TimeZone)
+	if err != nil {
+		return domain.PatchUserMeResponse{}, err
+	}
+
+	return domain.PatchUserMeResponse{
+		Message: "User updated successfully",
+		User: domain.PatchUserMeUpdated{
+			ID:        user.ID,
+			UpdatedBy: email,
+			UpdatedOn: updatedOn.UTC().Format(time.RFC3339),
+		},
+	}, nil
+}
+
 // CreateUser implements UserService.
 func (s *userService) CreateUser(ctx context.Context, req domain.CreateUserRequest) (domain.User, error) {
 	token := middleware.UserIDTokenFromContext(ctx)
@@ -336,6 +419,13 @@ func (s *userService) CreateUser(ctx context.Context, req domain.CreateUserReque
 	if len(req.Roles) > 50 {
 		return domain.User{}, &apierror.ValidationError{Msg: "roles cannot contain more than 50 values"}
 	}
+	if requestsInternalUserType(req.Roles) && !strings.HasSuffix(strings.ToLower(req.Email), wso2EmailDomain) {
+		return domain.User{}, &apierror.ValidationError{Msg: "an internal-type user must have a " + wso2EmailDomain + " email address"}
+	}
+	if requestsExternalUserType(req.Roles) {
+		return domain.User{}, &apierror.ValidationError{Msg: "creating an external-type user is not available at this time"}
+	}
 
 	return s.repo.CreateUser(ctx, req, actor)
 }
+

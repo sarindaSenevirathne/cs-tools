@@ -19,6 +19,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -31,6 +32,7 @@ import (
 // unconfigured methods panic if called -- same convention as
 // stubIncidentRepo (incident_service_test.go).
 type stubProblemRepo struct {
+	createProblem               func(ctx context.Context, req domain.CreateProblemRequest, createdBy string) (domain.ProblemDetail, error)
 	createProblemFromServiceNow func(ctx context.Context, req domain.CreateProblemRequest, id, number, createdBy string, state *string) (domain.ProblemDetail, error)
 	getProblem                  func(ctx context.Context, id string) (domain.ProblemDetail, error)
 	updateProblemFields         func(ctx context.Context, req domain.UpdateProblemRequest, actorEmail string) (time.Time, error)
@@ -53,6 +55,12 @@ func (s *stubProblemRepo) CreateProblemFromServiceNow(ctx context.Context, req d
 		return s.createProblemFromServiceNow(ctx, req, id, number, createdBy, state)
 	}
 	panic("CreateProblemFromServiceNow called unexpectedly: Postgres must stay untouched when ServiceNow never accepts the problem")
+}
+func (s *stubProblemRepo) CreateProblem(ctx context.Context, req domain.CreateProblemRequest, createdBy string) (domain.ProblemDetail, error) {
+	if s.createProblem != nil {
+		return s.createProblem(ctx, req, createdBy)
+	}
+	panic("CreateProblem called unexpectedly")
 }
 func (s *stubProblemRepo) UpdateProblemFields(ctx context.Context, req domain.UpdateProblemRequest, actorEmail string) (time.Time, error) {
 	if s.updateProblemFields != nil {
@@ -451,5 +459,35 @@ func TestProblemService_UpdateProblem_MirrorDispatchedEvenWhenReReadFails(t *tes
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("mirror.UpdateProblem was never called despite the Postgres write succeeding -- the re-read failure must not skip the mirror dispatch")
+	}
+}
+
+// TestProblemService_CreateProblem_RejectsBeforeServiceNowWhenPostgresWouldFail
+// proves values the Postgres insert cannot store are rejected BEFORE the
+// ServiceNow call, so no ServiceNow-only record is left behind.
+func TestProblemService_CreateProblem_RejectsBeforeServiceNowWhenPostgresWouldFail(t *testing.T) {
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	bad := "bogus"
+	cases := map[string]func(*domain.CreateProblemRequest){
+		"subject over 512 characters": func(r *domain.CreateProblemRequest) { r.Subject = strings.Repeat("a", 513) },
+		"unknown category":            func(r *domain.CreateProblemRequest) { r.Category = &bad },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			mirror := &stubMirrorProblemService{
+				createProblem: func(context.Context, domain.CreateProblemRequest) (domain.ProblemDetail, error) {
+					t.Fatal("ServiceNow must not be called")
+					return domain.ProblemDetail{}, nil
+				},
+			}
+			svc := NewProblemServiceWithSNMirror(&stubProblemRepo{}, mirror, nil)
+			req := validCreateProblemRequest()
+			mutate(&req)
+			_, err := svc.CreateProblem(ctx, req)
+			var ve *apierror.ValidationError
+			if !asValidationError(err, &ve) {
+				t.Fatalf("expected ValidationError, got %T: %v", err, err)
+			}
+		})
 	}
 }

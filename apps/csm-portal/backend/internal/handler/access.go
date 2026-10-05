@@ -40,12 +40,26 @@ const (
 	PermViewOperations
 	// PermTimeCardsAndUpdates is the Time Cards and Updates areas: every time-card
 	// route (search, create, update, delete) and the update-level lookups. Held by
-	// the CS engineer and admin, and by the time-card approver so approving does
-	// not require being a CS engineer. Narrower than PermView on purpose: a
-	// view-only role sees neither area.
+	// the CS engineer and admin, and by the time-card approver so viewing/managing
+	// time cards does not require being a CS engineer. This is deliberately
+	// broader than approving one — see PermApproveTimeCard below, which is what's
+	// actually narrowed to the approver role.
 	PermTimeCardsAndUpdates
-	// PermEscalate is escalating or de-escalating a case.
+	// PermEscalate is escalating or de-escalating a case. Held ONLY by the
+	// escalator role and admin — NOT the CS engineer, unlike most other
+	// permissions here. Escalation is a dedicated responsibility, not something
+	// being a CS engineer alone should grant.
 	PermEscalate
+	// PermApproveTimeCard is approving or rejecting a time card — a state
+	// transition on the same PATCH /time-cards/{id} route ordinary field edits
+	// use (see UpdateTimeCardRequest.State in entity-service's own domain
+	// types), so a route-level permission alone can't express this; TimeCardHandler
+	// inspects the request body itself (mirroring CaseHandler's identical
+	// approach for PermViewSecurityCenter — see that permission's own doc
+	// comment) and additionally requires this permission only when `state` is
+	// present. Held ONLY by the time-card approver role and admin — NOT the CS
+	// engineer, same narrowing as PermEscalate above.
+	PermApproveTimeCard
 	// PermDownloadAttachment is downloading attachment content, or minting a
 	// link that does.
 	PermDownloadAttachment
@@ -71,6 +85,92 @@ const (
 	// PermView, since this is deliberately narrower than the general case/
 	// product-data access PermView otherwise grants.
 	PermViewSecurityCenter
+	// PermViewerAccess is the blanket audience gate for every SupportPortalLite
+	// (Sales/Solutions-Architecture) route — replacing the old
+	// SPL_ALLOWED_GROUPS raw-Asgardeo-groups check (internal/splauth,
+	// removed).
+	//
+	// Granted to plain Viewer, unconditionally -- including callers who
+	// also hold CsEngineer. That's deliberate: this permission answers
+	// "can this caller reach SPL's API at all," which is a broader
+	// question than "which portal's nav should a caller land in by
+	// default." The latter is a webapp-only routing choice
+	// (usePortalView.ts), where CsEngineer takes precedence over Viewer so
+	// CS/ABT staff default to the CSM Portal nav even once they also carry
+	// Viewer (the baseline read role most staff role sets compose in).
+	// PermViewerAccess itself stays a plain Viewer-implies-access check with
+	// no CsEngineer exclusion, so a CS engineer who navigates to an SPL
+	// URL directly isn't hard-blocked by the backend -- only steered away
+	// from it by default in the webapp's own nav. See usePortalView.ts and
+	// useAccess.ts for the matching frontend halves of this split;
+	// keep all three in sync on which role each one checks.
+	PermViewerAccess
+	// PermUsageMetricsViewer is the SPL Usage Metrics domain
+	// (/usage-metrics/*), layered on top of PermViewerAccess the same way
+	// PermEscalate/PermDownloadAttachment layer on top of PermView —
+	// replacing the old SPL_USAGE_METRICS_GROUPS sub-group check. Unlike
+	// AccessConfig.UsageMetricsViewer's original CS-Portal-side grant (View
+	// only, since this backend had no usage-metrics route of its own before
+	// SPL), this is the real permission those SPL routes now check.
+	PermUsageMetricsViewer
+	// PermViewSharedEntity is read access to exactly the routes SupportPortalLite's
+	// merged accounts/projects/cases/team-members screens call: GET /accounts/{id},
+	// POST /accounts/search, GET /projects/{id}, POST /projects/search,
+	// POST /projects/{id}/contacts/search, POST /cases/search, GET /cases/{id},
+	// POST /cases/{id}/comments/search, and GET /teams/{id}/members — see
+	// main.go's own route registrations for the exact list. Deliberately its
+	// own permission rather than PermView itself: PermView is every read
+	// across the whole backend (users, deployments, tasks, SLAs, dashboards,
+	// schedules, announcements, ...), and sales_solutions must not gain all of
+	// that just because SPL's screens need this one narrow slice of it. Every
+	// existing PermView holder also holds this (nothing they could already
+	// read stops being readable); it exists only to grant sales_solutions
+	// this slice without the rest.
+	PermViewSharedEntity
+	// PermUsePlg is the PLG Customer Success Portal: every one of its routes
+	// except playbook management. CS engineer and admin only, which is
+	// deliberately narrower than PermView — PLG is a worklist staff act on, not
+	// a record the portal's view-only roles have any use for, and a viewer who
+	// could open it would see a section where every control returns 403.
+	//
+	// There is no view/write split within it on purpose. PLG's queue is a shared
+	// worklist: an engineer who can see a pairing is expected to act on it, and a
+	// read-only PLG user would be someone who watches work pile up and cannot
+	// touch it. Playbook management is the one exception — see below.
+	//
+	// This does NOT replace PLG's identity middleware, which resolves the caller
+	// to the "user".id every PLG write records and refuses anyone who is not
+	// ACTIVE INTERNAL staff. The two answer different questions: this one asks
+	// what the token claims, that one asks whether the person is still an
+	// employee. See internal/plg/plg.go.
+	PermUsePlg
+	// PermCreateWorkNote is posting a work_note-type comment on a case --
+	// POST /cases/{id}/comments, the route this gates. Deliberately broader
+	// than PermWrite at the ROUTE level (WorknoteCreator ∪ CsEngineer ∪
+	// Admin, a superset of PermWrite's CsEngineer ∪ Admin) so a
+	// WorknoteCreator-only caller can reach the handler at all; CaseHandler
+	// then requires the caller ALSO hold full PermWrite for any comment
+	// whose type is NOT work_note (a customer-visible reply, or any future
+	// type) -- same "broader route floor, narrower in-handler check for the
+	// more sensitive sub-action" shape as PermApproveTimeCard/
+	// PermViewSecurityCenter, just inverted: here the floor is the new
+	// permission and the narrower gate is the pre-existing one. A
+	// WorknoteCreator-only caller can therefore only ever post internal
+	// work notes, never a customer-visible comment.
+	PermCreateWorkNote
+	// PermManagePlaybooks is authoring a PLG playbook template: creating one,
+	// editing it, replacing its tasks, deleting it. Admin only.
+	//
+	// Separate from PermAdmin, which it currently matches exactly, because the
+	// two mean different things: PermAdmin is "actions no non-admin staff role
+	// should reach", and granting playbook authoring to some future PLG-admin
+	// role must not also hand out platform-user creation.
+	//
+	// READING playbooks is PermUsePlg, not this. A CS engineer browses templates
+	// and assigns them to a pairing; they just cannot change one. Assignment is
+	// POST /organizations/{id}/products/{product}/playbook-runs, a different path
+	// from the four this guards.
+	PermManagePlaybooks
 )
 
 // AccessConfig names, per portal role, the role names on the token that grant
@@ -91,6 +191,24 @@ type AccessConfig struct {
 	Admin             []string
 	TimecardApprover  []string
 	DashboardDesigner []string
+	// SalesSolutions grants PermViewSharedEntity (see that permission's own
+	// doc comment for exactly which routes -- deliberately NOT all of
+	// PermView). It's also, independently, a marker role: GET /users/me
+	// reports "sales_solutions" in its roles list. It does NOT grant
+	// PermViewerAccess or drive the webapp's SPL-vs-CS-Portal nav choice --
+	// that's Viewer's and CsEngineer's job respectively (see
+	// PermViewerAccess's own doc comment). A holder still needs one of the
+	// roles above to write, escalate, download an attachment, or
+	// administer anything — PermEscalate/PermDownloadAttachment/
+	// PermUsageMetricsViewer/PermWrite/PermAdmin etc. are unaffected by
+	// this role.
+	SalesSolutions []string
+	// WorknoteCreator grants PermCreateWorkNote (see that permission's own
+	// doc comment) -- creating a work_note-type comment on a case, and
+	// nothing else. A holder still needs CsEngineer/Admin's own PermWrite
+	// to post a customer-visible reply, escalate, download an attachment,
+	// or any other write action; this role grants none of those.
+	WorknoteCreator []string
 }
 
 // AccessGuard authorises a request from the roles on the caller's validated
@@ -113,18 +231,35 @@ type portalRole struct {
 
 // NewAccessGuard builds a guard from cfg. Admin satisfies every permission.
 // CS engineer (renamed from support_engineer -- see AccessConfig.CsEngineer's
-// own doc comment), the role for people who work cases, satisfies every one
-// too, EXCEPT PermAdmin — that one is admin-only, held by no other role,
-// unlike PermWrite which both share. The escalator and attachment-downloader
-// roles exist separately so other staff can be granted just that one ability.
-// The time-card approver also holds PermTimeCardsAndUpdates, so it can
-// approve without being a CS engineer. The usage-metrics and
-// dashboard-designer roles gate nothing here (this backend has no route for
-// those features) and grant only View. Every role implies View, so a user
-// granted only one specialised role can still open the pages it acts on.
-// PermViewSecurityCenter is the one exception to "every role implies View
-// covers it": plain viewer/escalator/attachment_downloader/usage_metrics_viewer/
-// timecard_approver/dashboard_designer all hold PermView but not this.
+// own doc comment), the role for people who work cases, satisfies every other
+// permission EXCEPT THREE: PermAdmin (admin-only, held by no other role,
+// unlike PermWrite which both share), PermEscalate, and PermApproveTimeCard —
+// escalating a case and approving a time card are each a dedicated
+// responsibility, held only by their own role (escalator / time-card
+// approver) plus admin, not by being a CS engineer alone. CS engineer DOES
+// still hold the broader PermTimeCardsAndUpdates (viewing/managing time
+// cards short of approving them). The attachment-downloader role exists
+// separately so other staff can be granted just that one ability. The
+// usage-metrics and dashboard-designer roles gate nothing here (this backend
+// has no route for those features) and grant only View. Every role implies
+// View, so a user granted only one specialised role can still open the pages
+// it acts on. Every View-implying role also holds PermViewSharedEntity, the
+// narrower slice of View that sales_solutions gets instead (see that
+// permission's own doc comment) -- nothing already readable stops being
+// readable. PermViewSecurityCenter is the one further exception to "every
+// role implies View covers it": plain viewer/escalator/attachment_downloader/
+// usage_metrics_viewer/timecard_approver/dashboard_designer all hold PermView
+// but not this. PermUsePlg is narrower the same way — CS engineer and admin
+// only — and PermManagePlaybooks narrower again, admin alone.
+// sales_solutions is a separate exception again: it implies
+// PermViewSharedEntity (only) rather than being implied BY it — see
+// AccessConfig.SalesSolutions's own doc comment. PermViewerAccess is implied by
+// plain Viewer, not sales_solutions or cs_engineer specifically -- see
+// PermViewerAccess's own doc comment for why that's a deliberately broader
+// audience check than the webapp's CsEngineer-first portal-nav choice.
+// worknote_creator is narrower still: it implies nothing but
+// PermCreateWorkNote, and even that is capped to work_note-type comments
+// only -- see that permission's own doc comment.
 func NewAccessGuard(cfg AccessConfig) *AccessGuard {
 	build := func(lists ...[]string) map[string]struct{} {
 		set := make(map[string]struct{})
@@ -145,18 +280,44 @@ func NewAccessGuard(cfg AccessConfig) *AccessGuard {
 			{"timecard_approver", build(cfg.TimecardApprover)},
 			{"dashboard_designer", build(cfg.DashboardDesigner)},
 			{"admin", build(cfg.Admin)},
+			{"sales_solutions", build(cfg.SalesSolutions)},
+			{"worknote_creator", build(cfg.WorknoteCreator)},
 		},
 		allowed: map[Permission]map[string]struct{}{
 			PermView: build(cfg.Viewer, cfg.Escalator, cfg.AttachmentDownloader,
 				cfg.UsageMetricsViewer, cfg.CsEngineer, cfg.Admin, cfg.TimecardApprover, cfg.DashboardDesigner),
 			PermViewOperations:      build(cfg.CsEngineer, cfg.Admin),
 			PermTimeCardsAndUpdates: build(cfg.CsEngineer, cfg.Admin, cfg.TimecardApprover),
-			PermEscalate:            build(cfg.Escalator, cfg.CsEngineer, cfg.Admin),
+			PermEscalate:            build(cfg.Escalator, cfg.Admin),
 			PermDownloadAttachment:  build(cfg.AttachmentDownloader, cfg.CsEngineer, cfg.Admin),
 			PermWrite:               build(cfg.CsEngineer, cfg.Admin),
 			PermViewAllDashboards:   build(cfg.CsEngineer, cfg.Admin),
 			PermAdmin:               build(cfg.Admin),
 			PermViewSecurityCenter:  build(cfg.CsEngineer, cfg.Admin),
+			PermApproveTimeCard:     build(cfg.TimecardApprover, cfg.Admin),
+			// Viewer, unconditionally (no cs_engineer exclusion) -- see
+			// PermViewerAccess's own doc comment for why.
+			PermViewerAccess: build(cfg.Viewer),
+			// Every existing PermView holder, so nothing they could already
+			// read stops being readable, plus SalesSolutions for exactly the
+			// routes this permission is registered on -- see
+			// PermViewSharedEntity's own doc comment for why this is not
+			// just PermView with SalesSolutions folded in.
+			PermViewSharedEntity: build(cfg.Viewer, cfg.Escalator, cfg.AttachmentDownloader,
+				cfg.UsageMetricsViewer, cfg.CsEngineer, cfg.Admin, cfg.TimecardApprover, cfg.DashboardDesigner,
+				cfg.SalesSolutions),
+			// Same population as PermEscalate/PermDownloadAttachment's own
+			// "the specialised role, or a CS Portal role that already
+			// dominates it" shape -- see PermUsageMetricsViewer's own doc
+			// comment.
+			PermUsageMetricsViewer: build(cfg.UsageMetricsViewer, cfg.CsEngineer, cfg.Admin),
+			PermUsePlg:             build(cfg.CsEngineer, cfg.Admin),
+			PermManagePlaybooks:    build(cfg.Admin),
+			// The route-level floor for POST /cases/{id}/comments -- see
+			// PermCreateWorkNote's own doc comment for the in-handler
+			// narrowing that keeps a WorknoteCreator-only caller from
+			// posting anything but a work_note.
+			PermCreateWorkNote: build(cfg.WorknoteCreator, cfg.CsEngineer, cfg.Admin),
 		},
 	}
 }

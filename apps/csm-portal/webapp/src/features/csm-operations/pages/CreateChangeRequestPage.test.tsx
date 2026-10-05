@@ -14,9 +14,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { fireEvent, render, screen, within } from "@testing-library/react";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
+import { clearUserPreferredTimeZone, setUserPreferredTimeZone } from "@utils/dateTime";
 import type {
   CloneChangeRequestNavState,
   CreateChangeRequestFromIncidentNavState,
@@ -105,13 +106,25 @@ vi.mock("@components/rich-text-editor/Editor", () => ({
 
 // Imported after the mocks above so the module picks them up.
 import CreateChangeRequestPage from "@features/csm-operations/pages/CreateChangeRequestPage";
-import { encodeParentRecordValue } from "@features/csm-operations/utils/changeRequests";
+import {
+  changeRequestDraftKey,
+  encodeParentRecordValue,
+  saveChangeRequestDraft,
+  type ChangeRequestDraft,
+} from "@features/csm-operations/utils/changeRequests";
+
+/** Pick one of the three change types in the "What type of change is
+ * required?" radio group. */
+function selectType(label: "Normal" | "Standard" | "Emergency" = "Normal"): void {
+  fireEvent.click(screen.getByRole("radio", { name: new RegExp(`^${label}`, "i") }));
+}
 
 /**
- * Fill the one field the form requires, so a test can reach the submit path
- * without restating unrelated input for every case.
+ * Fill the fields the form requires (a change type and a subject), so a test
+ * can reach the submit path without restating unrelated input for every case.
  */
-function fillSubject(): void {
+function fillSubject(type: "Normal" | "Standard" | "Emergency" = "Normal"): void {
+  selectType(type);
   fireEvent.change(screen.getByLabelText(/subject/i), {
     target: { value: "Roll out fix to production" },
   });
@@ -146,7 +159,7 @@ describe("CreateChangeRequestPage — Clone prefill", () => {
     };
     render(<CreateChangeRequestPage />);
     expect(screen.getByLabelText(/subject/i)).toHaveValue("Upgrade the gateway cluster");
-    expect(screen.getByText("Emergency")).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /^emergency/i })).toBeChecked();
     expect(screen.getByText("High")).toBeInTheDocument();
   });
 
@@ -163,10 +176,10 @@ describe("CreateChangeRequestPage — Clone prefill", () => {
     expect(screen.getByText(/cloned from an existing change request/i)).toBeInTheDocument();
   });
 
-  it("always resets state to 'new' regardless of the clone source", () => {
+  it("never offers a state picker, even when cloning -- every change request starts at New", () => {
     locationState = { subject: "Upgrade the gateway cluster" };
     render(<CreateChangeRequestPage />);
-    expect(screen.getByText("New")).toBeInTheDocument();
+    expect(screen.queryByText("State")).not.toBeInTheDocument();
   });
 
   it("leaves the planned start/end schedule empty even when cloning", () => {
@@ -203,14 +216,14 @@ describe("CreateChangeRequestPage — originating service request", () => {
   // above the Type/Priority/Impact/State row rather than at the very bottom
   // of the form — so it reads as more important than a plain inlined field,
   // not just "no longer collapsed".
-  it("gives the originating service request field its own heading and callout, positioned above Type/Priority/Impact/State, not a same-weight field among the rest of 'More options'", () => {
+  it("gives the originating service request field its own heading and callout, positioned above Priority/Impact, not a same-weight field among the rest of 'More options'", () => {
     render(<CreateChangeRequestPage />);
     const heading = screen.getByText("Originating service request or incident");
-    const typeField = screen.getByLabelText(/^type$/i);
-    // The callout's own heading sits earlier in the DOM than the Type field —
+    const priorityField = screen.getByLabelText(/^priority$/i);
+    // The callout's own heading sits earlier in the DOM than the Priority field —
     // i.e. above the core fields, not buried after them.
     expect(
-      heading.compareDocumentPosition(typeField) & Node.DOCUMENT_POSITION_FOLLOWING,
+      heading.compareDocumentPosition(priorityField) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
   });
 
@@ -573,6 +586,7 @@ describe("CreateChangeRequestPage — in-progress draft survives navigating away
   it("clears the draft once the change request is created, so re-opening the same clone source starts clean", () => {
     locationState = { sourceNumber: "CHG0009988", subject: "Original subject" };
     const { unmount } = render(<CreateChangeRequestPage />);
+    selectType("Normal");
     fireEvent.change(screen.getByLabelText(/subject/i), {
       target: { value: "Edited subject" },
     });
@@ -609,5 +623,363 @@ describe("CreateChangeRequestPage — in-progress draft survives navigating away
 
     render(<CreateChangeRequestPage />);
     expect(screen.getByLabelText(/subject/i)).toHaveValue("Original subject");
+  });
+});
+
+describe("CreateChangeRequestPage — planned dates are sent as UTC", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    navigateMock.mockReset();
+    postChangeRequestMutateMock.mockReset();
+    patchChangeRequestMutateMock.mockReset();
+    showErrorMock.mockReset();
+    locationState = undefined;
+  });
+
+  afterEach(() => {
+    clearUserPreferredTimeZone();
+  });
+
+  it("converts the picker's wall-clock values from the user's time zone to UTC", () => {
+    // Asia/Colombo is UTC+05:30 with no daylight saving.
+    setUserPreferredTimeZone("Asia/Colombo");
+    const draft: ChangeRequestDraft = {
+      subject: "Roll out fix to production",
+      type: "normal",
+      impact: "low",
+      priority: "",
+      plannedStartDate: "2030-03-01T15:30",
+      plannedEndDate: "2030-03-01T17:30",
+      description: "",
+      justification: "",
+      implementationPlan: "",
+      riskImpactAnalysis: "",
+      backoutPlan: "",
+      testPlan: "",
+      isPlanningVisibleToCustomers: false,
+      groupId: "",
+      assignedEngineerId: "",
+      requestedById: "",
+      parentValue: "",
+    };
+    saveChangeRequestDraft(changeRequestDraftKey({ kind: "new" }), draft);
+
+    render(<CreateChangeRequestPage />);
+    fireEvent.click(screen.getByRole("button", { name: /create change request/i }));
+
+    const [payload] = postChangeRequestMutateMock.mock.calls[0];
+    expect(payload.plannedStartDate).toBe("2030-03-01 10:00:00");
+    expect(payload.plannedEndDate).toBe("2030-03-01 12:00:00");
+  });
+});
+
+describe("CreateChangeRequestPage — the 'in the past' hint follows the profile time zone", () => {
+  const PAST_HINT = /this date is in the past/i;
+
+  function seedDraft(plannedStartDate: string, plannedEndDate: string): void {
+    saveChangeRequestDraft(changeRequestDraftKey({ kind: "new" }), {
+      subject: "Roll out fix to production",
+      type: "normal",
+      impact: "low",
+      priority: "",
+      plannedStartDate,
+      plannedEndDate,
+      description: "",
+      justification: "",
+      implementationPlan: "",
+      riskImpactAnalysis: "",
+      backoutPlan: "",
+      testPlan: "",
+      isPlanningVisibleToCustomers: false,
+      groupId: "",
+      assignedEngineerId: "",
+      requestedById: "",
+      parentValue: "",
+    });
+  }
+
+  beforeAll(() => {
+    // Pin the browser zone so it differs from the profile zone under test.
+    vi.stubEnv("TZ", "UTC");
+  });
+
+  afterAll(() => {
+    vi.unstubAllEnvs();
+  });
+
+  beforeEach(() => {
+    sessionStorage.clear();
+    locationState = undefined;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2030-03-01T12:00:00Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    clearUserPreferredTimeZone();
+  });
+
+  it("warns when the value is past in the profile zone but would look future in the browser zone", () => {
+    setUserPreferredTimeZone("Asia/Colombo");
+    // 15:30 Colombo is 10:00Z (past); as browser (UTC) digits it is 15:30Z (future).
+    seedDraft("2030-03-01T15:30", "2030-03-01T15:30");
+    render(<CreateChangeRequestPage />);
+    expect(screen.getAllByText(PAST_HINT)).toHaveLength(2);
+  });
+
+  it("does not warn when the value is future in the profile zone but would look past in the browser zone", () => {
+    setUserPreferredTimeZone("America/Los_Angeles");
+    // 08:00 Los Angeles is 16:00Z (future); as browser (UTC) digits it is 08:00Z (past).
+    seedDraft("2030-03-01T08:00", "2030-03-01T09:00");
+    render(<CreateChangeRequestPage />);
+    expect(screen.queryByText(PAST_HINT)).not.toBeInTheDocument();
+  });
+});
+
+describe("CreateChangeRequestPage — required change type (Normal / Standard / Emergency)", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    locationState = undefined;
+    navigateMock.mockReset();
+    postChangeRequestMutateMock.mockReset();
+    patchChangeRequestMutateMock.mockReset();
+    showErrorMock.mockReset();
+  });
+
+  it("opens the form with the type question first, offering exactly Normal, Standard, Emergency in that order", () => {
+    render(<CreateChangeRequestPage />);
+    const group = screen.getByRole("group", { name: /what type of change is required/i });
+    const radios = within(group).getAllByRole("radio");
+    expect(radios.map((r) => (r as HTMLInputElement).value)).toEqual(["normal", "standard", "emergency"]);
+    // The type question comes before the Subject field.
+    expect(
+      group.compareDocumentPosition(screen.getByLabelText(/subject/i)) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // No Model / Site reliability ops / Azure leftovers anywhere.
+    expect(screen.queryByText(/^azure$/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/site reliability/i)).not.toBeInTheDocument();
+  });
+
+  it("shows each type's short description beside it", () => {
+    render(<CreateChangeRequestPage />);
+    expect(screen.getByText(/general purpose change type that requires one or more approvals/i)).toBeInTheDocument();
+    expect(screen.getByText(/do not require approval/i)).toBeInTheDocument();
+    expect(screen.getByText(/must be implemented as soon as possible/i)).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /^normal/i })).toHaveAccessibleDescription(
+      /requires one or more approvals/i,
+    );
+  });
+
+  it("starts with no type selected and blocks Create, even with a subject filled in", () => {
+    render(<CreateChangeRequestPage />);
+    screen.getAllByRole("radio").forEach((r) => expect(r).not.toBeChecked());
+    fireEvent.change(screen.getByLabelText(/subject/i), { target: { value: "Roll out fix" } });
+    const create = screen.getByRole("button", { name: /create change request/i });
+    expect(create).toBeDisabled();
+    expect(screen.getByText(/select a change type to continue/i)).toBeInTheDocument();
+    fireEvent.click(create);
+    expect(postChangeRequestMutateMock).not.toHaveBeenCalled();
+  });
+
+  it("blocks Create when only a type is chosen but the subject is blank", () => {
+    render(<CreateChangeRequestPage />);
+    selectType("Standard");
+    expect(screen.getByRole("button", { name: /create change request/i })).toBeDisabled();
+  });
+
+  it("enables Create once a type and a subject are given, and clears the 'select a type' prompt", () => {
+    render(<CreateChangeRequestPage />);
+    fillSubject("Emergency");
+    expect(screen.getByRole("button", { name: /create change request/i })).toBeEnabled();
+    expect(screen.queryByText(/select a change type to continue/i)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["Normal", "normal"],
+    ["Standard", "standard"],
+    ["Emergency", "emergency"],
+  ] as const)("sends type=%s as the backend enum value '%s' in the create payload", (label, value) => {
+    render(<CreateChangeRequestPage />);
+    fillSubject(label);
+    fireEvent.click(screen.getByRole("button", { name: /create change request/i }));
+    expect(postChangeRequestMutateMock).toHaveBeenCalledTimes(1);
+    expect(postChangeRequestMutateMock.mock.calls[0]![0]).toEqual(
+      expect.objectContaining({ subject: "Roll out fix to production", type: value }),
+    );
+  });
+
+  it("sends the changed type when the selection is switched before submitting", () => {
+    render(<CreateChangeRequestPage />);
+    fillSubject("Normal");
+    selectType("Emergency");
+    fireEvent.click(screen.getByRole("button", { name: /create change request/i }));
+    expect(postChangeRequestMutateMock.mock.calls[0]![0]).toEqual(
+      expect.objectContaining({ type: "emergency" }),
+    );
+  });
+
+  it("surfaces the backend's 400 'type is required' message verbatim if it ever slips through", async () => {
+    const { BackendApiError } = await import("@api/backend/client");
+    render(<CreateChangeRequestPage />);
+    fillSubject("Standard");
+    fireEvent.click(screen.getByRole("button", { name: /create change request/i }));
+    const [, options] = postChangeRequestMutateMock.mock.calls[0];
+    const message = "type is required: a change request must be one of standard, normal or emergency";
+    const err = new (BackendApiError as unknown as new (s: number, m: string) => Error)(400, message);
+    options.onError(err);
+    expect(showErrorMock).toHaveBeenCalledWith(message, err);
+  });
+
+  it("pre-selects a cloned change's type when it is one of the three", () => {
+    locationState = { subject: "Clone me", type: "standard" };
+    render(<CreateChangeRequestPage />);
+    expect(screen.getByRole("radio", { name: /^standard/i })).toBeChecked();
+    expect(screen.getByRole("button", { name: /create change request/i })).toBeEnabled();
+  });
+
+  it("leaves the type unselected when a clone's source type is not one of the three (e.g. azure)", () => {
+    locationState = { subject: "Clone me", type: "azure" };
+    render(<CreateChangeRequestPage />);
+    screen.getAllByRole("radio").forEach((r) => expect(r).not.toBeChecked());
+    expect(screen.getByRole("button", { name: /create change request/i })).toBeDisabled();
+  });
+
+  it("restores the chosen type from an in-progress draft", () => {
+    locationState = undefined;
+    const { unmount } = render(<CreateChangeRequestPage />);
+    selectType("Emergency");
+    unmount();
+    render(<CreateChangeRequestPage />);
+    expect(screen.getByRole("radio", { name: /^emergency/i })).toBeChecked();
+  });
+});
+
+describe("CreateChangeRequestPage — Customer Approval / Customer Review checkboxes", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    locationState = undefined;
+    navigateMock.mockReset();
+    postChangeRequestMutateMock.mockReset();
+    patchChangeRequestMutateMock.mockReset();
+    showErrorMock.mockReset();
+  });
+
+  function submittedPayload(): Record<string, unknown> {
+    fireEvent.click(screen.getByRole("button", { name: /create change request/i }));
+    expect(postChangeRequestMutateMock).toHaveBeenCalledTimes(1);
+    return postChangeRequestMutateMock.mock.calls[0]![0] as Record<string, unknown>;
+  }
+
+  it("renders both as real checkboxes (not switches), unchecked by default", () => {
+    render(<CreateChangeRequestPage />);
+    const approval = screen.getByRole("checkbox", { name: "Customer Approval" });
+    const review = screen.getByRole("checkbox", { name: "Customer Review" });
+    expect(approval).not.toBeChecked();
+    expect(review).not.toBeChecked();
+    // A MUI Switch would expose role="switch"; these must not.
+    expect(screen.queryByRole("switch", { name: /customer (approval|review)/i })).not.toBeInTheDocument();
+    expect((approval as HTMLInputElement).type).toBe("checkbox");
+    expect((review as HTMLInputElement).type).toBe("checkbox");
+  });
+
+  it("shows each one's helper line", () => {
+    render(<CreateChangeRequestPage />);
+    expect(
+      screen.getByText("Adds a customer approval step after internal approval, before scheduling."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Adds a customer review step after Review, before closing."),
+    ).toBeInTheDocument();
+    // The helper text describes its checkbox for assistive tech.
+    expect(screen.getByRole("checkbox", { name: "Customer Approval" })).toHaveAccessibleDescription(
+      /customer approval step/i,
+    );
+  });
+
+  it("always sends both flags, false/false when neither is checked", () => {
+    render(<CreateChangeRequestPage />);
+    fillSubject("Normal");
+    const payload = submittedPayload();
+    expect(payload).toHaveProperty("customerApprovalRequired", false);
+    expect(payload).toHaveProperty("customerReviewRequired", false);
+  });
+
+  it.each([
+    [true, false],
+    [false, true],
+    [true, true],
+  ])("sends customerApprovalRequired=%s and customerReviewRequired=%s", (approval, review) => {
+    render(<CreateChangeRequestPage />);
+    fillSubject("Normal");
+    if (approval) fireEvent.click(screen.getByRole("checkbox", { name: "Customer Approval" }));
+    if (review) fireEvent.click(screen.getByRole("checkbox", { name: "Customer Review" }));
+    const payload = submittedPayload();
+    expect(payload.customerApprovalRequired).toBe(approval);
+    expect(payload.customerReviewRequired).toBe(review);
+  });
+
+  it("sits with Priority and Impact, above the Planning section", () => {
+    render(<CreateChangeRequestPage />);
+    const approval = screen.getByRole("checkbox", { name: "Customer Approval" });
+    expect(
+      screen.getByText("Planning").compareDocumentPosition(approval) & Node.DOCUMENT_POSITION_PRECEDING,
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("combobox", { name: /impact/i }).compareDocumentPosition(approval) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("restores both checked boxes from an in-progress draft after unmount/remount", () => {
+    const { unmount } = render(<CreateChangeRequestPage />);
+    fireEvent.click(screen.getByRole("checkbox", { name: "Customer Approval" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Customer Review" }));
+    unmount();
+    render(<CreateChangeRequestPage />);
+    expect(screen.getByRole("checkbox", { name: "Customer Approval" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Customer Review" })).toBeChecked();
+  });
+
+  it("starts unchecked from a draft saved before these checkboxes existed", () => {
+    const legacyDraft: ChangeRequestDraft = {
+      subject: "Old draft",
+      type: "normal",
+      impact: "low",
+      priority: "",
+      plannedStartDate: "",
+      plannedEndDate: "",
+      description: "",
+      justification: "",
+      implementationPlan: "",
+      riskImpactAnalysis: "",
+      backoutPlan: "",
+      testPlan: "",
+      isPlanningVisibleToCustomers: false,
+      groupId: "",
+      assignedEngineerId: "",
+      requestedById: "",
+      parentValue: "",
+    };
+    saveChangeRequestDraft(changeRequestDraftKey({ kind: "new" }), legacyDraft);
+    render(<CreateChangeRequestPage />);
+    expect(screen.getByRole("checkbox", { name: "Customer Approval" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Customer Review" })).not.toBeChecked();
+  });
+
+  it("pre-checks the boxes a clone's source had, and sends them", () => {
+    locationState = {
+      sourceNumber: "CHG0009988",
+      subject: "Clone me",
+      type: "normal",
+      customerApprovalRequired: true,
+      customerReviewRequired: false,
+    };
+    render(<CreateChangeRequestPage />);
+    expect(screen.getByRole("checkbox", { name: "Customer Approval" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Customer Review" })).not.toBeChecked();
+    const payload = submittedPayload();
+    expect(payload.customerApprovalRequired).toBe(true);
+    expect(payload.customerReviewRequired).toBe(false);
   });
 });

@@ -23,9 +23,14 @@ paths:
     post:
       summary: >-
         Ingest a Salesforce change event from sales-apex-trigger-subscriber.
-        Entity Account: fetches the Account via REST sales/sales-entity-service
-        POST /customer-search (isRealTime true), not GraphQL
-        sales/entity-graphql-service, and upserts the csm-platform account table.
+        Entity Account, only when CSM_MIGRATION_SALESFORCE_ACCOUNT_INGEST_ENABLED=true
+        (otherwise acknowledged and ignored): fetches the Account via REST
+        sales/sales-entity-service POST /customer-search (isRealTime true), not GraphQL
+        sales/entity-graphql-service, and upserts the csm-platform account table
+        (Salesforce-owned columns only) with its salesforce_ingest_state ledger row;
+        a replay whose lastModifiedDate is not newer than the ledger is a 204 no-op,
+        a customer without a name is a 204 recorded FAILED in the ledger, and
+        DELETED sets account.deleted_on (RESTORED clears it) instead of deleting.
         Entity Project_Contact__c (also accepted as Project_Contact), only when
         CSM_MIGRATION_SALESFORCE_MEMBERSHIP_INGEST_ENABLED=true: CREATED/UPDATED/RESTORED fetch
         the membership and its Contact (POST /project-contacts/search,
@@ -35,6 +40,26 @@ paths:
         resulting state is INVITED or RE-INVITED; DELETED marks the
         project_contact DEACTIVATED (never deletes). Entity Contact, UPDATED only:
         re-runs the membership upsert for each of the contact's memberships.
+        Entity Project__c, only when CSM_MIGRATION_SALESFORCE_PROJECT_INGEST_ENABLED=true:
+        CREATED/UPDATED/RESTORED fetch the project (POST /projects/search) and
+        update the Salesforce-owned project columns of the row found by sf_id or
+        else by key; the ingest is update-only (a project CSM does not have is
+        recorded FAILED and re-run by the delayed-retry job) unless
+        CSM_MIGRATION_SALESFORCE_PROJECT_INSERT_ENABLED=true also lets it insert;
+        a project without Project_Key__c is a 204 recorded FAILED; DELETED sets
+        project.is_active false (RESTORED sets it true).
+        Entity Linked_Opportunity__c (also accepted as Linked_Opportunity), only when
+        CSM_MIGRATION_SALESFORCE_OPPORTUNITY_INGEST_ENABLED=true: CREATED/UPDATED/RESTORED
+        fetch the link (POST /linked-opportunities/search), resolve its opportunity
+        and project, and upsert sf_opportunity_link by link_sf_id; DELETED
+        hard-deletes by link_sf_id.
+        Entity Invoice__c (also accepted as Invoice), only when
+        CSM_MIGRATION_SALESFORCE_OPPORTUNITY_INGEST_ENABLED=true: CREATED/UPDATED/RESTORED
+        fetch the invoice (POST /invoices/search), ingest its opportunity first when
+        missing, and upsert sf_invoice by sf_id; DELETED hard-deletes by sf_id.
+        Entity OpportunityLineItem, under the same flag, does the same for one
+        sf_opportunity_product row (POST /opportunity-line-items/search, keyed on
+        line_item_sf_id).
         Every other entity is acknowledged with 204 and ignored. A replay whose
         Salesforce lastModifiedDate is not newer than the recorded DATABASE step
         is a 204 no-op, so the customer portal and the reconcile job can replay
@@ -81,11 +106,117 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /salesforce/accounts/{sfId}/refresh-partners:
+    post:
+      summary: >-
+        Re-read one account's partners from Salesforce (REST sales-entity-service
+        POST /customer-search with includePartners) and make its stored partner
+        links in account_relationship equal to them: a forward "Is Partner Of"
+        row (partner to customer) and its reverse "Is Customer Of" mirror per
+        partner, missing partner accounts ingested first, rows of every other
+        label untouched. The same refresh runs after Account events and after
+        partner-contact membership events. Internal (M2M) callers only. Registered only when
+        CSM_MIGRATION_SALESFORCE_PARTNER_INGEST_ENABLED=true, DATA_SOURCE=postgres
+        and REST sales-entity-service config is present; 404 otherwise.
+      operationId: refreshSalesforceAccountPartners
+      parameters:
+        - name: sfId
+          in: path
+          required: true
+          description: Salesforce Account Id of the customer (15 or 18 characters).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The partner set now stored for the account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SalesforcePartnerRefreshResult'
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not an internal service.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: Not found (a partner or the account is not in CSM and the Account ingest is off).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "503":
+          description: Salesforce is temporarily unavailable, or sales-entity-service did not return the partner list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /customer-engagements/allocation-events:
+    post:
+      summary: >-
+        Apply one Allocation-app allocation event to customer engagements (port of
+        ServiceNow processAllocationEvent): for allocationType 76 or 83 (firefighting),
+        find the engagement by engagementId or create it; for any other type, find it by
+        line item (productId) or skip. Then upsert the allocation resource. One transaction; repeating an event is safe. Internal
+        clients only (M2M_CLIENT_IDS). Registered only when
+        CSM_MIGRATION_CUSTOMER_ENGAGEMENT_INGEST_ENABLED=true and PostgreSQL is authoritative.
+      operationId: processAllocationEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AllocationEvent'
+      responses:
+        "200":
+          description: Applied, or skipped with a reason (a skip is not retryable).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocationEventResult'
+        "400":
+          description: Bad request (malformed body, missing id or email, bad date, value too long).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: The caller is not an allow-listed internal client.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: The route is not registered (flag off).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error; retryable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /onboarding-steps/search:
     post:
       summary: >-
         Search the onboarding status ledger (onboarding_step): one row per
-        membership per step (IDENTITY, DATABASE, EMAIL, REGISTRATION), newest
+        membership per step (IDENTITY, DATABASE, EMAIL, REGISTRATION, WELCOME_EMAIL), newest
         first. Backs the onboarding dashboard. Has no ServiceNow equivalent —
         always backed by Postgres; 404 without a pool.
       operationId: searchOnboardingSteps
@@ -276,69 +407,70 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
-  /webhooks/github:
+  /github/deliveries:
     post:
       summary: >-
-        Receive a GitHub issue webhook. Called by GitHub, not by a portal
-        client, and authenticated by the X-Hub-Signature-256 HMAC rather than
-        by the OAuth2 scopes every other operation here uses -- GitHub cannot
-        obtain a token. Declared so the gateway routes it; the gateway must
-        leave the body byte-for-byte intact, since the signature covers the
-        raw bytes and any re-serialisation invalidates it.
-      operationId: handleGithubWebhook
-      security: []
-      parameters:
-        - name: X-Hub-Signature-256
-          in: header
-          required: true
-          description: HMAC-SHA256 of the raw body, keyed by the webhook secret.
-          schema:
-            type: string
-        - name: X-GitHub-Event
-          in: header
-          required: true
-          description: The event name, e.g. "issues" or "issue_comment".
-          schema:
-            type: string
-        - name: X-GitHub-Delivery
-          in: header
-          required: true
-          description: >-
-            GitHub's delivery id. Recorded, and a repeat of one already
-            applied is answered 200 without reapplying it.
-          schema:
-            type: string
+        Apply a GitHub delivery that operations/csm-webhooks has already
+        authenticated. That component is the public endpoint GitHub posts to;
+        it verifies the X-Hub-Signature-256 HMAC over the raw body and
+        forwards the result here. This service is Organization-visible and
+        never sees GitHub directly, so the internal client credential is what
+        stands in for the signature across this hop.
+      operationId: handleGithubDelivery
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/GithubWebhookPayload'
+              type: object
+              required: [id, event, payload]
+              properties:
+                id:
+                  type: string
+                  description: >-
+                    GitHub's delivery id. Recorded, so a repeat of one already
+                    applied is answered 409 rather than applied twice.
+                event:
+                  type: string
+                  description: The event name, e.g. "issues" or "issue_comment".
+                payload:
+                  type: object
+                  description: GitHub's webhook body, forwarded unchanged.
       responses:
         "200":
           description: >-
-            Accepted. Also returned for a delivery that was deliberately
-            skipped or already applied, so GitHub stops retrying it.
+            Applied, or deliberately skipped. The caller maps both to the 200
+            GitHub needs.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/GithubWebhookResult'
         "400":
-          description: Unreadable body, malformed payload, or a missing delivery/event header.
+          description: Malformed payload, or a missing id or event.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         "401":
+          description: Not an authorized internal client.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "409":
           description: >-
-            The signature did not verify. Deliberately identical for every
-            cause -- a caller must not learn which check failed.
+            This delivery id has already been applied. Distinct from 200 so
+            the caller can tell "already done" from "done just now" without
+            parsing a message.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         "500":
-          description: Processing failed. GitHub retries; the delivery claim is released.
+          description: >-
+            The delivery could not be applied. The caller returns 500 in turn
+            so GitHub retries: a delivery dropped here is dropped for good,
+            since nothing else re-reads GitHub's event stream.
           content:
             application/json:
               schema:
@@ -635,7 +767,7 @@ paths:
 
   /announcement-requests/search:
     post:
-      summary: Search announcement_requests rows, newest first, optionally filtered by state and/or createdBy.
+      summary: Search announcement_requests rows, newest first, optionally filtered by state (or a list of states) and/or createdBy.
       operationId: searchAnnouncementRequests
       requestBody:
         required: true
@@ -1276,6 +1408,373 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /cloud-status/monitors:
+    get:
+      summary: >-
+        The public cloud status dashboard's monitor view for one cloud, keyed
+        by region and grouped as the page renders it. Replaces the ServiceNow
+        Scripted REST API `monitors` that wso2-enterprise/uptime-dashboard
+        calls today; the response shape is that dashboard's and is reproduced
+        field for field.
+      operationId: getCloudStatusMonitors
+      parameters:
+        - name: cloud
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [asgardeo, choreo, bijira, devant, moesif, choreo-eu, agent-manager]
+          description: >-
+            Seven clouds, where the ServiceNow script accepted five. choreo-eu
+            and agent-manager have monitors and a dashboard but have never
+            been reachable, because the notification flow's URL script has no
+            branch for them.
+      responses:
+        "200":
+          description: >-
+            An object keyed by region ("cp - us", "eu - dp - eu"), each holding
+            the groups shown in that column.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/CloudStatusMonitorGroup'
+        "400":
+          description: BadRequest — unknown cloud.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /cloud-status/incidents:
+    get:
+      summary: >-
+        Six months of incident history for one cloud, keyed "YYYY-M". Every
+        month key is present whether or not it has incidents — the dashboard
+        renders a row per key, so omitting empty months would shorten the page.
+      operationId: getCloudStatusIncidents
+      parameters:
+        - name: cloud
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [asgardeo, choreo, bijira, devant, moesif, choreo-eu, agent-manager]
+      responses:
+        "200":
+          description: Six month keys, newest first in the dashboard's rendering.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  $ref: '#/components/schemas/CloudStatusIncidentMonth'
+        "400":
+          description: BadRequest — unknown cloud.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /cloud-status/availabilities:
+    get:
+      summary: >-
+        Weighted uptime for one cloud, one figure per region per window.
+        Replaces the ServiceNow Scripted REST API `/availabilities`. Each
+        region's figure is a weighted average over the service offerings
+        beneath one parent service; the weights are a product decision that
+        exists only in the deployed ServiceNow script and is reproduced
+        verbatim, not recomputed.
+      operationId: getCloudStatusAvailabilities
+      parameters:
+        - name: cloud
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [asgardeo, choreo, bijira, devant, moesif, choreo-eu, agent-manager]
+      responses:
+        "200":
+          description: >-
+            An object keyed by region ("cp", "us - dp", "eu - dp - eu"), each
+            holding exactly four windows in the order the dashboard renders
+            them: last 7 days, last 30 days, last 90 days, last 12 months.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/CloudAvailabilityWindow'
+        "400":
+          description: BadRequest — unknown cloud.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /cloud-status/availability-history:
+    get:
+      summary: >-
+        The 90-day daily uptime chart for one cloud, nested region → group →
+        monitor. Replaces the ServiceNow Scripted REST API `/history`. Unlike
+        the availabilities endpoint this one applies no weighting at all.
+      operationId: getCloudStatusAvailabilityHistory
+      parameters:
+        - name: cloud
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [asgardeo, choreo, bijira, devant, moesif, choreo-eu, agent-manager]
+      responses:
+        "200":
+          description: >-
+            An object keyed by region, each holding the groups shown in that
+            column. A monitor with no daily data carries an empty history
+            rather than a fabricated figure.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/AvailabilityHistoryGroup'
+        "400":
+          description: BadRequest — unknown cloud.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /cloud-status/incidents/{id}:
+    get:
+      summary: >-
+        One outage's public detail view. Replaces the ServiceNow Scripted
+        REST API `/incident/{sys_id}`.
+      description: >
+        *** THE 200 BODY HAS TWO SHAPES, AND THE SPARSE ONE IS THE COMMON
+        CASE. *** The ServiceNow script builds its payload from an incident
+        lookup gated on state, then assigns attachments onto whatever came
+        back. An outage with no linked incident — or one whose incident is
+        still New, On Hold or Canceled — therefore yields an object carrying
+        only `attachments`, with no id, begin or type. That is the majority
+        of outages. Reproduced rather than normalised, because the frontend
+        already handles it.
+
+
+        `comments` come from the outage's external communications, NOT from
+        the linked incident's comments. Postgres holds incident comments,
+        work notes and approval history; publishing those here would put
+        internal commentary on a public page, and ServiceNow does not.
+
+
+        `attachments` is always empty: nothing in Postgres stores outage
+        attachments, nothing writes any, and the dashboard frontend never
+        reads the field.
+      operationId: getCloudStatusIncidentDetail
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: The outage id.
+        - name: cloud
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [asgardeo, choreo, bijira, devant, moesif, choreo-eu, agent-manager]
+      responses:
+        "200":
+          description: The outage's detail, or an attachments-only object.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/CloudStatusIncidentDetail'
+                  - $ref: '#/components/schemas/CloudStatusIncidentAttachmentsOnly'
+        "400":
+          description: BadRequest — unknown cloud or missing id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No outage with that id belongs to that cloud.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /internal/availability/sweep:
+    post:
+      summary: >-
+        Internal-caller-only. Recomputes service availability for every
+        offering held to an AVAILABILITY commitment and writes
+        service_availability: the daily, weekly, monthly and annual periods
+        containing now, the four that most recently closed, and the rolling
+        last 7 / 30 / 90 days and 12 months. The producer behind the cloud
+        status dashboard endpoints; invoked nightly by
+        operations/csm-scheduled-tasks' availability_recalculation sub-cron.
+        Idempotent: rows are keyed on their own period, so a re-run rewrites
+        them rather than adding more.
+      operationId: sweepServiceAvailability
+      responses:
+        "200":
+          description: >-
+            The sweep ran. failed counts subjects whose computation errored;
+            the others were written regardless.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailabilitySweepResult'
+        "401":
+          description: >-
+            No valid internal client credential. The route is internal-only
+            (internalOnly in routes.go); customer user tokens are refused.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is authenticated but is not an internal caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "503":
+          description: The caller's identity could not be resolved right now; retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /internal/cloud-status/sweep:
+    post:
+      summary: >-
+        Internal-caller-only. Re-derives which outage transitions the public
+        cloud status dashboards are owed and records any not already recorded.
+        Decides only — sends nothing. The port of ServiceNow's `Cloud Status
+        Event Notification Flow`; invoked by operations/csm-scheduled-tasks'
+        cloud_status_webhooks sub-cron immediately before it delivers.
+        Idempotent: a sweep that finds nothing new records nothing, which is
+        the steady state.
+      operationId: sweepCloudStatusTransitions
+      responses:
+        "200":
+          description: The sweep ran. Recorded is 0 in the steady state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CloudStatusSweepResult'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /internal/cloud-status/pending:
+    get:
+      summary: >-
+        Internal-caller-only. Returns the cloud status webhooks still owed to
+        the public dashboards and not yet past their attempt limit, oldest
+        first, with each cloud already translated to the slug the dashboards
+        are addressed by.
+      operationId: listPendingCloudStatusWebhooks
+      responses:
+        "200":
+          description: The webhooks still owed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PendingCloudStatusWebhooks'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /internal/cloud-status/{id}/delivery:
+    post:
+      summary: >-
+        Internal-caller-only. Records the outcome of one webhook attempt.
+        Increments the attempt count on success and failure alike — it counts
+        what was tried, not what failed.
+      operationId: recordCloudStatusDelivery
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudStatusDeliveryReport'
+      responses:
+        "204":
+          description: Outcome recorded.
+        "400":
+          description: >-
+            BadRequest — invalid id, or a failure reported with no error
+            message.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No such webhook.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /scheduled-tasks/attempts:
     post:
       summary: >-
@@ -1824,6 +2323,10 @@ paths:
         via `user_role` in the same transaction. Postgres-only — always
         404s on the ServiceNow data source. The acting caller is resolved
         from `x-user-id-token` and stamped as `createdBy`/`updatedBy`.
+        `roles` also decides `userType`, since `recompute_user_type`'s trigger
+        derives it from role membership rather than a plain settable column —
+        granting `admin`/`internal` resolves to INTERNAL and is rejected with
+        400 unless `email` is a `@wso2.com` address.
       operationId: createUser
       tags: [Users]
       requestBody:
@@ -1840,7 +2343,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/User'
         '400':
-          description: Bad request — missing/invalid email, or neither firstName nor lastName supplied.
+          description: >
+            Bad request — missing/invalid email, neither firstName nor
+            lastName supplied, roles requests an internal-resolving role
+            (admin/internal) for a non-@wso2.com email, or roles requests an
+            external-resolving role (external/partner/customer/partner_admin/
+            customer_admin) — creating an external-type user is temporarily
+            disabled regardless of email.
           content:
             application/json:
               schema:
@@ -2045,9 +2554,49 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /teams/{id}/members:
+    get:
+      summary: Get a team's member roster.
+      operationId: getTeamMembers
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The team's members.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetTeamMembersResponse'
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: Team not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /accounts/search:
     post:
-      summary: Search accounts by name or Salesforce ID.
+      summary: >-
+        Search accounts by name or Salesforce ID. Accounts deleted in Salesforce
+        (account.deleted_on set by the Salesforce Account ingest) are never
+        returned; GET /accounts/{id} still resolves them.
       operationId: searchAccounts
       requestBody:
         required: true
@@ -2078,7 +2627,7 @@ paths:
   /accounts/{id}/contacts/search:
     post:
       summary: Search contacts for an account.
-      description: ServiceNow data source only; there is no Postgres equivalent.
+      description: Needs a user token, or an allow-listed internal client on Postgres.
       operationId: searchAccountContacts
       parameters:
         - name: id
@@ -2123,9 +2672,8 @@ paths:
     post:
       summary: Search opportunities.
       description: >
-        ServiceNow data source only; there is no Postgres equivalent. Sourced from
-        Salesforce-sync data via the ServiceNow Table API — no scoped-app endpoint
-        exists for this resource.
+        On Postgres, read from the Salesforce-ingested sf_* tables and limited to
+        internal callers (403 otherwise); on ServiceNow, from the Table API.
       operationId: searchOpportunities
       requestBody:
         required: false
@@ -2146,6 +2694,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Missing or invalid credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not an internal caller (Postgres data source).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         "500":
           description: Internal server error.
           content:
@@ -2156,7 +2716,7 @@ paths:
   /opportunities/{id}:
     get:
       summary: Get an opportunity by ID.
-      description: ServiceNow data source only; there is no Postgres equivalent.
+      description: Postgres reads sf_opportunity, internal callers only (403 otherwise).
       operationId: getOpportunity
       parameters:
         - name: id
@@ -2184,6 +2744,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Missing or invalid credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not an internal caller (Postgres data source).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         "500":
           description: Internal server error.
           content:
@@ -2195,9 +2767,8 @@ paths:
     post:
       summary: Search invoices.
       description: >
-        ServiceNow data source only; there is no Postgres equivalent. Sourced from
-        Salesforce-sync data via the ServiceNow Table API — no scoped-app endpoint
-        exists for this resource.
+        On Postgres, read from the Salesforce-ingested sf_* tables and limited to
+        internal callers (403 otherwise); on ServiceNow, from the Table API.
       operationId: searchInvoices
       requestBody:
         required: false
@@ -2218,6 +2789,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Missing or invalid credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not an internal caller (Postgres data source).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         "500":
           description: Internal server error.
           content:
@@ -2228,7 +2811,7 @@ paths:
   /invoices/{id}:
     get:
       summary: Get an invoice by ID.
-      description: ServiceNow data source only; there is no Postgres equivalent.
+      description: Postgres reads sf_invoice, internal callers only (403 otherwise).
       operationId: getInvoice
       parameters:
         - name: id
@@ -2256,6 +2839,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Missing or invalid credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not an internal caller (Postgres data source).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         "500":
           description: Internal server error.
           content:
@@ -2267,9 +2862,8 @@ paths:
     post:
       summary: Search project-opportunity links.
       description: >
-        ServiceNow data source only; there is no Postgres equivalent. Sourced from
-        Salesforce-sync data via the ServiceNow Table API — no scoped-app endpoint
-        exists for this resource. A project can have more than one linked
+        On Postgres, read from the Salesforce-ingested sf_* tables and limited to
+        internal callers (403 otherwise); on ServiceNow, from the Table API. A project can have more than one linked
         opportunity — one row per link — so this always returns a list. No by-id
         fetch: the underlying data has no single-record endpoint.
       operationId: searchProjectOpportunityLinks
@@ -2288,6 +2882,18 @@ paths:
                 $ref: '#/components/schemas/SearchProjectOpportunityLinksResponse'
         "400":
           description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Missing or invalid credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not an internal caller (Postgres data source).
           content:
             application/json:
               schema:
@@ -2356,11 +2962,12 @@ paths:
     patch:
       summary: Update a project's closure-state fields or hasAgent/hasKbReferences toggles.
       description: >
-        ServiceNow data source only; there is no Postgres equivalent. At least one
-        field must be provided. closureState itself is not settable — it is derived
-        automatically from the three closure sub-state fields by an SN business
-        rule, so setting one of those and re-fetching the project is how a caller
-        observes the resulting overall status.
+        At least one field must be provided. closureState itself is not settable — it
+        is derived from the three closure sub-states (by an SN business rule, or on
+        Postgres by the same rule in the same transaction) and returned. Sub-states
+        are accepted and returned in ServiceNow Title Case, e.g. "Pending Notified".
+        On Postgres, an allow-listed internal client may call without
+        x-user-id-token, and suspensionProcessState is accepted but not stored.
       operationId: updateProject
       parameters:
         - name: id
@@ -2383,13 +2990,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/ProjectUpdateResponse'
         "400":
-          description: Bad request — no field provided, or an invalid value.
+          description: >-
+            Bad request — no field provided, or an invalid value. The message names
+            the value and lists the accepted ones.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         "401":
-          description: Missing or invalid x-user-id-token header (ServiceNow data source only).
+          description: Missing or invalid x-user-id-token header, and not an allow-listed internal client.
           content:
             application/json:
               schema:
@@ -2428,7 +3037,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/SearchProjectsResponse'
         "400":
-          description: Bad request.
+          description: >-
+            Bad request. The message names the invalid value and lists the accepted
+            ones, e.g. `excludeClosureStates: "suspended" is not a valid closure
+            state; use one of Open, Restricted, Suspended`.
           content:
             application/json:
               schema:
@@ -2466,8 +3078,8 @@ paths:
 
         Postgres data source only, and registered only when
         CSM_MIGRATION_PORTAL_WRITES_ENABLED is exactly "true" — the path 404s otherwise.
-        Internal callers only (AUTH_INTERNAL_CLIENT_IDS); a portal end user is 403. The
-        calling portal backend decides who may invite whom.
+        A customer must be REGISTERED on the project (else 404) and hold customer_admin or
+        partner_admin (else 403); their own email is the inviter. Internal callers pass.
       operationId: inviteProjectContact
       tags: [Projects]
       parameters:
@@ -2498,19 +3110,22 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '403':
-          description: The caller is not an allow-listed internal service.
+          description: The caller is a customer without customer_admin or partner_admin.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Project not found, or the project has no Salesforce account to add a contact to.
+          description: Project not found.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
-          description: The address is already an active contact on this project.
+          description: >
+            The address is already an active contact on this project, or the project,
+            its account or the membership being re-invited has no Salesforce id yet (a
+            generic "please contact WSO2 support" message; the missing id is logged, not returned).
           content:
             application/json:
               schema:
@@ -2523,6 +3138,77 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '503':
           description: Salesforce is unavailable, or the change could not be saved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /projects/{id}/contacts/validate:
+    post:
+      summary: Check an invitation without making it.
+      description: >
+        The dry run of POST /projects/{id}/contacts: the same caller gate, the same
+        "already an active contact" rule and the same invitation checks (public email
+        domains, the allowed domain list read from Salesforce, duplicate Salesforce
+        contacts and, with inviterEmail, whether the inviter's account owns or partners
+        the project). Nothing is written to Salesforce or the database and no event is
+        published. A refused invitation is answered 200 with valid=false, a reason and a
+        message safe to show the person inviting; error statuses mean the check itself
+        could not be made. The answer is advice, not a reservation: the invitation
+        checks everything again.
+
+
+        Registered and gated exactly like the invitation: Postgres data source,
+        CSM_MIGRATION_PORTAL_WRITES_ENABLED exactly "true", same authorization as the invitation.
+      operationId: validateProjectContact
+      tags: [Projects]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The CSM project id.
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ValidateProjectMembershipRequest'
+      responses:
+        '200':
+          description: The verdict, whether or not the invitation would be allowed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectMembershipValidation'
+        '400':
+          description: Bad request — the project id is not a UUID, or the e-mail address is missing or malformed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: The caller is a customer without customer_admin or partner_admin.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Project not found, or the project has no Salesforce account to add a contact to.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Salesforce is unavailable, so the checks could not be made.
           content:
             application/json:
               schema:
@@ -2543,7 +3229,7 @@ paths:
         Here contactId is the contact's E-MAIL ADDRESS (URL-encoded), not a user id — the
         same key the invite and role-change operations use. Postgres data source only,
         registered only when CSM_MIGRATION_PORTAL_WRITES_ENABLED is exactly "true".
-        Internal callers only.
+        Same authorization as POST /projects/{id}/contacts.
       operationId: resendProjectContactInvitation
       tags: [Projects]
       parameters:
@@ -2571,7 +3257,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '403':
-          description: The caller is not an allow-listed internal service.
+          description: The caller is a customer without customer_admin or partner_admin.
           content:
             application/json:
               schema:
@@ -2583,7 +3269,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
-          description: The membership is neither INVITED nor RE-INVITED, so there is no outstanding invitation to re-send.
+          description: >
+            The membership is neither INVITED nor RE-INVITED, so there is no outstanding
+            invitation to re-send; or the membership or its contact has no Salesforce id yet
+            (a generic "please contact WSO2 support" message; the missing id is logged, not returned).
           content:
             application/json:
               schema:
@@ -2659,18 +3348,22 @@ paths:
     patch:
       summary: Replace a contact's roles on a project.
       description: >
-        Replaces the membership's Salesforce roles, and with them its project groups.
-        The membership's state is untouched. An empty roles list is accepted and means
-        "no roles" — it removes every project group rather than leaving the current set
-        alone. The database transaction and the Salesforce write succeed together or
+        Replaces the membership's portal-managed Salesforce roles (Portal user, Security
+        Contact, Lead, Admin), and with them its project groups. Every other Role__c label
+        already on the Salesforce membership (Business Contact, Business/Technical
+        Owner, Champion, Promoter or Detractor, or any label this service does not know)
+        is kept. If the membership's current roles cannot be read from Salesforce the
+        call fails with 503 instead of overwriting them. The membership's state is
+        untouched. An empty roles list is accepted and removes every portal-managed role
+        and its project group; labels set only in Salesforce stay. The database transaction and the Salesforce write succeed together or
         neither is applied; the database commits last.
 
 
         Here contactId is the contact's E-MAIL ADDRESS (URL-encoded), not a user id —
         the key a membership is addressed by, unlike the GET on this same path, which
         takes the contact's platform user id. Postgres data source only, registered
-        only when CSM_MIGRATION_PORTAL_WRITES_ENABLED is exactly "true". Internal
-        callers only.
+        only when CSM_MIGRATION_PORTAL_WRITES_ENABLED is exactly "true". Same
+        authorization as POST /projects/{id}/contacts.
       operationId: updateProjectContactRoles
       tags: [Projects]
       parameters:
@@ -2708,13 +3401,22 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '403':
-          description: The caller is not an allow-listed internal service.
+          description: The caller is a customer without customer_admin or partner_admin.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Project not found, or the contact is not a contact on this project.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: >
+            The project, its account, the membership or its contact has no Salesforce id
+            yet (a generic "please contact WSO2 support" message; the missing id is logged,
+            not returned). Nothing is written to either system.
           content:
             application/json:
               schema:
@@ -2745,7 +3447,7 @@ paths:
 
         Here contactId is the contact's E-MAIL ADDRESS (URL-encoded), not a user id.
         Postgres data source only, registered only when
-        CSM_MIGRATION_PORTAL_WRITES_ENABLED is exactly "true". Internal callers only.
+        CSM_MIGRATION_PORTAL_WRITES_ENABLED is exactly "true". Same authorization as POST /projects/{id}/contacts.
       operationId: deactivateProjectContact
       tags: [Projects]
       parameters:
@@ -2773,13 +3475,22 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '403':
-          description: The caller is not an allow-listed internal service.
+          description: The caller is a customer without customer_admin or partner_admin.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Project not found, or the contact is not a contact on this project.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: >
+            The project, its account, the membership or its contact has no Salesforce id
+            yet (a generic "please contact WSO2 support" message; the missing id is logged,
+            not returned). Nothing is written to either system.
           content:
             application/json:
               schema:
@@ -2799,7 +3510,7 @@ paths:
   /projects/{id}/contacts/search:
     post:
       summary: Search contacts for a project.
-      description: ServiceNow data source only; there is no Postgres equivalent.
+      description: Needs a user token, or an allow-listed internal client on Postgres.
       operationId: searchProjectContacts
       parameters:
         - name: id
@@ -3265,6 +3976,49 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /products/github-repo:
+    get:
+      summary: Get the GitHub repository mapped to a product.
+      description: >
+        Resolves a case product name against the active product_repo_mapping
+        rows: an exact product name first, then an exact abbreviation, then the
+        longest product name followed by a space (so a versioned name such as
+        "<product> 6.0.0" resolves to "<product>"). Matching is case-insensitive.
+        Registered only when DATA_SOURCE is postgres.
+      operationId: getProductRepoMapping
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Product name from the case, with or without a version.
+      responses:
+        "200":
+          description: The mapped repository.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductRepoMapping'
+        "400":
+          description: name is missing or blank.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No GitHub repository is mapped for this product.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /deployments:
     post:
       summary: Create a new deployment.
@@ -3557,6 +4311,67 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /announcements/registry/cases:
+    post:
+      summary: List every announcement case matching a search, in one response.
+      description: >
+        Internal callers only. Backs the CSM announcement registry, which groups the
+        whole matching set before it paginates, so it needs every row rather than a
+        page. Same request shape as POST /cases/search, except that type is always
+        announcement whatever the request says, anyOf is rejected, groupBy is ignored,
+        and pagination is ignored. sortBy is validated like /cases/search but does not
+        change the order: results are always newest-updated first (updatedOn
+        descending, id as tie-break). Only the fields the registry reads are populated
+        (id, number, internalId, type, subject, state, createdOn, updatedOn, createdBy
+        and project); every other field of the case view is null. total equals the
+        number returned. More than 10,000 matches is a 400 rather than a truncated
+        list. Available on the Postgres data source only; on the ServiceNow data source
+        the route does not exist and the registry pages POST /cases/search instead.
+      operationId: searchAnnouncementRegistryCases
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchCasesRequest'
+      responses:
+        "200":
+          description: Every announcement case matching the filters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchCasesResponse'
+        "400":
+          description: A filter is invalid, or more than 10,000 announcements match.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: A token is invalid or expired, or neither a user token nor an authorized internal client credential was supplied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not an internal caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "503":
+          description: The caller's identity could not be resolved to a scope (for example no verified identity on the request).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /cases/aggregate:
     post:
       summary: >-
@@ -3605,8 +4420,7 @@ paths:
   /cases/feedback/search:
     post:
       summary: >-
-        Search case-feedback (satisfaction rating) records across cases
-        (ServiceNow data source only).
+        Search case-feedback (satisfaction rating) records across cases.
       description: >-
         Backs the case-feedback dashboard's list view. Distinct from any
         single-case feedback lookup: this is filterable by case, accounts,
@@ -3660,11 +4474,15 @@ paths:
     post:
       summary: >-
         Date-bucketed rating aggregation of case-feedback records across
-        cases (ServiceNow data source only).
+        cases.
       description: >-
         Backs the case-feedback dashboard's rating-trend chart. This is the
         many-cases trend endpoint, not scoped to one case, so filters.caseId
         is not accepted here (unlike POST /cases/feedback/search).
+
+        Postgres: the reasons_* buckets return an empty result (the stored
+        feedback carries no per-rating reason selections), and pageSize is
+        capped at 50 on search.
       operationId: aggregateCaseFeedback
       requestBody:
         required: true
@@ -4283,7 +5101,7 @@ paths:
 
   /cases/{id}/escalations:
     get:
-      summary: Get a case's full escalation history, newest first (ServiceNow data source only).
+      summary: Get a case's full escalation history, newest first.
       operationId: searchCaseEscalations
       parameters:
         - name: id
@@ -4324,14 +5142,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-        "503":
-          description: Case escalations are only supported for the ServiceNow data source.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
     post:
-      summary: Escalate or de-escalate a case (ServiceNow data source only).
+      summary: Escalate or de-escalate a case.
       operationId: createCaseEscalation
       parameters:
         - name: id
@@ -4374,12 +5186,6 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         "500":
           description: Internal server error.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        "503":
-          description: Case escalations are only supported for the ServiceNow data source.
           content:
             application/json:
               schema:
@@ -5401,6 +6207,789 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
 
 
+  /team-schedule/catalogue:
+    get:
+      summary: The Team Schedule catalogue — time zones, shift windows and absence kinds.
+      description: >
+        Everything a client needs before it can draw a rota. Served as one
+        payload because a single day view needs all three, and three round
+        trips to render one screen is three too many.
+      operationId: getScheduleCatalogue
+      responses:
+        "200":
+          description: The zones, windows and absence kinds currently in use.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleCatalogue'
+        "401":
+          description: No user token and not an authorized internal client.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not internal staff — the rota is not available to customers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /team-schedule/assignments/search:
+    post:
+      summary: Who is working over a date window.
+      description: >
+        `includeOvernight` widens the window to catch a block that began before
+        `from` and is still running into it — the night crew a day view shows at
+        the top, rostered for yesterday but working this morning.
+      operationId: searchScheduleAssignments
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchScheduleAssignmentsRequest'
+      responses:
+        "200":
+          description: The rota for the window asked for.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleAssignmentsResponse'
+        "400":
+          description: Bad request — missing, malformed or too wide a window.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: No user token and not an authorized internal client.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not internal staff — the rota is not available to customers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: >
+            Not found — the schedule routes are registered only when a database
+            pool is configured, so an entity-service running without one has no
+            such path.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /team-schedule/absences/search:
+    post:
+      summary: Who is out of the rota over a date window.
+      operationId: searchScheduleAbsences
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchScheduleAbsencesRequest'
+      responses:
+        "200":
+          description: Absences overlapping the window asked for.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleAbsencesResponse'
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: No user token and not an authorized internal client.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not internal staff — the rota is not available to customers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: >
+            Not found — the schedule routes are registered only when a database
+            pool is configured, so an entity-service running without one has no
+            such path.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /team-schedule/assignments:
+    post:
+      summary: Put somebody on a window for a day.
+      description: >
+        Lead edit. The caller must lead the team named in the request. `startsAt`
+        and `endsAt` are not accepted — they are resolved from the shift's own
+        window and authoring timezone, so a hand-placed cover cannot drift from
+        the window it claims to be.
+      operationId: createScheduleAssignment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateScheduleAssignmentRequest'
+      responses:
+        "201":
+          description: The assignment as stored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleAssignment'
+        "400":
+          description: Bad request — missing or malformed fields.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller does not lead this team.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: Not found — the schedule routes register only with a database pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /team-schedule/assignments/apply:
+    post:
+      summary: Set one engineer to one window across a span of days.
+      description: >
+        How the month roster's cell picker edits. Each day in the range replaces
+        whatever that engineer held, because the roster is one slot per person
+        per day. A day the window is not worked on — a weekday rotation landing
+        on a Saturday — is skipped rather than refused, and reported back in
+        `skippedDates`. The whole range is one transaction.
+      operationId: applyScheduleRange
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApplyScheduleRangeRequest'
+      responses:
+        "200":
+          description: What was applied, and what was skipped.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplyScheduleRangeResponse'
+        "400":
+          description: Bad request — missing fields, malformed dates, or a range over a year.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller does not lead this team.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: Not found — the schedule routes register only with a database pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /team-schedule/edit-markers:
+    get:
+      summary: Which roster cells a person has changed, in a window.
+      description: >
+        One row per cell, not the changes themselves. The month roster is a
+        hundred-odd engineers by three months, so shipping every field that
+        moved for every cell would cost far more than the marks are worth: the
+        page needs to know which cells to mark and what to say when one is
+        pointed at. A cell's full history is a separate request.
+
+
+        Only changes made by a person are listed. The seed and the roster
+        importer wrote most of the rota; they did not change anybody's day, and
+        marking twelve thousand generated cells would say nothing.
+      operationId: getScheduleEditMarkers
+      parameters:
+        - in: query
+          name: from
+          required: true
+          schema: { type: string, format: date }
+        - in: query
+          name: to
+          required: true
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: The marked cells in that window.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleEditMarkersResponse'
+        "400":
+          description: Bad request — a missing or malformed window.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: Not an internal caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /team-schedule/absences/{id}:
+    delete:
+      summary: Remove one absence — the whole span, open-ended or not.
+      description: >
+        Lead edit, gated on the team the absence belongs to (read from the row,
+        not from the caller). Unlike clearing a date range with
+        /team-schedule/absences/apply, this also removes an absence with no end
+        date. The removal is recorded in the absence history before the row
+        goes.
+      operationId: deleteScheduleAbsence
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: note
+          in: query
+          required: false
+          description: Why it was removed, kept on the history row.
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Removed.
+        "400":
+          description: Bad request — malformed id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller does not lead this absence's team.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No such absence.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /team-schedule/absence-kinds:
+    post:
+      summary: Add a leave or allocation kind to the shared catalogue.
+      description: >
+        Any team lead may add one, and every team then sees it. The code is
+        derived from the label (upper case, words joined by underscores), so the
+        same label cannot be added twice. The colour must be one the rota draws
+        a leave or allocation chip for.
+      operationId: createScheduleAbsenceKind
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateScheduleAbsenceKindRequest'
+      responses:
+        "201":
+          description: The new kind.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleAbsenceKind'
+        "400":
+          description: Bad request — a missing or over-long field, an unknown bucket or colour.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller neither leads a team nor is a rota admin.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "409":
+          description: A kind with that label, or an active kind with that short code, already exists.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /team-schedule/absence-kinds/{code}:
+    delete:
+      summary: Delete a tag a lead added.
+      description: >
+        Any team lead may. Only a tag added from the portal can be deleted, never
+        one of the catalogue's own, and only once no leave or allocation uses it
+        -- a tag still in use is refused with how many entries use it, since
+        retiring it quietly would leave those entries with no label or colour.
+      operationId: deleteScheduleAbsenceKind
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted.
+        "401":
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller leads no team, or the tag is a built-in one.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No such tag.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "409":
+          description: The tag is still in use.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /team-schedule/absences/apply:
+    post:
+      summary: Mark one engineer away across a span, or bring them back over it.
+      description: >
+        The other half of the month roster's cell picker. Unlike a rota window
+        this is not resolved day by day — an absence is a span in the model and
+        stays one, so a weekend inside the range is covered too. An empty
+        `kindCode` clears the span instead of marking it.
+
+
+        Absences already there are reconciled rather than replaced: one that
+        falls entirely inside the span is removed, one overlapping either end is
+        shortened, and one straddling both is split in two. Clearing three days
+        out of a fortnight of leave leaves the fortnight either side standing.
+        The whole thing is one transaction.
+      operationId: applyScheduleAbsence
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApplyScheduleAbsenceRequest'
+      responses:
+        "200":
+          description: What was created, removed and shortened.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplyScheduleAbsenceResponse'
+        "400":
+          description: Bad request — missing fields, malformed dates, or a range over a year.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller does not lead this team.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: Not found — the schedule routes register only with a database pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /team-schedule/assignments/{id}:
+    patch:
+      summary: Change who holds a slot, or its detail.
+      description: >
+        Lead edit. The team is read from the row being changed, not from the
+        request, so naming your own team does not grant access to another's slot.
+        Changing the person records the assignment as a `SWAP`.
+      operationId: updateScheduleAssignment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateScheduleAssignmentRequest'
+      responses:
+        "200":
+          description: The assignment after the change.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleAssignment'
+        "400":
+          description: Bad request — malformed id or body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller does not lead this slot's team.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No such assignment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      summary: Take somebody off a slot.
+      description: >
+        Lead edit. The change is recorded before the row is removed, so the
+        deletion survives in the activity trail.
+      operationId: deleteScheduleAssignment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: note
+          in: query
+          required: false
+          description: Why the person was taken off, kept on the activity row.
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Removed.
+        "400":
+          description: Bad request — malformed id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller does not lead this slot's team.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No such assignment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /team-schedule/my-lead-teams:
+    get:
+      summary: Which teams the caller may edit.
+      description: >
+        The registry keys of every team this caller leads. An empty list is a
+        valid answer for somebody who leads nothing; the portal uses it to decide
+        which rows to offer an edit control on.
+      operationId: getMyLeadTeams
+      responses:
+        "200":
+          description: The caller's lead teams.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  teamKeys:
+                    type: array
+                    items:
+                      type: string
+        "401":
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: Not an internal caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: Not found — the schedule routes register only with a database pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /team-schedule/activity:
+    get:
+      summary: What changed on a team's rota, newest first.
+      operationId: getScheduleActivity
+      parameters:
+        - name: teamKey
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+      responses:
+        "200":
+          description: The changes in the window.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleActivityResponse'
+        "400":
+          description: Bad request — missing or too wide a window.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller does not lead this team.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: Not found — the schedule routes register only with a database pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /team-schedule/on-duty:
+    get:
+      summary: Who is responsible at this instant.
+      description: >
+        The lookup an alert escalation makes before it decides who to ring.
+        Defaults to now; `at` asks about another moment.
+      operationId: getScheduleOnDuty
+      parameters:
+        - name: at
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: RFC3339 instant. Defaults to now.
+      responses:
+        "200":
+          description: Everyone whose window covers that instant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleAssignmentsResponse'
+        "400":
+          description: Bad request — `at` is not an RFC3339 instant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: No user token and not an authorized internal client.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not internal staff — the rota is not available to customers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /groups/search:
     post:
       summary: Search groups (ServiceNow data source only).
@@ -6534,7 +8123,7 @@ paths:
 
   /incidents:
     post:
-      summary: Create a new incident (ServiceNow data source only).
+      summary: Create a new incident.
       operationId: createIncident
       requestBody:
         required: true
@@ -6852,6 +8441,247 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /outage-communications/sweep:
+    post:
+      summary: Evaluate which outages owe an SRE communication email.
+      description: >-
+        Postgres data source only. The port of ServiceNow's
+        `Outage Communication` flow — the SRE-facing pair of emails that
+        announce an outage and then announce its resolution.
+
+
+        Distinct from `/outage-notifications/sweep`, which is the internal
+        STAKEHOLDER notifier. Different flow, different audience, different
+        content.
+
+
+        POST because it is not read-only: every decision is written to the
+        communication log before it is returned. That log row is this port's
+        idempotency guard — ServiceNow relies on "Run Trigger: Once" and
+        writes no state to the outage at all, which a sweep cannot inherit.
+        Recording first means a crash loses an email rather than repeating
+        it, matching the internal notifier's choice.
+
+
+        *** ONLY `type=outage` IS EVER DECLARED. *** ServiceNow's step 4
+        requires it, so a DEGRADATION or PLANNED outage produces no email.
+        Reproduced deliberately.
+
+
+        Internal callers only.
+      operationId: sweepOutageCommunications
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+          description: Maximum outages to evaluate in this sweep.
+      responses:
+        "200":
+          description: >-
+            The emails to send. An empty `decisions` list is the normal
+            steady state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutageCommunicationSweepResponse'
+        "400":
+          description: Bad request — limit is not an integer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not an internal service.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /outages/{number}/communication-log:
+    get:
+      summary: What has been emailed about one outage, newest first.
+      description: >-
+        Postgres data source only. Operational visibility over the outage
+        communication log.
+
+
+        Keyed on the outage NUMBER rather than its id: ServiceNow's table
+        carries a reference column that is empty on every row, so the number
+        string has always been the only link.
+
+
+        The log is SHARED — it also holds rows written by the outage-update
+        flow and historical rows from flows that no longer run, so entries
+        carry `emailType` verbatim plus a normalised `emailTypeNorm`.
+
+
+        Full email bodies are deliberately NOT returned; this answers
+        "did we send, and when".
+
+
+        Internal callers only.
+      operationId: getOutageCommunicationLog
+      parameters:
+        - name: number
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The outage number, e.g. OUT0001234.
+      responses:
+        "200":
+          description: The outage's communication history, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OutageCommunicationLogEntry'
+        "400":
+          description: Bad request — the outage number is missing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not an internal service.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /outage-notifications/sweep:
+    post:
+      summary: Evaluate which internal-stakeholder outage emails are due.
+      description: >-
+        Postgres data source only. entity-service's own outage notice
+        drainer runs this decision every few seconds and publishes what it
+        returns on the outage-events topic for csm-notification-service to
+        send; this endpoint remains for manual use. Sweeps take turns under
+        an advisory lock, so a call while one is running returns no
+        decisions.
+
+
+        The port of ServiceNow's `Internal Stakeholders Email Notification -
+        Outage Communication`. A sweep rather than a record trigger because
+        nothing in this stack writes `outage` — csm-sync-service mirrors it in
+        from ServiceNow, so there is no local write to react to.
+
+
+        POST rather than GET because it is not read-only: each decision is
+        recorded as sent BEFORE it is returned, so the same sweep run twice
+        does not report the same email twice. The consequence is deliberate —
+        a decision the caller fails to deliver is lost rather than retried,
+        because a duplicate outage notice to the whole internal audience is
+        worse than a missed one.
+
+
+        Internal callers only: a sweep is estate-wide by definition and has no
+        project or account to scope to.
+      operationId: sweepOutageNotifications
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+          description: Maximum outages to evaluate in this sweep.
+      responses:
+        "200":
+          description: >-
+            The emails to send. An empty `decisions` list is the normal
+            steady state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutageNotificationSweepResponse'
+        "400":
+          description: Bad request — limit is not an integer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not an internal service.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /outages/{id}/notification-state:
+    get:
+      summary: What has already been sent for one outage.
+      description: >-
+        Postgres data source only. Operational visibility, mainly for
+        answering why an outage did or did not produce an email.
+
+
+        `seededFromSync` distinguishes a phase this service earned by sending
+        an email from one seeded out of ServiceNow's own mirrored value at
+        cutover — which is why an outage can be `DECLARED` with no
+        `declaredOn`.
+      operationId: getOutageNotificationState
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The outage's notification state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutageNotificationState'
+        "400":
+          description: Bad request — the id is not a UUID.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not an internal service.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: This outage has never been evaluated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /outages/{id}/communications:
     post:
       summary: >-
@@ -7326,8 +9156,8 @@ paths:
     get:
       summary: Get system-wide reference metadata (time zones, project types, feedback emojis).
       description: >
-        Postgres: projectTypes come from project_type; timeZones and feedbackEmojies have no
-        Postgres source yet and come back empty.
+        Postgres: projectTypes come from project_type and timeZones come from timezone;
+        feedbackEmojies has no Postgres source yet and comes back empty.
       operationId: getSystemMetadata
       responses:
         "200":
@@ -7365,15 +9195,19 @@ paths:
 
         On the Postgres data source, every request's tokens are validated (Asgardeo), and
         results are scoped to the caller (the same rule GET /projects/{id}, POST
-        /projects/search, GET /cases/{id}, and POST /cases/search also apply): if the
-        request's `x-jwt-assertion` client-credentials token names a client id in
-        AUTH_INTERNAL_CLIENT_IDS, the caller sees every project and case unconditionally --
-        regardless of any `x-user-id-token` the same request also carries (that token, if
-        present, is never used to scope an internal caller). Any other caller is resolved
-        purely from its `x-user-id-token`: an internal user still sees everything, a
+        /projects/search, GET /cases/{id}, and POST /cases/search also apply). The
+        request's `x-jwt-assertion` client-credentials token's client id decides how:
+        a customer-facing backend's client id is always resolved from the forwarded
+        `x-user-id-token`, checked first and never unconditionally trusted; the CSM
+        portal backend's client id sees every project and case unconditionally, but
+        only if that same user token's email also matches the configured CSM portal
+        user domain (otherwise refused, 403); a pure machine-to-machine client id sees
+        everything unconditionally regardless of any user token it also carries (never
+        used to scope). Any other caller is resolved purely from its `x-user-id-token`:
+        an internal user still sees everything, a
         customer sees only projects they are a REGISTERED contact of and the cases in
         them, and any other user type, an inactive user, or an unknown email is refused
-        (403). No user token and not an internal client id is refused (401) -- there is no
+        (403). No user token and no client id match above is refused (401) -- there is no
         legitimate caller to resolve. A token that is present but invalid is always
         rejected with 401. The project counts (`activeChatsCount`, `actionRequiredCount`,
         `outstandingCount`) are 0 on Postgres.
@@ -7825,7 +9659,7 @@ paths:
 
   /escalations/search:
     post:
-      summary: Search case escalations (ServiceNow data source only).
+      summary: Search case escalations.
       operationId: searchEscalations
       requestBody:
         required: true
@@ -7858,16 +9692,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-        "503":
-          description: Escalations are only supported for the ServiceNow data source.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
 
   /escalations:
     post:
-      summary: Escalate or de-escalate a case (ServiceNow data source only).
+      summary: Escalate or de-escalate a case.
       description: >
         Defaults to action ESCALATE when omitted, which requires a non-blank reason.
         DEESCALATE does not require a reason.
@@ -7892,7 +9720,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         "401":
-          description: Missing or invalid x-user-id-token header (ServiceNow data source only).
+          description: >-
+            Missing or invalid x-user-id-token header, or (Postgres data source) the
+            authenticated user is not recognised in this system.
           content:
             application/json:
               schema:
@@ -7905,12 +9735,6 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         "500":
           description: Internal server error.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        "503":
-          description: Escalations are only supported for the ServiceNow data source.
           content:
             application/json:
               schema:
@@ -9384,12 +11208,69 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: >-
-        A client-credentials token whose client id appears in
-        AUTH_INTERNAL_CLIENT_IDS. Declared on the operations that verify it
+        A client-credentials token whose client id appears in the service's
+        machine-to-machine client id allow-list. Declared on the operations that verify it
         themselves; most endpoints in this service scope by caller instead and
         do not carry this requirement.
 
   schemas:
+    AllocationEvent:
+      type: object
+      description: >-
+        The Finance Entity's allocation record as posted to ServiceNow
+        allocation_added_or_modified, plus customerCode. Unknown fields are ignored.
+      required: [id, email, allocationType]
+      properties:
+        id: {type: string, maxLength: 20, description: Allocation id.}
+        email: {type: string, description: Consultant email; matched to user.email then user.user_name.}
+        allocationType: {type: integer, description: 76 and 83 are firefighting.}
+        allocationTypeName: {type: string}
+        startDate: {type: string, format: date}
+        endDate: {type: string, format: date}
+        comment: {type: string, nullable: true}
+        clearanceStatus: {type: string, nullable: true, description: 'Label, e.g. "Confirmed"; stored as the allocation state.'}
+        isTravelRequired: {type: string, nullable: true}
+        addedBy: {type: string}
+        isRecurring: {type: string, nullable: true}
+        startTime: {type: string, nullable: true, maxLength: 8}
+        endTime: {type: string, nullable: true, maxLength: 8}
+        timeZone: {type: string, nullable: true, maxLength: 20}
+        consultantRole: {type: string, nullable: true}
+        status: {type: string, nullable: true}
+        customerCode: {type: string, nullable: true, description: Salesforce Account id (15 or 18 characters); engagement.customerCode is also read.}
+        engagement:
+          $ref: '#/components/schemas/AllocationEventEngagement'
+    AllocationEventEngagement:
+      type: object
+      properties:
+        type: {type: integer}
+        engagementTypeName: {type: string, description: '"Paid" sets is_paid on a created firefighting engagement.'}
+        engagementType: {type: string, nullable: true}
+        engagementId: {type: string, maxLength: 20}
+        customerName: {type: string, description: 'Account name fallback when customerCode does not match.'}
+        opportunityName: {type: string}
+        productName: {type: string}
+        productId: {type: string, nullable: true, description: 'Salesforce line-item id; finds the engagement for a non-firefighting allocation.'}
+        engagementCode: {type: string, maxLength: 20}
+        engagementNature: {type: string, description: 'Off-site -> OFFSITE, On-site -> ONSITE.'}
+        country: {type: string}
+        customerCode: {type: string, nullable: true}
+    AllocationEventResult:
+      type: object
+      required: [result, engagementId, allocationResourceId, engagementCreated]
+      properties:
+        result:
+          type: string
+          enum: [created, updated, skipped]
+        reason:
+          type: string
+          description: >-
+            Present when skipped: no engagement details, no engagement id, no engagement for
+            line item, account not found, ambiguous account name, user not found, or
+            firefighting engagement type id not configured.
+        engagementId: {type: string, format: uuid, nullable: true}
+        allocationResourceId: {type: string, format: uuid, nullable: true}
+        engagementCreated: {type: boolean}
     CreateServiceRequestFromIssueRequest:
       type: object
       required: [owner, repository, issueNumber, title]
@@ -9786,6 +11667,11 @@ components:
       description: >-
         At least one of firstName/lastName is required. userType is never
         accepted here -- it is derived by the database from role membership.
+        Granting a role that resolves to userType INTERNAL (admin/internal)
+        for a non-@wso2.com email is rejected with 400. Granting a role that
+        resolves to userType EXTERNAL (external/partner/customer/partner_admin/
+        customer_admin) is rejected with 400 regardless of email -- creating
+        an external-type user via this endpoint is temporarily disabled.
         Postgres-only.
 
     SNUser:
@@ -10110,11 +11996,13 @@ components:
         isPartner:
           type: boolean
           nullable: true
-          description: Whether this account is itself a partner organization. ServiceNow data source only.
+          description: Whether this account is itself a partner organization (on Postgres, classification is Partner).
         hasPrimaryPartner:
           type: boolean
           nullable: true
-          description: Whether this account has a primary partner account set. ServiceNow data source only.
+          description: >-
+            Whether this account has a primary partner account set. Postgres approximates
+            this as having any partner in account_relationship.
 
     SNSupportTierRef:
       type: object
@@ -10187,11 +12075,13 @@ components:
         isPartner:
           type: boolean
           nullable: true
-          description: Whether this account is itself a partner organization. ServiceNow data source only.
+          description: Whether this account is itself a partner organization (on Postgres, classification is Partner).
         hasPrimaryPartner:
           type: boolean
           nullable: true
-          description: Whether this account has a primary partner account set. ServiceNow data source only.
+          description: >-
+            Whether this account has a primary partner account set. Postgres approximates
+            this as having any partner in account_relationship.
 
     SearchAccountsResponse:
       type: object
@@ -10253,6 +12143,40 @@ components:
         searchQuery:
           type: string
           description: Case-insensitive match against name, key, and subscription_type.
+        closureStatus:
+          type: string
+          enum: [Open, Suspended, Restricted]
+          description: Only projects with this overall closure state.
+        sortBy:
+          type: string
+          enum: [endDate]
+          description: Sort field. Postgres puts projects with no end date last.
+        sortOrder:
+          type: string
+          enum: [asc, desc]
+        endDateFrom:
+          type: string
+          format: date
+          description: Only projects ending on or after this date (yyyy-MM-dd).
+        endDateTo:
+          type: string
+          format: date
+          description: Only projects ending on or before this date (yyyy-MM-dd).
+        onboardingStatus:
+          type: array
+          items:
+            type: string
+          description: >-
+            Only projects whose onboarding status is any of these, e.g. "In-Progress".
+            Case and separators are ignored; an unknown value returns 400.
+        subRegion:
+          type: string
+          description: Only projects whose account has this sub-region (case-insensitive).
+        arrTodayGte:
+          type: string
+          description: >-
+            Only projects whose account ARR is at least this value. ServiceNow only;
+            Postgres returns 400 because account ARR is not stored yet.
         excludeClosureStates:
           type: array
           items:
@@ -10260,7 +12184,7 @@ components:
             enum: [Open, Suspended, Restricted]
           description: >-
             Excludes projects whose closure state is any of the given values.
-            Supported on both data sources (case-insensitive on Postgres).
+            Supported on both data sources.
         excludeSubscriptionTypes:
           type: array
           items:
@@ -10325,8 +12249,8 @@ components:
           type: boolean
           nullable: true
           description: >
-            Whether this project's linked account is itself a partner organization.
-            ServiceNow data source only.
+            Whether this project's linked account is itself a partner organization
+            (on Postgres, classification is Partner).
 
     ProjectDetailsView:
       type: object
@@ -10463,6 +12387,12 @@ components:
           type: string
         key:
           type: string
+        sfId:
+          type: string
+          nullable: true
+          description: >
+            Salesforce id. Null when the backing data source has no value
+            recorded for this project.
         subscriptionType:
           type: string
           enum:
@@ -10494,13 +12424,34 @@ components:
             When the project record was created. Distinct from startDate, which
             moves forward on each renewal.
         account:
+          type: object
           nullable: true
-          description: Null when the project has no linked account.
-          allOf:
-            - $ref: '#/components/schemas/EntityRef'
+          description: Null when the project has no linked account. arrToday is ServiceNow only.
+          properties:
+            id:
+              type: string
+            name:
+              type: string
+            region:
+              type: string
+              nullable: true
+            subRegion:
+              type: string
+              nullable: true
+            arrToday:
+              type: string
+              nullable: true
+            isPartner:
+              type: boolean
+              nullable: true
+        onboardingStatus:
+          type: string
+          nullable: true
+          description: Hyphenated Title Case, e.g. "In-Progress".
         closureState:
           type: string
           nullable: true
+          description: Open, Suspended or Restricted. Sub-states are Title Case too, e.g. "Pending Notified".
         endDateClosureState:
           type: string
           nullable: true
@@ -10513,6 +12464,7 @@ components:
         complianceViolationDate:
           type: string
           nullable: true
+          description: yyyy-MM-dd.
         suspensionProcessState:
           type: object
           additionalProperties: true
@@ -10521,7 +12473,7 @@ components:
             Free-form, per-dimension Account Closure Process (ACP) suspension-process
             state (event type + action results) written by an existing ServiceNow
             suspension flow. This is opaque JSON passed through as-is — its shape is
-            not defined or validated by this layer.
+            not defined or validated by this layer. Always null on Postgres.
 
     SearchProjectsResponse:
       type: object
@@ -10683,7 +12635,8 @@ components:
           description: >
             Whether this row would actually grant its person visibility into this project's
             cases: a linked contact record AND the address the row was invited under matching
-            that record's own address, compared case-insensitively. Deliberately not a
+            that record's own address, compared case-insensitively (on Postgres, the row
+            must also be REGISTERED). Deliberately not a
             restatement of `customerContactPresent` — a row invited under one address but
             linked to a contact whose own address differs is invisible to both people, and
             that does happen on genuine customer rows.
@@ -10724,6 +12677,55 @@ components:
             invitation email. Only honoured when this request creates the
             Salesforce contact; an existing contact keeps its own flag.
 
+    ValidateProjectMembershipRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+          description: The address that would be invited.
+        inviterEmail:
+          type: string
+          format: email
+          description: >
+            As on CreateProjectMembershipRequest: the signed-in inviter's address, set by
+            the Customer Portal backend. Turns on the checks about who may invite.
+
+    ProjectMembershipValidation:
+      type: object
+      required: [valid]
+      properties:
+        valid:
+          type: boolean
+        reason:
+          type: string
+          enum: [CONFLICT, FORBIDDEN, INVALID]
+          description: >
+            Present when valid is false. The status the invitation itself would have been
+            refused with: CONFLICT 409 (already an active contact, or duplicate Salesforce
+            contacts), FORBIDDEN 403 (e.g. public or unlisted domain, inviter not allowed),
+            INVALID 400 (e.g. no domain list defined for the account).
+        message:
+          type: string
+          description: Present when valid is false. Safe to show the person inviting.
+        existingMembershipState:
+          type: string
+          description: The state of the project's existing membership for the address, if any. DEACTIVATED on a valid answer.
+        existingContact:
+          type: object
+          description: The Salesforce contact the invitation would adopt. Only on a valid answer.
+          properties:
+            contactSfId: {type: string}
+            email: {type: string}
+            firstName: {type: string}
+            lastName: {type: string}
+            isCsAdmin: {type: boolean}
+            isCsIntegrationUser: {type: boolean}
+            accountSfId: {type: string}
+            accountClassification: {type: string}
+            isPartnerAccount: {type: boolean}
+
     UpdateProjectMembershipRolesRequest:
       type: object
       required: [roles]
@@ -10734,8 +12736,9 @@ components:
             type: string
             enum: [Portal user, Security Contact, Lead, Admin]
           description: >
-            The membership's new complete set of Salesforce roles — a replacement, not a merge.
-            An empty list is allowed and removes every project group.
+            The membership's new complete set of portal-managed Salesforce roles. It replaces
+            the Portal user / Security Contact / Lead / Admin labels; other Role__c labels
+            already on the Salesforce membership are kept. An empty list is allowed.
 
     ProjectMembership:
       type: object
@@ -10773,8 +12776,10 @@ components:
           items:
             type: string
           description: >
-            The raw Salesforce Role__c labels the membership now carries, exactly as written to
-            Salesforce — not the derived project_role/project_group values.
+            The portal-managed Salesforce Role__c labels (Portal user / Security Contact / Lead /
+            Admin) the membership now carries, as written to Salesforce — not the derived
+            project_role/project_group values. Labels set only in Salesforce (e.g. Business
+            Contact) are kept on the record but not listed here.
 
     SearchProjectContactsResponse:
       type: object
@@ -10844,6 +12849,24 @@ components:
           type: integer
         hasMore:
           type: boolean
+
+    ProductRepoMapping:
+      type: object
+      required: [productName, owner, repository, githubLabel]
+      properties:
+        productName:
+          type: string
+        abbreviation:
+          type: string
+          description: Short code the case payload may use instead of the product name. Omitted when unset.
+        owner:
+          type: string
+          description: GitHub organisation that owns the repository.
+        repository:
+          type: string
+        githubLabel:
+          type: string
+          description: Product label applied to issues filed in this repository.
 
     SNProduct:
       description: Product returned by the ServiceNow data source. Timestamp fields are absent; class is a ServiceNow label (e.g. "Software Model").
@@ -11110,7 +13133,7 @@ components:
           type: array
           items:
             type: string
-          description: Optional filter by product category (e.g. "pdp"). Combines with deploymentIds rather than replacing it. Supported only for the ServiceNow-backed data source; a non-empty value returns 400 when the active data source is PostgreSQL.
+          description: Optional filter by product category (e.g. "pdp"). Combines with deploymentIds rather than replacing it. Values are matched case-insensitively against the deployed product's category and are supported on both the PostgreSQL and the ServiceNow-backed data sources. The category returned on each deployed product is the same lower-case code.
 
     DeployedProductVersionRef:
       type: object
@@ -11301,6 +13324,13 @@ components:
         description:
           type: string
           description: Description of the deployed product.
+        category:
+          type: string
+          enum: [pdp, ms, ps, cl, pc]
+          description: >-
+            Optional product category/classification (PDP/MS/PS/CL/PC). Postgres-only --
+            never forwarded to the ServiceNow mirror under dual-write, since ServiceNow's own
+            create payload has no equivalent field.
 
     CreateDeployedProductResponse:
       type: object
@@ -11324,7 +13354,7 @@ components:
 
     UpdateDeployedProductRequest:
       oneOf:
-        - description: Update deployed product detail fields. At least one of cores, tps, description, or updates must be provided.
+        - description: Update deployed product detail fields. At least one of cores, tps, description, category, or updates must be provided.
           type: object
           minProperties: 1
           additionalProperties: false
@@ -11345,6 +13375,12 @@ components:
               type: string
               nullable: true
               description: Description of the deployed product.
+            category:
+              type: string
+              enum: [pdp, ms, ps, cl, pc]
+              description: >-
+                Optional product category/classification (PDP/MS/PS/CL/PC). Postgres-only --
+                never forwarded to the ServiceNow mirror under dual-write.
             updates:
               type: array
               items:
@@ -12528,6 +14564,37 @@ components:
           type: string
           nullable: true
 
+    TeamMember:
+      type: object
+      description: >-
+        One member of a team's roster. Role is "member" or "lead" only (a
+        fixed two-value constraint), narrower than ServiceNow's free-form
+        u_role on sys_user_grmember, but always populated.
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        email:
+          type: string
+          nullable: true
+        role:
+          type: string
+          enum: [member, lead]
+      required:
+        - id
+        - name
+        - role
+
+    GetTeamMembersResponse:
+      type: object
+      properties:
+        members:
+          type: array
+          items:
+            $ref: '#/components/schemas/TeamMember'
+
     DeployedProductRef:
       type: object
       # Nullable here rather than at each $ref: a sibling `nullable` next to a
@@ -13694,8 +15761,31 @@ components:
               nullable: true
             hasCustomerApproved:
               type: boolean
+              description: >-
+                The customer's OUTCOME: true once the customer's approval has
+                been recorded (state scheduled out of customer_approval). Not
+                the creation checkbox -- see customerApprovalRequired.
             hasCustomerReviewed:
               type: boolean
+              description: >-
+                The customer's OUTCOME: true once the customer's review has
+                been recorded (state closed out of customer_review). Not the
+                creation checkbox -- see customerReviewRequired.
+            customerApprovalRequired:
+              type: boolean
+              description: >-
+                The creation form's "Customer Approval" checkbox: the change
+                needs the customer's approval before it is scheduled. When
+                true, CAB / ECAB approval (or Request Approval on a Standard
+                change) moves the change to customer_approval instead of
+                scheduled. PostgreSQL data source only (always false on the
+                ServiceNow data source).
+            customerReviewRequired:
+              type: boolean
+              description: >-
+                The creation form's "Customer Review" checkbox: the change
+                needs the customer's review before it is closed. When true,
+                review offers customer_review instead of closed.
             approvedBy:
               $ref: '#/components/schemas/EntityRef'
               nullable: true
@@ -13706,6 +15796,25 @@ components:
               type: array
               items:
                 type: string
+              description: >-
+                Next states a human may move the change request to, per state
+                (the single source of truth the portal renders).
+                new: [assess, canceled] -- "assess" is the "Request Approval"
+                action for every type; the state it lands in depends on the
+                type (Assess for Normal, Authorize for Emergency, Scheduled for
+                Standard -- customer_approval instead when
+                customerApprovalRequired).
+                assess: [authorize, canceled]; authorize: [canceled] (CAB/ECAB
+                approval moves the change on by itself: to scheduled, or to
+                customer_approval when customerApprovalRequired).
+                customer_approval: [scheduled, canceled] -- "scheduled" here
+                means "record the customer's approval" and is the ONLY state
+                from which a manual scheduled is accepted.
+                scheduled: [implement, canceled]; implement: [review,
+                canceled].
+                review: [customer_review, canceled] when customerReviewRequired,
+                else [closed, canceled].
+                customer_review: [closed, canceled]. Terminal states: none.
             implementationPlan:
               type: string
               nullable: true
@@ -13784,6 +15893,8 @@ components:
 
     ChangeRequestApprover:
       type: object
+      required:
+        - createdOn
       properties:
         id:
           type: string
@@ -13795,16 +15906,41 @@ components:
           description: >-
             Approver response status. Open string set (e.g. APPROVED, NOT_REQUIRED,
             REQUESTED, REJECTED, CANCELLED, NO_CONSENSUS); not a fixed enum.
+        canDecide:
+          type: boolean
+          description: >-
+            True only on the calling user's own REQUESTED row, when they may
+            actually decide it (they are not the change request's creator, and
+            are not an SRE team member on the peer approval stage). Advisory --
+            the decision endpoint re-checks. Postgres data source only; false
+            elsewhere.
+        createdOn:
+          type: string
+          nullable: true
+          description: >-
+            When this approval was requested. Always present on the Postgres data
+            source; always null on the ServiceNow-backed one (the Choreo
+            GET /change-requests/{id}/approvals response carries no equivalent
+            field).
         respondedOn:
           type: string
           nullable: true
+        comments:
+          type: string
+          nullable: true
+          description: >-
+            The approver's own comment on their decision, if any. Always null on
+            the ServiceNow-backed data source, same reason as createdOn above.
 
     ChangeRequestApproval:
       type: object
       properties:
         stage:
           type: string
-          description: Approval stage name (e.g. Assess, Authorize, Customer Approval).
+          description: >-
+            Approval stage name: "Peer Approval", "CAB Approval", "ECAB Approval"
+            or "Review" for stages provisioned by this service; legacy/synced
+            stages may be "Assess", "Authorize" or "Customer Approval".
         approverType:
           type: string
           enum: [STATIC_GROUP, DYNAMIC_CONTACT]
@@ -14220,9 +16356,17 @@ components:
       type: object
       required:
         - subject
+        - type
       properties:
         subject:
           type: string
+        type:
+          type: string
+          enum: [standard, normal, emergency]
+          description: >-
+            Required. Decides the approval flow: Standard needs no approval
+            (Request Approval goes straight to Scheduled); Normal needs peer
+            approval then CAB approval; Emergency needs ECAB approval only.
         category:
           type: string
           enum:
@@ -14261,15 +16405,6 @@ components:
             - high
             - medium
             - low
-        type:
-          type: string
-          enum:
-            - standard
-            - normal
-            - emergency
-            - model
-            - site_reliability_ops
-            - azure
         state:
           type: string
           enum:
@@ -14354,6 +16489,20 @@ components:
           description: >-
             Whether the Implementation Plan is visible to customers on the
             customer-facing portal.
+        customerApprovalRequired:
+          type: boolean
+          description: >-
+            The "Customer Approval" checkbox: the change needs the customer's
+            approval before it is scheduled (CAB / ECAB approval, or Request
+            Approval on a Standard change, then moves it to customer_approval
+            instead of scheduled). Defaults to false. PostgreSQL data source
+            only.
+        customerReviewRequired:
+          type: boolean
+          description: >-
+            The "Customer Review" checkbox: the change needs the customer's
+            review before it is closed (review offers customer_review instead
+            of closed). Defaults to false. PostgreSQL data source only.
 
     CreateChangeRequestResponse:
       type: object
@@ -14462,6 +16611,21 @@ components:
           description: >-
             Whether the Implementation Plan is visible to customers on the
             customer-facing portal.
+        customerApprovalRequired:
+          type: boolean
+          description: >-
+            The "Customer Approval" checkbox. Editable only until the approval
+            gate has been passed, i.e. while the state is new, assess or
+            authorize; a change of value afterwards is a 400 ("customerApprovalRequired
+            can no longer be changed ..."). Resending the stored value is
+            always accepted. PostgreSQL data source only.
+        customerReviewRequired:
+          type: boolean
+          description: >-
+            The "Customer Review" checkbox. Editable until the change leaves
+            review (any state up to and including review); a change of value
+            from customer_review onwards is a 400 ("customerReviewRequired can
+            no longer be changed ..."). PostgreSQL data source only.
         implementationPlan:
           type: string
           nullable: true
@@ -15371,6 +17535,440 @@ components:
           type: string
           description: Free-text search query.
 
+    ScheduleZone:
+      type: object
+      description: An SRE time zone.
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, example: TZ1 }
+        label: { type: string }
+        weekendZoneCode:
+          type: string
+          description: >
+            The zone that absorbs this one at the weekend, when three weekday
+            zones collapse into two.
+        sortOrder: { type: integer }
+    ScheduleShift:
+      type: object
+      description: >
+        A named window of the working day. Minutes are counted from midnight in
+        authoringTimeZone; an end past 1440 runs into the next day, so
+        21:00–06:00 is one window (1260 → 1800) rather than two.
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, example: SRE_TZ1_L1 }
+        shortCode: { type: string, example: L1 }
+        label: { type: string }
+        family: { type: string, enum: [CRE, SRE] }
+        zoneCode: { type: string }
+        tier: { type: string, enum: [L1, L2, L3] }
+        dayScope: { type: string, enum: [WEEKDAY, WEEKEND, ANY] }
+        startMinute: { type: integer }
+        endMinute: { type: integer }
+        authoringTimeZone: { type: string, example: Asia/Colombo }
+        isOnCall: { type: boolean }
+        isEscalation: { type: boolean }
+        isRotation:
+          type: boolean
+          description: >-
+            Whether being on this window is a turn somebody takes, as opposed
+            to simply when their team works. Regular hours and the Americas
+            cover are not rotations.
+        requiredHeadcount:
+          type: integer
+          nullable: true
+          description: >-
+            How many people this window is meant to carry, where a target has
+            been agreed. Null where none has -- every SRE window today.
+        crossesMidnight: { type: boolean }
+        colourToken: { type: string }
+        sortOrder: { type: integer }
+    ScheduleTeam:
+      type: object
+      required: [key, name, family, sortOrder]
+      description: >-
+        One team the rota is run for. Served so no client has to hold the list:
+        team names are organisation vocabulary, and a frontend that hardcodes
+        them is coupled to a deploy it cannot see.
+      properties:
+        key: { type: string, example: castor }
+        name: { type: string }
+        family: { type: string, enum: [CRE, SRE] }
+        sortOrder:
+          type: integer
+          description: >-
+            Display order, and what gives a team a stable colour without any
+            client naming it.
+    CreateScheduleAbsenceKindRequest:
+      type: object
+      required: [shortCode, label, bucket, colourToken]
+      properties:
+        shortCode:
+          type: string
+          maxLength: 12
+          description: What a roster cell draws, e.g. "Trn". Unique among active kinds.
+        label:
+          type: string
+          maxLength: 100
+        bucket:
+          type: string
+          enum: [LEAVE, ALLOCATION]
+        colourToken:
+          type: string
+          enum: [AL, LL, MAT, PAT, RND, EXT, INT, BR, MIG, ONB, EXC, IND]
+    ScheduleAbsenceKind:
+      type: object
+      description: Why someone is out of the rota.
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, example: ANNUAL_LEAVE }
+        shortCode: { type: string, example: AL }
+        label: { type: string }
+        bucket: { type: string, enum: [LEAVE, ALLOCATION, EXCLUDED] }
+        colourToken: { type: string }
+        sortOrder: { type: integer }
+        custom:
+          type: boolean
+          description: True for a tag a lead added from the portal, which a lead may also delete.
+        family:
+          type: string
+          enum: [CRE, SRE]
+          description: The rota the kind is offered on. Absent for a kind both rotas use, which is every kind of leave.
+        retired:
+          type: boolean
+          description: >-
+            True for a kind no longer offered. Still served so the days already
+            marked with it keep their label; a client must not offer it.
+    ScheduleCatalogue:
+      type: object
+      properties:
+        zones:
+          type: array
+          items: { $ref: '#/components/schemas/ScheduleZone' }
+        shifts:
+          type: array
+          items: { $ref: '#/components/schemas/ScheduleShift' }
+        absenceKinds:
+          type: array
+          items: { $ref: '#/components/schemas/ScheduleAbsenceKind' }
+        teams:
+          type: array
+          items: { $ref: '#/components/schemas/ScheduleTeam' }
+    ScheduleEngineer:
+      type: object
+      properties:
+        userId: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string }
+        isLead: { type: boolean }
+    ScheduleEditMarker:
+      type: object
+      required: [userId, rotaDate, actor, changedAt, action]
+      properties:
+        userId: { type: string, format: uuid }
+        rotaDate: { type: string, format: date }
+        actor:
+          type: string
+          description: Who made the change, by email.
+        changedAt: { type: string, format: date-time }
+        action: { type: string, enum: [CREATED, UPDATED, DELETED] }
+    ScheduleEditMarkersResponse:
+      type: object
+      required: [markers, count]
+      properties:
+        markers:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScheduleEditMarker'
+        count: { type: integer }
+    ApplyScheduleAbsenceRequest:
+      type: object
+      required: [userId, teamKey, from, to]
+      properties:
+        userId:
+          type: string
+          format: uuid
+        teamKey:
+          type: string
+        kindCode:
+          type: string
+          description: >-
+            A schedule_absence_kind code, e.g. ANNUAL_LEAVE. Empty, or omitted,
+            brings them back over the span instead. Must be an active kind.
+        from:
+          type: string
+          format: date
+        to:
+          type: string
+          format: date
+        note:
+          type: string
+        allocatedTo:
+          type: string
+          maxLength: 100
+          description: >-
+            Who an allocation is for: the customer, or the product team for
+            RnD. Stored only with an ALLOCATION kind; ignored for leave, and a
+            blank value is treated as absent.
+    ApplyScheduleAbsenceResponse:
+      type: object
+      required: [created, removed, trimmed]
+      properties:
+        created:
+          type: integer
+          description: 1 when a span was marked, 0 when it was cleared.
+        removed:
+          type: integer
+          description: Absences that fell entirely inside the span and went.
+        trimmed:
+          type: integer
+          description: Absences shortened or split rather than deleted.
+    ApplyScheduleRangeRequest:
+      type: object
+      required: [userId, teamKey, from, to]
+      properties:
+        userId:
+          type: string
+          format: uuid
+        teamKey:
+          type: string
+        shiftCode:
+          type: string
+          description: >-
+            The window to put them on. Empty, or omitted, takes them off the
+            rota over the span instead -- the picker's own clear option.
+        from:
+          type: string
+          format: date
+        to:
+          type: string
+          format: date
+        note:
+          type: string
+          nullable: true
+        tier:
+          type: string
+          enum: [L1, L2, L3]
+          description: >-
+            For an escalation window that leaves the tier to the person
+            (SRE_TZ1, SRE_TZ3, ...), which tier they hold. Omitted takes the
+            window's own tier; a window that fixes a tier accepts only that
+            one, and a window that is not an escalation window accepts none.
+            An escalation window that leaves the tier open requires one --
+            with no tier, the person is on the zone's regular hours, which
+            have a window of their own.
+        zoneCode:
+          type: string
+          description: >-
+            With shiftCode empty, clears only this zone's turn and leaves the
+            rest of the day. (An escalation turn only ever displaces what is in
+            its own zone or overlaps it in time, so one engineer can hold turns
+            in two zones on one day.)
+
+    ApplyScheduleRangeResponse:
+      type: object
+      properties:
+        applied:
+          type: integer
+        skipped:
+          type: integer
+        skippedDates:
+          type: array
+          items:
+            type: string
+            format: date
+          description: The days the window is not worked on.
+
+    CreateScheduleAssignmentRequest:
+      type: object
+      required: [userId, teamKey, shiftCode, rotaDate]
+      properties:
+        userId:
+          type: string
+          format: uuid
+        teamKey:
+          type: string
+        shiftCode:
+          type: string
+        rotaDate:
+          type: string
+          format: date
+        tier:
+          type: string
+          enum: [L1, L2, L3]
+          nullable: true
+        isOnCall:
+          type: boolean
+          nullable: true
+          description: Defaults to the shift's own setting when omitted.
+        note:
+          type: string
+          nullable: true
+
+    UpdateScheduleAssignmentRequest:
+      type: object
+      description: Every field optional; an omitted field is left as it was.
+      properties:
+        userId:
+          type: string
+          format: uuid
+        tier:
+          type: string
+          enum: [L1, L2, L3]
+        isOnCall:
+          type: boolean
+        note:
+          type: string
+
+    ScheduleAssignmentActivity:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        assignmentId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+          format: uuid
+        teamKey:
+          type: string
+        rotaDate:
+          type: string
+          format: date
+          description: The day changed -- for leave, the first day of the span.
+        subject:
+          type: string
+          enum: [rota, leave]
+          description: Whether this changed a window on the rota or a span of leave.
+        endsOn:
+          type: string
+          format: date
+          nullable: true
+          description: For leave, the last day of the span; absent for an open-ended one.
+        shiftCode:
+          type: string
+          description: The window's code, or for leave the absence kind's code.
+        action:
+          type: string
+          enum: [CREATED, UPDATED, DELETED, TRIMMED]
+          description: TRIMMED is leave shortened rather than removed.
+        fieldName:
+          type: string
+          nullable: true
+        oldValue:
+          type: string
+          nullable: true
+        newValue:
+          type: string
+          nullable: true
+        actorEmail:
+          type: string
+          description: Who made the change, not who the row is about.
+        note:
+          type: string
+          nullable: true
+        createdOn:
+          type: string
+          format: date-time
+
+    ScheduleActivityResponse:
+      type: object
+      properties:
+        activity:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScheduleAssignmentActivity'
+        count:
+          type: integer
+
+    ScheduleAssignment:
+      type: object
+      description: One engineer, one rota day, one window.
+      properties:
+        id: { type: string, format: uuid }
+        engineer: { $ref: '#/components/schemas/ScheduleEngineer' }
+        teamKey: { type: string }
+        shiftCode: { type: string }
+        zoneCode: { type: string }
+        tier: { type: string, enum: [L1, L2, L3] }
+        rotaDate:
+          type: string
+          format: date
+          description: >
+            The day the crew is rostered for, not the calendar date of every
+            hour worked: a Monday 21:00–06:00 block carries the Monday even
+            though six of its hours fall on Tuesday.
+        startsAt: { type: string, format: date-time }
+        endsAt: { type: string, format: date-time }
+        isOnCall: { type: boolean }
+        source: { type: string, enum: [GENERATED, MANUAL, SWAP, IMPORTED] }
+        note: { type: string }
+    ScheduleAbsence:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        engineer: { $ref: '#/components/schemas/ScheduleEngineer' }
+        teamKey: { type: string }
+        kindCode: { type: string }
+        startsOn: { type: string, format: date }
+        endsOn:
+          type: string
+          format: date
+          description: Absent for a standing allocation that runs until further notice.
+        note: { type: string }
+        allocatedTo:
+          type: string
+          description: >
+            Who an allocation is for -- the customer for a customer allocation,
+            the product team for RnD. Absent when not known, and for leave.
+    SearchScheduleAssignmentsRequest:
+      type: object
+      required: [from, to]
+      properties:
+        from: { type: string, format: date }
+        to: { type: string, format: date }
+        teamKeys:
+          type: array
+          items: { type: string }
+        family: { type: string, enum: [CRE, SRE] }
+        userId: { type: string, format: uuid }
+        userEmail:
+          type: string
+          description: >
+            One engineer's own rota. The portal knows its users by email rather
+            than by this service's ids, so it is resolved here.
+        includeOvernight:
+          type: boolean
+          description: >
+            Also return a block that began before `from` and is still running
+            into it — the night crew a day view shows at the top.
+    SearchScheduleAbsencesRequest:
+      type: object
+      required: [from, to]
+      properties:
+        from: { type: string, format: date }
+        to: { type: string, format: date }
+        teamKeys:
+          type: array
+          items: { type: string }
+        userId: { type: string, format: uuid }
+        userEmail: { type: string }
+    ScheduleAssignmentsResponse:
+      type: object
+      properties:
+        assignments:
+          type: array
+          items: { $ref: '#/components/schemas/ScheduleAssignment' }
+        count: { type: integer }
+    ScheduleAbsencesResponse:
+      type: object
+      properties:
+        absences:
+          type: array
+          items: { $ref: '#/components/schemas/ScheduleAbsence' }
+        count: { type: integer }
     SearchGroupsRequest:
       type: object
       properties:
@@ -15661,16 +18259,117 @@ components:
           type: string
           pattern: '.*\S.*'
           description: >-
-            Salesforce sObject name. Account is always processed.
-            Project_Contact__c (also accepted as Project_Contact) and Contact
-            are processed only when CSM_MIGRATION_SALESFORCE_MEMBERSHIP_INGEST_ENABLED is
-            true; otherwise, like every other value, they are acknowledged
-            with 204 and ignored.
+            Salesforce sObject name. Each family is processed only when its
+            flag is true; otherwise, like every other value, it is acknowledged
+            with 204 and ignored. Account: CSM_MIGRATION_SALESFORCE_ACCOUNT_INGEST_ENABLED.
+            Project_Contact__c (also accepted as Project_Contact) and Contact:
+            CSM_MIGRATION_SALESFORCE_MEMBERSHIP_INGEST_ENABLED. Project__c:
+            CSM_MIGRATION_SALESFORCE_PROJECT_INGEST_ENABLED (update-only; inserts
+            also need CSM_MIGRATION_SALESFORCE_PROJECT_INSERT_ENABLED). Opportunity,
+            Linked_Opportunity__c (also accepted as Linked_Opportunity), Invoice__c
+            (also accepted as Invoice) and OpportunityLineItem:
+            CSM_MIGRATION_SALESFORCE_OPPORTUNITY_INGEST_ENABLED.
         referenceId:
           type: string
           pattern: '.*\S.*'
           description: Salesforce record Id.
 
+    SalesforcePartnerRefreshResult:
+      type: object
+      required: [customerSfId, partnerSfIds, added, removed]
+      properties:
+        customerSfId:
+          type: string
+          description: The customer's Salesforce Account Id as Salesforce spells it (18 characters).
+        partnerSfIds:
+          type: array
+          items:
+            type: string
+          description: The partner accounts Salesforce lists now, and so the ones stored.
+        added:
+          type: integer
+          description: account_relationship rows inserted (a new partner is two rows, forward and reverse).
+        removed:
+          type: integer
+          description: account_relationship rows deleted.
+
+    OutageCommunicationSweepResponse:
+      type: object
+      required: [evaluated, decisions]
+      properties:
+        evaluated:
+          type: integer
+          description: How many outages the sweep considered.
+        decisions:
+          type: array
+          description: >-
+            The emails owed, each already recorded in the communication log.
+            Empty is the normal steady state.
+          items:
+            $ref: '#/components/schemas/OutageCommunicationDecision'
+    OutageCommunicationDecision:
+      type: object
+      required: [outageId, number, kind]
+      properties:
+        outageId:
+          type: string
+          format: uuid
+        number:
+          type: string
+          example: OUT0001234
+        kind:
+          type: string
+          enum: [DECLARED, RESOLVED]
+          description: >-
+            Which email is owed. There is no update arm — the "Update" rows
+            in the log belong to a different flow.
+        reason:
+          type: string
+          description: >-
+            The ServiceNow branch that selected this, in the flow's own
+            words, so a decision can be traced back to a step.
+          example: Declare Outage
+        subject:
+          type: string
+          description: >-
+            For a RESOLVED decision this is the declaration's subject,
+            reused so the two emails thread.
+        body:
+          type: string
+    OutageCommunicationLogEntry:
+      type: object
+      required: [id, outageNumber, sentOn]
+      properties:
+        id:
+          type: string
+          format: uuid
+        outageNumber:
+          type: string
+          example: OUT0001234
+        emailType:
+          type: string
+          description: >-
+            Verbatim as written. Historical values are inconsistent —
+            "Declared" and "Declare" both occur, alongside "Update" and
+            "RCA" from other flows — so match on emailTypeNorm instead.
+          example: Declared
+        emailTypeNorm:
+          type: string
+          description: Normalised for matching; DECLARED, RESOLVED, UPDATE or RCA.
+          example: DECLARED
+        outageStatus:
+          type: string
+          example: sent
+        subject:
+          type: string
+        recipients:
+          type: string
+        mainContent:
+          type: string
+          description: The one-line summary; the full body is not returned.
+        sentOn:
+          type: string
+          format: date-time
     ErrorResponse:
       type: object
       properties:
@@ -16373,6 +19072,11 @@ components:
         serviceId:
           type: string
           format: uuid
+          description: >-
+            The incident's assignment group is set from this service's support
+            group; there is no assignmentGroupId on create. A service with no
+            support group creates the incident unassigned. Reassign afterwards
+            with PATCH.
         serviceOfferingId:
           type: string
           format: uuid
@@ -16382,6 +19086,9 @@ components:
           format: uuid
           nullable: true
         contactType:
+          description: >-
+            How the incident was reported. Shown as "Channel" in the CSM portal
+            (ServiceNow's incident contact_type, which ServiceNow also labels Channel).
           type: string
           enum: [SELF_SERVICE, EMAIL, WALK_IN, AZURE, EMAIL_INTERNAL, SITE_247, DIRECT,
                  PHONE, SENTINEL, VIRTUAL_AGENT, CHAT, EMAIL_EXTERNAL]
@@ -16392,10 +19099,6 @@ components:
         urgency:
           type: string
           enum: [HIGH, MEDIUM, LOW]
-        assignmentGroupId:
-          type: string
-          format: uuid
-          nullable: true
         assignedEngineerId:
           type: string
           format: uuid
@@ -16438,7 +19141,7 @@ components:
           type: string
           nullable: true
           description: Optional caller-supplied external-system key, stored on ServiceNow's
-            correlation_id field. Look it up via SearchIncidentsFilters.correlationId
+            correlation_id field. Look it up via SearchIncidentsRequest filters.correlationId
             to find an incident this caller already created, without depending on
             free-text search over subject or workNotes.
         environment:
@@ -16626,6 +19329,9 @@ components:
           $ref: '#/components/schemas/EntityRef'
           nullable: true
         contactType:
+          description: >-
+            How the incident was reported. Shown as "Channel" in the CSM portal
+            (ServiceNow's incident contact_type, which ServiceNow also labels Channel).
           type: string
           nullable: true
           enum: [SELF_SERVICE, EMAIL, WALK_IN, AZURE, EMAIL_INTERNAL, SITE_247, DIRECT, PHONE, SENTINEL, VIRTUAL_AGENT, CHAT, EMAIL_EXTERNAL]
@@ -16637,6 +19343,9 @@ components:
           type: string
           nullable: true
           enum: [HIGH, MEDIUM, LOW]
+        environment:
+          type: string
+          nullable: true
         changeRequest:
           $ref: '#/components/schemas/EntityRef'
           nullable: true
@@ -16691,6 +19400,13 @@ components:
           type: string
           nullable: true
           description: Root-cause/incident report notes. Populated for resolved/closed ServiceNow incidents; null otherwise.
+        description:
+          type: string
+          nullable: true
+          description: >-
+            ServiceNow's incident.description field (distinct from subject, which maps to the
+            shorter short_description). Not yet synced from ServiceNow as of this field's
+            introduction, so always null until the companion csm-sync-service change lands.
         specialistHandoff:
           allOf:
             - $ref: '#/components/schemas/IncidentSpecialistHandoffSummary'
@@ -16880,6 +19596,9 @@ components:
                  UNAUTHORIZED_ACCESS, IDENTITY_PROTECTION, PHISHING, IMPROPER_CONFIGURATION,
                  INFORMATION_REQUEST, DB2, PARTIAL_OUTAGE, EMAIL, MONITOR, WIRELESS]
         contactType:
+          description: >-
+            How the incident was reported. Shown as "Channel" in the CSM portal
+            (ServiceNow's incident contact_type, which ServiceNow also labels Channel).
           type: string
           enum: [SELF_SERVICE, EMAIL, WALK_IN, AZURE, EMAIL_INTERNAL, SITE_247, DIRECT,
                  PHONE, SENTINEL, VIRTUAL_AGENT, CHAT, EMAIL_EXTERNAL]
@@ -16963,6 +19682,10 @@ components:
           description: |
             The full set of user identifiers to set as the incident watch list, replacing
             whatever is there. An empty array clears the watch list.
+        environment:
+          type: string
+          nullable: true
+          maxLength: 40
 
     UpdateIncidentResponse:
       type: object
@@ -16978,6 +19701,13 @@ components:
       properties:
         subject:
           type: string
+        description:
+          type: string
+          nullable: true
+          description: >-
+            Accepted and validated, but not yet forwarded to ServiceNow -- the
+            Choreo integration's own POST /problems contract has no field to
+            receive it. Silently dropped after validation until that changes.
         category:
           type: string
           nullable: true
@@ -17201,6 +19931,9 @@ components:
           type: string
           nullable: true
         subject:
+          type: string
+          nullable: true
+        description:
           type: string
           nullable: true
         state:
@@ -17608,6 +20341,16 @@ components:
         statusPageCloud:
           type: string
           nullable: true
+        notifyInternalStakeholders:
+          type: boolean
+        outageCommunication:
+          type: boolean
+        impact:
+          type: string
+          nullable: true
+        state:
+          type: string
+          nullable: true
         createdOn:
           type: string
         createdBy:
@@ -17738,6 +20481,8 @@ components:
         - caseTypes
         - engagementTypes
         - engagementPaymentTypes
+        - resolutionCodes
+        - causes
         - features
       properties:
         caseStates:
@@ -17790,6 +20535,18 @@ components:
             $ref: '#/components/schemas/ChoiceListItem'
         engagementPaymentTypes:
           type: array
+          items:
+            $ref: '#/components/schemas/ChoiceListItem'
+        resolutionCodes:
+          type: array
+          description: >
+            Valid values for PATCH /cases/{id}'s `resolutionCode`, required alongside
+            `cause` and `closeNotes` when closing (or proposing a solution for) a case.
+          items:
+            $ref: '#/components/schemas/ChoiceListItem'
+        causes:
+          type: array
+          description: Valid values for PATCH /cases/{id}'s `cause`.
           items:
             $ref: '#/components/schemas/ChoiceListItem'
         features:
@@ -18281,6 +21038,77 @@ components:
         additional:
           type: integer
 
+    OutageNotificationSweepResponse:
+      type: object
+      properties:
+        evaluated:
+          type: integer
+          description: Outages considered in this sweep.
+        decisions:
+          type: array
+          description: The emails to send, already recorded as sent.
+          items:
+            $ref: '#/components/schemas/OutageNotificationDecision'
+        errors:
+          type: object
+          additionalProperties:
+            type: string
+          description: >-
+            Keyed by outage id. An outage whose send could not be recorded is
+            reported here and deliberately omitted from `decisions` — nothing
+            is emailed without a trace of having been emailed.
+    OutageNotificationDecision:
+      type: object
+      properties:
+        outageId:
+          type: string
+          format: uuid
+        number:
+          type: string
+        kind:
+          type: string
+          enum: [DECLARED, RESOLVED, UPDATE]
+        reason:
+          type: string
+          description: >-
+            The branch that selected this email, in the ServiceNow flow's own
+            vocabulary, so a log line can be matched against the original.
+        subject:
+          type: string
+        body:
+          type: string
+          description: >-
+            A fixed sentence carrying no outage detail, reproducing the
+            ServiceNow original exactly.
+    OutageNotificationState:
+      type: object
+      properties:
+        outageId:
+          type: string
+          format: uuid
+        phase:
+          type: string
+          enum: [NONE, DECLARED, RESOLVED]
+          description: NONE is a real state — no email has gone out yet.
+        declaredOn:
+          type: string
+          format: date-time
+        resolvedOn:
+          type: string
+          format: date-time
+        lastUpdateOn:
+          type: string
+          format: date-time
+        updateCount:
+          type: integer
+          description: >-
+            The update arm advances no phase and can fire repeatedly, so its
+            noisiness is tracked here rather than in the state machine.
+        seededFromSync:
+          type: boolean
+          description: >-
+            True when `phase` came from ServiceNow's mirrored value rather
+            than from an email this service sent.
     OutageDetail:
       allOf:
         - $ref: '#/components/schemas/Outage'
@@ -18326,6 +21154,31 @@ components:
           type: boolean
           nullable: true
           description: Required when configurationItemId resolves to a monitored status-page cloud.
+        notifyInternalStakeholders:
+          type: boolean
+          description: >-
+            Opt-in for the internal-stakeholder outage notification (ServiceNow
+            "Notify internal stakeholders"). Omitted means false.
+        outageCommunication:
+          type: boolean
+          description: >-
+            Opt-in for the SRE outage-communication email (ServiceNow "Outage
+            communication"). Omitted means false.
+        impact:
+          type: string
+          maxLength: 40
+          description: Printed as "Impact:" in the outage-communication email.
+        state:
+          type: string
+          maxLength: 40
+          description: Printed as "Current Status:" in the outage-communication email.
+        affectedConfigurationItemIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: >-
+            Service offerings this outage also affects (ServiceNow Affected CIs). They drive each one's status-page monitor and availability. Adding one with a status-page monitor needs acknowledgePublicPublication.
 
     CreateOutageResponse:
       type: object
@@ -18358,6 +21211,31 @@ components:
           format: uuid
         acknowledgePublicPublication:
           type: boolean
+        notifyInternalStakeholders:
+          type: boolean
+          description: >-
+            Opt-in for the internal-stakeholder outage notification (ServiceNow
+            "Notify internal stakeholders"). Omit to leave it unchanged.
+        outageCommunication:
+          type: boolean
+          description: >-
+            Opt-in for the SRE outage-communication email (ServiceNow "Outage
+            communication"). Omit to leave it unchanged.
+        impact:
+          type: string
+          maxLength: 40
+          description: Printed as "Impact:" in the outage-communication email. An empty string clears it.
+        state:
+          type: string
+          maxLength: 40
+          description: Printed as "Current Status:" in the outage-communication email. An empty string clears it.
+        affectedConfigurationItemIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: >-
+            Replaces the whole affected set ([] clears it); omit to leave it alone. Newly added items must be service offerings; ones already on the outage are kept whatever their class. Only additions with a status-page monitor need acknowledgePublicPublication. Changing only this list does not update the outage itself.
 
     PatchOutageResponse:
       type: object
@@ -19940,6 +22818,297 @@ components:
         offset:
           type: integer
 
+    CloudAvailabilityWindow:
+      type: object
+      description: One weighted uptime figure for one window.
+      properties:
+        availability:
+          description: >-
+            The figure, rounded to three decimals. *** THE JSON TYPE VARIES BY
+            CLOUD, AND THAT IS DELIBERATE. *** Six clouds emit a STRING
+            ("100.000") because the ServiceNow weighting functions end in
+            toFixed; asgardeo emits a NUMBER (100) because it takes an
+            unweighted mean and parseFloat drops the trailing zeros. Verified
+            against the live API on 2026-09-29. Normalising the two would
+            change six clouds' payloads.
+          oneOf:
+            - type: string
+            - type: number
+        duration:
+          type: string
+          description: The window's label, rendered verbatim by the frontend.
+          enum: ["Last 7 days", "Last 30 days", "Last 90 days", "Last 12 months"]
+      required: [availability, duration]
+    AvailabilityHistoryPoint:
+      type: object
+      description: One day's uptime.
+      properties:
+        availability:
+          type: number
+          description: >-
+            A plain number for every cloud — the history resource uses
+            parseFloat and never toFixed, unlike the availabilities one.
+        date:
+          type: string
+          format: date
+          description: >-
+            The local day, YYYY-MM-DD, in the ServiceNow instance's timezone
+            (Asia/Colombo), which is where the daily buckets are cut.
+      required: [availability, date]
+    AvailabilityHistorySubgroup:
+      type: object
+      description: One monitored component's 90-day history.
+      properties:
+        display_name:
+          type: string
+        history:
+          type: array
+          items:
+            $ref: '#/components/schemas/AvailabilityHistoryPoint'
+      required: [display_name, history]
+    AvailabilityHistoryGroup:
+      type: object
+      description: One named group within a region.
+      properties:
+        display_name:
+          type: string
+        subgroups:
+          type: array
+          items:
+            $ref: '#/components/schemas/AvailabilityHistorySubgroup'
+      required: [display_name, subgroups]
+    CloudStatusIncidentComment:
+      type: object
+      description: One entry from the outage's external communications.
+      properties:
+        comment:
+          type: string
+        created_on:
+          type: string
+          description: UTC, "YYYY-MM-DD HH:MM:SS".
+      required: [comment, created_on]
+    CloudStatusIncidentAttachment:
+      type: object
+      properties:
+        name:
+          type: string
+        id:
+          type: string
+      required: [name, id]
+    CloudStatusIncidentDetail:
+      type: object
+      description: The full detail view, when the outage's incident qualifies.
+      properties:
+        id:
+          type: string
+        begin:
+          type: string
+        end:
+          type: string
+          description: Empty string while the outage is ongoing.
+        type:
+          type: string
+          description: >-
+            Not the enum and not plain title case — degradation renders as
+            "Degraded" and planned as "Maintenance".
+          enum: [Outage, Degraded, Maintenance]
+        status:
+          type: string
+          enum: ["In Progress", "Resolved"]
+        short_description:
+          type: string
+        comments:
+          type: array
+          items:
+            $ref: '#/components/schemas/CloudStatusIncidentComment'
+        attachments:
+          type: array
+          items:
+            $ref: '#/components/schemas/CloudStatusIncidentAttachment'
+      required: [id, begin, end, type, status, short_description, comments, attachments]
+    CloudStatusIncidentAttachmentsOnly:
+      type: object
+      description: >-
+        What the endpoint returns when the outage's incident does not
+        qualify — the majority case. Carries no incident fields at all.
+      properties:
+        attachments:
+          type: array
+          items:
+            $ref: '#/components/schemas/CloudStatusIncidentAttachment'
+      required: [attachments]
+    CloudStatusMonitorGroup:
+      type: object
+      properties:
+        display_name:
+          type: string
+        subgroups:
+          type: array
+          items:
+            $ref: '#/components/schemas/CloudStatusMonitorSubgroup'
+      required: [display_name, subgroups]
+    CloudStatusMonitorSubgroup:
+      type: object
+      properties:
+        description:
+          type: string
+        display_name:
+          type: string
+        status:
+          type: integer
+          description: >-
+            0 Operational · 1 Maintenance · 2 Degraded · 3 Outage. The
+            dashboard's own scale, fixed by its constants.js.
+        availability:
+          type: array
+          items:
+            $ref: '#/components/schemas/CloudStatusAvailability'
+        message:
+          type: string
+          description: >-
+            Short description of an ongoing outage, and only when that
+            outage's type agrees with the status shown. Empty otherwise.
+      required: [description, display_name, status, availability, message]
+    CloudStatusAvailability:
+      type: object
+      properties:
+        availability:
+          type: string
+          description: >-
+            A string, not a number — the dashboard renders it verbatim and has
+            always received it as text.
+        duration:
+          type: string
+          enum: ["Last 30 days", "Last 90 days"]
+      required: [availability, duration]
+    CloudStatusIncidentMonth:
+      type: object
+      properties:
+        incidents:
+          type: array
+          items:
+            $ref: '#/components/schemas/CloudStatusIncident'
+      required: [incidents]
+    CloudStatusIncident:
+      type: object
+      properties:
+        id:
+          type: string
+        begin:
+          type: string
+        end:
+          type: string
+          description: Empty while the outage is ongoing.
+        type:
+          type: string
+          enum: [Outage, Degradation, Planned]
+        status:
+          type: string
+          enum: [Ongoing, Resolved]
+        short_description:
+          type: string
+        expanded:
+          type: boolean
+          description: Drives a UI accordion; always false on the wire.
+      required: [id, begin, end, type, status, short_description, expanded]
+    AvailabilitySweepResult:
+      type: object
+      properties:
+        subjects:
+          type: integer
+          description: How many offering/commitment pairs the sweep computed.
+        rows:
+          type: integer
+          description: How many service_availability rows were written.
+        failed:
+          type: integer
+          description: >-
+            Subjects whose computation errored. Non-zero is a fault; the
+            entity-service log names each one and its commitment.
+    CloudStatusSweepResult:
+      type: object
+      properties:
+        scanned:
+          type: integer
+          description: How many in-scope outages the sweep considered.
+        recorded:
+          type: integer
+          description: >-
+            How many new transitions were recorded. 0 is the steady state — a
+            sweep that records nothing is working correctly.
+        skippedNoCloud:
+          type: integer
+          description: >-
+            In-scope outages whose configuration item has no cloud monitor, or
+            whose cloud offering this build cannot address, and which therefore
+            cannot be routed to any dashboard. Non-zero means those outages are
+            never reaching the status page — a data problem in the outage
+            record, not a failure of the sweep.
+      required: [scanned, recorded, skippedNoCloud]
+    PendingCloudStatusWebhook:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        outageId:
+          type: string
+          format: uuid
+        number:
+          type: string
+          description: >-
+            The outage number, for logging and for whoever reads a failure. Not
+            part of the webhook body sent to the dashboard.
+        event:
+          type: string
+          enum: [OUTAGE_BEGIN, OUTAGE_END]
+          description: >-
+            This service's own name for the transition, for logs and for the
+            operator reading a failure. NOT what the webhook body carries --
+            see wireEvent.
+        wireEvent:
+          type: string
+          description: >-
+            The literal the webhook body must carry, e.g. "outage_begin". Kept
+            separate from event because the two are different contracts: event
+            belongs to this API, wireEvent belongs to the status dashboard and
+            cannot change without coordinating with it.
+        cloud:
+          type: string
+          description: >-
+            The dashboard slug, already translated from the stored offering
+            enum — e.g. "choreo-eu", not "CHOREO_EU".
+        timestamp:
+          type: string
+          format: date-time
+          description: >-
+            The outage's own begin or end instant, matching event — not the
+            moment of sending, so a delayed or retried webhook still reports
+            when the outage actually changed.
+        attemptCount:
+          type: integer
+        lastError:
+          type: string
+      required: [id, outageId, number, event, wireEvent, cloud, timestamp, attemptCount]
+    PendingCloudStatusWebhooks:
+      type: object
+      properties:
+        count:
+          type: integer
+        webhooks:
+          type: array
+          items:
+            $ref: '#/components/schemas/PendingCloudStatusWebhook'
+      required: [count, webhooks]
+    CloudStatusDeliveryReport:
+      type: object
+      properties:
+        delivered:
+          type: boolean
+        error:
+          type: string
+          description: Required when delivered is false.
+      required: [delivered]
     AnnouncementRequest:
       description: >
         A draft, in-review, or approved announcement that has not yet been
@@ -20299,6 +23468,17 @@ components:
         state:
           type: string
           enum: [draft, pending_approval, approved, published]
+        states:
+          type: array
+          description: >-
+            Matches a request in any of the listed states, as one merged
+            paginated list (total/hasMore describe the merged list). On its own,
+            an empty or omitted list means no state filter. Rejected if sent
+            together with state or readyForScheduledPublish, even as an empty
+            list.
+          items:
+            type: string
+            enum: [draft, pending_approval, approved, published]
         createdBy:
           type: string
         readyForScheduledPublish:
@@ -20307,7 +23487,7 @@ components:
             When true, ignores state and instead matches every approved
             request whose scheduledFor has already arrived — the query
             operations/csm-scheduled-tasks' publish_scheduled_announcements
-            sub-cron uses. Rejected if combined with state.
+            sub-cron uses. Rejected if combined with state or states.
         pagination:
           $ref: '#/components/schemas/Pagination'
 
@@ -20334,8 +23514,9 @@ components:
         write done by the Salesforce membership ingest; IDENTITY is the Asgardeo
         user provisioned by csm-notification-service via the SCIM service; EMAIL
         the invitation email; REGISTRATION the member's first sign-in, recorded
-        by the customer portal backend.
-      enum: [IDENTITY, DATABASE, EMAIL, REGISTRATION]
+        by the customer portal backend; WELCOME_EMAIL the Welcome email sent
+        by csm-notification-service after registration.
+      enum: [IDENTITY, DATABASE, EMAIL, REGISTRATION, WELCOME_EMAIL]
 
     OnboardingStepStatus:
       type: string

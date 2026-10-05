@@ -23,6 +23,7 @@ import (
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	integrationservice "github.com/wso2-open-operations/cs-tools/entity-service/internal/servicenow-integration-service"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/validate"
 )
 
 // Watch lists on case create/update (and incident create) arrive either as
@@ -136,7 +137,7 @@ func watchListEmails(
 	var firstInvalid string
 	for _, v := range values {
 		isEmail := emailRE.MatchString(v)
-		isUUID := uuidRE.MatchString(v)
+		isUUID := validate.IsUUID(v)
 		if !isEmail {
 			allEmail = false
 		}

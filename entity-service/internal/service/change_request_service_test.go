@@ -19,18 +19,22 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/auth"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
 )
 
 // stubChangeRequestRepo is a minimal repository.ChangeRequestRepository
 // whose unconfigured methods panic if called -- same convention as
 // stubIncidentRepo (incident_service_test.go).
 type stubChangeRequestRepo struct {
+	createChangeRequest               func(ctx context.Context, req domain.CreateChangeRequestRequest, createdBy string) (domain.CreateChangeRequestResponse, error)
 	createChangeRequestFromServiceNow func(ctx context.Context, req domain.CreateChangeRequestRequest, id, number, createdBy string) (domain.CreateChangeRequestResponse, error)
 	patchChangeRequest                func(ctx context.Context, id string, req domain.PatchChangeRequestRequest, email string) (domain.ChangeRequest, error)
 	getChangeRequestApprovals         func(ctx context.Context, id string) (domain.ChangeRequestApprovals, error)
@@ -73,6 +77,13 @@ func (s *stubChangeRequestRepo) CreateChangeRequestFromServiceNow(ctx context.Co
 	panic("CreateChangeRequestFromServiceNow called unexpectedly: Postgres must stay untouched when ServiceNow never accepts the change request")
 }
 
+func (s *stubChangeRequestRepo) CreateChangeRequest(ctx context.Context, req domain.CreateChangeRequestRequest, createdBy string) (domain.CreateChangeRequestResponse, error) {
+	if s.createChangeRequest != nil {
+		return s.createChangeRequest(ctx, req, createdBy)
+	}
+	panic("CreateChangeRequest called unexpectedly")
+}
+
 // stubMirrorChangeRequestService embeds ChangeRequestService (nil) and
 // overrides only CreateChangeRequest -- same convention as
 // stubMirrorIncidentService (incident_service_test.go). Any other method
@@ -99,7 +110,57 @@ func (s *stubMirrorChangeRequestService) PatchChangeRequest(ctx context.Context,
 }
 
 func validCreateChangeRequestRequest() domain.CreateChangeRequestRequest {
-	return domain.CreateChangeRequestRequest{Subject: "subject"}
+	normal := domain.ChangeRequestTypeNormal
+	return domain.CreateChangeRequestRequest{Subject: "subject", Type: &normal}
+}
+
+// TestChangeRequestService_CreateChangeRequest_RequiresType: a change request
+// must be created as standard, normal or emergency -- the type decides its
+// whole approval flow. A missing or other type is refused before ServiceNow
+// (dual-write) or Postgres (plain) is touched.
+func TestChangeRequestService_CreateChangeRequest_RequiresType(t *testing.T) {
+	azure := domain.ChangeRequestTypeAzure
+	empty := domain.ChangeRequestType("")
+	cases := map[string]*domain.ChangeRequestType{"missing": nil, "empty": &empty, "azure": &azure}
+	for name, typ := range cases {
+		t.Run("dual-write/"+name, func(t *testing.T) {
+			mirror := &stubMirrorChangeRequestService{
+				createChangeRequest: func(context.Context, domain.CreateChangeRequestRequest) (domain.CreateChangeRequestResponse, error) {
+					t.Fatal("ServiceNow must never be called without a valid type")
+					return domain.CreateChangeRequestResponse{}, nil
+				},
+			}
+			svc := NewChangeRequestServiceWithSNMirror(&stubChangeRequestRepo{}, stubUserRepo{}, mirror)
+			_, err := svc.CreateChangeRequest(context.Background(), domain.CreateChangeRequestRequest{Subject: "subject", Type: typ})
+			var ve *apierror.ValidationError
+			if !asValidationError(err, &ve) {
+				t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+			}
+			if !strings.Contains(ve.Msg, "standard, normal or emergency") {
+				t.Errorf("message %q should name the three allowed types", ve.Msg)
+			}
+		})
+		t.Run("postgres/"+name, func(t *testing.T) {
+			svc := NewChangeRequestService(&stubChangeRequestRepo{}, stubUserRepo{})
+			_, err := svc.CreateChangeRequest(contextWithUserIDToken(fakeJWTWithEmail(t, "a@example.com")), domain.CreateChangeRequestRequest{Subject: "subject", Type: typ})
+			var ve *apierror.ValidationError
+			if !asValidationError(err, &ve) {
+				t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+			}
+		})
+	}
+	for _, ok := range domain.ChangeRequestCreatableTypes {
+		ok := ok
+		t.Run("accepts/"+string(ok), func(t *testing.T) {
+			repo := &stubChangeRequestRepo{createChangeRequest: func(_ context.Context, req domain.CreateChangeRequestRequest, _ string) (domain.CreateChangeRequestResponse, error) {
+				return domain.CreateChangeRequestResponse{Message: "ok"}, nil
+			}}
+			svc := NewChangeRequestService(repo, stubUserRepo{})
+			if _, err := svc.CreateChangeRequest(contextWithUserIDToken(fakeJWTWithEmail(t, "a@example.com")), domain.CreateChangeRequestRequest{Subject: "subject", Type: &ok}); err != nil {
+				t.Fatalf("type %s: %v", ok, err)
+			}
+		})
+	}
 }
 
 // TestChangeRequestService_CreateChangeRequest_SNFailureLeavesPostgresUntouched
@@ -539,4 +600,253 @@ func TestChangeRequestService_DecideChangeRequestApproval_RepoNotFoundPropagates
 	if !errors.As(err, &nfe) {
 		t.Fatalf("expected *apierror.NotFoundError, got %T: %v", err, err)
 	}
+}
+
+// TestChangeRequestService_PatchChangeRequest_AcceptsFieldParityFieldsAlone
+// proves a request carrying only one of the field-parity fields (previously
+// rejected with "at least one field must be provided") reaches the
+// repository, and that fields with no Postgres backing are rejected rather
+// than silently dropped.
+func TestChangeRequestService_PatchChangeRequest_AcceptsFieldParityFieldsAlone(t *testing.T) {
+	text := "2 hours"
+	ptr := &text
+	var got domain.PatchChangeRequestRequest
+	repo := &stubChangeRequestRepo{
+		patchChangeRequest: func(_ context.Context, id string, req domain.PatchChangeRequestRequest, _ string) (domain.ChangeRequest, error) {
+			got = req
+			return domain.ChangeRequest{SearchChangeRequestView: domain.SearchChangeRequestView{ID: id}}, nil
+		},
+	}
+	svc := NewChangeRequestService(repo, stubUserRepo{})
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+
+	if _, err := svc.PatchChangeRequest(ctx, testUUID, domain.PatchChangeRequestRequest{RollbackDurationText: &ptr}); err != nil {
+		t.Fatalf("rollbackDurationText alone: unexpected error: %v", err)
+	}
+	if got.RollbackDurationText == nil {
+		t.Fatal("repository never saw RollbackDurationText")
+	}
+
+	comment := "hello"
+	_, err := svc.PatchChangeRequest(ctx, testUUID, domain.PatchChangeRequestRequest{Comment: &comment})
+	var ve *apierror.ValidationError
+	if !asValidationError(err, &ve) {
+		t.Fatalf("comment: expected ValidationError, got %T: %v", err, err)
+	}
+}
+
+// TestChangeRequestService_PatchChangeRequest_CustomerGateFlagsAlone: the
+// creation form's two checkboxes (customerApprovalRequired /
+// customerReviewRequired) are a patch on their own -- not rejected as "at least
+// one field must be provided" -- and reach the repository unchanged.
+func TestChangeRequestService_PatchChangeRequest_CustomerGateFlagsAlone(t *testing.T) {
+	yes, no := true, false
+	for name, req := range map[string]domain.PatchChangeRequestRequest{
+		"customerApprovalRequired": {CustomerApprovalRequired: &yes},
+		"customerReviewRequired":   {CustomerReviewRequired: &no},
+		"both":                     {CustomerApprovalRequired: &no, CustomerReviewRequired: &yes},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var got domain.PatchChangeRequestRequest
+			repo := &stubChangeRequestRepo{
+				patchChangeRequest: func(_ context.Context, id string, r domain.PatchChangeRequestRequest, _ string) (domain.ChangeRequest, error) {
+					got = r
+					return domain.ChangeRequest{SearchChangeRequestView: domain.SearchChangeRequestView{ID: id}}, nil
+				},
+			}
+			svc := NewChangeRequestService(repo, stubUserRepo{})
+			ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+			if _, err := svc.PatchChangeRequest(ctx, testUUID, req); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.CustomerApprovalRequired != req.CustomerApprovalRequired || got.CustomerReviewRequired != req.CustomerReviewRequired {
+				t.Fatalf("repository saw %+v/%+v, want the request's own flags", got.CustomerApprovalRequired, got.CustomerReviewRequired)
+			}
+		})
+	}
+}
+
+// TestChangeRequestService_PatchChangeRequest_CustomerGateFlagsStayOutOfTheMirror:
+// ServiceNow's change request API has no field the service can name for the
+// two checkboxes, so they are stripped from the dual-write mirror; a PATCH that
+// carried nothing else is not mirrored at all (an empty ServiceNow PATCH would
+// only record a writeback failure).
+func TestChangeRequestService_PatchChangeRequest_CustomerGateFlagsStayOutOfTheMirror(t *testing.T) {
+	yes := true
+	title := "new title"
+	repo := &stubChangeRequestRepo{
+		patchChangeRequest: func(_ context.Context, id string, _ domain.PatchChangeRequestRequest, _ string) (domain.ChangeRequest, error) {
+			return domain.ChangeRequest{SearchChangeRequestView: domain.SearchChangeRequestView{ID: id}}, nil
+		},
+	}
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+
+	t.Run("mixed with other fields: flags stripped, rest mirrored", func(t *testing.T) {
+		called := make(chan domain.PatchChangeRequestRequest, 1)
+		mirror := &stubMirrorChangeRequestService{
+			patchChangeRequest: func(_ context.Context, _ string, r domain.PatchChangeRequestRequest) (domain.PatchChangeRequestResponse, error) {
+				called <- r
+				return domain.PatchChangeRequestResponse{}, nil
+			},
+		}
+		svc := NewChangeRequestServiceWithSNWriteback(repo, stubUserRepo{}, mirror, NewSNWritebackDispatcher(&recordingSNWritebackFailures{}))
+		if _, err := svc.PatchChangeRequest(ctx, testUUID, domain.PatchChangeRequestRequest{Title: &title, CustomerApprovalRequired: &yes, CustomerReviewRequired: &yes}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		select {
+		case got := <-called:
+			if got.Title == nil || *got.Title != title {
+				t.Errorf("mirror title = %v, want %q", got.Title, title)
+			}
+			if got.CustomerApprovalRequired != nil || got.CustomerReviewRequired != nil {
+				t.Errorf("mirror saw the Postgres-only flags: %v/%v", got.CustomerApprovalRequired, got.CustomerReviewRequired)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("mirror.PatchChangeRequest was never called")
+		}
+	})
+
+	t.Run("flags alone: nothing to mirror", func(t *testing.T) {
+		mirror := &stubMirrorChangeRequestService{
+			patchChangeRequest: func(context.Context, string, domain.PatchChangeRequestRequest) (domain.PatchChangeRequestResponse, error) {
+				t.Error("mirror was called for a PATCH that only carried the Postgres-only flags")
+				return domain.PatchChangeRequestResponse{}, nil
+			},
+		}
+		failures := &recordingSNWritebackFailures{}
+		svc := NewChangeRequestServiceWithSNWriteback(repo, stubUserRepo{}, mirror, NewSNWritebackDispatcher(failures))
+		if _, err := svc.PatchChangeRequest(ctx, testUUID, domain.PatchChangeRequestRequest{CustomerApprovalRequired: &yes}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		time.Sleep(150 * time.Millisecond) // the dispatch is asynchronous; give a wrongly-fired one time to show
+		if got := failures.count(); got != 0 {
+			t.Errorf("writeback failures = %d, want 0", got)
+		}
+	})
+}
+
+// TestChangeRequestService_CreateChangeRequest_PassesCustomerGateFlags: both
+// Postgres create paths (plain and ServiceNow-first) hand the checkboxes to the
+// repository untouched.
+func TestChangeRequestService_CreateChangeRequest_PassesCustomerGateFlags(t *testing.T) {
+	yes, no := true, false
+	want := validCreateChangeRequestRequest()
+	want.CustomerApprovalRequired, want.CustomerReviewRequired = &yes, &no
+	ok := func() domain.CreateChangeRequestResponse {
+		resp := domain.CreateChangeRequestResponse{Message: "ok"}
+		resp.ChangeRequest.ID = testUUID
+		return resp
+	}
+
+	t.Run("plain", func(t *testing.T) {
+		var got domain.CreateChangeRequestRequest
+		repo := &stubChangeRequestRepo{
+			createChangeRequest: func(_ context.Context, r domain.CreateChangeRequestRequest, _ string) (domain.CreateChangeRequestResponse, error) {
+				got = r
+				return ok(), nil
+			},
+		}
+		svc := NewChangeRequestService(repo, stubUserRepo{})
+		ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+		if _, err := svc.CreateChangeRequest(ctx, want); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.CustomerApprovalRequired == nil || !*got.CustomerApprovalRequired || got.CustomerReviewRequired == nil || *got.CustomerReviewRequired {
+			t.Fatalf("repository saw %v/%v, want true/false", got.CustomerApprovalRequired, got.CustomerReviewRequired)
+		}
+	})
+
+	t.Run("servicenow-first", func(t *testing.T) {
+		var got domain.CreateChangeRequestRequest
+		mirror := &stubMirrorChangeRequestService{
+			createChangeRequest: func(context.Context, domain.CreateChangeRequestRequest) (domain.CreateChangeRequestResponse, error) {
+				return ok(), nil
+			},
+		}
+		repo := &stubChangeRequestRepo{
+			createChangeRequestFromServiceNow: func(_ context.Context, r domain.CreateChangeRequestRequest, _, _, _ string) (domain.CreateChangeRequestResponse, error) {
+				got = r
+				return ok(), nil
+			},
+		}
+		svc := NewChangeRequestServiceWithSNMirror(repo, stubUserRepo{}, mirror)
+		if _, err := svc.CreateChangeRequest(context.Background(), want); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.CustomerApprovalRequired == nil || !*got.CustomerApprovalRequired || got.CustomerReviewRequired == nil || *got.CustomerReviewRequired {
+			t.Fatalf("repository saw %v/%v, want true/false", got.CustomerApprovalRequired, got.CustomerReviewRequired)
+		}
+	})
+}
+
+// TestChangeRequestService_GetChangeRequestApprovals_StampsViewerEmail is the
+// regression guard for "Approve/Reject disabled for the approver themselves":
+// an internal user resolved from the user token alone comes back from
+// AccessService.ResolveScope Unrestricted with an EMPTY ViewerEmail, and the
+// repository's markCanDecide leaves every canDecide false without one. The
+// service must therefore hand the repo an identity naming the caller (taken
+// from the same x-user-id-token DecideChangeRequestApproval uses). The scope
+// here is produced by the REAL AccessService, exactly as
+// callerIdentityMiddleware stamps it on the HTTP path.
+func TestChangeRequestService_GetChangeRequestApprovals_StampsViewerEmail(t *testing.T) {
+	const email = "jane.doe@example.com"
+
+	var seen repository.SearchScope
+	var seenOK bool
+	repo := &stubChangeRequestRepo{
+		getChangeRequestApprovals: func(ctx context.Context, _ string) (domain.ChangeRequestApprovals, error) {
+			seen, seenOK = repository.CallerIdentityFromContext(ctx)
+			return domain.ChangeRequestApprovals{}, nil
+		},
+	}
+	svc := NewChangeRequestService(repo, stubUserRepo{})
+
+	// The HTTP path: auth.Middleware validates the token, the identity
+	// middleware resolves + stamps the scope, the handler calls the service.
+	httpCtx := func(t *testing.T, access AccessService) context.Context {
+		t.Helper()
+		ctx := auth.WithIdentity(contextWithUserIDToken(fakeJWTWithEmail(t, email)), auth.Identity{Validated: true, UserEmail: email})
+		scope, err := access.ResolveScope(ctx)
+		if err != nil {
+			t.Fatalf("ResolveScope: %v", err)
+		}
+		return repository.WithCallerIdentity(ctx, scope)
+	}
+
+	t.Run("internal user resolved from the user token (no CSM-portal client config)", func(t *testing.T) {
+		access := NewAccessService(&fakeAccessRepo{users: []repository.AccessUser{userOf("INTERNAL", true)}}, AccessClientConfig{})
+		ctx := httpCtx(t, access)
+		if pre, _ := repository.CallerIdentityFromContext(ctx); pre.ViewerEmail != "" {
+			t.Fatalf("precondition: ResolveScope now sets ViewerEmail (%q); this regression test needs revisiting", pre.ViewerEmail)
+		}
+		seen, seenOK = repository.SearchScope{}, false
+		if _, err := svc.GetChangeRequestApprovals(ctx, testUUID); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !seenOK || seen.ViewerEmail != email || !seen.Unrestricted {
+			t.Errorf("repo saw identity %+v (present=%v), want Unrestricted with ViewerEmail %q", seen, seenOK, email)
+		}
+	})
+
+	t.Run("an identity that already names the viewer is left alone", func(t *testing.T) {
+		ctx := repository.WithCallerIdentity(contextWithUserIDToken(fakeJWTWithEmail(t, "someone.else@example.com")),
+			repository.SearchScope{Unrestricted: true, ViewerEmail: email})
+		seen, seenOK = repository.SearchScope{}, false
+		if _, err := svc.GetChangeRequestApprovals(ctx, testUUID); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if seen.ViewerEmail != email {
+			t.Errorf("ViewerEmail = %q, want it kept as %q", seen.ViewerEmail, email)
+		}
+	})
+
+	t.Run("no caller identity on ctx stays absent (fails closed, nothing invented)", func(t *testing.T) {
+		seen, seenOK = repository.SearchScope{}, true
+		if _, err := svc.GetChangeRequestApprovals(contextWithUserIDToken(fakeJWTWithEmail(t, email)), testUUID); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if seenOK {
+			t.Errorf("repo saw an identity %+v, want none", seen)
+		}
+	})
 }

@@ -24,14 +24,13 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
 )
 
 // IncidentTaskRepository defines the read operations for incident_task
-// (migration 000066), a work_item type extension (id IS work_item.id) --
+// (migration 0066), a work_item type extension (id IS work_item.id) --
 // same shared-PK pattern as "case"/change_request. There is no Postgres
 // write path at all: no CreateIncidentTask/UpdateIncidentTask exists on
 // IncidentTaskService in the first place (it's read-only on every data
@@ -67,11 +66,11 @@ type IncidentTaskRepository interface {
 }
 
 type incidentTaskRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
 // NewIncidentTaskRepository constructs an IncidentTaskRepository backed by the given connection pool.
-func NewIncidentTaskRepository(db *pgxpool.Pool) IncidentTaskRepository {
+func NewIncidentTaskRepository(db *Scoped) IncidentTaskRepository {
 	return &incidentTaskRepo{db: db}
 }
 

@@ -19,6 +19,7 @@ package service
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
@@ -28,7 +29,7 @@ import (
 )
 
 // incidentStateToEnum maps domain.IncidentState to incident_state_enum's
-// real labels (migration 000058) -- identity for every value except
+// real labels (migration 0058) -- identity for every value except
 // "canceled", which the enum spells with one L ('CANCELED') where
 // domain.IncidentStateCancelled has two ("CANCELLED").
 func incidentStateToEnum(s domain.IncidentState) string {
@@ -36,6 +37,71 @@ func incidentStateToEnum(s domain.IncidentState) string {
 		return "CANCELED"
 	}
 	return string(s)
+}
+
+// incidentResolutionCodeToEnum maps domain.IncidentResolutionCode to
+// incident_resolution_code_enum's real labels (migration 0058). Two differ:
+// the enum spells "Solved (Work Around)" 'SOLVED_WORK_AROUND' and "Not
+// Actionable Alert" 'NOT_ACTIONABLE_ALERT'. Any other value (the domain type
+// is a plain string, unchecked at decode) returns ok=false.
+func incidentResolutionCodeToEnum(c domain.IncidentResolutionCode) (string, bool) {
+	switch c {
+	case domain.IncidentResolutionCodeSolvedWorkaround:
+		return "SOLVED_WORK_AROUND", true
+	case domain.IncidentResolutionCodeNotActionable:
+		return "NOT_ACTIONABLE_ALERT", true
+	case domain.IncidentResolutionCodeSolvedPermanently, domain.IncidentResolutionCodeNotSolvedNotReproducible,
+		domain.IncidentResolutionCodeFalseAlarm, domain.IncidentResolutionCodeDuplicate:
+		return string(c), true
+	default:
+		return "", false
+	}
+}
+
+// incidentLifecycleUpdateFromRequest validates and maps the state-transition
+// fields of an UPDATE (state, assignedEngineerId, resolutionCode,
+// resolutionNotes, resolvedById) to their Postgres form. ok reports whether
+// any of them was set. No field is required by any state here -- In Progress
+// in particular needs no assignee or assignment group, matching ServiceNow;
+// the Resolved/Closed resolution requirement is checked by the repository,
+// which can see what is already on the record.
+func incidentLifecycleUpdateFromRequest(req domain.UpdateIncidentRequest) (u repository.IncidentLifecycleUpdate, ok bool, err error) {
+	if req.State != nil {
+		if !validIncidentState[*req.State] {
+			return u, false, &apierror.ValidationError{Msg: "invalid state: " + string(*req.State)}
+		}
+		v := incidentStateToEnum(*req.State)
+		u.State = &v
+		ok = true
+	}
+	if req.ResolutionCode != nil {
+		v, valid := incidentResolutionCodeToEnum(*req.ResolutionCode)
+		if !valid {
+			return u, false, &apierror.ValidationError{Msg: "invalid resolutionCode: " + string(*req.ResolutionCode)}
+		}
+		u.ResolutionCode = &v
+		ok = true
+	}
+	for field, val := range map[string]*string{"assignedEngineerId": req.AssignedEngineerID, "resolvedById": req.ResolvedByID} {
+		if val != nil {
+			if err := validateUUIDs(field, []string{*val}); err != nil {
+				return u, false, err
+			}
+		}
+	}
+	if req.AssignedEngineerID != nil {
+		u.AssignedEngineerID = req.AssignedEngineerID
+		ok = true
+	}
+	if req.ResolvedByID != nil {
+		u.ResolvedByID = req.ResolvedByID
+		ok = true
+	}
+	if req.ResolutionNotes != nil {
+		u.ResolutionNotes = req.ResolutionNotes
+		ok = true
+	}
+	return u, ok, nil
 }
 
 // incidentPriorityToEnum maps domain.IncidentPriority to
@@ -207,9 +273,10 @@ type incidentService struct {
 	// own doc comment. Set only via NewIncidentServiceWithSNMirror. Backs
 	// UpdateIncident's best-effort async ServiceNow mirror write.
 	snWriteback *SNWritebackDispatcher
-	// eventPublisher is nil in every mode except
-	// DATA_SOURCE=postgres-servicenow-dual-write. createIncidentSNFirst
-	// publishes incident.created itself, after CreateIncidentFromServiceNow
+	// eventPublisher publishes incident.created after a create has committed
+	// to Postgres: createIncidentPortal (plain Postgres) and
+	// createIncidentSNFirst (dual-write) both do. createIncidentSNFirst
+	// publishes it itself, after CreateIncidentFromServiceNow
 	// succeeds -- the mirror IncidentService above is always constructed
 	// with its own publisher=nil in this mode, specifically so it never
 	// publishes prematurely (before the Postgres insert this mode's reads
@@ -219,8 +286,8 @@ type incidentService struct {
 }
 
 // NewIncidentService constructs an IncidentService backed by Postgres.
-func NewIncidentService(repo repository.IncidentRepository) IncidentService {
-	return &incidentService{repo: repo}
+func NewIncidentService(repo repository.IncidentRepository, eventPublisher EventPublisherService) IncidentService {
+	return &incidentService{repo: repo, eventPublisher: eventPublisher}
 }
 
 // NewIncidentServiceWithSNMirror is NewIncidentService plus the wiring
@@ -262,12 +329,12 @@ const incidentSystemActorEmail = "system-m2m@wso2.com"
 // Deliberately DIFFERENT from caseService.resolveActor in one respect: this
 // falls back to incidentSystemActorEmail instead of a 401 when no token is
 // forwarded, rather than requiring one unconditionally. comment.created_by
-// (migration 000037) is a free-text VARCHAR with no FK to a real user row
+// (migration 0040) is a free-text VARCHAR with no FK to a real user row
 // (see CreateIncidentComment's own doc comment) -- there is no schema reason
 // to require a resolvable platform user here. This matters concretely: the
 // M2M pipeline this whole UpdateIncident extension exists to unblock
-// (sre-alert-ingestion-service -> csm-integration-service, both M2M-only,
-// forwarding no end-user token by design) would otherwise trade the
+// (a machine client -> csm-integration-service, both M2M-only, forwarding
+// no end-user token by design) would otherwise trade the
 // original unconditional 503 for an unconditional 401 -- fixing nothing.
 // Case's comment endpoints are reached by real logged-in portal users, so a
 // hard requirement is correct there; this one is also reached by
@@ -360,34 +427,126 @@ func (s *incidentService) SearchIncidentActivities(ctx context.Context, req doma
 // CreateIncident implements IncidentService.
 //
 // Under DATA_SOURCE=postgres-servicenow-dual-write (snMirror != nil), this
-// delegates to createIncidentSNFirst instead of the plain Postgres path's
-// ServiceUnavailableError below -- see that method's own doc comment.
+// delegates to createIncidentSNFirst -- see that method's own doc comment.
+// Otherwise it is createIncidentPortal, the native Postgres create.
 func (s *incidentService) CreateIncident(ctx context.Context, req domain.CreateIncidentRequest) (domain.CreateIncidentResponse, error) {
+	var err error
+	if req, err = s.withAssignmentGroupFromService(ctx, req); err != nil {
+		return domain.CreateIncidentResponse{}, err
+	}
 	if s.snMirror != nil {
-		// ConfigurationItemID/AssignmentGroupID have no backing column on
-		// this data source at all (unlike Subcategory/AssignedEngineerID/
-		// WatchList/AdditionalComments/WorkNotes, which are accepted but
-		// silently not persisted -- a separate, tracked follow-up per
-		// CodeRabbit's finding on PR #1922). Rejecting these two explicitly
-		// is strictly better than the alternative: ServiceNow would already
-		// have accepted and stored them by the time Postgres is ever
-		// touched, so silently dropping them here would mean the caller's
-		// request appears to succeed while quietly losing data they
-		// explicitly asked to set.
+		// ConfigurationItemID has no backing column on this data source at
+		// all (unlike Subcategory/AssignedEngineerID/WatchList/
+		// AdditionalComments/WorkNotes, which are accepted but silently
+		// not persisted -- a separate, tracked follow-up per CodeRabbit's
+		// finding on PR #1922). Rejecting it explicitly is strictly
+		// better than the alternative: ServiceNow would already have
+		// accepted and stored it by the time Postgres is ever touched, so
+		// silently dropping it here would mean the caller's request
+		// appears to succeed while quietly losing data they explicitly
+		// asked to set.
+		//
+		// AssignmentGroupID, by contrast, DOES have a backing column
+		// (work_item.assignment_group_id, migration 0075) and is now
+		// persisted by CreateIncidentFromServiceNow -- see that
+		// function's own doc comment.
 		if req.ConfigurationItemID != nil {
 			return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "configurationItemId is not supported for this data source"}
 		}
-		if req.AssignmentGroupID != nil {
-			return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "assignmentGroupId is not supported for this data source"}
-		}
 		return s.createIncidentSNFirst(ctx, req)
 	}
-	// CreateIncident is not supported for the plain PostgreSQL data source:
-	// like CaseRepository.CreateCase, work_item.number has no DB default and
-	// no backing sequence anywhere in migrations/.
-	return domain.CreateIncidentResponse{}, &apierror.ServiceUnavailableError{
-		Msg: "creating an incident is not available on this data source: work_item.number has no generation strategy defined here",
+	return s.createIncidentPortal(ctx, req)
+}
+
+// withAssignmentGroupFromService sets an incident's assignment group to its
+// service's support group.
+//
+// *** THE ONLY PLACE THE GROUP IS CHOSEN. *** The create request has no
+// assignmentGroupId (see domain.CreateIncidentRequest.AssignmentGroupID), so
+// the portal, the microapp, alert-born incidents from sre-alert-core-service
+// and any M2M client all get the same group from one call, read live from the
+// service as ServiceNow's alert business rule does. Done before either create
+// path, so in dual-write mode ServiceNow and Postgres get the same group.
+//
+// A service with no support group leaves the incident unassigned. An invalid
+// service id is left for request validation to reject.
+func (s *incidentService) withAssignmentGroupFromService(ctx context.Context, req domain.CreateIncidentRequest) (domain.CreateIncidentRequest, error) {
+	req.AssignmentGroupID = nil
+	serviceID := strings.TrimSpace(req.ServiceID)
+	if serviceID == "" || validateUUIDs("serviceId", []string{serviceID}) != nil || s.repo == nil {
+		return req, nil
 	}
+	group, err := s.repo.SupportGroupOfService(ctx, serviceID)
+	if err != nil {
+		return req, err
+	}
+	if group != "" {
+		req.AssignmentGroupID = &group
+	}
+	return req, nil
+}
+
+// createIncidentPortal implements CreateIncident's plain-Postgres path
+// (s.snMirror == nil, no ServiceNow at all). It reproduces ServiceNow's
+// IncidentUtils.createIncident, the script include behind the ServiceNow
+// path's POST:
+//
+//   - state New (the column default) and priority from impact x urgency
+//     (incidentPriorityFor);
+//   - every optional field IncidentUtils sets when present, including
+//     subcategory, assigned engineer, configuration item and watch list;
+//   - additionalComments and workNotes written as journal entries (COMMENT /
+//     WORK_NOTE rows) once the record exists, not as fields on it;
+//   - incident.created published after the insert commits, the event the
+//     ServiceNow path publishes and csm-notification-service consumes.
+//
+// The number is the portal's own (next_portal_work_item_number, migration
+// 0140), as for every other type created natively; INC numbers come with the
+// native numbering cutover (migration 0180).
+//
+// The actor is the caller's validated identity (actorOf): the user's email,
+// or the client id of a machine caller such as alert ingestion, which has no
+// user token to forward.
+func (s *incidentService) createIncidentPortal(ctx context.Context, req domain.CreateIncidentRequest) (domain.CreateIncidentResponse, error) {
+	if err := validateCreateIncidentRequest(req); err != nil {
+		return domain.CreateIncidentResponse{}, err
+	}
+
+	var subcategoryValue *string
+	if req.Subcategory != nil {
+		v := snIncidentSubcategoryKeyMap[*req.Subcategory]
+		subcategoryValue = &v
+	}
+
+	resp, err := s.repo.CreateIncident(ctx, req, incidentPriorityFor(req.Impact, req.Urgency), subcategoryValue, actorOf(ctx))
+	if err != nil {
+		return domain.CreateIncidentResponse{}, err
+	}
+	publishIncidentCreatedEvent(ctx, s.eventPublisher, req, resp.Incident.ID)
+	return resp, nil
+}
+
+// incidentPriorityFor is ServiceNow's stock priority lookup (dl_u_priority):
+// impact x urgency to priority, as an incident_priority_enum label. The
+// create form's preview (webapp utils/incidentPriorityMatrix.ts) shows the
+// same matrix.
+//
+//	impact \ urgency   HIGH       MEDIUM     LOW
+//	HIGH              CRITICAL   HIGH       MODERATE
+//	MEDIUM            HIGH       MODERATE   LOW
+//	LOW               MODERATE   LOW        PLANNING
+func incidentPriorityFor(impact domain.IncidentImpact, urgency domain.IncidentUrgency) string {
+	rank := func(v string) int {
+		switch v {
+		case "HIGH":
+			return 0
+		case "MEDIUM":
+			return 1
+		default:
+			return 2
+		}
+	}
+	return [...]string{"CRITICAL", "HIGH", "MODERATE", "LOW", "PLANNING"}[rank(string(impact))+rank(string(urgency))]
 }
 
 // createIncidentSNFirst implements CreateIncident's
@@ -448,16 +607,24 @@ func (s *incidentService) createIncidentSNFirst(ctx context.Context, req domain.
 // UpdateIncident always had here.
 //
 // Under DATA_SOURCE=postgres-servicenow-dual-write (s.snWriteback != nil),
-// this supports EXACTLY WorkNotes and AdditionalComments -- a deliberate,
-// narrow scope, not a stepping stone left half-built: every other field
-// (Subject/Priority/State/Category/Subcategory/ContactType/ResolutionCode/
-// ParentID/ParentIncidentID/AssignmentGroupID/AssignedEngineerID/ServiceID/
-// ServiceOfferingID/ConfigurationItemID/ChangeRequestID/ProblemID/
-// CausedByID/ResolvedByID/ResolutionNotes/IncidentReport/WatchList) is
-// rejected with a ValidationError if set, mirroring caseService.UpdateCase's
-// own narrow-field-set rejection style/wording (case_service.go) --
-// wiring up incident State/Priority/etc against their real backing Postgres
-// columns is separate, future work.
+// this supports two field groups:
+//
+//   - The state transition the portal's incident action bar sends:
+//     State, plus AssignedEngineerID (the "claim" sent with In Progress on
+//     an unassigned incident) and ResolutionCode/ResolutionNotes/
+//     ResolvedByID (sent with Resolved/Closed). Written to incident/work_item
+//     in one transaction by IncidentRepository.UpdateIncidentLifecycle; see
+//     repository.IncidentLifecycleUpdate for the rules. No state requires an
+//     assignee or group (In Progress included), matching ServiceNow. These
+//     used to be rejected here, so no incident could leave New in this mode.
+//   - WorkNotes and AdditionalComments (below).
+//
+// Every other field (Subject/Priority/Category/Subcategory/ContactType/
+// ParentID/ParentIncidentID/AssignmentGroupID/ServiceID/ServiceOfferingID/
+// ConfigurationItemID/ChangeRequestID/ProblemID/CausedByID/IncidentReport/
+// WatchList) is still rejected with a ValidationError if set, mirroring
+// caseService.UpdateCase's narrow-field-set rejection style -- wiring those
+// up is separate, future work.
 //
 // WorkNotes/AdditionalComments each become their own comment row
 // (comment.work_item_id = req.ID, IncidentRepository.CreateIncidentComment)
@@ -494,22 +661,36 @@ func (s *incidentService) UpdateIncident(ctx context.Context, req domain.UpdateI
 	if err := validateUUIDs("id", []string{req.ID}); err != nil {
 		return domain.UpdateIncidentResponse{}, err
 	}
-	if req.Subject != nil || req.Priority != nil || req.State != nil || req.Category != nil ||
-		req.Subcategory != nil || req.ContactType != nil || req.ResolutionCode != nil ||
+	if req.Subject != nil || req.Priority != nil || req.Category != nil ||
+		req.Subcategory != nil || req.ContactType != nil ||
 		req.ParentID != nil || req.ParentIncidentID != nil || req.AssignmentGroupID != nil ||
-		req.AssignedEngineerID != nil || req.ServiceID != nil || req.ServiceOfferingID != nil ||
+		req.ServiceID != nil || req.ServiceOfferingID != nil ||
 		req.ConfigurationItemID != nil || req.ChangeRequestID != nil || req.ProblemID != nil ||
-		req.CausedByID != nil || req.ResolvedByID != nil || req.ResolutionNotes != nil ||
-		req.IncidentReport != nil || req.WatchList != nil {
-		return domain.UpdateIncidentResponse{}, &apierror.ValidationError{Msg: "subject, priority, state, category, subcategory, contactType, resolutionCode, parentId, parentIncidentId, assignmentGroupId, assignedEngineerId, serviceId, serviceOfferingId, configurationItemId, changeRequestId, problemId, causedById, resolvedById, resolutionNotes, incidentReport, and watchList are only supported for the ServiceNow data source"}
+		req.CausedByID != nil || req.IncidentReport != nil || req.WatchList != nil {
+		// Kept under the BFF's 256-byte upstream error excerpt, so the reason
+		// still reaches the portal intact if that cap is ever lowered again.
+		return domain.UpdateIncidentResponse{}, &apierror.ValidationError{Msg: "subject, priority, category, subcategory, contactType, parentId, parentIncidentId, assignmentGroupId, serviceId, serviceOfferingId, configurationItemId, changeRequestId, problemId, causedById, incidentReport and watchList cannot be updated on this data source yet"}
 	}
-	if req.WorkNotes == nil && req.AdditionalComments == nil {
-		return domain.UpdateIncidentResponse{}, &apierror.ValidationError{Msg: "at least one of workNotes or additionalComments must be provided"}
+	lifecycle, hasLifecycle, err := incidentLifecycleUpdateFromRequest(req)
+	if err != nil {
+		return domain.UpdateIncidentResponse{}, err
+	}
+	if !hasLifecycle && req.WorkNotes == nil && req.AdditionalComments == nil {
+		return domain.UpdateIncidentResponse{}, &apierror.ValidationError{Msg: "at least one of state, assignedEngineerId, resolutionCode, resolutionNotes, resolvedById, workNotes or additionalComments must be provided"}
 	}
 
 	actor, err := s.resolveActor(ctx)
 	if err != nil {
 		return domain.UpdateIncidentResponse{}, err
+	}
+
+	if hasLifecycle {
+		if actor.ID != "" {
+			lifecycle.DefaultResolvedByID = &actor.ID
+		}
+		if err := s.repo.UpdateIncidentLifecycle(ctx, req.ID, lifecycle, actor.Email); err != nil {
+			return domain.UpdateIncidentResponse{}, err
+		}
 	}
 
 	if req.WorkNotes != nil {
@@ -535,9 +716,22 @@ func (s *incidentService) UpdateIncident(ctx context.Context, req domain.UpdateI
 	// ID plus the field(s) this call actually set -- never forwards req
 	// itself -- so this can never accidentally carry an unsupported field
 	// into the mirror call.
-	mirrorReq := domain.UpdateIncidentRequest{ID: req.ID, WorkNotes: req.WorkNotes, AdditionalComments: req.AdditionalComments}
+	mirrorReq := domain.UpdateIncidentRequest{
+		ID:                 req.ID,
+		State:              req.State,
+		AssignedEngineerID: req.AssignedEngineerID,
+		ResolutionCode:     req.ResolutionCode,
+		ResolutionNotes:    req.ResolutionNotes,
+		ResolvedByID:       req.ResolvedByID,
+		WorkNotes:          req.WorkNotes,
+		AdditionalComments: req.AdditionalComments,
+	}
 	s.snWriteback.Dispatch(ctx, "incident", req.ID, "update",
-		map[string]any{"id": req.ID, "workNotes": req.WorkNotes, "additionalComments": req.AdditionalComments},
+		map[string]any{
+			"id": req.ID, "state": req.State, "assignedEngineerId": req.AssignedEngineerID,
+			"resolutionCode": req.ResolutionCode, "resolutionNotes": req.ResolutionNotes, "resolvedById": req.ResolvedByID,
+			"workNotes": req.WorkNotes, "additionalComments": req.AdditionalComments,
+		},
 		func(writeCtx context.Context) error {
 			_, err := s.snMirror.UpdateIncident(writeCtx, mirrorReq)
 			return err

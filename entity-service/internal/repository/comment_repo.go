@@ -23,14 +23,13 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
 )
 
 // CommentRow is the raw shape of one row read from the comment table
-// (migration 000037, extended by migration 000086 with DeletedAt/DeletedBy/
+// (migration 0040, extended by migration 0131 with DeletedAt/DeletedBy/
 // LastEditedAt).
 type CommentRow struct {
 	ID         string
@@ -59,7 +58,7 @@ type CommentRow struct {
 }
 
 // CommentEditHistoryRow is one prior version of a comment's body, recorded by
-// UpdateComment before it overwrites comment.content (migration 000086's
+// UpdateComment before it overwrites comment.content (migration 0131's
 // comment_edit_history table). Body is always the PRE-edit content.
 type CommentEditHistoryRow struct {
 	ID        string
@@ -73,7 +72,7 @@ type CommentEditHistoryRow struct {
 // work_item_type_enum value(s) it corresponds to. comment.work_item_id is a
 // foreign key into work_item(id), so only reference types that are
 // themselves work_item subtypes can be commented on through this data
-// source. "deployment" has no entry: deployment (migration 000013) is its
+// source. "deployment" has no entry: deployment (migration 0018) is its
 // own standalone table with its own primary key space, not a work_item
 // subtype, so a comment can never point at one here.
 //
@@ -130,11 +129,11 @@ type CommentRepository interface {
 }
 
 type commentRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
 // NewCommentRepository constructs a CommentRepository backed by the given connection pool.
-func NewCommentRepository(db *pgxpool.Pool) CommentRepository {
+func NewCommentRepository(db *Scoped) CommentRepository {
 	return &commentRepo{db: db}
 }
 
@@ -288,45 +287,42 @@ func (r *commentRepo) GetCommentByID(ctx context.Context, id string) (CommentRow
 
 // UpdateComment implements CommentRepository.
 func (r *commentRepo) UpdateComment(ctx context.Context, id string, newContent string, editorEmail string) (CommentRow, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return CommentRow{}, fmt.Errorf("update comment: begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	var row CommentRow
+	err := r.db.InTx(ctx, func(tx pgx.Tx) error {
+		var oldContent string
+		var deletedAt *time.Time
+		// SELECT ... FOR UPDATE: row-locked for the duration of the transaction so
+		// a concurrent edit or delete can't interleave between this read and the
+		// INSERT/UPDATE below.
+		if err := tx.QueryRow(ctx, `SELECT content, deleted_at FROM comment WHERE id = $1 FOR UPDATE`, id).Scan(&oldContent, &deletedAt); err != nil {
+			return err
+		}
+		if deletedAt != nil {
+			return &apierror.ValidationError{Msg: "a deleted comment cannot be edited"}
+		}
 
-	var oldContent string
-	var deletedAt *time.Time
-	// SELECT ... FOR UPDATE: row-locked for the duration of the transaction so
-	// a concurrent edit or delete can't interleave between this read and the
-	// INSERT/UPDATE below.
-	err = tx.QueryRow(ctx, `SELECT content, deleted_at FROM comment WHERE id = $1 FOR UPDATE`, id).Scan(&oldContent, &deletedAt)
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO comment_edit_history (comment_id, body, edited_by, edited_at) VALUES ($1, $2, $3, NOW())`,
+			id, oldContent, editorEmail,
+		); err != nil {
+			return fmt.Errorf("update comment: insert edit history: %w", err)
+		}
+
+		var txErr error
+		row, txErr = scanComment(tx.QueryRow(ctx,
+			`UPDATE comment SET content = $1, last_edited_at = NOW() WHERE id = $2 RETURNING `+commentColumns,
+			newContent, id,
+		))
+		if txErr != nil {
+			return fmt.Errorf("update comment: write new content: %w", txErr)
+		}
+		return nil
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return CommentRow{}, &apierror.NotFoundError{Msg: "comment not found: " + id}
 	}
 	if err != nil {
-		return CommentRow{}, fmt.Errorf("update comment: read current: %w", err)
-	}
-	if deletedAt != nil {
-		return CommentRow{}, &apierror.ValidationError{Msg: "a deleted comment cannot be edited"}
-	}
-
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO comment_edit_history (comment_id, body, edited_by, edited_at) VALUES ($1, $2, $3, NOW())`,
-		id, oldContent, editorEmail,
-	); err != nil {
-		return CommentRow{}, fmt.Errorf("update comment: insert edit history: %w", err)
-	}
-
-	row, err := scanComment(tx.QueryRow(ctx,
-		`UPDATE comment SET content = $1, last_edited_at = NOW() WHERE id = $2 RETURNING `+commentColumns,
-		newContent, id,
-	))
-	if err != nil {
-		return CommentRow{}, fmt.Errorf("update comment: write new content: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return CommentRow{}, fmt.Errorf("update comment: commit tx: %w", err)
+		return CommentRow{}, err
 	}
 	return row, nil
 }

@@ -110,7 +110,7 @@ func NewAnnouncementRequestRepository(db *pgxpool.Pool) AnnouncementRequestRepos
 // returns a full row, kept in one place so it can't drift out of sync with
 // scanAnnouncementRequest's field order.
 const announcementRequestColumns = `
-	id, kind, state, subject, description, is_security_announcement,
+	id, kind, state, subject, description, announcement_type::TEXT,
 	audience_definition, resolved_project_ids, resolved_project_count,
 	dry_run_case_id, dry_run_on, dry_run_by,
 	created_by, created_by_email, created_on, updated_on,
@@ -122,8 +122,9 @@ const announcementRequestColumns = `
 func scanAnnouncementRequest(row pgx.Row) (domain.AnnouncementRequest, error) {
 	var r domain.AnnouncementRequest
 	var resolvedProjectIDsRaw, publishedCaseIDsRaw []byte
+	var announcementType string
 	if err := row.Scan(
-		&r.ID, &r.Kind, &r.State, &r.Subject, &r.Description, &r.IsSecurityAnnouncement,
+		&r.ID, &r.Kind, &r.State, &r.Subject, &r.Description, &announcementType,
 		&r.AudienceDefinition, &resolvedProjectIDsRaw, &r.ResolvedProjectCount,
 		&r.DryRunCaseID, &r.DryRunAt, &r.DryRunBy,
 		&r.CreatedBy, &r.CreatedByEmail, &r.CreatedAt, &r.UpdatedAt,
@@ -134,6 +135,11 @@ func scanAnnouncementRequest(row pgx.Row) (domain.AnnouncementRequest, error) {
 	); err != nil {
 		return domain.AnnouncementRequest{}, err
 	}
+	// The domain's IsSecurityAnnouncement stays a plain bool (no wire-contract
+	// change for existing callers) even though storage is now the same
+	// announcement_type_enum the "announcement" table uses -- see this
+	// migration's own comment (0151_announcement_requests_announcement_type).
+	r.IsSecurityAnnouncement = announcementType == "SECURITY"
 	// resolved_project_ids/published_case_ids are JSONB and nil until
 	// Submit/MarkPublished respectively — decoded explicitly (not left to
 	// pgx's default codec) so a NULL column reads back as a nil slice
@@ -158,12 +164,12 @@ func (r *announcementRequestRepo) Create(ctx context.Context, req domain.CreateA
 		audience = json.RawMessage(`{}`)
 	}
 	query := `
-		INSERT INTO announcement_requests (kind, subject, description, is_security_announcement, audience_definition, created_by, created_by_email)
-		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''))
+		INSERT INTO announcement_requests (kind, subject, description, announcement_type, audience_definition, created_by, created_by_email)
+		VALUES ($1, $2, $3, $4::announcement_type_enum, $5, $6, NULLIF($7, ''))
 		RETURNING ` + announcementRequestColumns
 
 	ar, err := scanAnnouncementRequest(r.db.QueryRow(ctx, query,
-		req.Kind, req.Subject, req.Description, req.IsSecurityAnnouncement, audience, req.CreatedBy, req.CreatedByEmail,
+		req.Kind, req.Subject, req.Description, announcementTypeEnumValue(req.IsSecurityAnnouncement), audience, req.CreatedBy, req.CreatedByEmail,
 	))
 	if err != nil {
 		return domain.AnnouncementRequest{}, fmt.Errorf("create announcement_request: %w", err)
@@ -187,37 +193,46 @@ func (r *announcementRequestRepo) Get(ctx context.Context, id string) (domain.An
 
 // Search implements AnnouncementRequestRepository.
 func (r *announcementRequestRepo) Search(ctx context.Context, req domain.SearchAnnouncementRequestsRequest) ([]domain.AnnouncementRequest, int, error) {
-	// state and created_by are both optional filters; NULL::text on the
+	// state, states and created_by are all optional filters; NULL on the
 	// unused side of each OR makes an unset filter match every row without
-	// needing to build the WHERE clause dynamically. readyForScheduledPublish
-	// works the same way via NOT $3::boolean: when false the whole OR branch
-	// is unconditionally true (no extra restriction), when true it requires
-	// state = 'approved' and a scheduled_on that has already arrived — the
-	// one query operations/csm-scheduled-tasks' publish_scheduled_announcements
+	// needing to build the WHERE clause dynamically. states is a text[]
+	// (nil when the caller sent none -- pgx encodes a nil slice as NULL, so an
+	// empty list means "no state filter," never "match nothing"). The
+	// service layer rejects state and states together, so at most one of
+	// $1/$4 is ever set. readyForScheduledPublish works the same way via NOT
+	// $3::boolean: when false the whole OR branch is unconditionally true (no
+	// extra restriction), when true it requires state = 'approved' and a
+	// scheduled_on that has already arrived -- the one query
+	// operations/csm-scheduled-tasks' publish_scheduled_announcements
 	// sub-cron needs (the service layer validates this is never combined
-	// with an explicit State).
+	// with an explicit State or States).
 	const where = `WHERE ($1::text IS NULL OR state = $1)
 		AND ($2::text IS NULL OR created_by = $2)
-		AND (NOT $3::boolean OR (state = 'approved' AND scheduled_on IS NOT NULL AND scheduled_on <= NOW()))`
+		AND (NOT $3::boolean OR (state = 'approved' AND scheduled_on IS NOT NULL AND scheduled_on <= NOW()))
+		AND ($4::text[] IS NULL OR state = ANY($4::text[]))`
 	countQuery := `SELECT COUNT(*) FROM announcement_requests ` + where
 	dataQuery := `SELECT ` + announcementRequestColumns + ` FROM announcement_requests ` + where + `
 		ORDER BY created_on DESC, id
-		LIMIT $4 OFFSET $5`
+		LIMIT $5 OFFSET $6`
 
 	var state *string
 	if req.State != nil {
 		s := string(*req.State)
 		state = &s
 	}
+	var states []string
+	for _, st := range req.States {
+		states = append(states, string(st))
+	}
 
 	var total int
 	var requests []domain.AnnouncementRequest
 	eg, egCtx := errgroup.WithContext(ctx)
 	eg.Go(func() error {
-		return r.db.QueryRow(egCtx, countQuery, state, req.CreatedBy, req.ReadyForScheduledPublish).Scan(&total)
+		return r.db.QueryRow(egCtx, countQuery, state, req.CreatedBy, req.ReadyForScheduledPublish, states).Scan(&total)
 	})
 	eg.Go(func() error {
-		rows, err := r.db.Query(egCtx, dataQuery, state, req.CreatedBy, req.ReadyForScheduledPublish, req.Pagination.Limit, req.Pagination.Offset)
+		rows, err := r.db.Query(egCtx, dataQuery, state, req.CreatedBy, req.ReadyForScheduledPublish, states, req.Pagination.Limit, req.Pagination.Offset)
 		if err != nil {
 			return err
 		}
@@ -255,7 +270,7 @@ func (r *announcementRequestRepo) Update(ctx context.Context, id string, expecte
 		UPDATE announcement_requests SET
 			subject = COALESCE($2, subject),
 			description = COALESCE($3, description),
-			is_security_announcement = COALESCE($4, is_security_announcement),
+			announcement_type = COALESCE($4::announcement_type_enum, announcement_type),
 			audience_definition = CASE WHEN $5::boolean THEN $6 ELSE audience_definition END,
 			updated_on = NOW()
 		WHERE id = $1 AND state = $7
@@ -270,7 +285,7 @@ func (r *announcementRequestRepo) Update(ctx context.Context, id string, expecte
 	}
 
 	ar, err := scanAnnouncementRequest(r.db.QueryRow(ctx, query,
-		id, req.Subject, req.Description, req.IsSecurityAnnouncement, audienceSet, audience, expectedState,
+		id, req.Subject, req.Description, announcementTypeEnumValuePtr(req.IsSecurityAnnouncement), audienceSet, audience, expectedState,
 	))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -423,7 +438,7 @@ func (r *announcementRequestRepo) RevertToDraft(ctx context.Context, id string, 
 			state = 'draft',
 			subject = COALESCE($2, subject),
 			description = COALESCE($3, description),
-			is_security_announcement = COALESCE($4, is_security_announcement),
+			announcement_type = COALESCE($4::announcement_type_enum, announcement_type),
 			audience_definition = CASE WHEN $5::boolean THEN $6 ELSE audience_definition END,
 			resolved_project_ids = NULL, resolved_project_count = NULL,
 			dry_run_case_id = NULL, dry_run_on = NULL, dry_run_by = NULL,
@@ -441,7 +456,7 @@ func (r *announcementRequestRepo) RevertToDraft(ctx context.Context, id string, 
 	}
 
 	ar, err := scanAnnouncementRequest(r.db.QueryRow(ctx, query,
-		id, req.Subject, req.Description, req.IsSecurityAnnouncement, audienceSet, audience,
+		id, req.Subject, req.Description, announcementTypeEnumValuePtr(req.IsSecurityAnnouncement), audienceSet, audience,
 	))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

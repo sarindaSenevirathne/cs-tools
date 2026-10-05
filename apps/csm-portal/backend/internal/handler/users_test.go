@@ -22,9 +22,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/apierror"
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/directory"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/scim"
 )
@@ -33,7 +36,7 @@ import (
 
 func TestGetMe(t *testing.T) {
 	t.Run("requires authenticated user", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := httptest.NewRequest(http.MethodGet, "/users/me", nil)
 		w := httptest.NewRecorder()
 		h.GetMe(w, r)
@@ -49,7 +52,7 @@ func TestGetMe(t *testing.T) {
 				return nil, errors.New("scim unavailable")
 			},
 		}
-		h := NewUsersHandler(scimClient, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(scimClient, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/users/me", nil))
 		w := httptest.NewRecorder()
 		h.GetMe(w, r)
@@ -67,6 +70,12 @@ func TestGetMe(t *testing.T) {
 
 	t.Run("upstream errors from the entity service are mapped correctly", func(t *testing.T) {
 		for _, tc := range upstreamErrorsGeneric("Failed to fetch the current user.") {
+			// "apierror 404" is excluded: GetMe deliberately maps a 404 to 403
+			// instead of the generic table's 404->404 pass-through, asserted
+			// in its own test below.
+			if tc.name == "apierror 404" {
+				continue
+			}
 			t.Run(tc.name, func(t *testing.T) {
 				t.Parallel()
 				entityClient := &mockEntityUserClient{
@@ -74,7 +83,7 @@ func TestGetMe(t *testing.T) {
 						return nil, tc.err
 					},
 				}
-				h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false)
+				h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
 				r := withUser(httptest.NewRequest(http.MethodGet, "/users/me", nil))
 				w := httptest.NewRecorder()
 				h.GetMe(w, r)
@@ -85,13 +94,35 @@ func TestGetMe(t *testing.T) {
 		}
 	})
 
+	// Regression guard: a caller authenticated by a valid JWT whose email has
+	// no "user" row at all (never provisioned downstream) made entity-service
+	// 404 GetUserMe. Passing that 404 straight through used to leave the
+	// webapp's profile-fetch hook with nothing to render and no 403 state to
+	// fall into, spinning forever instead. GetMe now maps it to the same 403
+	// the UI already knows how to show, while the real reason is still logged
+	// server-side.
+	t.Run("entity 404 (user not found) maps to 403, not 404", func(t *testing.T) {
+		entityClient := &mockEntityUserClient{
+			getUserMeFn: func(_ context.Context) ([]byte, error) {
+				return nil, &apierror.Error{StatusCode: http.StatusNotFound}
+			},
+		}
+		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
+		r := withUser(httptest.NewRequest(http.MethodGet, "/users/me", nil))
+		w := httptest.NewRecorder()
+		h.GetMe(w, r)
+		assertStatus(t, w, http.StatusForbidden)
+		assertErrorMessage(t, w, ErrMsgForbidden)
+		assertContentType(t, w, "application/json")
+	})
+
 	t.Run("returns email from JWT when SCIM returns no user", func(t *testing.T) {
 		scimClient := &mockSCIMClient{
 			searchUserFn: func(_ context.Context, _ string) (*scim.UserInfo, error) {
 				return nil, nil // user not found in SCIM
 			},
 		}
-		h := NewUsersHandler(scimClient, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(scimClient, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/users/me", nil))
 		w := httptest.NewRecorder()
 		h.GetMe(w, r)
@@ -113,7 +144,7 @@ func TestGetMe(t *testing.T) {
 			},
 		}
 		_ = entityCalls
-		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/users/me", nil))
 		w := httptest.NewRecorder()
 		h.GetMe(w, r)
@@ -147,7 +178,7 @@ func TestGetMe(t *testing.T) {
 					`"groups":[{"id":"g-2","name":"ABT Two"}]}`), nil
 			},
 		}
-		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/users/me", nil))
 		w := httptest.NewRecorder()
 		h.GetMe(w, r)
@@ -176,7 +207,7 @@ func TestGetMe(t *testing.T) {
 					`"groups":[{"id":"g-9","name":"Some Other Group"}]}`), nil
 			},
 		}
-		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/users/me", nil))
 		w := httptest.NewRecorder()
 		h.GetMe(w, r)
@@ -199,7 +230,7 @@ func TestGetMe(t *testing.T) {
 				}, nil
 			},
 		}
-		h := NewUsersHandler(scimClient, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(scimClient, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/users/me", nil))
 		w := httptest.NewRecorder()
 		h.GetMe(w, r)
@@ -230,7 +261,7 @@ func TestGetMe(t *testing.T) {
 func TestGetMeSftpgoAttachmentStorageEnabled(t *testing.T) {
 	for _, enabled := range []bool{true, false} {
 		t.Run(fmt.Sprintf("flag=%v", enabled), func(t *testing.T) {
-			h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), enabled)
+			h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), enabled, nil)
 			r := withUser(httptest.NewRequest(http.MethodGet, "/users/me", nil))
 			w := httptest.NewRecorder()
 			h.GetMe(w, r)
@@ -277,7 +308,7 @@ func joined(l *[]string) string {
 // role still gets a profile rather than an error.
 func TestGetMeRoles(t *testing.T) {
 	newHandler := func(t *testing.T, entity *mockEntityUserClient, cfg AccessConfig) *UsersHandler {
-		return NewUsersHandler(&mockSCIMClient{}, entity, testDirectory(t), false).WithAccessGuard(NewAccessGuard(cfg))
+		return NewUsersHandler(&mockSCIMClient{}, entity, testDirectory(t), false, nil).WithAccessGuard(NewAccessGuard(cfg))
 	}
 	def := testAccessConfig()
 
@@ -323,7 +354,7 @@ func TestGetMeRoles(t *testing.T) {
 	})
 
 	t.Run("no guard wired reports an empty array, not null", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		resp := getMeAs(t, h, "agent@example.com", []string{"test-admin"})
 		if resp.Roles == nil || len(*resp.Roles) != 0 {
 			t.Errorf("roles = %s, want an empty non-null array", joined(resp.Roles))
@@ -344,7 +375,7 @@ func TestGetMeRoles(t *testing.T) {
 
 func TestPatchMe(t *testing.T) {
 	t.Run("requires authenticated user", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := httptest.NewRequest(http.MethodPatch, "/users/me", strings.NewReader(`{"phoneNumber":"+1"}`))
 		w := httptest.NewRecorder()
 		h.PatchMe(w, r)
@@ -354,7 +385,7 @@ func TestPatchMe(t *testing.T) {
 	})
 
 	t.Run("rejects body exceeding 1 MiB", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodPatch, "/users/me", strings.NewReader(strings.Repeat("x", maxRequestBodyBytes+1))))
 		w := httptest.NewRecorder()
 		h.PatchMe(w, r)
@@ -363,7 +394,7 @@ func TestPatchMe(t *testing.T) {
 	})
 
 	t.Run("rejects empty body", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodPatch, "/users/me", strings.NewReader("")))
 		w := httptest.NewRecorder()
 		h.PatchMe(w, r)
@@ -372,7 +403,7 @@ func TestPatchMe(t *testing.T) {
 	})
 
 	t.Run("rejects invalid JSON", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodPatch, "/users/me", strings.NewReader(`not-json`)))
 		w := httptest.NewRecorder()
 		h.PatchMe(w, r)
@@ -381,7 +412,7 @@ func TestPatchMe(t *testing.T) {
 	})
 
 	t.Run("rejects JSON with no updateable fields", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodPatch, "/users/me", strings.NewReader(`{}`)))
 		w := httptest.NewRecorder()
 		h.PatchMe(w, r)
@@ -399,7 +430,7 @@ func TestPatchMe(t *testing.T) {
 				return &updated, nil
 			},
 		}
-		h := NewUsersHandler(scimClient, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(scimClient, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodPatch, "/users/me", strings.NewReader(`{"phoneNumber":"+94777654321"}`)))
 		w := httptest.NewRecorder()
 		h.PatchMe(w, r)
@@ -430,7 +461,7 @@ func TestPatchMe(t *testing.T) {
 						return nil, tc.err
 					},
 				}
-				h := NewUsersHandler(scimClient, &mockEntityUserClient{}, testDirectory(t), false)
+				h := NewUsersHandler(scimClient, &mockEntityUserClient{}, testDirectory(t), false, nil)
 				r := withUser(httptest.NewRequest(http.MethodPatch, "/users/me", strings.NewReader(`{"phoneNumber":"+1"}`)))
 				w := httptest.NewRecorder()
 				h.PatchMe(w, r)
@@ -446,7 +477,7 @@ func TestPatchMe(t *testing.T) {
 
 func TestSearchUsers(t *testing.T) {
 	t.Run("requires authenticated user", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := httptest.NewRequest(http.MethodPost, "/users/search", strings.NewReader(`{}`))
 		w := httptest.NewRecorder()
 		h.SearchUsers(w, r)
@@ -456,7 +487,7 @@ func TestSearchUsers(t *testing.T) {
 	})
 
 	t.Run("rejects body exceeding 1 MiB", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodPost, "/users/search", strings.NewReader(strings.Repeat("x", maxRequestBodyBytes+1))))
 		w := httptest.NewRecorder()
 		h.SearchUsers(w, r)
@@ -465,7 +496,7 @@ func TestSearchUsers(t *testing.T) {
 	})
 
 	t.Run("rejects invalid JSON body", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodPost, "/users/search", strings.NewReader(`not-json`)))
 		w := httptest.NewRecorder()
 		h.SearchUsers(w, r)
@@ -482,7 +513,7 @@ func TestSearchUsers(t *testing.T) {
 				return []byte(`{"users":[{"id":"u-1"}],"total":1}`), nil
 			},
 		}
-		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodPost, "/users/search", strings.NewReader(reqPayload)))
 		w := httptest.NewRecorder()
 		h.SearchUsers(w, r)
@@ -507,7 +538,7 @@ func TestSearchUsers(t *testing.T) {
 						return nil, tc.err
 					},
 				}
-				h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false)
+				h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
 				r := withUser(httptest.NewRequest(http.MethodPost, "/users/search", strings.NewReader(`{}`)))
 				w := httptest.NewRecorder()
 				h.SearchUsers(w, r)
@@ -525,7 +556,7 @@ func TestSearchUsers(t *testing.T) {
 // these tests cover the handler's own request validation and upstream forwarding.
 func TestCreateUser(t *testing.T) {
 	t.Run("requires authenticated user", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := httptest.NewRequest(http.MethodPost, "/users", strings.NewReader(`{}`))
 		w := httptest.NewRecorder()
 		h.CreateUser(w, r)
@@ -534,7 +565,7 @@ func TestCreateUser(t *testing.T) {
 	})
 
 	t.Run("rejects body exceeding 1 MiB", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodPost, "/users", strings.NewReader(strings.Repeat("x", maxRequestBodyBytes+1))))
 		w := httptest.NewRecorder()
 		h.CreateUser(w, r)
@@ -543,7 +574,7 @@ func TestCreateUser(t *testing.T) {
 	})
 
 	t.Run("rejects invalid JSON body", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodPost, "/users", strings.NewReader(`not-json`)))
 		w := httptest.NewRecorder()
 		h.CreateUser(w, r)
@@ -559,7 +590,7 @@ func TestCreateUser(t *testing.T) {
 				return []byte(`{}`), nil
 			},
 		}
-		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodPost, "/users",
 			strings.NewReader(`{"firstName":"Jane","email":"jane@example.com","roles":["not-a-real-role"]}`)))
 		w := httptest.NewRecorder()
@@ -568,6 +599,92 @@ func TestCreateUser(t *testing.T) {
 		if called {
 			t.Fatal("entity service must not be called for an invalid role")
 		}
+	})
+
+	t.Run("enforces the internal-email and external-type-disabled constraints, before reaching upstream", func(t *testing.T) {
+		teams, err := directory.ParseTeamRegistry(testTeamRegistry)
+		if err != nil {
+			t.Fatalf("ParseTeamRegistry: %v", err)
+		}
+		roles, err := directory.ParseRoles("internal,external,admin,agent,partner,customer,partner_admin,customer_admin")
+		if err != nil {
+			t.Fatalf("ParseRoles: %v", err)
+		}
+		dir, err := directory.New(teams, roles)
+		if err != nil {
+			t.Fatalf("directory.New: %v", err)
+		}
+		for _, role := range []string{"internal", "admin"} {
+			t.Run(role, func(t *testing.T) {
+				called := false
+				entityClient := &mockEntityUserClient{
+					createUserFn: func(context.Context, []byte) ([]byte, error) {
+						called = true
+						return []byte(`{}`), nil
+					},
+				}
+				h := NewUsersHandler(&mockSCIMClient{}, entityClient, dir, false, nil)
+				r := withUser(httptest.NewRequest(http.MethodPost, "/users",
+					strings.NewReader(`{"firstName":"Jane","email":"jane@example.com","roles":["`+role+`"]}`)))
+				w := httptest.NewRecorder()
+				h.CreateUser(w, r)
+				assertStatus(t, w, http.StatusBadRequest)
+				if called {
+					t.Fatal("entity service must not be called when an internal-resolving role is requested for a non-wso2.com email")
+				}
+			})
+		}
+
+		t.Run("allows the same role for a wso2.com email", func(t *testing.T) {
+			entityClient := &mockEntityUserClient{
+				createUserFn: func(context.Context, []byte) ([]byte, error) {
+					return []byte(`{"id":"u-1"}`), nil
+				},
+			}
+			h := NewUsersHandler(&mockSCIMClient{}, entityClient, dir, false, nil)
+			r := withUser(httptest.NewRequest(http.MethodPost, "/users",
+				strings.NewReader(`{"firstName":"Jane","email":"jane@wso2.com","roles":["internal"]}`)))
+			w := httptest.NewRecorder()
+			h.CreateUser(w, r)
+			assertStatus(t, w, http.StatusCreated)
+		})
+
+		t.Run("allows a non-wso2.com email for a role that resolves to neither internal nor external", func(t *testing.T) {
+			entityClient := &mockEntityUserClient{
+				createUserFn: func(context.Context, []byte) ([]byte, error) {
+					return []byte(`{"id":"u-1"}`), nil
+				},
+			}
+			h := NewUsersHandler(&mockSCIMClient{}, entityClient, dir, false, nil)
+			r := withUser(httptest.NewRequest(http.MethodPost, "/users",
+				strings.NewReader(`{"firstName":"Jane","email":"jane@example.com","roles":["agent"]}`)))
+			w := httptest.NewRecorder()
+			h.CreateUser(w, r)
+			assertStatus(t, w, http.StatusCreated)
+		})
+
+		t.Run("rejects an external-resolving role -- creating an external-type user is temporarily disabled", func(t *testing.T) {
+			for _, role := range []string{"external", "partner", "customer", "partner_admin", "customer_admin"} {
+				t.Run(role, func(t *testing.T) {
+					called := false
+					entityClient := &mockEntityUserClient{
+						createUserFn: func(context.Context, []byte) ([]byte, error) {
+							called = true
+							return []byte(`{}`), nil
+						},
+					}
+					h := NewUsersHandler(&mockSCIMClient{}, entityClient, dir, false, nil)
+					r := withUser(httptest.NewRequest(http.MethodPost, "/users",
+						strings.NewReader(`{"firstName":"Jane","email":"jane@example.com","roles":["`+role+`"]}`)))
+					w := httptest.NewRecorder()
+					h.CreateUser(w, r)
+					assertStatus(t, w, http.StatusBadRequest)
+					if called {
+						t.Fatal("entity service must not be called when an external-resolving role is requested")
+					}
+				})
+			}
+		})
 	})
 
 	t.Run("forwards the body unchanged and returns 201 with the upstream response", func(t *testing.T) {
@@ -579,7 +696,7 @@ func TestCreateUser(t *testing.T) {
 				return []byte(`{"id":"u-1","email":"jane.doe@example.com"}`), nil
 			},
 		}
-		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodPost, "/users", strings.NewReader(reqPayload)))
 		w := httptest.NewRecorder()
 		h.CreateUser(w, r)
@@ -604,7 +721,7 @@ func TestCreateUser(t *testing.T) {
 						return nil, tc.err
 					},
 				}
-				h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false)
+				h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
 				r := withUser(httptest.NewRequest(http.MethodPost, "/users",
 					strings.NewReader(`{"firstName":"Jane","email":"jane@example.com"}`)))
 				w := httptest.NewRecorder()
@@ -617,9 +734,107 @@ func TestCreateUser(t *testing.T) {
 	})
 }
 
+// ----- GetTimeCardApprovers -----
+
+func TestGetTimeCardApprovers(t *testing.T) {
+	t.Run("requires authenticated user", func(t *testing.T) {
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, []string{"role-1"})
+		r := httptest.NewRequest(http.MethodGet, "/users/time-card-approvers", nil)
+		w := httptest.NewRecorder()
+		h.GetTimeCardApprovers(w, r)
+		assertStatus(t, w, http.StatusUnauthorized)
+		assertErrorMessage(t, w, ErrMsgUnauthorized)
+	})
+
+	t.Run("fetches the configured role id and maps members to id/email", func(t *testing.T) {
+		var gotRoleID string
+		scimClient := &mockSCIMClient{
+			getRoleFn: func(_ context.Context, roleID string) ([]scim.RoleMember, error) {
+				gotRoleID = roleID
+				return []scim.RoleMember{
+					{ID: "u-1", Email: "jane.doe@wso2.com"},
+					{ID: "u-2", Email: "john.smith@wso2.com"},
+				}, nil
+			},
+		}
+		h := NewUsersHandler(scimClient, &mockEntityUserClient{}, testDirectory(t), false, []string{"role-1"})
+		r := withUser(httptest.NewRequest(http.MethodGet, "/users/time-card-approvers", nil))
+		w := httptest.NewRecorder()
+		h.GetTimeCardApprovers(w, r)
+
+		assertStatus(t, w, http.StatusOK)
+		assertContentType(t, w, "application/json")
+		if gotRoleID != "role-1" {
+			t.Errorf("roleID passed to scim.GetRole = %q, want %q", gotRoleID, "role-1")
+		}
+		resp := decodeJSON[timeCardApproversResponse](t, w)
+		want := []timeCardApproverRef{
+			{ID: "u-1", Email: "jane.doe@wso2.com"},
+			{ID: "u-2", Email: "john.smith@wso2.com"},
+		}
+		if !reflect.DeepEqual(resp.Approvers, want) {
+			t.Errorf("approvers = %+v, want %+v", resp.Approvers, want)
+		}
+	})
+
+	t.Run("returns 404 when no role id is configured, rather than falling through to GetUser", func(t *testing.T) {
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
+		r := withUser(httptest.NewRequest(http.MethodGet, "/users/time-card-approvers", nil))
+		w := httptest.NewRecorder()
+		h.GetTimeCardApprovers(w, r)
+		assertStatus(t, w, http.StatusNotFound)
+		assertErrorMessage(t, w, ErrMsgNotFound)
+	})
+
+	// A SCIM 401/403 means this backend's own credentials lack a roles-read
+	// scope, not that the caller lacks permission -- excluded from the shared
+	// upstreamErrorsGeneric table (which asserts the ordinary 401->401/403->403
+	// pass-through) and asserted separately below.
+	t.Run("upstream errors are mapped correctly", func(t *testing.T) {
+		for _, tc := range upstreamErrorsGeneric("Failed to list time card approvers.") {
+			if tc.wantCode == http.StatusUnauthorized || tc.wantCode == http.StatusForbidden {
+				continue
+			}
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				scimClient := &mockSCIMClient{
+					getRoleFn: func(context.Context, string) ([]scim.RoleMember, error) {
+						return nil, tc.err
+					},
+				}
+				h := NewUsersHandler(scimClient, &mockEntityUserClient{}, testDirectory(t), false, []string{"role-1"})
+				r := withUser(httptest.NewRequest(http.MethodGet, "/users/time-card-approvers", nil))
+				w := httptest.NewRecorder()
+				h.GetTimeCardApprovers(w, r)
+				assertStatus(t, w, tc.wantCode)
+				assertErrorMessage(t, w, tc.wantMsg)
+				assertContentType(t, w, "application/json")
+			})
+		}
+	})
+
+	t.Run("a SCIM 401 or 403 is reported as a sanitized 502, never the caller's own 401/403", func(t *testing.T) {
+		for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+			t.Run(http.StatusText(code), func(t *testing.T) {
+				scimClient := &mockSCIMClient{
+					getRoleFn: func(context.Context, string) ([]scim.RoleMember, error) {
+						return nil, &apierror.Error{StatusCode: code, Body: "scim detail that must not leak"}
+					},
+				}
+				h := NewUsersHandler(scimClient, &mockEntityUserClient{}, testDirectory(t), false, []string{"role-1"})
+				r := withUser(httptest.NewRequest(http.MethodGet, "/users/time-card-approvers", nil))
+				w := httptest.NewRecorder()
+				h.GetTimeCardApprovers(w, r)
+				assertStatus(t, w, http.StatusBadGateway)
+				assertErrorMessage(t, w, "Failed to list time card approvers.")
+			})
+		}
+	})
+}
+
 func TestListSavedFilterViews(t *testing.T) {
 	t.Run("requires authenticated user", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := httptest.NewRequest(http.MethodGet, "/users/me/saved-filter-views?listKey=cases", nil)
 		w := httptest.NewRecorder()
 		h.ListSavedFilterViews(w, r)
@@ -628,7 +843,7 @@ func TestListSavedFilterViews(t *testing.T) {
 	})
 
 	t.Run("requires listKey", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/users/me/saved-filter-views", nil))
 		w := httptest.NewRecorder()
 		h.ListSavedFilterViews(w, r)
@@ -644,7 +859,7 @@ func TestListSavedFilterViews(t *testing.T) {
 				return []byte(`{"views":[{"name":"Open","qs":"states=open"}]}`), nil
 			},
 		}
-		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/users/me/saved-filter-views?listKey=cases", nil))
 		w := httptest.NewRecorder()
 		h.ListSavedFilterViews(w, r)
@@ -663,7 +878,7 @@ func TestListSavedFilterViews(t *testing.T) {
 						return nil, tc.err
 					},
 				}
-				h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false)
+				h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
 				r := withUser(httptest.NewRequest(http.MethodGet, "/users/me/saved-filter-views?listKey=cases", nil))
 				w := httptest.NewRecorder()
 				h.ListSavedFilterViews(w, r)
@@ -676,7 +891,7 @@ func TestListSavedFilterViews(t *testing.T) {
 
 func TestSaveSavedFilterView(t *testing.T) {
 	t.Run("requires authenticated user", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := httptest.NewRequest(http.MethodPatch, "/users/me/saved-filter-views", strings.NewReader(`{}`))
 		w := httptest.NewRecorder()
 		h.SaveSavedFilterView(w, r)
@@ -684,7 +899,7 @@ func TestSaveSavedFilterView(t *testing.T) {
 	})
 
 	t.Run("rejects invalid JSON", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodPatch, "/users/me/saved-filter-views", strings.NewReader(`not-json`)))
 		w := httptest.NewRecorder()
 		h.SaveSavedFilterView(w, r)
@@ -701,7 +916,7 @@ func TestSaveSavedFilterView(t *testing.T) {
 				return []byte(`{"views":[{"name":"Open","qs":"states=open"}]}`), nil
 			},
 		}
-		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodPatch, "/users/me/saved-filter-views", strings.NewReader(payload)))
 		w := httptest.NewRecorder()
 		h.SaveSavedFilterView(w, r)
@@ -714,7 +929,7 @@ func TestSaveSavedFilterView(t *testing.T) {
 
 func TestDeleteSavedFilterView(t *testing.T) {
 	t.Run("requires listKey and name", func(t *testing.T) {
-		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, &mockEntityUserClient{}, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodDelete, "/users/me/saved-filter-views?listKey=cases", nil))
 		w := httptest.NewRecorder()
 		h.DeleteSavedFilterView(w, r)
@@ -730,7 +945,7 @@ func TestDeleteSavedFilterView(t *testing.T) {
 				return []byte(`{"views":[]}`), nil
 			},
 		}
-		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodDelete, "/users/me/saved-filter-views?listKey=incidents&name=Mine", nil))
 		w := httptest.NewRecorder()
 		h.DeleteSavedFilterView(w, r)
@@ -751,7 +966,7 @@ func TestReorderSavedFilterView(t *testing.T) {
 				return []byte(`{"views":[]}`), nil
 			},
 		}
-		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false)
+		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodPost, "/users/me/saved-filter-views/reorder", strings.NewReader(payload)))
 		w := httptest.NewRecorder()
 		h.ReorderSavedFilterView(w, r)

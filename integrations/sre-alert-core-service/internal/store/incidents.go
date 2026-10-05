@@ -18,437 +18,294 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
-	"github.com/gocql/gocql"
-	"github.com/scylladb/gocqlx/v2"
-	"github.com/scylladb/gocqlx/v2/qb"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"alert-core-service/internal/model"
+	"alert-core-service/internal/pglock"
 )
 
-var incidentColumns = []string{
-	"fingerprint", "incident_id", "incident_number", "status", "severity", "impact", "urgency", "service",
-	"metric_name", "description", "category", "environment", "source", "alert_ids", "alert_count", "work_notes",
-	"pending_notes", "first_seen", "last_seen", "state_checked_at", "fallback", "csm_confirmed", "csm_attempts",
-	"csm_permanently_failed", "csm_last_attempt_at",
-}
-
-// Bounds unbounded lists so a flapping alert can't blow past Cosmos's row-size limit; AlertCount keeps growing regardless.
-const maxWorkNotes = 200
-
-// IncidentRepo owns the incidents table; dedup uniqueness is a lightweight CAS transaction on fingerprint.
+// IncidentRepo owns the incidents_processed and incident_notes tables.
 type IncidentRepo struct {
-	session gocqlx.Session
-	// maxAlertIDs bounds AlertIDs for replay idempotency; must be >= poll.max_window to prevent re-duplicating trimmed IDs.
-	maxAlertIDs int
-	// dedupWindow bounds how long an incident absorbs duplicates before starting a new generation.
-	dedupWindow time.Duration
+	pool   *pgxpool.Pool
+	locker *pglock.Locker
 }
 
-// NewIncidentRepo ties the AlertIDs idempotency cap to the poller's own max_window so the two can't drift apart.
-func NewIncidentRepo(session *gocql.Session, maxWindow int, dedupWindow time.Duration) (*IncidentRepo, error) {
-	return &IncidentRepo{session: gocqlx.NewSession(session), maxAlertIDs: maxWindow, dedupWindow: dedupWindow}, nil
+// NewIncidentRepo wraps pool for incident reads and writes; locker gives cross-replica delivery exclusivity.
+func NewIncidentRepo(pool *pgxpool.Pool, locker *pglock.Locker) *IncidentRepo {
+	return &IncidentRepo{pool: pool, locker: locker}
 }
 
-// pendingIncidentNumber is a placeholder until CSM assigns the real one, derived from fingerprint so it's deterministic.
-func pendingIncidentNumber(fingerprint string) string {
-	return "PENDING-" + fingerprint[:12]
+const incidentColumns = `id, fingerprint, incident_id, incident_number, status, severity, impact, urgency, service,
+	metric_name, category, environment, source, alert_count, first_seen, last_seen, state_checked_at, fallback,
+	csm_confirmed, csm_attempts, csm_permanently_failed, csm_last_attempt_at, fold_version, created_at`
+
+// FoldPlan is what folding a fingerprint's alerts writes: notes and counters on the current incident, and any new incidents.
+type FoldPlan struct {
+	Current *CurrentFold
+	New     []NewIncident
 }
 
-// capTail keeps only the last max entries of list, so a long-lived, flapping incident's stored history stays bounded.
-func capTail[T any](list []T, max int) []T {
-	if len(list) <= max {
-		return list
-	}
-	return append([]T{}, list[len(list)-max:]...)
+// CurrentFold adds alerts to an existing incident.
+type CurrentFold struct {
+	ID       int64
+	Added    int
+	LastSeen time.Time
+	// Category fills the incident's category only if it is still empty.
+	Category string
+	Notes    []model.Note
 }
 
-// isPending returns true if an incident still owes CSM/Chat delivery.
-func isPending(csmConfirmed, csmPermanentlyFailed bool, pendingNotesLen int) bool {
-	owesCSMOrChat := !csmConfirmed && !csmPermanentlyFailed
-	owesNotes := csmConfirmed && pendingNotesLen > 0
-	return owesCSMOrChat || owesNotes
+// NewIncident starts a new incident with its notes, the first being its creation note.
+type NewIncident struct {
+	Incident model.Incident
+	Notes    []model.Note
 }
 
-// setPendingIndex syncs incidents_pending without re-reading incidents_processed.
-func (r *IncidentRepo) setPendingIndex(ctx context.Context, fp string, pending bool) error {
-	if pending {
-		stmt, names := qb.Insert("incidents_pending").Columns("fingerprint").ToCql()
-		if err := r.session.Query(stmt, names).WithContext(ctx).BindMap(qb.M{"fingerprint": fp}).ExecRelease(); err != nil {
-			return fmt.Errorf("mark incident %s pending: %w", fp, err)
-		}
-		return nil
-	}
-	stmt, names := qb.Delete("incidents_pending").Where(qb.Eq("fingerprint")).ToCql()
-	if err := r.session.Query(stmt, names).WithContext(ctx).BindMap(qb.M{"fingerprint": fp}).ExecRelease(); err != nil {
-		return fmt.Errorf("clear incident %s from pending index: %w", fp, err)
-	}
-	return nil
-}
+// Decide turns the fingerprint's current incident (nil if none) and the alert ids already recorded into a FoldPlan.
+type Decide func(current *model.Incident, recorded map[string]bool) FoldPlan
 
-// syncPendingIndex re-derives pending status from the ground-truth row without a full-table scan.
-func (r *IncidentRepo) syncPendingIndex(ctx context.Context, fp string) error {
-	inc, found, err := r.get(ctx, fp)
+const (
+	selectCurrentQuery = `SELECT ` + incidentColumns + ` FROM incidents_processed WHERE fingerprint = $1 ORDER BY first_seen DESC LIMIT 1`
+	updateCurrentQuery = `UPDATE incidents_processed SET alert_count = alert_count + $2, last_seen = greatest(last_seen, $3),
+	category = CASE WHEN category = '' THEN $4 ELSE category END,
+	fold_version = fold_version + 1, delivery_due_at = least(coalesce(delivery_due_at, now()), now())
+	WHERE id = $1`
+	insertNotesQuery = `INSERT INTO incident_notes (incident, alert_id, kind, note, chat_pending)
+	SELECT $1::bigint, * FROM unnest($2::text[], $3::text[], $4::text[], $5::bool[])
+	ON CONFLICT (alert_id) DO NOTHING`
+	insertIncidentQuery = `WITH inc AS (
+	INSERT INTO incidents_processed (fingerprint, incident_number, status, severity, impact, urgency, service, metric_name,
+		category, environment, source, alert_count, first_seen, last_seen, delivery_due_at)
+	VALUES ($1, $2, 'new', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
+	RETURNING id)
+	INSERT INTO incident_notes (incident, alert_id, kind, note, chat_pending)
+	SELECT inc.id, n.* FROM inc, unnest($14::text[], $15::text[], $16::text[], $17::bool[]) AS n
+	ON CONFLICT (alert_id) DO NOTHING`
+)
+
+// Fold locks fp for this transaction across every replica, reads its current incident and which alertIDs are already recorded, applies decide's plan, and commits; two round trips per call.
+func (r *IncidentRepo) Fold(ctx context.Context, fp string, alertIDs []string, decide Decide) (plan FoldPlan, err error) {
+	conn, err := r.pool.Acquire(ctx)
 	if err != nil {
-		return fmt.Errorf("sync pending index for %s: %w", fp, err)
+		return FoldPlan{}, fmt.Errorf("fold %s: acquire: %w", fp, err)
 	}
-	if !found {
-		return nil
-	}
-	return r.setPendingIndex(ctx, fp, isPending(inc.CSMConfirmed, inc.CSMPermanentlyFailed, len(inc.PendingNotes)))
-}
-
-// Upsert maps the alert onto an incident by fingerprint, creating it via IF NOT EXISTS or updating it.
-func (r *IncidentRepo) Upsert(ctx context.Context, alertID string, a model.Alert, severityNum int) (model.Incident, bool, error) {
-	fp := model.Fingerprint(a.Source, a.Service, a.MetricName, a.Environment, a.UniqueIdentifier)
-
-	existing, found, err := r.get(ctx, fp)
-	if err != nil {
-		return model.Incident{}, false, err
-	}
-
-	if !found {
-		now := time.Now().UTC()
-		impact, urgency := model.ImpactUrgency(severityNum)
-		inc := model.Incident{
-			Fingerprint:    fp,
-			IncidentNumber: pendingIncidentNumber(fp),
-			Status:         "new",
-			Severity:       severityNum,
-			Impact:         impact,
-			Urgency:        urgency,
-			Service:        a.Service,
-			MetricName:     a.MetricName,
-			Description:    model.BuildCreationNote(alertID, a),
-			Category:       a.Category,
-			Environment:    a.Environment,
-			Source:         a.Source,
-			AlertIDs:       []string{alertID},
-			AlertCount:     1,
-			FirstSeen:      now,
-			LastSeen:       now,
-		}
-		stmt, names := qb.Insert("incidents_processed").Columns(incidentColumns...).Unique().ToCql()
-		applied, err := r.session.Query(stmt, names).WithContext(ctx).BindStruct(inc).ExecCASRelease()
+	defer conn.Release()
+	defer func() {
 		if err != nil {
-			return model.Incident{}, false, fmt.Errorf("create incident %s: %w", fp, err)
+			rollback(ctx, conn)
 		}
-		if applied {
-			// Best-effort: row is durable, Handle's idempotency check would skip retry, so a missed index write just delays RetrySweep.
-			_ = r.setPendingIndex(ctx, fp, true)
-			return inc, true, nil
-		}
-		// Lost the race to another core; fall through and treat this alert as an update.
-		existing, found, err = r.get(ctx, fp)
-		if err != nil {
-			return model.Incident{}, false, err
-		}
-		if !found {
-			ins, insNames := qb.Insert("incidents_processed").Columns(incidentColumns...).ToCql()
-			if err := r.session.Query(ins, insNames).WithContext(ctx).BindStruct(inc).ExecRelease(); err != nil {
-				return model.Incident{}, false, fmt.Errorf("create incident %s (unconditional after stale CAS): %w", fp, err)
-			}
-			// Best-effort, same reasoning as the CAS-applied branch above.
-			_ = r.setPendingIndex(ctx, fp, true)
-			return inc, true, nil
-		}
-	}
+	}()
 
-	// Skip if alertID already folded in (retry after ambiguous timeout); engine.Handle's idempotency check relies on this too.
-	for _, seen := range existing.AlertIDs {
-		if seen == alertID {
-			return existing, false, nil
-		}
+	reads := &pgx.Batch{}
+	reads.Queue(`BEGIN`)
+	reads.Queue(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "fold:"+fp)
+	reads.Queue(selectCurrentQuery, fp)
+	reads.Queue(`SELECT alert_id FROM incident_notes WHERE alert_id = ANY($1)`, alertIDs)
+	br := conn.SendBatch(ctx, reads)
+	current, recorded, err := readFoldState(br)
+	if closeErr := br.Close(); err == nil {
+		err = closeErr
 	}
-
-	updated := existing
-	updated.AlertIDs = capTail(append(append([]string{}, existing.AlertIDs...), alertID), r.maxAlertIDs)
-	updated.AlertCount = existing.AlertCount + 1
-	if severityNum < existing.Severity { // lower number = more severe
-		updated.Severity = severityNum
-		// Impact/Urgency must be recomputed on escalation -- otherwise a Minor->Critical incident keeps its original, now-stale pair.
-		updated.Impact, updated.Urgency = model.ImpactUrgency(severityNum)
-	}
-	updated.LastSeen = time.Now().UTC()
-	if updated.Category == "" && a.Category != "" {
-		// Self-heal: an incident with no category yet picks one up from a later alert instead of staying blank.
-		updated.Category = a.Category
-	}
-	if updated.Description == "" {
-		// Self-heal: same as Category, so an incident created before its first descriptive alert still fills in.
-		updated.Description = model.BuildCreationNote(alertID, a)
-	}
-
-	setCols := []string{"alert_ids", "alert_count", "severity", "impact", "urgency", "category", "description", "last_seen"}
-	// Reset delivery fields on generation boundaries to prevent silently swallowing recurrences.
-	if !existing.IsOpen(time.Now(), r.dedupWindow) {
-		// Rebuild Description with new alert ID so NotifyCSM doesn't push a stale creation note.
-		updated.Description = model.BuildCreationNote(alertID, a)
-		updated.Status = "new"
-		updated.IncidentID = ""
-		updated.IncidentNumber = pendingIncidentNumber(fp)
-		updated.Fallback = false
-		updated.CSMConfirmed = false
-		updated.CSMAttempts = 0
-		updated.CSMPermanentlyFailed = false
-		updated.CSMLastAttemptAt = time.Time{}
-		updated.FirstSeen = updated.LastSeen
-		updated.PendingNotes = nil
-		updated.StateCheckedAt = time.Time{}
-		setCols = append(setCols, "status", "incident_id", "incident_number", "fallback", "csm_confirmed", "csm_attempts",
-			"csm_permanently_failed", "csm_last_attempt_at", "first_seen", "pending_notes", "state_checked_at")
-	}
-
-	stmt, names := qb.Update("incidents_processed").
-		Set(setCols...).
-		Where(qb.Eq("fingerprint")).
-		ToCql()
-	if err := r.session.Query(stmt, names).WithContext(ctx).BindStruct(updated).ExecRelease(); err != nil {
-		return model.Incident{}, false, fmt.Errorf("update incident %s: %w", fp, err)
-	}
-	// Best-effort: row is durable, so a missed index sync doesn't affect Handle's idempotency check.
-	_ = r.setPendingIndex(ctx, fp, isPending(updated.CSMConfirmed, updated.CSMPermanentlyFailed, len(updated.PendingNotes)))
-	return updated, false, nil
-}
-
-// RecordAlertID appends alertID for idempotent annotate-only paths, matching Upsert's dedup check; no-op if already present.
-func (r *IncidentRepo) RecordAlertID(ctx context.Context, existing model.Incident, alertID string) error {
-	for _, seen := range existing.AlertIDs {
-		if seen == alertID {
-			return nil
-		}
-	}
-	updated := capTail(append(append([]string{}, existing.AlertIDs...), alertID), r.maxAlertIDs)
-	stmt, names := qb.Update("incidents_processed").
-		Set("alert_ids").
-		Where(qb.Eq("fingerprint")).
-		ToCql()
-	err := r.session.Query(stmt, names).WithContext(ctx).BindMap(qb.M{
-		"fingerprint": existing.Fingerprint,
-		"alert_ids":   updated,
-	}).ExecRelease()
 	if err != nil {
-		return fmt.Errorf("record alert id on incident %s: %w", existing.Fingerprint, err)
+		return FoldPlan{}, fmt.Errorf("fold %s: read: %w", fp, err)
 	}
-	return nil
-}
 
-// RecordCSMIncident writes id, number, and csm_confirmed together so confirmed is never observed with a placeholder id.
-func (r *IncidentRepo) RecordCSMIncident(ctx context.Context, fingerprint, incidentID, incidentNumber string) error {
-	stmt, names := qb.Update("incidents_processed").
-		Set("incident_id", "incident_number", "csm_confirmed").
-		Where(qb.Eq("fingerprint")).
-		ToCql()
-	err := r.session.Query(stmt, names).WithContext(ctx).BindMap(qb.M{
-		"fingerprint":     fingerprint,
-		"incident_id":     incidentID,
-		"incident_number": incidentNumber,
-		"csm_confirmed":   true,
-	}).ExecRelease()
-	if err != nil {
-		return fmt.Errorf("record csm incident for %s: %w", fingerprint, err)
-	}
-	// Best-effort: csm_confirmed is durable, so a missed index sync mustn't mask CSM success.
-	_ = r.syncPendingIndex(ctx, fingerprint)
-	return nil
-}
-
-// RecordCSMAttemptStarted persists attempts before NotifyCSM so the count is a lower bound for fail-open decisions.
-func (r *IncidentRepo) RecordCSMAttemptStarted(ctx context.Context, fingerprint string, attempts int) error {
-	stmt, names := qb.Update("incidents_processed").
-		Set("csm_attempts", "csm_last_attempt_at").
-		Where(qb.Eq("fingerprint")).
-		ToCql()
-	err := r.session.Query(stmt, names).WithContext(ctx).BindMap(qb.M{
-		"fingerprint":         fingerprint,
-		"csm_attempts":        attempts,
-		"csm_last_attempt_at": time.Now().UTC(),
-	}).ExecRelease()
-	if err != nil {
-		return fmt.Errorf("record csm attempt started for %s: %w", fingerprint, err)
-	}
-	return nil
-}
-
-// RecordCSMAttemptFailure sets csm_permanently_failed once attempts are exhausted or CSM rejects non-retryably, stopping RetrySweep from retrying forever.
-func (r *IncidentRepo) RecordCSMAttemptFailure(ctx context.Context, fingerprint string, attempts, maxAttempts int, permanent bool) error {
-	failed := permanent || attempts >= maxAttempts
-	stmt, names := qb.Update("incidents_processed").
-		Set("csm_attempts", "csm_permanently_failed").
-		Where(qb.Eq("fingerprint")).
-		ToCql()
-	err := r.session.Query(stmt, names).WithContext(ctx).BindMap(qb.M{
-		"fingerprint":            fingerprint,
-		"csm_attempts":           attempts,
-		"csm_permanently_failed": failed,
-	}).ExecRelease()
-	if err != nil {
-		return fmt.Errorf("record csm attempt failure for %s: %w", fingerprint, err)
-	}
-	// Best-effort: attempt/failure state is durable, so a missed index sync mustn't mask durability.
-	_ = r.syncPendingIndex(ctx, fingerprint)
-	return nil
-}
-
-// SyncStatus persists CSM's status and checkedAt timestamp for throttling future state checks.
-func (r *IncidentRepo) SyncStatus(ctx context.Context, fingerprint, status string, checkedAt time.Time) error {
-	stmt, names := qb.Update("incidents_processed").
-		Set("status", "state_checked_at").
-		Where(qb.Eq("fingerprint")).
-		ToCql()
-	err := r.session.Query(stmt, names).WithContext(ctx).BindMap(qb.M{
-		"fingerprint":      fingerprint,
-		"status":           status,
-		"state_checked_at": checkedAt,
-	}).ExecRelease()
-	if err != nil {
-		return fmt.Errorf("sync status for %s: %w", fingerprint, err)
-	}
-	return nil
-}
-
-// RecordStateChecked advances the throttle window when status hasn't changed.
-func (r *IncidentRepo) RecordStateChecked(ctx context.Context, fingerprint string, checkedAt time.Time) error {
-	stmt, names := qb.Update("incidents_processed").
-		Set("state_checked_at").
-		Where(qb.Eq("fingerprint")).
-		ToCql()
-	err := r.session.Query(stmt, names).WithContext(ctx).BindMap(qb.M{
-		"fingerprint":      fingerprint,
-		"state_checked_at": checkedAt,
-	}).ExecRelease()
-	if err != nil {
-		return fmt.Errorf("record state checked for %s: %w", fingerprint, err)
-	}
-	return nil
-}
-
-// FindByFingerprint reads without mutating, so the engine can decide annotate vs Upsert before touching any row.
-func (r *IncidentRepo) FindByFingerprint(ctx context.Context, fp string) (model.Incident, bool, error) {
-	return r.get(ctx, fp)
-}
-
-// MarkFallbackNotified flips fallback to true once Chat has delivered to every configured target.
-func (r *IncidentRepo) MarkFallbackNotified(ctx context.Context, fingerprint string) error {
-	stmt, names := qb.Update("incidents_processed").
-		Set("fallback").
-		Where(qb.Eq("fingerprint")).
-		ToCql()
-	err := r.session.Query(stmt, names).WithContext(ctx).BindMap(qb.M{
-		"fingerprint": fingerprint,
-		"fallback":    true,
-	}).ExecRelease()
-	if err != nil {
-		return fmt.Errorf("mark incident %s fallback-notified: %w", fingerprint, err)
-	}
-	return nil
-}
-
-// ListPending reads the incidents_pending index instead of scanning the whole incidents_processed table.
-func (r *IncidentRepo) ListPending(ctx context.Context) ([]model.Incident, error) {
-	stmt, names := qb.Select("incidents_pending").Columns("fingerprint").ToCql()
-	var rows []struct {
-		Fingerprint string `db:"fingerprint"`
-	}
-	if err := r.session.Query(stmt, names).WithContext(ctx).SelectRelease(&rows); err != nil {
-		return nil, fmt.Errorf("list pending fingerprints: %w", err)
-	}
-	pending := make([]model.Incident, 0, len(rows))
-	for _, row := range rows {
-		inc, found, err := r.get(ctx, row.Fingerprint)
-		if err != nil {
-			return nil, fmt.Errorf("list pending: read incident %s: %w", row.Fingerprint, err)
-		}
-		if !found {
-			continue // index entry outlived its row; skip, nothing to retry.
-		}
-		if !isPending(inc.CSMConfirmed, inc.CSMPermanentlyFailed, len(inc.PendingNotes)) {
-			// Index entry is stale (e.g. a partial failure between the primary write and its index
-			// sync elsewhere) -- self-heal so future sweeps don't keep re-reading a delivered incident.
-			_ = r.setPendingIndex(ctx, row.Fingerprint, false)
-			continue
-		}
-		pending = append(pending, inc)
-	}
-	return pending, nil
-}
-
-// BackfillPendingIndex populates incidents_pending for rows that owe delivery before this index existed (one-time cost at startup).
-func (r *IncidentRepo) BackfillPendingIndex(ctx context.Context) error {
-	stmt, names := qb.Select("incidents_processed").
-		Columns("fingerprint", "csm_confirmed", "csm_permanently_failed", "pending_notes").
-		ToCql()
-	var rows []struct {
-		Fingerprint          string   `db:"fingerprint"`
-		CSMConfirmed         bool     `db:"csm_confirmed"`
-		CSMPermanentlyFailed bool     `db:"csm_permanently_failed"`
-		PendingNotes         []string `db:"pending_notes"`
-	}
-	if err := r.session.Query(stmt, names).WithContext(ctx).SelectRelease(&rows); err != nil {
-		return fmt.Errorf("backfill pending index: list incidents: %w", err)
-	}
-	for _, row := range rows {
-		if !isPending(row.CSMConfirmed, row.CSMPermanentlyFailed, len(row.PendingNotes)) {
-			continue
-		}
-		if err := r.setPendingIndex(ctx, row.Fingerprint, true); err != nil {
-			return fmt.Errorf("backfill pending index: mark %s pending: %w", row.Fingerprint, err)
+	plan = decide(current, recorded)
+	writes := &pgx.Batch{}
+	if c := plan.Current; c != nil {
+		writes.Queue(updateCurrentQuery, c.ID, c.Added, c.LastSeen, c.Category)
+		if len(c.Notes) > 0 {
+			writes.Queue(insertNotesQuery, append([]any{c.ID}, noteArrays(c.Notes)...)...)
 		}
 	}
-	return nil
-}
-
-// AppendWorkNote appends to both work_notes (audit log) and pending_notes (delivery queue) since Cassandra lacks native list append.
-func (r *IncidentRepo) AppendWorkNote(ctx context.Context, existing model.Incident, note string) error {
-	updatedNotes := capTail(append(append([]string{}, existing.WorkNotes...), note), maxWorkNotes)
-	updatedPending := capTail(append(append([]string{}, existing.PendingNotes...), note), maxWorkNotes)
-	stmt, names := qb.Update("incidents_processed").
-		Set("work_notes", "pending_notes").
-		Where(qb.Eq("fingerprint")).
-		ToCql()
-	err := r.session.Query(stmt, names).WithContext(ctx).BindMap(qb.M{
-		"fingerprint":   existing.Fingerprint,
-		"work_notes":    updatedNotes,
-		"pending_notes": updatedPending,
-	}).ExecRelease()
-	if err != nil {
-		return fmt.Errorf("append work note to incident %s: %w", existing.Fingerprint, err)
+	for _, n := range plan.New {
+		inc := n.Incident
+		args := []any{inc.Fingerprint, inc.IncidentNumber, inc.Severity, inc.Impact, inc.Urgency, inc.Service,
+			inc.MetricName, inc.Category, inc.Environment, inc.Source, inc.AlertCount, inc.FirstSeen, inc.LastSeen}
+		writes.Queue(insertIncidentQuery, append(args, noteArrays(n.Notes)...)...)
 	}
-	// Best-effort: note is durable, so a missed index sync doesn't affect delivery state.
-	_ = r.setPendingIndex(ctx, existing.Fingerprint, isPending(existing.CSMConfirmed, existing.CSMPermanentlyFailed, len(updatedPending)))
-	return nil
-}
-
-// ClearPendingNotes persists unpushed notes after a push attempt (empty on full success, unpushed suffix on partial failure).
-func (r *IncidentRepo) ClearPendingNotes(ctx context.Context, fingerprint string, remaining []string) error {
-	stmt, names := qb.Update("incidents_processed").
-		Set("pending_notes").
-		Where(qb.Eq("fingerprint")).
-		ToCql()
-	err := r.session.Query(stmt, names).WithContext(ctx).BindMap(qb.M{
-		"fingerprint":   fingerprint,
-		"pending_notes": remaining,
-	}).ExecRelease()
-	if err != nil {
-		return fmt.Errorf("clear pending notes for %s: %w", fingerprint, err)
+	writes.Queue(`COMMIT`)
+	br = conn.SendBatch(ctx, writes)
+	for range writes.Len() {
+		if _, err = br.Exec(); err != nil {
+			break
+		}
 	}
-	// Best-effort, same reasoning as the other index-sync calls above.
-	_ = r.syncPendingIndex(ctx, fingerprint)
-	return nil
+	if closeErr := br.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return FoldPlan{}, fmt.Errorf("fold %s: write: %w", fp, err)
+	}
+	return plan, nil
 }
 
-// get reads the incident for a fingerprint, reporting absence as false rather than an error.
-func (r *IncidentRepo) get(ctx context.Context, fp string) (model.Incident, bool, error) {
-	stmt, names := qb.Select("incidents_processed").Columns(incidentColumns...).Where(qb.Eq("fingerprint")).ToCql()
-	var inc model.Incident
-	err := r.session.Query(stmt, names).WithContext(ctx).BindMap(qb.M{"fingerprint": fp}).GetRelease(&inc)
-	if err == gocql.ErrNotFound {
+func readFoldState(br pgx.BatchResults) (*model.Incident, map[string]bool, error) {
+	if _, err := br.Exec(); err != nil {
+		return nil, nil, err
+	}
+	if _, err := br.Exec(); err != nil {
+		return nil, nil, err
+	}
+	rows, err := br.Query()
+	if err != nil {
+		return nil, nil, err
+	}
+	current, err := pgx.CollectOneRow(rows, pgx.RowToAddrOfStructByName[model.Incident])
+	if errors.Is(err, pgx.ErrNoRows) {
+		current, err = nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	rows, err = br.Query()
+	if err != nil {
+		return nil, nil, err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, nil, err
+	}
+	recorded := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		recorded[id] = true
+	}
+	return current, recorded, nil
+}
+
+func noteArrays(notes []model.Note) []any {
+	ids := make([]string, len(notes))
+	kinds := make([]string, len(notes))
+	texts := make([]string, len(notes))
+	chat := make([]bool, len(notes))
+	for i, n := range notes {
+		ids[i], kinds[i], texts[i], chat[i] = n.AlertID, n.Kind, n.Text, n.ChatPending
+	}
+	return []any{ids, kinds, texts, chat}
+}
+
+// rollback ends a failed transaction; pgxpool also destroys a connection released mid-transaction, so a failed rollback cannot leak one.
+func rollback(ctx context.Context, conn *pgxpool.Conn) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_, _ = conn.Exec(rctx, `ROLLBACK`)
+}
+
+// TryLock takes the delivery lock for incident id without waiting; ok=false means another worker or replica is delivering it.
+func (r *IncidentRepo) TryLock(ctx context.Context, id int64) (unlock func(), ok bool, err error) {
+	return r.locker.TryLock(ctx, fmt.Sprintf("deliver:%d", id))
+}
+
+// ListDue returns up to limit incidents whose delivery is due, longest-waiting first.
+func (r *IncidentRepo) ListDue(ctx context.Context, limit int) ([]int64, error) {
+	rows, err := r.pool.Query(ctx, `SELECT id FROM incidents_processed WHERE delivery_due_at <= now() ORDER BY delivery_due_at LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list due incidents: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return nil, fmt.Errorf("list due incidents: %w", err)
+	}
+	return ids, nil
+}
+
+// Get reads one incident, reporting absence as false.
+func (r *IncidentRepo) Get(ctx context.Context, id int64) (model.Incident, bool, error) {
+	rows, err := r.pool.Query(ctx, `SELECT `+incidentColumns+` FROM incidents_processed WHERE id = $1`, id)
+	if err != nil {
+		return model.Incident{}, false, fmt.Errorf("read incident %d: %w", id, err)
+	}
+	inc, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[model.Incident])
+	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Incident{}, false, nil
 	}
 	if err != nil {
-		return model.Incident{}, false, fmt.Errorf("read incident %s: %w", fp, err)
+		return model.Incident{}, false, fmt.Errorf("read incident %d: %w", id, err)
 	}
 	return inc, true, nil
+}
+
+// PendingNotes returns up to limit notes still owed to CSM or Chat, in the order they were folded.
+func (r *IncidentRepo) PendingNotes(ctx context.Context, id int64, limit int) ([]model.Note, error) {
+	rows, err := r.pool.Query(ctx, `SELECT id, alert_id, kind, note, csm_pending, chat_pending FROM incident_notes
+		WHERE incident = $1 AND (csm_pending OR chat_pending) ORDER BY id LIMIT $2`, id, limit)
+	if err != nil {
+		return nil, fmt.Errorf("read pending notes for incident %d: %w", id, err)
+	}
+	notes, err := pgx.CollectRows(rows, pgx.RowToStructByName[model.Note])
+	if err != nil {
+		return nil, fmt.Errorf("read pending notes for incident %d: %w", id, err)
+	}
+	return notes, nil
+}
+
+func (r *IncidentRepo) exec(ctx context.Context, what string, id int64, sql string, args ...any) error {
+	if _, err := r.pool.Exec(ctx, sql, args...); err != nil {
+		return fmt.Errorf("%s for incident %d: %w", what, id, err)
+	}
+	return nil
+}
+
+// RecordCSMAttemptStarted persists the attempt before calling CSM, so CSMAttempts is a lower bound on creates that may have reached it.
+func (r *IncidentRepo) RecordCSMAttemptStarted(ctx context.Context, id int64, attempts int) error {
+	return r.exec(ctx, "record csm attempt", id,
+		`UPDATE incidents_processed SET csm_attempts = $2, csm_last_attempt_at = now() WHERE id = $1`, id, attempts)
+}
+
+// RecordCSMIncident writes CSM's id, number and confirmation together; a just-created incident is known open, so its status counts as checked now.
+func (r *IncidentRepo) RecordCSMIncident(ctx context.Context, id int64, csmID, number string) error {
+	return r.exec(ctx, "record csm incident", id, `UPDATE incidents_processed SET incident_id = $2, incident_number = $3,
+		csm_confirmed = true, status = 'open', state_checked_at = now() WHERE id = $1`, id, csmID, number)
+}
+
+// RecordCSMAttemptFailure stores a failed create; permanent stops further CSM attempts.
+func (r *IncidentRepo) RecordCSMAttemptFailure(ctx context.Context, id int64, permanent bool) error {
+	return r.exec(ctx, "record csm failure", id,
+		`UPDATE incidents_processed SET csm_permanently_failed = $2 WHERE id = $1`, id, permanent)
+}
+
+// MarkFallback records that the incident reached every Chat webhook.
+func (r *IncidentRepo) MarkFallback(ctx context.Context, id int64) error {
+	return r.exec(ctx, "mark fallback", id, `UPDATE incidents_processed SET fallback = true WHERE id = $1`, id)
+}
+
+// SyncStatus stores CSM's status and when it was checked.
+func (r *IncidentRepo) SyncStatus(ctx context.Context, id int64, status string, checkedAt time.Time) error {
+	return r.exec(ctx, "sync status", id,
+		`UPDATE incidents_processed SET status = $2, state_checked_at = $3 WHERE id = $1`, id, status, checkedAt)
+}
+
+// ClearNotes marks notes as no longer owed to CSM (csm) and/or Chat (chat).
+func (r *IncidentRepo) ClearNotes(ctx context.Context, incident int64, noteIDs []int64, csm, chat bool) error {
+	return r.exec(ctx, "clear notes", incident, `UPDATE incident_notes
+		SET csm_pending = csm_pending AND NOT $2, chat_pending = chat_pending AND NOT $3 WHERE id = ANY($1)`, noteIDs, csm, chat)
+}
+
+// SettleNotes clears every note of the incident still owed to CSM (csm) and/or Chat (chat).
+func (r *IncidentRepo) SettleNotes(ctx context.Context, incident int64, csm, chat bool) error {
+	return r.exec(ctx, "settle notes", incident, `UPDATE incident_notes
+		SET csm_pending = csm_pending AND NOT $2, chat_pending = chat_pending AND NOT $3
+		WHERE incident = $1 AND ((csm_pending AND $2) OR (chat_pending AND $3))`, incident, csm, chat)
+}
+
+// FinishDelivery schedules the next delivery at next (nil means nothing owed), unless a fold added notes since foldVersion was read, in which case it is due now.
+func (r *IncidentRepo) FinishDelivery(ctx context.Context, id, foldVersion int64, next *time.Time) error {
+	return r.exec(ctx, "finish delivery", id, `UPDATE incidents_processed
+		SET delivery_due_at = CASE WHEN fold_version = $2 THEN $3::timestamptz ELSE least(coalesce(delivery_due_at, now()), now()) END
+		WHERE id = $1`, id, foldVersion, next)
+}
+
+// Purge deletes up to limit incidents, and their notes, last seen before cutoff with no delivery still owed.
+func (r *IncidentRepo) Purge(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `DELETE FROM incidents_processed WHERE id IN (
+		SELECT id FROM incidents_processed WHERE last_seen < $1 AND delivery_due_at IS NULL ORDER BY id LIMIT $2)`, cutoff, limit)
+	if err != nil {
+		return 0, fmt.Errorf("purge incidents: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }

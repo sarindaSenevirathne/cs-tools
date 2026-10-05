@@ -122,6 +122,14 @@ export type RemoveUserModalProps = {
   onConfirm: () => void;
 };
 
+export type ResendInvitationModalProps = {
+  open: boolean;
+  contact: ProjectContact | null;
+  isResending?: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+};
+
 export type GenerateTokenModalProps = {
   open: boolean;
   onClose: () => void;

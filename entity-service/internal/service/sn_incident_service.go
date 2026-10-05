@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
@@ -227,13 +228,28 @@ type snIncidentService struct {
 	// publisher is nil when Event Hub is not configured — every call site
 	// must check before using it. See publishIncidentCreated.
 	publisher EventPublisherService
+	// groupFromService is true for DATA_SOURCE=servicenow, where this is the
+	// whole incident service and so the only place left to set an incident's
+	// assignment group from its service. As the dual-write mirror it is
+	// false: incidentService has already read the group from Postgres, and
+	// reading it again from ServiceNow could give the two sides different
+	// groups.
+	groupFromService bool
 }
 
 // NewServiceNowIncidentService constructs an IncidentService backed by the
 // Choreo API. publisher may be nil (see snIncidentService.publisher's doc
 // comment).
 func NewServiceNowIncidentService(client *integrationservice.Client, publisher EventPublisherService) IncidentService {
-	return &snIncidentService{client: client, publisher: publisher}
+	return &snIncidentService{client: client, publisher: publisher, groupFromService: true}
+}
+
+// NewServiceNowIncidentMirrorService is the ServiceNow side of
+// DATA_SOURCE=postgres-servicenow-dual-write. It sends the assignment group
+// incidentService chose and never chooses one itself, and it publishes
+// nothing (see routes.go for why the mirror's publisher is nil).
+func NewServiceNowIncidentMirrorService(client *integrationservice.Client) IncidentService {
+	return &snIncidentService{client: client}
 }
 
 func (s *snIncidentService) SearchIncidents(ctx context.Context, req domain.SearchIncidentsRequest) (domain.SearchIncidentsResponse, error) {
@@ -699,49 +715,53 @@ type snCreateIncidentResponse struct {
 	} `json:"incident"`
 }
 
-func (s *snIncidentService) CreateIncident(ctx context.Context, req domain.CreateIncidentRequest) (domain.CreateIncidentResponse, error) {
+// validateCreateIncidentRequest is the request validation both incident
+// create paths share: the ServiceNow one (before its POST) and the plain
+// Postgres one (before its insert), so the same input is rejected the same
+// way whichever data source is behind the endpoint.
+func validateCreateIncidentRequest(req domain.CreateIncidentRequest) error {
 	// Reject before the ServiceNow call, not after: createIncidentSNFirst
 	// creates the ServiceNow incident first and has no compensating delete,
 	// so a value too long for either ServiceNow's u_enviroment (max 40) or
 	// this service's own environment column (VARCHAR(40)) must fail fast
 	// here rather than leave an orphaned ServiceNow incident behind.
 	if req.Environment != nil && len([]rune(*req.Environment)) > 40 {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{
+		return &apierror.ValidationError{
 			Msg: "environment must not exceed 40 characters",
 		}
 	}
 	if req.Subject == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "subject is required"}
+		return &apierror.ValidationError{Msg: "subject is required"}
 	}
 	if req.CallerID == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "callerId is required"}
+		return &apierror.ValidationError{Msg: "callerId is required"}
 	}
 	if req.Category == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "category is required"}
+		return &apierror.ValidationError{Msg: "category is required"}
 	}
 	if req.ServiceID == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "serviceId is required"}
+		return &apierror.ValidationError{Msg: "serviceId is required"}
 	}
 	if req.Impact == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "impact is required"}
+		return &apierror.ValidationError{Msg: "impact is required"}
 	}
 	if req.Urgency == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "urgency is required"}
+		return &apierror.ValidationError{Msg: "urgency is required"}
 	}
 	if !validIncidentCategory[req.Category] {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "invalid category: " + string(req.Category)}
+		return &apierror.ValidationError{Msg: "invalid category: " + string(req.Category)}
 	}
 	if req.Subcategory != nil && !validIncidentSubcategory[*req.Subcategory] {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "invalid subcategory: " + string(*req.Subcategory)}
+		return &apierror.ValidationError{Msg: "invalid subcategory: " + string(*req.Subcategory)}
 	}
 	if req.ContactType != nil && !validIncidentContactType[*req.ContactType] {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "invalid contactType: " + string(*req.ContactType)}
+		return &apierror.ValidationError{Msg: "invalid contactType: " + string(*req.ContactType)}
 	}
 	if !validIncidentImpact[req.Impact] {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "invalid impact: " + string(req.Impact)}
+		return &apierror.ValidationError{Msg: "invalid impact: " + string(req.Impact)}
 	}
 	if !validIncidentUrgency[req.Urgency] {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "invalid urgency: " + string(req.Urgency)}
+		return &apierror.ValidationError{Msg: "invalid urgency: " + string(req.Urgency)}
 	}
 
 	uuidFields := map[string]string{
@@ -750,7 +770,7 @@ func (s *snIncidentService) CreateIncident(ctx context.Context, req domain.Creat
 	}
 	for field, val := range uuidFields {
 		if err := validateUUIDs(field, []string{val}); err != nil {
-			return domain.CreateIncidentResponse{}, err
+			return err
 		}
 	}
 	optionalUUIDs := map[string]*string{
@@ -767,9 +787,16 @@ func (s *snIncidentService) CreateIncident(ctx context.Context, req domain.Creat
 	for field, val := range optionalUUIDs {
 		if val != nil {
 			if err := validateUUIDs(field, []string{*val}); err != nil {
-				return domain.CreateIncidentResponse{}, err
+				return err
 			}
 		}
+	}
+	return nil
+}
+
+func (s *snIncidentService) CreateIncident(ctx context.Context, req domain.CreateIncidentRequest) (domain.CreateIncidentResponse, error) {
+	if err := validateCreateIncidentRequest(req); err != nil {
+		return domain.CreateIncidentResponse{}, err
 	}
 	token := middleware.UserIDTokenFromContext(ctx)
 
@@ -779,6 +806,14 @@ func (s *snIncidentService) CreateIncident(ctx context.Context, req domain.Creat
 	watchList, err := watchListEmails(ctx, s.client, token, "watchList", req.WatchList)
 	if err != nil {
 		return domain.CreateIncidentResponse{}, err
+	}
+
+	if s.groupFromService {
+		group, err := s.supportGroupOfService(ctx, token, req.ServiceID)
+		if err != nil {
+			return domain.CreateIncidentResponse{}, err
+		}
+		req.AssignmentGroupID = group
 	}
 
 	payload := snCreateIncidentPayload{
@@ -1002,25 +1037,28 @@ var snIncidentUrgencyLabelMap = map[int]string{
 
 // snGetIncidentResponse mirrors the Choreo GET /incidents/{id} response.
 type snGetIncidentResponse struct {
-	ID                    *string                     `json:"id"`
-	Number                *string                     `json:"number"`
-	OpenedOn              *string                     `json:"openedOn"`
-	Subject               *string                     `json:"subject"`
-	Caller                *snIncidentEntityRef        `json:"caller"`
-	Priority              *snIncidentIntLabel         `json:"priority"`
-	State                 *snIncidentIntLabel         `json:"state"`
-	Category              *snIncidentStrLabel         `json:"category"`
-	Subcategory           *snIncidentStrLabel         `json:"subcategory"`
-	Parent                *snIncidentEntityRef        `json:"parent"`
-	ParentIncident        *snIncidentEntityRef        `json:"parentIncident"`
-	AssignmentGroup       *snIncidentEntityRef        `json:"assignmentGroup"`
-	AssignedTo            *snIncidentEntityRef        `json:"assignedTo"`
-	Service               *snIncidentEntityRef        `json:"service"`
-	ServiceOffering       *snIncidentEntityRef        `json:"serviceOffering"`
-	ConfigurationItem     *snIncidentEntityRef        `json:"configurationItem"`
-	ContactType           *snIncidentStrLabel         `json:"contactType"`
-	Impact                *snIncidentIntLabel         `json:"impact"`
-	Urgency               *snIncidentIntLabel         `json:"urgency"`
+	ID                *string              `json:"id"`
+	Number            *string              `json:"number"`
+	OpenedOn          *string              `json:"openedOn"`
+	Subject           *string              `json:"subject"`
+	Caller            *snIncidentEntityRef `json:"caller"`
+	Priority          *snIncidentIntLabel  `json:"priority"`
+	State             *snIncidentIntLabel  `json:"state"`
+	Category          *snIncidentStrLabel  `json:"category"`
+	Subcategory       *snIncidentStrLabel  `json:"subcategory"`
+	Parent            *snIncidentEntityRef `json:"parent"`
+	ParentIncident    *snIncidentEntityRef `json:"parentIncident"`
+	AssignmentGroup   *snIncidentEntityRef `json:"assignmentGroup"`
+	AssignedTo        *snIncidentEntityRef `json:"assignedTo"`
+	Service           *snIncidentEntityRef `json:"service"`
+	ServiceOffering   *snIncidentEntityRef `json:"serviceOffering"`
+	ConfigurationItem *snIncidentEntityRef `json:"configurationItem"`
+	ContactType       *snIncidentStrLabel  `json:"contactType"`
+	Impact            *snIncidentIntLabel  `json:"impact"`
+	Urgency           *snIncidentIntLabel  `json:"urgency"`
+	// Environment: see snCreateIncidentPayload.Environment doc comment. Maps
+	// to ServiceNow's own custom incident.u_enviroment field.
+	Environment           *string                     `json:"u_enviroment"`
 	ChangeRequest         *snIncidentEntityRef        `json:"changeRequest"`
 	Problem               *snIncidentEntityRef        `json:"problem"`
 	CausedBy              *snIncidentEntityRef        `json:"causedBy"`
@@ -1104,6 +1142,7 @@ func mapSNIncidentToView(sn snGetIncidentResponse) domain.IncidentView {
 		ResolvedBy:         sn.ResolvedBy,
 		ResolvedOn:         sn.ResolvedOn,
 		IncidentReport:     sn.IncidentReport,
+		Environment:        sn.Environment,
 	}
 	if sn.ResolutionCode != nil {
 		view.ResolutionCode = &sn.ResolutionCode.Label
@@ -1260,6 +1299,11 @@ type snUpdateIncidentPayload struct {
 	AdditionalComments  *string   `json:"additionalComments,omitempty"`
 	WorkNotes           *string   `json:"workNotes,omitempty"`
 	WatchList           *[]string `json:"watchList,omitempty"`
+	// Environment: see snCreateIncidentPayload.Environment doc comment.
+	// json.RawMessage (not *string) so an explicit clear can be forwarded to
+	// ServiceNow as a real `null`, not just omitted -- same pattern as
+	// sn_change_request_service.go's CustomerGroupID.
+	Environment json.RawMessage `json:"u_enviroment,omitempty"`
 }
 
 // snUpdateIncidentResponse mirrors the Choreo PATCH /incidents/{id} response.
@@ -1280,9 +1324,17 @@ func (s *snIncidentService) UpdateIncident(ctx context.Context, req domain.Updat
 		req.ServiceOfferingID != nil || req.ConfigurationItemID != nil || req.ChangeRequestID != nil ||
 		req.ProblemID != nil || req.CausedByID != nil || req.ResolvedByID != nil ||
 		req.ResolutionNotes != nil || req.IncidentReport != nil || req.AdditionalComments != nil ||
-		req.WorkNotes != nil || req.WatchList != nil
+		req.WorkNotes != nil || req.WatchList != nil || req.Environment != nil
 	if !hasUpdate {
 		return domain.UpdateIncidentResponse{}, &apierror.ValidationError{Msg: "at least one field must be provided"}
+	}
+
+	// Reject before the ServiceNow call, same as CreateIncident: a value too
+	// long for ServiceNow's u_enviroment (max 40) must fail fast here. Skipped
+	// for an explicit clear (*req.Environment == nil) -- there's no length to
+	// check when the new value is null.
+	if req.Environment != nil && *req.Environment != nil && len([]rune(**req.Environment)) > 40 {
+		return domain.UpdateIncidentResponse{}, &apierror.ValidationError{Msg: "environment must not exceed 40 characters"}
 	}
 
 	if req.Priority != nil && !validIncidentPriority[*req.Priority] {
@@ -1346,6 +1398,17 @@ func (s *snIncidentService) UpdateIncident(ctx context.Context, req domain.Updat
 		IncidentReport:     req.IncidentReport,
 		AdditionalComments: req.AdditionalComments,
 		WorkNotes:          req.WorkNotes,
+	}
+	if req.Environment != nil {
+		var v any
+		if *req.Environment != nil {
+			v = **req.Environment
+		}
+		raw, err := rawJSONOrNull(v)
+		if err != nil {
+			return domain.UpdateIncidentResponse{}, fmt.Errorf("sn update incident: marshal environment: %w", err)
+		}
+		payload.Environment = raw
 	}
 	if req.WatchList != nil {
 		// The backing service's incident-update payload declares the watch list as
@@ -1601,4 +1664,55 @@ func (s *snIncidentService) HandOffIncidentToSpecialist(ctx context.Context, req
 	}
 
 	return domain.HandOffIncidentToSpecialistResponse{Message: snResp.Message, Handoff: result}, nil
+}
+
+// snServiceScanMaxPages bounds supportGroupOfService's scan at 40 pages of
+// maxLimit (2,000 services).
+const snServiceScanMaxPages = 40
+
+// supportGroupOfService is incidentService.withAssignmentGroupFromService for
+// DATA_SOURCE=servicenow: the service's support group, or nil when it has
+// none.
+//
+// *** IT SCANS, BECAUSE IT HAS TO. *** ServiceNow's POST /services/search
+// filters on `name CONTAINS searchQuery` only -- there is no lookup by sys_id
+// -- so the service is found by paging through cmdb_ci_service and matching
+// the id. It runs once per incident create and stops at the first match.
+//
+// *** ONLY A COMPLETE SCAN MAY CONCLUDE "NO GROUP". *** A short page means
+// ServiceNow has no more services, so a service not seen by then is not
+// listed and the incident is created unassigned, with a warning. Running out
+// of pages proves nothing -- the service may simply be further on -- so that
+// is an error: creating the incident unassigned there would misroute one
+// whose service does have a group.
+func (s *snIncidentService) supportGroupOfService(ctx context.Context, token, serviceID string) (*string, error) {
+	want := uuidToSysid(strings.TrimSpace(serviceID))
+	for page := 0; page < snServiceScanMaxPages; page++ {
+		payload := snITServiceSearchPayload{Pagination: snProjectPagination{Limit: maxLimit, Offset: page * maxLimit}}
+		raw, err := s.client.Post(ctx, "/services/search", token, payload)
+		if err != nil {
+			return nil, fmt.Errorf("looking up the support group of service %s: %w", serviceID, err)
+		}
+		var resp snITServicesResponse
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return nil, fmt.Errorf("sn services: parse response: %w", err)
+		}
+		for _, svc := range resp.Services {
+			if !strings.EqualFold(svc.ID, want) {
+				continue
+			}
+			if svc.SupportGroup == nil || svc.SupportGroup.ID == "" {
+				return nil, nil
+			}
+			group := sysidToUUID(svc.SupportGroup.ID)
+			return &group, nil
+		}
+		if len(resp.Services) < maxLimit {
+			slog.WarnContext(ctx, "incident create: service not in ServiceNow's service list; creating it with no assignment group",
+				"serviceId", serviceID)
+			return nil, nil
+		}
+	}
+	return nil, fmt.Errorf("looking up the support group of service %s: not found in the first %d ServiceNow services; raise snServiceScanMaxPages",
+		serviceID, snServiceScanMaxPages*maxLimit)
 }

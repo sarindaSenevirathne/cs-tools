@@ -65,11 +65,18 @@ func (m *mockIdentityProvisioner) EnsureExternalUser(ctx context.Context, email,
 // RecordOnboardingStep, keeping every write in order.
 type mockStepRecorder struct {
 	err error
-	// emailAlreadySent / emailSentErr drive the durable duplicate-invitation
-	// guard; emailSentChecks counts how often it was consulted.
+	// emailAlreadySent / emailSentOn / emailSentErr drive the durable
+	// duplicate-invitation guard: emailAlreadySent puts a SUCCEEDED EMAIL
+	// step on the ledger, stamped with emailSentOn (empty = no timestamp);
+	// emailSentChecks counts how often it was consulted.
 	emailAlreadySent bool
+	emailSentOn      string
 	emailSentErr     error
 	emailSentChecks  int
+	// welcomeAlreadySent / welcomeErr drive the WELCOME_EMAIL guard.
+	welcomeAlreadySent bool
+	welcomeErr         error
+	welcomeChecks      int
 	// requireLiveContext makes every write fail if its context has already
 	// been cancelled, which is how the detached-context test detects a
 	// regression rather than relying on timing.
@@ -78,13 +85,37 @@ type mockStepRecorder struct {
 	calls              []entity.OnboardingStepRequest
 }
 
-// emailAlreadySent is what EmailAlreadySent answers; emailSentErr makes the
-// ledger read itself fail.
-func (m *mockStepRecorder) EmailAlreadySent(context.Context, string) (bool, error) {
+// SucceededEmailStep answers from emailAlreadySent/emailSentOn;
+// emailSentErr makes the ledger read itself fail.
+func (m *mockStepRecorder) SucceededEmailStep(context.Context, string) (*entity.RecordedOnboardingStep, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.emailSentChecks++
-	return m.emailAlreadySent, m.emailSentErr
+	if m.emailSentErr != nil {
+		return nil, m.emailSentErr
+	}
+	if !m.emailAlreadySent {
+		return nil, nil
+	}
+	return &entity.RecordedOnboardingStep{Step: entity.OnboardingStepEmail, Status: entity.OnboardingStepSucceeded, EventModifiedOn: m.emailSentOn}, nil
+}
+
+// SucceededStep answers the Welcome guard from welcomeAlreadySent and
+// delegates the EMAIL step to SucceededEmailStep.
+func (m *mockStepRecorder) SucceededStep(ctx context.Context, id string, step entity.OnboardingStep) (*entity.RecordedOnboardingStep, error) {
+	if step == entity.OnboardingStepEmail {
+		return m.SucceededEmailStep(ctx, id)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.welcomeChecks++
+	if m.welcomeErr != nil {
+		return nil, m.welcomeErr
+	}
+	if !m.welcomeAlreadySent {
+		return nil, nil
+	}
+	return &entity.RecordedOnboardingStep{Step: step, Status: entity.OnboardingStepSucceeded}, nil
 }
 
 func (m *mockStepRecorder) RecordOnboardingStep(ctx context.Context, req entity.OnboardingStepRequest) error {
@@ -131,6 +162,17 @@ func invitedRecord(integration bool) eventbus.Record {
 	return eventbus.Record{Value: []byte(`{"type":"project_contact.invited","entityId":"` + invitedMembership + `","payload":{"membershipSfId":"` + invitedMembership + `","contactSfId":"003000000000001AAA","email":"jane@acme.com","givenName":"Jane","familyName":"Doe","projectName":"Acme Cloud","projectKey":"ACMECLOUD","roles":["Admin","Portal user"],"isIntegrationUser":` + isIntegration + `,"type":"OWN CONTACT"}}`)}
 }
 
+// invitedRecordAt is invitedRecord(false) carrying eventModifiedOn -- the
+// membership's Salesforce LastModifiedDate, i.e. the version being invited.
+func invitedRecordAt(eventModifiedOn string) eventbus.Record {
+	return eventbus.Record{Value: []byte(`{"type":"project_contact.invited","entityId":"` + invitedMembership + `","payload":{"membershipSfId":"` + invitedMembership + `","contactSfId":"003000000000001AAA","email":"jane@acme.com","givenName":"Jane","familyName":"Doe","projectName":"Acme Cloud","projectKey":"ACMECLOUD","roles":["Admin","Portal user"],"isIntegrationUser":false,"type":"OWN CONTACT","eventModifiedOn":"` + eventModifiedOn + `"}}`)}
+}
+
+// resentInvitedRecordAt is resentInvitedRecord carrying eventModifiedOn.
+func resentInvitedRecordAt(eventModifiedOn string) eventbus.Record {
+	return eventbus.Record{Value: []byte(`{"type":"project_contact.invited","entityId":"` + invitedMembership + `","payload":{"membershipSfId":"` + invitedMembership + `","contactSfId":"003000000000001AAA","email":"jane@acme.com","givenName":"Jane","familyName":"Doe","projectName":"Acme Cloud","projectKey":"ACMECLOUD","roles":["Admin","Portal user"],"isIntegrationUser":false,"type":"OWN CONTACT","isResend":true,"eventModifiedOn":"` + eventModifiedOn + `"}}`)}
+}
+
 // resentInvitedRecord is the same invitation republished by entity-service
 // after an admin pressed "Resend invitation" -- identical to
 // invitedRecord(false) but for the isResend marker.
@@ -149,6 +191,7 @@ func newOnboardingDispatcher(identity *mockIdentityProvisioner, email *mockEmail
 		IdentityEnabled: identityEnabled,
 		EmailEnabled:    emailEnabled,
 		PortalURL:       "https://support.wso2.com",
+		ReplyTo:         []string{"support@wso2.com"},
 	})
 }
 
@@ -297,8 +340,11 @@ func TestDispatcher_Handle_ProjectContactInvited_NewUser(t *testing.T) {
 	if len(sent.to) != 1 || sent.to[0] != "jane@acme.com" || len(sent.bcc) != 0 {
 		t.Errorf("to = %v, bcc = %v, want the invitee alone", sent.to, sent.bcc)
 	}
-	if !strings.Contains(sent.subject, "Welcome") || !strings.Contains(sent.subject, "Acme Cloud") {
-		t.Errorf("subject = %q, want the welcome wording naming the project", sent.subject)
+	if sent.subject != "Invitation To Use WSO2 Support for Acme Cloud" {
+		t.Errorf("subject = %q, want the invitation subject naming the project", sent.subject)
+	}
+	if len(sent.replyTo) != 1 || sent.replyTo[0] != "support@wso2.com" {
+		t.Errorf("replyTo = %v, want the configured onboarding Reply-To", sent.replyTo)
 	}
 	for _, want := range []string{"A WSO2 account has been created for you", "Jane Doe", "Acme Cloud", "ACMECLOUD", "Admin, Portal user", `href="https://support.wso2.com"`} {
 		if !strings.Contains(sent.htmlBody, want) {
@@ -333,8 +379,8 @@ func TestDispatcher_Handle_ProjectContactInvited_ExistingUser(t *testing.T) {
 		t.Fatalf("sent %d emails, want 1", len(email.calls))
 	}
 	sent := email.calls[0]
-	if !strings.Contains(sent.subject, "has been added to your account") {
-		t.Errorf("subject = %q, want the existing-account wording", sent.subject)
+	if sent.subject != "Invitation To Use WSO2 Support for Acme Cloud" {
+		t.Errorf("subject = %q, want the invitation subject", sent.subject)
 	}
 	if !strings.Contains(sent.htmlBody, "You already have a WSO2 account") || strings.Contains(sent.htmlBody, "A WSO2 account has been created for you") {
 		t.Error("body does not use the existing-account wording")
@@ -463,7 +509,7 @@ func TestDispatcher_Handle_ProjectContactInvited_IdentityOffUsesNewWording(t *te
 		strings.Contains(body, "You already have a WSO2 account") {
 		t.Error("with identity disabled the email must use the neutral wording and make no claim about the account")
 	}
-	if !strings.Contains(email.calls[0].subject, "You have been given access to") {
+	if !strings.Contains(email.calls[0].subject, "Invitation To Use WSO2 Support for") {
 		t.Errorf("subject = %q, want the neutral subject", email.calls[0].subject)
 	}
 	assertSteps(t, steps, "IDENTITY=SKIPPED", "EMAIL=SUCCEEDED")
@@ -530,7 +576,7 @@ func TestDispatcher_Handle_ProjectContactInvited_NamelessInviteeUsesEmailLocalPa
 // not FAILED, and the identity step still runs.
 func TestDispatcher_Handle_ProjectContactInvited_Killswitch(t *testing.T) {
 	identity, email, steps := &mockIdentityProvisioner{}, &mockEmailSender{}, &mockStepRecorder{}
-	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, false, false, nil, true, "", "").
+	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, false, false, nil, true, "", nil).
 		WithOnboarding(OnboardingConfig{Identity: identity, Email: email, Steps: steps, IdentityEnabled: true, EmailEnabled: true, PortalURL: "https://support.wso2.com"})
 
 	if err := d.Handle(context.Background(), invitedRecord(false)); err != nil {
@@ -546,7 +592,7 @@ func TestDispatcher_Handle_ProjectContactInvited_Killswitch(t *testing.T) {
 // mode sends the invitation to the test list, never to the real contact.
 func TestDispatcher_Handle_ProjectContactInvited_DebugModeRedirects(t *testing.T) {
 	email, steps := &mockEmailSender{}, &mockStepRecorder{}
-	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, true, true, []string{"debug@wso2.com"}, true, "", "").
+	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, true, true, []string{"debug@wso2.com"}, true, "", nil).
 		WithOnboarding(OnboardingConfig{Identity: &mockIdentityProvisioner{}, Email: email, Steps: steps, IdentityEnabled: true, EmailEnabled: true, PortalURL: "https://support.wso2.com"})
 
 	if err := d.Handle(context.Background(), invitedRecord(false)); err != nil {
@@ -697,10 +743,13 @@ func TestDispatcher_Handle_ProjectContactInvited_ResendUsesReminderWording(t *te
 		t.Fatalf("sent %d emails, want 1", len(email.calls))
 	}
 	sent := email.calls[0]
-	if !strings.Contains(sent.subject, "Reminder") || !strings.Contains(sent.subject, "Acme Cloud") {
+	if sent.subject != "Reminder: Invitation To Use WSO2 Support for Acme Cloud" {
 		t.Errorf("subject = %q, want the reminder wording naming the project", sent.subject)
 	}
-	if !strings.Contains(sent.htmlBody, "Here is your invitation to the project") {
+	if len(sent.replyTo) != 1 || sent.replyTo[0] != "support@wso2.com" {
+		t.Errorf("replyTo = %v, want the configured onboarding Reply-To", sent.replyTo)
+	}
+	if !strings.Contains(sent.htmlBody, "This is a reminder of your invitation to") {
 		t.Error("body does not use the reminder wording")
 	}
 	for _, deny := range []string{"A WSO2 account has been created for you", "You already have a WSO2 account"} {
@@ -806,4 +855,288 @@ func TestDispatcher_Handle_ProjectContactInvited_LedgerWriteSurvivesCancellation
 		t.Fatalf("emails sent = %d, want 1", len(email.calls))
 	}
 	assertSteps(t, steps, "IDENTITY=SUCCEEDED", "EMAIL=SUCCEEDED")
+}
+
+// firstInvitedOn is the membership version the ledger's SUCCEEDED EMAIL step
+// was recorded for in the re-invitation tests below -- the first invitation.
+// entity-service returns it the way Go marshals a time.Time.
+const firstInvitedOn = "2026-09-01T08:00:00.123Z"
+
+// TestDispatcher_Handle_ProjectContactInvited_VersionedLedgerGuard pins what
+// "already sent" means: sent for this version of the membership. The ledger
+// keeps one EMAIL row per membership, so a bare "is there a SUCCEEDED row"
+// check let the first invitation block every later one -- a contact
+// deactivated and then re-invited (a newer Salesforce LastModifiedDate)
+// never got an email. A newer version sends; the same version (Salesforce's
+// several UPDATED events per save, or a redelivery) and an older one (a
+// delayed delivery) are still skipped. When either timestamp is missing or
+// unreadable the versions cannot be compared, so any SUCCEEDED row still
+// means sent.
+func TestDispatcher_Handle_ProjectContactInvited_VersionedLedgerGuard(t *testing.T) {
+	cases := map[string]struct {
+		eventOn    string // payload eventModifiedOn; "" = omitted
+		recordedOn string // ledger EMAIL step eventModifiedOn; "" = absent
+		wantSent   bool
+	}{
+		"re-invite: newer version than the recorded invitation sends": {eventOn: "2026-09-20T10:30:00.000Z", recordedOn: firstInvitedOn, wantSent: true},
+		"duplicate: same version is skipped":                          {eventOn: firstInvitedOn, recordedOn: firstInvitedOn, wantSent: false},
+		"duplicate: same instant in another offset is skipped":        {eventOn: "2026-09-01T13:30:00.123+05:30", recordedOn: firstInvitedOn, wantSent: false},
+		"redelivery: older version is skipped":                        {eventOn: "2026-08-15T09:00:00Z", recordedOn: firstInvitedOn, wantSent: false},
+		"missing event timestamp falls back to skip":                  {eventOn: "", recordedOn: firstInvitedOn, wantSent: false},
+		"missing recorded timestamp falls back to skip":               {eventOn: "2026-09-20T10:30:00Z", recordedOn: "", wantSent: false},
+		"zero recorded timestamp falls back to skip":                  {eventOn: "2026-09-20T10:30:00Z", recordedOn: "0001-01-01T00:00:00Z", wantSent: false},
+		"unparseable recorded timestamp falls back to skip":           {eventOn: "2026-09-20T10:30:00Z", recordedOn: "yesterday", wantSent: false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			identity, email := &mockIdentityProvisioner{existed: true}, &mockEmailSender{}
+			steps := &mockStepRecorder{emailAlreadySent: true, emailSentOn: tc.recordedOn}
+			d := newOnboardingDispatcher(identity, email, steps, true, true)
+
+			rec := invitedRecord(false)
+			if tc.eventOn != "" {
+				rec = invitedRecordAt(tc.eventOn)
+			}
+			if err := d.Handle(context.Background(), rec); err != nil {
+				t.Fatalf("Handle() error = %v", err)
+			}
+			if steps.emailSentChecks != 1 {
+				t.Errorf("ledger consulted %d times, want exactly 1", steps.emailSentChecks)
+			}
+			if len(identity.calls) != 1 {
+				t.Errorf("EnsureExternalUser called %d times, want 1: identity runs whatever the ledger says", len(identity.calls))
+			}
+			if !tc.wantSent {
+				if len(email.calls) != 0 {
+					t.Errorf("sent %d emails, want none", len(email.calls))
+				}
+				assertSteps(t, steps, "IDENTITY=SUCCEEDED")
+				return
+			}
+			if len(email.calls) != 1 {
+				t.Fatalf("sent %d emails, want 1", len(email.calls))
+			}
+			// A re-invitation is an ordinary invitation, not a reminder:
+			// the account already exists, so the "added" wording.
+			if sent := email.calls[0]; strings.Contains(sent.subject, "Reminder") || !strings.Contains(sent.htmlBody, "You already have a WSO2 account") {
+				t.Errorf("subject = %q, want the existing-account invitation wording", sent.subject)
+			}
+			assertSteps(t, steps, "IDENTITY=SUCCEEDED", "EMAIL=SUCCEEDED")
+			// The new EMAIL row is stamped with the re-invitation's version,
+			// so a duplicate of this event is recognised in turn.
+			want, _ := time.Parse(time.RFC3339Nano, tc.eventOn)
+			if got := steps.calls[len(steps.calls)-1].EventModifiedOn; !got.Equal(want) {
+				t.Errorf("EMAIL step eventModifiedOn = %v, want the event's %v", got, want)
+			}
+		})
+	}
+}
+
+// TestDispatcher_Handle_ProjectContactInvited_ReinviteThenDuplicate walks the
+// staging scenario end to end against one ledger: the first invitation is
+// sent and recorded, its duplicate is skipped, a later re-invitation sends,
+// and that re-invitation's own duplicate is skipped.
+func TestDispatcher_Handle_ProjectContactInvited_ReinviteThenDuplicate(t *testing.T) {
+	const reinvitedOn = "2026-09-20T10:30:00.456Z"
+	identity, email, steps := &mockIdentityProvisioner{}, &mockEmailSender{}, &mockStepRecorder{}
+	d := newOnboardingDispatcher(identity, email, steps, true, true)
+
+	deliver := func(eventOn string, offset int64, wantEmails int) {
+		t.Helper()
+		rec := invitedRecordAt(eventOn)
+		rec.Offset = offset
+		if err := d.Handle(context.Background(), rec); err != nil {
+			t.Fatalf("Handle(%s) error = %v", eventOn, err)
+		}
+		if len(email.calls) != wantEmails {
+			t.Fatalf("after delivering %s: sent %d emails in total, want %d", eventOn, len(email.calls), wantEmails)
+		}
+		// Mirror what entity-service would now return for the EMAIL row.
+		for _, c := range steps.calls {
+			if c.Step == entity.OnboardingStepEmail && c.Status == entity.OnboardingStepSucceeded {
+				steps.emailAlreadySent = true
+				steps.emailSentOn = c.EventModifiedOn.Format(time.RFC3339Nano)
+			}
+		}
+	}
+	deliver(firstInvitedOn, 1, 1) // first invitation
+	deliver(firstInvitedOn, 2, 1) // Salesforce's second UPDATED event for the same save
+	deliver(reinvitedOn, 3, 2)    // deactivated, then re-invited
+	deliver(reinvitedOn, 4, 2)    // redelivery of the re-invitation
+	deliver(firstInvitedOn, 5, 2) // a very late copy of the first invitation
+}
+
+// TestDispatcher_Handle_ProjectContactInvited_ResendIgnoresVersions: the
+// versioned guard does not apply to a resend. Even with the ledger holding a
+// SUCCEEDED EMAIL step for the very same version, a resend always sends,
+// never reads the ledger, and uses the reminder template.
+func TestDispatcher_Handle_ProjectContactInvited_ResendIgnoresVersions(t *testing.T) {
+	identity, email := &mockIdentityProvisioner{existed: true}, &mockEmailSender{}
+	steps := &mockStepRecorder{emailAlreadySent: true, emailSentOn: firstInvitedOn}
+	d := newOnboardingDispatcher(identity, email, steps, true, true)
+
+	if err := d.Handle(context.Background(), resentInvitedRecordAt(firstInvitedOn)); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if steps.emailSentChecks != 0 {
+		t.Errorf("ledger consulted %d times on a resend, want 0", steps.emailSentChecks)
+	}
+	if len(email.calls) != 1 {
+		t.Fatalf("sent %d emails, want 1", len(email.calls))
+	}
+	if sent := email.calls[0]; !strings.Contains(sent.subject, "Reminder") || !strings.Contains(sent.htmlBody, "This is a reminder of your invitation to") {
+		t.Errorf("subject = %q, want the reminder template", sent.subject)
+	}
+	assertSteps(t, steps, "IDENTITY=SUCCEEDED", "EMAIL=SUCCEEDED")
+}
+
+// registeredRecord builds a project_contact.registered record for jane@acme.com.
+func registeredRecord(integration bool) eventbus.Record {
+	extra := ""
+	if integration {
+		extra = `,"isIntegrationUser":true`
+	}
+	return eventbus.Record{Value: []byte(`{"type":"project_contact.registered","entityId":"` + invitedMembership + `","payload":{"membershipSfId":"` + invitedMembership + `","contactSfId":"003000000000001AAA","email":"jane@acme.com","givenName":"Jane","familyName":"Doe","projectName":"Acme Cloud","projectKey":"ACMECLOUD","eventModifiedOn":"2026-09-18T06:37:07Z"` + extra + `}}`)}
+}
+
+func TestDispatcher_Handle_ProjectContactRegistered_SendsWelcome(t *testing.T) {
+	email, steps := &mockEmailSender{}, &mockStepRecorder{}
+	d := newOnboardingDispatcher(&mockIdentityProvisioner{}, email, steps, true, true)
+
+	if err := d.Handle(context.Background(), registeredRecord(false)); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if len(email.calls) != 1 {
+		t.Fatalf("sent %d emails, want 1", len(email.calls))
+	}
+	sent := email.calls[0]
+	if sent.subject != "Welcome to WSO2 Support for Acme Cloud" || len(sent.to) != 1 || sent.to[0] != "jane@acme.com" {
+		t.Errorf("subject = %q, to = %v", sent.subject, sent.to)
+	}
+	if len(sent.replyTo) != 1 || sent.replyTo[0] != "support@wso2.com" {
+		t.Errorf("replyTo = %v, want the onboarding Reply-To", sent.replyTo)
+	}
+	for _, want := range []string{"Hi Jane Doe,", "Acme Cloud", "Go to Support Portal", `href="https://support.wso2.com"`} {
+		if !strings.Contains(sent.htmlBody, want) {
+			t.Errorf("body does not contain %q", want)
+		}
+	}
+	assertSteps(t, steps, "WELCOME_EMAIL=SUCCEEDED")
+	if c := steps.calls[0]; c.EventType != "project_contact.registered" || c.MembershipSfID != invitedMembership || c.EventModifiedOn.IsZero() {
+		t.Errorf("step write = %+v", c)
+	}
+}
+
+func TestDispatcher_Handle_ProjectContactRegistered_AlreadySent(t *testing.T) {
+	email, steps := &mockEmailSender{}, &mockStepRecorder{welcomeAlreadySent: true}
+	d := newOnboardingDispatcher(&mockIdentityProvisioner{}, email, steps, true, true)
+
+	if err := d.Handle(context.Background(), registeredRecord(false)); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if len(email.calls) != 0 || steps.welcomeChecks != 1 {
+		t.Errorf("emails = %d, checks = %d, want no send after one ledger check", len(email.calls), steps.welcomeChecks)
+	}
+	assertSteps(t, steps)
+}
+
+func TestDispatcher_Handle_ProjectContactRegistered_Skips(t *testing.T) {
+	cases := map[string]struct {
+		d      func(email *mockEmailSender, steps *mockStepRecorder) *Dispatcher
+		record eventbus.Record
+	}{
+		"integration user": {
+			d: func(e *mockEmailSender, s *mockStepRecorder) *Dispatcher {
+				return newOnboardingDispatcher(&mockIdentityProvisioner{}, e, s, true, true)
+			},
+			record: registeredRecord(true),
+		},
+		"email flag off": {
+			d: func(e *mockEmailSender, s *mockStepRecorder) *Dispatcher {
+				return newOnboardingDispatcher(&mockIdentityProvisioner{}, e, s, true, false)
+			},
+			record: registeredRecord(false),
+		},
+		"killswitch": {
+			d: func(e *mockEmailSender, s *mockStepRecorder) *Dispatcher {
+				return NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, false, false, nil, true, "", nil).
+					WithOnboarding(OnboardingConfig{Email: e, Steps: s, EmailEnabled: true})
+			},
+			record: registeredRecord(false),
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			email, steps := &mockEmailSender{}, &mockStepRecorder{}
+			if err := tc.d(email, steps).Handle(context.Background(), tc.record); err != nil {
+				t.Fatalf("Handle() error = %v", err)
+			}
+			if len(email.calls) != 0 {
+				t.Errorf("sent %d emails, want 0", len(email.calls))
+			}
+			assertSteps(t, steps, "WELCOME_EMAIL=SKIPPED")
+		})
+	}
+}
+
+// A skipped replay must not overwrite a SUCCEEDED Welcome, and a failed lookup writes nothing.
+func TestDispatcher_Handle_ProjectContactRegistered_SkipKeepsSentWelcome(t *testing.T) {
+	email, steps := &mockEmailSender{}, &mockStepRecorder{welcomeAlreadySent: true}
+	if err := newOnboardingDispatcher(&mockIdentityProvisioner{}, email, steps, true, false).Handle(context.Background(), registeredRecord(false)); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if len(email.calls) != 0 || steps.welcomeChecks != 1 {
+		t.Errorf("emails = %d, checks = %d, want no send after one ledger check", len(email.calls), steps.welcomeChecks)
+	}
+	assertSteps(t, steps)
+
+	failing := &mockStepRecorder{welcomeErr: errors.New("ledger down")}
+	if err := newOnboardingDispatcher(&mockIdentityProvisioner{}, &mockEmailSender{}, failing, true, false).Handle(context.Background(), registeredRecord(false)); err == nil {
+		t.Fatal("Handle() = nil, want the lookup error so the record is retried")
+	}
+	assertSteps(t, failing)
+}
+
+func TestDispatcher_Handle_ProjectContactRegistered_DebugModeRedirects(t *testing.T) {
+	email, steps := &mockEmailSender{}, &mockStepRecorder{}
+	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, true, true, []string{"debug@wso2.com"}, true, "", nil).
+		WithOnboarding(OnboardingConfig{Email: email, Steps: steps, EmailEnabled: true})
+
+	if err := d.Handle(context.Background(), registeredRecord(false)); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if len(email.calls) != 1 || email.calls[0].to[0] != "debug@wso2.com" {
+		t.Errorf("email calls = %+v, want one send to the debug list", email.calls)
+	}
+}
+
+func TestDispatcher_Handle_ProjectContactRegistered_Failures(t *testing.T) {
+	email, steps := &mockEmailSender{err: errors.New("smtp down")}, &mockStepRecorder{}
+	if err := newOnboardingDispatcher(&mockIdentityProvisioner{}, email, steps, true, true).Handle(context.Background(), registeredRecord(false)); err == nil {
+		t.Fatal("Handle() = nil, want the send error")
+	}
+	assertSteps(t, steps, "WELCOME_EMAIL=FAILED")
+
+	email, steps = &mockEmailSender{}, &mockStepRecorder{welcomeErr: errors.New("ledger down")}
+	if err := newOnboardingDispatcher(&mockIdentityProvisioner{}, email, steps, true, true).Handle(context.Background(), registeredRecord(false)); err == nil {
+		t.Fatal("Handle() = nil, want the ledger error")
+	}
+	if len(email.calls) != 0 {
+		t.Error("sent a welcome email without being able to read the ledger")
+	}
+}
+
+// TestDispatcher_ReplyToOnlyOnOnboardingEmails: a case email keeps a nil Reply-To.
+func TestDispatcher_ReplyToOnlyOnOnboardingEmails(t *testing.T) {
+	email := &mockEmailSender{}
+	d := newTestDispatcher(email, &mockGoogleChatSender{}, &mockCallSender{}).
+		WithOnboarding(OnboardingConfig{Email: email, Steps: &mockStepRecorder{}, EmailEnabled: true, ReplyTo: []string{"support@wso2.com"}})
+
+	record := eventbus.Record{Value: []byte(`{"type":"case.comment_added","entityId":"CASE-1","payload":{"name":"Commenter","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseComment":"fixed it","commentId":"C-1","recipients":["test-recipient@example.com"]}}`)}
+	if err := d.Handle(context.Background(), record); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if len(email.calls) != 1 || email.calls[0].replyTo != nil {
+		t.Errorf("case email calls = %+v, want one send with no Reply-To", email.calls)
+	}
 }

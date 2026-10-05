@@ -30,6 +30,7 @@ import {
   visibleNavSections,
 } from "@config/featureFlags";
 import { usePortalAccess } from "@context/current-user/usePortalAccess";
+import { usePortalView } from "@context/current-user/usePortalView";
 import { useNavTransition } from "@hooks/useNavTransition";
 
 /** Tooltip for a disabled WIP item. Includes the label so the collapsed rail
@@ -106,6 +107,18 @@ function pickActiveId(pathname: string): string {
   return navSectionForPath(pathname)?.id ?? getLastSectionId();
 }
 
+/**
+ * Active id for the Sales/SA view's flat nav (see the "sales-sa" branch
+ * below): the matched `viewer.*` node, or "viewer.cases" (that view's own
+ * landing page — see RootLanding in App.tsx) for any route this nav has no
+ * entry for, e.g. /spl/projects/:id/sla-report/:sysId or the bare "/"
+ * redirect, which would otherwise leave the rail with nothing highlighted.
+ */
+function pickViewerActiveId(pathname: string): string {
+  const match = navNodeMatchForPath(pathname);
+  return match?.node.id.startsWith("viewer.") ? match.node.id : "viewer.cases";
+}
+
 export default function CsmSideBar({
   collapsed,
   expandedMenus,
@@ -115,8 +128,20 @@ export default function CsmSideBar({
   const access = usePortalAccess();
   const location = useLocation();
   const navigate = useNavTransition();
-  const activeItem = pickActiveId(location.pathname);
+  // Which entire nav this render shows — see usePortalView's own doc
+  // comment. Everything below branches on it, but every hook here still
+  // runs unconditionally on every render (rules of hooks): only the derived
+  // values and the final JSX are conditional.
+  const view = usePortalView();
+  const activeItem =
+    view === "sales-sa" ? pickViewerActiveId(location.pathname) : pickActiveId(location.pathname);
   useEffect(() => {
+    // Last-section persistence is CS-nav-only bookkeeping (see
+    // `pickActiveId`'s doc comment) — the Sales/SA view never falls back to
+    // it (`pickViewerActiveId` always resolves to a real `viewer.*` id or
+    // its own default), and persisting a `viewer.*` id here would corrupt
+    // that fallback for the CS view the next time this session renders it.
+    if (view === "sales-sa") return;
     // The persisted id is the fallback used for routes with no owning section
     // (see `pickActiveId`'s doc comment) -- it must stay a *section* id.
     // `activeItem` can be a submenu child's own dotted id (e.g.
@@ -127,7 +152,7 @@ export default function CsmSideBar({
       ? activeItem.slice(0, activeItem.indexOf("."))
       : activeItem;
     setLastSectionId(owningSectionId);
-  }, [activeItem]);
+  }, [view, activeItem]);
 
   // A submenu child (e.g. `operations.incidents`, rendered without its own
   // navigating `Link` — see below) reaches here through Oxygen's own
@@ -170,6 +195,16 @@ export default function CsmSideBar({
     return { ...expandedMenus, [sectionId]: true };
   }, [expandedMenus, activeItem]);
 
+  // Sales/SA view — SPL's own flat nav (this node's children, no nesting),
+  // entirely replacing the CS section list below rather than merging into
+  // it. featureState/visibleNavChildren still apply (a deployment can still
+  // WIP/hide an individual viewer.* page via CSM_PORTAL_FEATURE_OVERRIDES),
+  // but there is no per-user PortalAccess capability gating here — SPL's own
+  // access model is the separate useAccess audience gate (see
+  // usePortalView.ts), not this app's `requires` mechanism.
+  const viewerNode = view === "sales-sa" ? navNodeById("viewer") : undefined;
+  const viewerItems = viewerNode ? visibleNavChildren(viewerNode, access) : [];
+
   return (
     <Sidebar
       collapsed={collapsed}
@@ -185,96 +220,143 @@ export default function CsmSideBar({
     >
       <Sidebar.Nav>
         <Sidebar.Category>
-          {/* `hidden` sections are filtered out entirely; `wip` ones stay
-              rendered but disabled below. */}
-          {visibleNavSections(access).map((item) => {
-            const itemContent = (
-              <Sidebar.Item id={item.id}>
-                <Sidebar.ItemIcon>
-                  <item.icon size={20} />
-                </Sidebar.ItemIcon>
-                {/* Plain string: Oxygen derives the collapsed-rail tooltip via
-                    String(ItemLabel.children), so a wrapper element would render
-                    as "[object Object]". */}
-                <Sidebar.ItemLabel>{item.label}</Sidebar.ItemLabel>
-              </Sidebar.Item>
-            );
+          {view === "sales-sa" ? (
+            // No category label here, matching the CS-ABT branch below: a
+            // viewer with the "viewer" role is just a CSM Portal user whose
+            // nav happens to be this set of sections, not someone using a
+            // separate "Support Portal Lite" product -- see usePortalView.ts.
+            <>
+              {viewerItems.map((item) => {
+                const itemContent = (
+                  <Sidebar.Item id={item.id}>
+                    {item.icon && (
+                      <Sidebar.ItemIcon>
+                        <item.icon size={20} />
+                      </Sidebar.ItemIcon>
+                    )}
+                    <Sidebar.ItemLabel>{item.label}</Sidebar.ItemLabel>
+                  </Sidebar.Item>
+                );
 
-            // WIP sections stay visible but disabled: no navigating Link, dimmed
-            // and non-clickable (pointer events blocked on the inner box so no
-            // click reaches Oxygen's select handler). The outer element is a
-            // focusable div (tabIndex 0, aria-disabled) so keyboard users can
-            // reach it and reveal the "work in progress" tooltip, which fires on
-            // both hover and focus. Their routes render the coming-soon page
-            // (see App.tsx's WipRouteGuard).
-            if (featureState(item.id) === "wip") {
-              return (
-                <Tooltip
-                  key={item.id}
-                  title={wipTooltip(item.label)}
-                  placement="right"
-                >
-                  <Box
-                    aria-disabled
-                    tabIndex={0}
-                    sx={{ display: "block", cursor: "not-allowed" }}
+                if (featureState(item.id) === "wip") {
+                  return (
+                    <Tooltip key={item.id} title={wipTooltip(item.label)} placement="right">
+                      <Box aria-disabled tabIndex={0} sx={{ display: "block", cursor: "not-allowed" }}>
+                        <Box sx={{ opacity: 0.45, pointerEvents: "none" }}>{itemContent}</Box>
+                      </Box>
+                    </Tooltip>
+                  );
+                }
+
+                return (
+                  <Link
+                    key={item.id}
+                    component={NavigateLink}
+                    to={item.href}
+                    color="inherit"
+                    underline="none"
                   >
-                    <Box sx={{ opacity: 0.45, pointerEvents: "none" }}>
-                      {itemContent}
-                    </Box>
-                  </Box>
-                </Tooltip>
-              );
-            }
+                    {itemContent}
+                  </Link>
+                );
+              })}
+            </>
+          ) : (
+            /* `hidden` sections are filtered out entirely; `wip` ones stay
+               rendered but disabled below. "viewer" itself is excluded here —
+               it renders as its own exclusive view above, not merged into
+               this list (see usePortalView.ts). */
+            visibleNavSections(access)
+              .filter((item) => item.id !== "viewer")
+              .map((item) => {
+                const itemContent = (
+                  <Sidebar.Item id={item.id}>
+                    <Sidebar.ItemIcon>
+                      <item.icon size={20} />
+                    </Sidebar.ItemIcon>
+                    {/* Plain string: Oxygen derives the collapsed-rail tooltip via
+                        String(ItemLabel.children), so a wrapper element would render
+                        as "[object Object]". */}
+                    <Sidebar.ItemLabel>{item.label}</Sidebar.ItemLabel>
+                  </Sidebar.Item>
+                );
 
-            // A submenu section (Operations, Security Center) renders its
-            // children as nested `Sidebar.Item`s instead of navigating
-            // directly: Oxygen shows a chevron and calls `onToggleExpand`
-            // for any item with nested items rather than `onSelect`, so this
-            // parent is deliberately NOT wrapped in a `Link` — only its
-            // children (below) navigate. A section whose config has hidden
-            // every one of its children falls through to the plain flat item
-            // instead of rendering an entry with nothing to expand.
-            const children = isSubmenuSection(item) ? visibleNavChildren(item, access) : [];
-            if (children.length > 0) {
-              return (
-                <Sidebar.Item id={item.id} key={item.id}>
-                  <Sidebar.ItemIcon>
-                    <item.icon size={20} />
-                  </Sidebar.ItemIcon>
-                  <Sidebar.ItemLabel>{item.label}</Sidebar.ItemLabel>
-                  {children.map((child) => {
-                    const childWip = featureState(child.id) === "wip";
-                    return (
-                      <Sidebar.Item id={child.id} key={child.id}>
-                        {child.icon && (
-                          <Sidebar.ItemIcon>
-                            <child.icon size={18} />
-                          </Sidebar.ItemIcon>
-                        )}
-                        <Sidebar.ItemLabel>{child.label}</Sidebar.ItemLabel>
-                        {childWip && (
-                          <Sidebar.ItemBadge color="warning">WIP</Sidebar.ItemBadge>
-                        )}
-                      </Sidebar.Item>
-                    );
-                  })}
-                </Sidebar.Item>
-              );
-            }
+                // WIP sections stay visible but disabled: no navigating Link, dimmed
+                // and non-clickable (pointer events blocked on the inner box so no
+                // click reaches Oxygen's select handler). The outer element is a
+                // focusable div (tabIndex 0, aria-disabled) so keyboard users can
+                // reach it and reveal the "work in progress" tooltip, which fires on
+                // both hover and focus. Their routes render the coming-soon page
+                // (see App.tsx's WipRouteGuard).
+                if (featureState(item.id) === "wip") {
+                  return (
+                    <Tooltip
+                      key={item.id}
+                      title={wipTooltip(item.label)}
+                      placement="right"
+                    >
+                      <Box
+                        aria-disabled
+                        tabIndex={0}
+                        sx={{ display: "block", cursor: "not-allowed" }}
+                      >
+                        <Box sx={{ opacity: 0.45, pointerEvents: "none" }}>
+                          {itemContent}
+                        </Box>
+                      </Box>
+                    </Tooltip>
+                  );
+                }
 
-            return (
-              <Link
-                key={item.id}
-                component={NavigateLink}
-                to={item.href}
-                color="inherit"
-                underline="none"
-              >
-                {itemContent}
-              </Link>
-            );
-          })}
+                // A submenu section (Operations, Security Center) renders its
+                // children as nested `Sidebar.Item`s instead of navigating
+                // directly: Oxygen shows a chevron and calls `onToggleExpand`
+                // for any item with nested items rather than `onSelect`, so this
+                // parent is deliberately NOT wrapped in a `Link` — only its
+                // children (below) navigate. A section whose config has hidden
+                // every one of its children falls through to the plain flat item
+                // instead of rendering an entry with nothing to expand.
+                const children = isSubmenuSection(item) ? visibleNavChildren(item, access) : [];
+                if (children.length > 0) {
+                  return (
+                    <Sidebar.Item id={item.id} key={item.id}>
+                      <Sidebar.ItemIcon>
+                        <item.icon size={20} />
+                      </Sidebar.ItemIcon>
+                      <Sidebar.ItemLabel>{item.label}</Sidebar.ItemLabel>
+                      {children.map((child) => {
+                        const childWip = featureState(child.id) === "wip";
+                        return (
+                          <Sidebar.Item id={child.id} key={child.id}>
+                            {child.icon && (
+                              <Sidebar.ItemIcon>
+                                <child.icon size={18} />
+                              </Sidebar.ItemIcon>
+                            )}
+                            <Sidebar.ItemLabel>{child.label}</Sidebar.ItemLabel>
+                            {childWip && (
+                              <Sidebar.ItemBadge color="warning">WIP</Sidebar.ItemBadge>
+                            )}
+                          </Sidebar.Item>
+                        );
+                      })}
+                    </Sidebar.Item>
+                  );
+                }
+
+                return (
+                  <Link
+                    key={item.id}
+                    component={NavigateLink}
+                    to={item.href}
+                    color="inherit"
+                    underline="none"
+                  >
+                    {itemContent}
+                  </Link>
+                );
+              })
+          )}
         </Sidebar.Category>
       </Sidebar.Nav>
 

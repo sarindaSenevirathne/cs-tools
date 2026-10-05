@@ -24,7 +24,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
@@ -50,12 +49,14 @@ type PendingVerificationRepository interface {
 }
 
 type pendingVerificationRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
 // NewPendingVerificationRepository constructs a PendingVerificationRepository
-// backed by the given connection pool.
-func NewPendingVerificationRepository(db *pgxpool.Pool) PendingVerificationRepository {
+// backed by the given connection pool. work_item/"case" are both RLS-protected
+// (see Scoped's own doc comment), so this holds a *Scoped rather than a raw
+// *pgxpool.Pool -- every query here joins one or both of those tables.
+func NewPendingVerificationRepository(db *Scoped) PendingVerificationRepository {
 	return &pendingVerificationRepo{db: db}
 }
 

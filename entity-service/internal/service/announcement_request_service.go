@@ -103,14 +103,7 @@ func NewAnnouncementRequestService(repo repository.AnnouncementRequestRepository
 // short of "internal service" that would be safe to hand this out under, the
 // same rationale sla_status_service.go's own copy documents.
 func (s *announcementRequestService) requireInternalCaller(ctx context.Context) error {
-	scope, err := s.access.ResolveScope(ctx)
-	if err != nil {
-		return err
-	}
-	if !scope.Unrestricted {
-		return &apierror.ForbiddenError{Msg: "auto-publish is only available to internal services"}
-	}
-	return nil
+	return RequireInternalCaller(ctx, s.access, "auto-publish is only available to internal services")
 }
 
 // CreateDraft implements AnnouncementRequestService.
@@ -140,8 +133,21 @@ func (s *announcementRequestService) Search(ctx context.Context, req domain.Sear
 	if req.State != nil && !isValidAnnouncementRequestState(*req.State) {
 		return domain.SearchAnnouncementRequestsResponse{}, &apierror.ValidationError{Msg: "state must be one of: draft, pending_approval, approved, published"}
 	}
-	if req.ReadyForScheduledPublish && req.State != nil {
-		return domain.SearchAnnouncementRequestsResponse{}, &apierror.ValidationError{Msg: "readyForScheduledPublish cannot be combined with state"}
+	for _, st := range req.States {
+		if !isValidAnnouncementRequestState(st) {
+			return domain.SearchAnnouncementRequestsResponse{}, &apierror.ValidationError{Msg: "states must each be one of: draft, pending_approval, approved, published"}
+		}
+	}
+	// "Combined" means the field was sent at all, so these compare against nil
+	// rather than len(): an explicit `"states": []` decodes to a non-nil empty
+	// slice, and a request that names both fields is contradictory even when
+	// one of them is empty. States on its own, empty or omitted, still just
+	// means "no state filter."
+	if req.State != nil && req.States != nil {
+		return domain.SearchAnnouncementRequestsResponse{}, &apierror.ValidationError{Msg: "state cannot be combined with states"}
+	}
+	if req.ReadyForScheduledPublish && (req.State != nil || req.States != nil) {
+		return domain.SearchAnnouncementRequestsResponse{}, &apierror.ValidationError{Msg: "readyForScheduledPublish cannot be combined with state or states"}
 	}
 
 	requests, total, err := s.repo.Search(ctx, req)
@@ -563,11 +569,12 @@ func (s *announcementRequestService) AutoPublish(ctx context.Context, id string)
 			defer func() { <-fanOutSem }()
 
 			created, err := s.cases.CreateCase(ctx, domain.CreateCaseRequest{
-				CreatedBy:   current.CreatedBy,
-				Type:        "announcement",
-				ProjectID:   projectID,
-				Subject:     current.Subject,
-				Description: current.Description,
+				CreatedBy:              current.CreatedBy,
+				Type:                   "announcement",
+				ProjectID:              projectID,
+				Subject:                current.Subject,
+				Description:            current.Description,
+				IsSecurityAnnouncement: current.IsSecurityAnnouncement,
 			})
 			if err != nil {
 				mu.Lock()

@@ -18,7 +18,6 @@ import { Box, Button, Menu, MenuItem, Tooltip, Typography } from "@wso2/oxygen-u
 import {
   ArrowRight,
   Ban,
-  CalendarClock,
   CheckCircle,
   ChevronDown,
   Play,
@@ -45,7 +44,8 @@ type TargetConfig = {
 
 const TARGET_CONFIG: Record<string, TargetConfig> = {
   assess: { color: "primary", icon: <Send size={16} /> },
-  scheduled: { color: "primary", icon: <CalendarClock size={16} /> },
+  // Only ever rendered from `customer_approval` ("Record customer approval").
+  scheduled: { color: "primary", icon: <UserCheck size={16} /> },
   implement: { color: "primary", icon: <Play size={16} /> },
   review: { color: "primary", icon: <CheckCircle size={16} /> },
   customer_review: { color: "primary", icon: <UserCheck size={16} /> },
@@ -78,6 +78,7 @@ const DEFAULT_TARGET_CONFIG: TargetConfig = {
  */
 const FORWARD_ORDER: readonly string[] = [
   "assess",
+  // Reachable only from `customer_approval` (see `isOfferedTarget`).
   "scheduled",
   "implement",
   "review",
@@ -92,16 +93,56 @@ const MENU_ORDER: readonly string[] = [...FORWARD_ORDER, "rollback", "canceled"]
  * States this bar never offers, no matter what `legalNextStates` contains.
  *
  * Do not delete this filter because "the list doesn't include them anyway".
- * Neither state is human-enterable in the backing system: of its 38 UI
- * actions on the change-request table, none sets either one. Both are reached
- * only by automation — rollback is written by the workflow that handles a
- * rejected review, customer approval by the approval process itself. Setting
- * either by hand from here would leave a record sitting in an approval state
- * with no approver record behind it, which is an audit hole rather than a
- * shortcut. The exclusion is deliberately unconditional so a future backend
- * change that starts returning them cannot silently reopen it.
+ * `rollback`/`customer_approval`: neither state is human-enterable in the
+ * backing system — of its 38 UI actions on the change-request table, none
+ * sets either one. Both are reached only by automation — rollback is written
+ * by the workflow that handles a rejected review, customer approval by the
+ * approval process itself. Setting either by hand from here would leave a
+ * record sitting in an approval state with no approver record behind it,
+ * which is an audit hole rather than a shortcut.
+ *
+ * `authorize` is a different case: it IS reachable by a human action, just
+ * never this one. It's the automatic side effect of an approver approving in
+ * the Approvers section (`ChangeRequestApprovals.tsx` / the decide-approval
+ * endpoint), which already correctly cascades the change request's own state
+ * forward on approval — not "automation-only" the way the other two are, but
+ * gated by a real human decision made somewhere else in the UI, not here.
+ * Offering it as a directly-clickable button/menu item from here would let
+ * someone skip the actual approval process entirely and land the record in
+ * Authorize with no approval behind it — the same audit hole as above, by a
+ * different route.
+ *
+ * `scheduled` is the same shape as `authorize`: a CR is moved to Scheduled
+ * automatically the moment its approval is granted (CAB/ECAB, or Standard's
+ * Request Approval) -- or, when the CR requires customer approval, it first
+ * waits in `customer_approval`. There is no manual "Schedule" action anywhere,
+ * with exactly one exception: leaving `customer_approval`, where
+ * `scheduled` *is* the way the customer's approval is recorded
+ * ("Record customer approval", `PATCH {state:"scheduled"}`). So `scheduled` is
+ * filtered out unless the CR's current state is `customer_approval` -- see
+ * `isOfferedTarget`.
+ *
+ * The exclusions are deliberately unconditional (the `scheduled` carve-out is
+ * keyed on the record's own state, never on what `legalNextStates` claims) so a
+ * future backend change that starts returning any of these cannot silently
+ * reopen them.
  */
-const NEVER_OFFERED_TARGETS: readonly string[] = ["rollback", "customer_approval"];
+const NEVER_OFFERED_TARGETS: readonly string[] = [
+  "rollback",
+  "customer_approval",
+  "authorize",
+];
+
+/**
+ * `scheduled` is a manual action only from `customer_approval`, where it
+ * records the customer's approval. Everywhere else it is reached
+ * automatically, so it is never offered.
+ */
+function isOfferedTarget(target: string, currentState: string | null | undefined): boolean {
+  if (!target || target === currentState) return false;
+  if (target === "scheduled") return currentState === "customer_approval";
+  return !NEVER_OFFERED_TARGETS.includes(target);
+}
 
 /** Sort key for a target: curated order first, uncurated states after. */
 function menuRank(target: string): number {
@@ -115,9 +156,22 @@ function menuRank(target: string): number {
  * backing system checks on write — offering it anyway just round-trips into a
  * rejection, so it renders disabled with the reason instead.
  *
- * Deliberately a per-target map rather than a special case for `assess`: the
- * same situation (legal transition, unmet prerequisite) can apply to any
- * target.
+ * Deliberately a per-target map rather than a special case for any one
+ * target: the same situation (legal transition, unmet prerequisite) can
+ * apply to any target.
+ *
+ * `assess` ("Request Approval") requires `assignedTeam` — by explicit product decision, confirmed
+ * compulsory: the assigned team's own members are what populate the Assess
+ * stage's approvers the moment the transition lands (see
+ * `PatchChangeRequest`'s own doc comment in `change_request_repo.go`), so
+ * there is no such thing as entering Assess with no team to assign that
+ * stage to. This was previously removed as a stale leftover from when
+ * New → Assess sent a ServiceNow "Request Approval" action — that removal
+ * was wrong: the requirement is real under the current plain
+ * `{ state: "assess" }` PATCH too, just enforced for a different reason now
+ * (who gets provisioned as an approver), and the backend itself rejects the
+ * transition with no team regardless of what this map does — this entry is
+ * what keeps the button from round-tripping into that rejection.
  */
 const TARGET_BLOCKED_REASON: Record<
   string,
@@ -167,9 +221,7 @@ export default function ChangeRequestActionBar({
   // `DEFAULT_TARGET_CONFIG` alike.
   const targets = Array.from(
     new Set(
-      (cr.legalNextStates ?? []).filter(
-        (s) => !!s && s !== cr.state && !NEVER_OFFERED_TARGETS.includes(s),
-      ),
+      (cr.legalNextStates ?? []).filter((s) => isOfferedTarget(s, cr.state)),
     ),
   ).sort((a, b) => menuRank(a) - menuRank(b));
   if (targets.length === 0) return null;
@@ -190,7 +242,7 @@ export default function ChangeRequestActionBar({
 
   const renderPrimary = (target: string): JSX.Element => {
     const { color, icon } = configFor(target);
-    const label = changeRequestTransitionLabel(target);
+    const label = changeRequestTransitionLabel(target, cr.state);
     const reason = blockedReason(target);
     if (reason) {
       return (
@@ -263,7 +315,7 @@ export default function ChangeRequestActionBar({
           >
             {menuTargets.map((target) => {
               const { color, icon } = configFor(target);
-              const label = changeRequestTransitionLabel(target);
+              const label = changeRequestTransitionLabel(target, cr.state);
               const reason = blockedReason(target);
               const destructive = isDestructiveChangeRequestTransition(target);
               return (

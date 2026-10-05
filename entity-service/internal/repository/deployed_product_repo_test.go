@@ -74,7 +74,7 @@ func TestParseUpdateDeployedProductDescription(t *testing.T) {
 // TestDeployedProductCreateFKField locks in the constraint-name -> field-name
 // mapping CreateDeployedProductFromServiceNow's 23503 handling depends on --
 // these names come from Postgres' own default "<table>_<column>_fkey"
-// naming for migration 000014's unnamed foreign keys, so a schema rename
+// naming for migration 0019's unnamed foreign keys, so a schema rename
 // would silently break this mapping (falling back to the generic "one or
 // more referenced fields" message) without this test to catch it.
 func TestDeployedProductCreateFKField(t *testing.T) {
@@ -91,5 +91,37 @@ func TestDeployedProductCreateFKField(t *testing.T) {
 		if got := deployedProductCreateFKField[constraint]; got != field {
 			t.Errorf("deployedProductCreateFKField[%q] = %q, want %q", constraint, got, field)
 		}
+	}
+}
+
+// TestLowercaseCategory pins the egress casing of a deployed product's
+// category: the enum's UPPER labels become the lower-case codes the request
+// filter and project metadata use, and NULL stays nil.
+func TestLowercaseCategory(t *testing.T) {
+	str := func(s string) *string { return &s }
+	cases := []struct {
+		name string
+		in   *string
+		want *string
+	}{
+		{"nil stays nil", nil, nil},
+		{"MS", str("MS"), str("ms")},
+		{"PC", str("PC"), str("pc")},
+		{"PS", str("PS"), str("ps")},
+		{"CL", str("CL"), str("cl")},
+		{"PDP", str("PDP"), str("pdp")},
+		{"already lower", str("ms"), str("ms")},
+		{"empty stays empty", str(""), str("")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := lowercaseCategory(tc.in)
+			if (got == nil) != (tc.want == nil) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			if got != nil && *got != *tc.want {
+				t.Fatalf("got %q, want %q", *got, *tc.want)
+			}
+		})
 	}
 }

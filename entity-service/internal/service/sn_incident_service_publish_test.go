@@ -29,10 +29,12 @@ import (
 // newTestCreateIncidentClient stubs the POST /incidents create call
 // publishIncidentCreated triggers after — unlike publishCaseCreated, no
 // enrichment round trip is needed (see that function's doc comment), so
-// this is the only request in play.
+// this and the support-group lookup (snServicesStub) are the only
+// requests in play.
 func newTestCreateIncidentClient(t *testing.T, incidentSysid string) *integrationservice.Client {
 	t.Helper()
 	mux := http.NewServeMux()
+	mux.HandleFunc("/services/search", snServicesStub(nil))
 	mux.HandleFunc("/incidents", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{

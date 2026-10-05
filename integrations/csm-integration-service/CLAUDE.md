@@ -65,21 +65,16 @@ exact path against `wso2sndev` on 2026-09-20 succeeded with no 401, creating a
 real incident (`INC0096966`). So whether these two endpoints 401 depends on the
 target ServiceNow environment's M2M credential configuration — it is not an
 unconditional consequence of this service being M2M-only. Treat a 401 from
-either endpoint as a possible, retryable outcome (see
-`internal/csmclient/incidents.go`'s doc comment in `sre-alert-ingestion-service`
-for the caller-side reasoning), not as proof the endpoint is permanently broken.
+either endpoint as a possible outcome that depends on the environment's M2M
+ServiceNow credential: check that credential before retrying, and don't treat
+the 401 as proof the endpoint is permanently broken.
 
 **`POST /services/search` (`SearchITServices`) uses this exact same
 M2M-fallback mechanism** — it proxies a ServiceNow-backed entity-service CMDB
 IT-service search operation, confirmed to go through the identical code path
 as `CreateIncident`/`SearchIncidents` above. It works over M2M the same way
 those two now do: a 401 is possible if the target environment's M2M
-ServiceNow credential isn't configured, but that is not unconditional. This
-endpoint backs `sre-alert-ingestion-service`'s live service-UUID resolution
-fallback (see that service's own CLAUDE.md) — a static label-to-UUID map is
-consulted first, synchronously, before an alert is ever buffered; this
-endpoint is only called, at delivery-attempt time, for a label the static map
-doesn't cover.
+ServiceNow credential isn't configured, but that is not unconditional.
 
 **`PATCH /incidents/{id}` (`PatchIncident`) uses this exact same M2M-fallback
 mechanism as `CreateIncident`/`SearchIncidents`/`SearchITServices` above — but
@@ -96,12 +91,7 @@ configured, but not unconditional. **Do not describe this endpoint as "always
 exception like `PATCH /cases/{id}` (that endpoint's Postgres path narrows to
 specific fields instead of failing outright) — its actual behavior is
 "unconditionally ServiceNow-backed, no Postgres fallback, M2M-credential-
-dependent on that data source."** Added for `sre-alert-ingestion-service`'s
-group-attach work-note push (see that service's own CLAUDE.md): when it
-attaches a new alert to an already-existing incident instead of creating one,
-it pushes a work note summarizing the new alert via this endpoint —
-best-effort, non-blocking, matching that service's existing failure-tolerance
-conventions.
+dependent on that data source."**
 
 The "deferred pending a captured end-user token" history below (from the owning
 team's internal issue, written by the engineer who built the ACP path) describes
@@ -175,6 +165,10 @@ check whether the underlying entity-service operation is ServiceNow-backed
 (needs either a forwarded identity or a configured M2M fallback) or
 Postgres-only (works fine over M2M unconditionally) before documenting a new
 endpoint one way or the other.
+
+## Contacts and opportunity reads on `DATA_SOURCE=postgres`
+
+Contacts search and opportunity/invoice/link reads work over M2M only if this service's client id is in entity-service's `AUTH_INTERNAL_CLIENT_IDS`; otherwise 401/403.
 
 ## Middleware chain
 

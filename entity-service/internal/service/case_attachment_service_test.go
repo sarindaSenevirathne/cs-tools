@@ -19,6 +19,8 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -78,7 +80,7 @@ func TestCaseService_CreateCaseAttachment_Succeeds(t *testing.T) {
 		},
 	}
 
-	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	resp, err := svc.CreateCaseAttachment(ctx, validCreateAttachmentRequest())
@@ -110,7 +112,7 @@ func TestCaseService_CreateCaseAttachment_RequiresStorageKey(t *testing.T) {
 			return domain.Attachment{}, nil
 		},
 	}
-	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	req := validCreateAttachmentRequest()
@@ -127,7 +129,7 @@ func TestCaseService_CreateCaseAttachment_RequiresStorageKey(t *testing.T) {
 // must be a positive value: this service cannot compute it (it never sees
 // the file bytes for this data source).
 func TestCaseService_CreateCaseAttachment_RequiresSizeBytes(t *testing.T) {
-	svc := NewCaseService(&stubCaseRepo{}, actorUserRepo(t), nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(&stubCaseRepo{}, actorUserRepo(t), nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	req := validCreateAttachmentRequest()
@@ -144,7 +146,7 @@ func TestCaseService_CreateCaseAttachment_RequiresSizeBytes(t *testing.T) {
 // this data source only models case attachments -- conversation, deployment,
 // change_request, and incident have no Postgres schema backing here.
 func TestCaseService_CreateCaseAttachment_RejectsNonCaseReferenceType(t *testing.T) {
-	svc := NewCaseService(&stubCaseRepo{}, actorUserRepo(t), nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(&stubCaseRepo{}, actorUserRepo(t), nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	req := validCreateAttachmentRequest()
@@ -161,7 +163,7 @@ func TestCaseService_CreateCaseAttachment_RejectsNonCaseReferenceType(t *testing
 // the same "must be a known, authenticated user" gate CreateCaseComment
 // already enforces also protects attachment creation.
 func TestCaseService_CreateCaseAttachment_RejectsUnauthenticatedCaller(t *testing.T) {
-	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken("") // no x-user-id-token header
 
 	_, err := svc.CreateCaseAttachment(ctx, validCreateAttachmentRequest())
@@ -190,7 +192,7 @@ func TestCaseService_CreateCaseAttachment_DefaultsToComplete(t *testing.T) {
 			}, nil
 		},
 	}
-	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	req := validCreateAttachmentRequest() // Status left unset
@@ -220,7 +222,7 @@ func TestCaseService_CreateCaseAttachment_Pending(t *testing.T) {
 			}, nil
 		},
 	}
-	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	req := validCreateAttachmentRequest()
@@ -242,7 +244,7 @@ func TestCaseService_CreateCaseAttachment_Pending(t *testing.T) {
 // to the database (where the CHECK constraint would catch it anyway, but the
 // service should fail fast with a clear message).
 func TestCaseService_CreateCaseAttachment_RejectsInvalidStatus(t *testing.T) {
-	svc := NewCaseService(&stubCaseRepo{}, actorUserRepo(t), nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(&stubCaseRepo{}, actorUserRepo(t), nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	req := validCreateAttachmentRequest()
@@ -279,7 +281,7 @@ func TestCaseService_ConfirmCaseAttachment_TransitionsToComplete(t *testing.T) {
 			}, nil
 		},
 	}
-	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	resp, err := svc.ConfirmCaseAttachment(ctx, testAttachmentID)
@@ -313,7 +315,7 @@ func TestCaseService_ConfirmCaseAttachment_RejectsAlreadyComplete(t *testing.T) 
 			return domain.Attachment{}, nil
 		},
 	}
-	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	_, err := svc.ConfirmCaseAttachment(ctx, testAttachmentID)
@@ -341,7 +343,7 @@ func TestCaseService_ConfirmCaseAttachment_RejectsDifferentActor(t *testing.T) {
 			return domain.Attachment{}, nil
 		},
 	}
-	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	_, err := svc.ConfirmCaseAttachment(ctx, testAttachmentID)
@@ -359,7 +361,7 @@ func TestCaseService_ConfirmCaseAttachment_NotFound(t *testing.T) {
 			return domain.Attachment{}, &apierror.NotFoundError{Msg: "attachment not found"}
 		},
 	}
-	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	_, err := svc.ConfirmCaseAttachment(ctx, testAttachmentID)
@@ -379,7 +381,7 @@ func TestCaseService_ConfirmCaseAttachment_RejectsUnauthenticatedCaller(t *testi
 			return domain.Attachment{}, nil
 		},
 	}
-	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken("")
 
 	_, err := svc.ConfirmCaseAttachment(ctx, testAttachmentID)
@@ -412,7 +414,7 @@ func TestCaseService_SearchCaseAttachments_ReturnsStorageKey(t *testing.T) {
 		},
 	}
 
-	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 	resp, err := svc.SearchCaseAttachments(context.Background(), domain.SearchAttachmentsRequest{
 		ReferenceID:   testCaseID,
 		ReferenceType: domain.ReferenceTypeCase,
@@ -453,7 +455,7 @@ func TestCaseService_GetAttachmentByID_ReturnsStorageKeyNotContent(t *testing.T)
 		},
 	}
 
-	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 	details, err := svc.GetAttachmentByID(context.Background(), testAttachmentID)
 	if err != nil {
 		t.Fatalf("GetAttachmentByID returned error: %v", err)
@@ -483,7 +485,7 @@ func TestCaseService_GetAttachmentByID_NotFound(t *testing.T) {
 			return domain.Attachment{}, &apierror.NotFoundError{Msg: "attachment not found"}
 		},
 	}
-	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 
 	_, err := svc.GetAttachmentByID(context.Background(), testAttachmentID)
 	var nfe *apierror.NotFoundError
@@ -497,7 +499,7 @@ func TestCaseService_GetAttachmentByID_NotFound(t *testing.T) {
 // it returns an accurate, typed error instead of fabricating a response or
 // reaching out to SFTPGo itself.
 func TestCaseService_GetCaseAttachmentContent_ReturnsTypedError(t *testing.T) {
-	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 
 	content, contentType, err := svc.GetCaseAttachmentContent(context.Background(), testAttachmentID)
 	if content != nil {
@@ -522,7 +524,7 @@ func TestCaseService_DeleteCaseAttachment_RemovesRow(t *testing.T) {
 			return nil
 		},
 	}
-	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	resp, err := svc.DeleteCaseAttachment(ctx, domain.DeleteAttachmentRequest{AttachmentID: testAttachmentID})
@@ -546,7 +548,7 @@ func TestCaseService_DeleteCaseAttachment_RejectsUnauthenticatedCaller(t *testin
 			return nil
 		},
 	}
-	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken("")
 
 	_, err := svc.DeleteCaseAttachment(ctx, domain.DeleteAttachmentRequest{AttachmentID: testAttachmentID})
@@ -564,7 +566,7 @@ func TestCaseService_DeleteCaseAttachment_NotFound(t *testing.T) {
 			return &apierror.NotFoundError{Msg: "attachment not found"}
 		},
 	}
-	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	_, err := svc.DeleteCaseAttachment(ctx, domain.DeleteAttachmentRequest{AttachmentID: testAttachmentID})
@@ -586,7 +588,7 @@ func TestCaseService_UpdateAttachment_RenamesFile(t *testing.T) {
 			return updatedOn, nil
 		},
 	}
-	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, actorUserRepo(t), nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	name := "renamed.log"
@@ -614,7 +616,7 @@ func TestCaseService_UpdateAttachment_RenamesFile(t *testing.T) {
 // ServiceNow path's validateAttachmentUpdate rule: description is not a
 // valid field to update for reference type "case".
 func TestCaseService_UpdateAttachment_RejectsDescriptionForCase(t *testing.T) {
-	svc := NewCaseService(&stubCaseRepo{}, actorUserRepo(t), nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(&stubCaseRepo{}, actorUserRepo(t), nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	name := "renamed.log"
@@ -636,7 +638,7 @@ func TestCaseService_UpdateAttachment_RejectsDescriptionForCase(t *testing.T) {
 // data source rejects the "deployment" reference type ServiceNow allows for
 // updates: deployment attachments have no Postgres schema backing here.
 func TestCaseService_UpdateAttachment_RejectsDeploymentReferenceType(t *testing.T) {
-	svc := NewCaseService(&stubCaseRepo{}, actorUserRepo(t), nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(&stubCaseRepo{}, actorUserRepo(t), nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	name := "renamed.log"
@@ -690,4 +692,222 @@ func errorsAsForbidden(err error, target **apierror.ForbiddenError) bool {
 		return true
 	}
 	return false
+}
+
+const testWorkItemID = "00000000-0000-0000-0000-0000000000d1"
+
+// TestCaseService_SearchCaseAttachments_WorkItemTypes proves change_request,
+// incident and conversation searches go through SearchWorkItemAttachments
+// (never the case path), echo the reference type, and fill pagination the
+// same way the case path does.
+func TestCaseService_SearchCaseAttachments_WorkItemTypes(t *testing.T) {
+	for _, rt := range []domain.ReferenceType{
+		domain.ReferenceTypeChangeRequest,
+		domain.ReferenceTypeIncident,
+		domain.ReferenceTypeConversation,
+	} {
+		t.Run(string(rt), func(t *testing.T) {
+			repo := &stubCaseRepo{
+				searchWorkItemAttachments: func(_ context.Context, id string, gotType domain.ReferenceType, p domain.Pagination) ([]domain.Attachment, int, error) {
+					if id != testWorkItemID || gotType != rt {
+						t.Fatalf("got id=%q type=%q, want %q/%q", id, gotType, testWorkItemID, rt)
+					}
+					if p.Limit != 1 || p.Offset != 0 {
+						t.Fatalf("unexpected pagination %+v", p)
+					}
+					return []domain.Attachment{{
+						ID:            testAttachmentID,
+						ReferenceID:   id,
+						ReferenceType: gotType,
+						Name:          "plan.pdf",
+						Type:          "application/pdf",
+						SizeBytes:     10,
+						CreatedBy:     domain.NewUserReference("", "jane.doe@example.com", "Jane Doe"),
+						CreatedOn:     time.Now(),
+						Status:        domain.AttachmentStatusComplete,
+					}}, 3, nil
+				},
+			}
+			svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
+			resp, err := svc.SearchCaseAttachments(context.Background(), domain.SearchAttachmentsRequest{
+				ReferenceID:   testWorkItemID,
+				ReferenceType: rt,
+				Pagination:    domain.Pagination{Limit: 1, Offset: 0},
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(resp.Attachments) != 1 || resp.Attachments[0].ReferenceType != rt {
+				t.Fatalf("unexpected attachments: %+v", resp.Attachments)
+			}
+			if resp.Total != 3 || resp.Limit != 1 || resp.Offset != 0 || !resp.HasMore {
+				t.Fatalf("pagination = total %d limit %d offset %d hasMore %v, want 3/1/0/true", resp.Total, resp.Limit, resp.Offset, resp.HasMore)
+			}
+		})
+	}
+}
+
+// TestCaseService_SearchCaseAttachments_WorkItemEmptyIsSuccess: no
+// attachments is total 0 and no error.
+func TestCaseService_SearchCaseAttachments_WorkItemEmptyIsSuccess(t *testing.T) {
+	repo := &stubCaseRepo{
+		searchWorkItemAttachments: func(context.Context, string, domain.ReferenceType, domain.Pagination) ([]domain.Attachment, int, error) {
+			return []domain.Attachment{}, 0, nil
+		},
+	}
+	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
+	resp, err := svc.SearchCaseAttachments(context.Background(), domain.SearchAttachmentsRequest{
+		ReferenceID:   testWorkItemID,
+		ReferenceType: domain.ReferenceTypeIncident,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Total != 0 || len(resp.Attachments) != 0 || resp.HasMore {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+}
+
+// TestCaseService_SearchCaseAttachments_CaseStaysOnCasePath: case must not
+// touch the work item method (the stub panics if it does).
+func TestCaseService_SearchCaseAttachments_CaseStaysOnCasePath(t *testing.T) {
+	called := false
+	repo := &stubCaseRepo{
+		searchCaseAttachments: func(_ context.Context, id string, _ domain.Pagination) ([]domain.Attachment, int, error) {
+			called = true
+			return nil, 0, nil
+		},
+	}
+	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
+	if _, err := svc.SearchCaseAttachments(context.Background(), domain.SearchAttachmentsRequest{
+		ReferenceID:   testCaseID,
+		ReferenceType: domain.ReferenceTypeCase,
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !called {
+		t.Fatal("case search did not use SearchCaseAttachments")
+	}
+}
+
+// TestCaseService_SearchCaseAttachments_UnsupportedType: deployment and
+// unknown types stay a validation error, before any repository call.
+func TestCaseService_SearchCaseAttachments_UnsupportedType(t *testing.T) {
+	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
+	for _, rt := range []domain.ReferenceType{domain.ReferenceTypeDeployment, "bogus", ""} {
+		_, err := svc.SearchCaseAttachments(context.Background(), domain.SearchAttachmentsRequest{
+			ReferenceID:   testWorkItemID,
+			ReferenceType: rt,
+		})
+		var ve *apierror.ValidationError
+		if !errors.As(err, &ve) {
+			t.Fatalf("type %q: want ValidationError, got %v", rt, err)
+		}
+		if !strings.Contains(ve.Msg, "not supported for this data source") {
+			t.Fatalf("type %q: unclear message %q", rt, ve.Msg)
+		}
+	}
+}
+
+// stubAttachmentSearchMirror is a mirror CaseService that only implements
+// SearchCaseAttachments; any other method panics via the nil embed.
+type stubAttachmentSearchMirror struct {
+	CaseService
+	search func(ctx context.Context, req domain.SearchAttachmentsRequest) (domain.SearchAttachmentsResponse, error)
+	calls  int
+}
+
+func (m *stubAttachmentSearchMirror) SearchCaseAttachments(ctx context.Context, req domain.SearchAttachmentsRequest) (domain.SearchAttachmentsResponse, error) {
+	m.calls++
+	return m.search(ctx, req)
+}
+
+// TestCaseService_SearchCaseAttachments_DeploymentDualWrite covers the
+// deployment stopgap: delegated to the mirror only when one is configured.
+func TestCaseService_SearchCaseAttachments_DeploymentDualWrite(t *testing.T) {
+	mirrorErr := errors.New("mirror unavailable")
+	mirrorResp := domain.SearchAttachmentsResponse{
+		Attachments: []domain.Attachment{{ID: testAttachmentID, ReferenceID: testWorkItemID, ReferenceType: domain.ReferenceTypeDeployment, Name: "plan.pdf"}},
+		Total:       1, Limit: 10, Offset: 0,
+	}
+	tests := []struct {
+		name        string
+		refType     domain.ReferenceType
+		withMirror  bool
+		mirrorErr   error
+		wantMirror  int
+		wantRepo    bool
+		wantErr     error
+		wantValid   bool
+		wantMirrorR bool
+	}{
+		{name: "dual-write deployment delegates to mirror", refType: domain.ReferenceTypeDeployment, withMirror: true, wantMirror: 1, wantMirrorR: true},
+		{name: "dual-write deployment returns mirror error", refType: domain.ReferenceTypeDeployment, withMirror: true, mirrorErr: mirrorErr, wantMirror: 1, wantErr: mirrorErr},
+		{name: "plain postgres deployment is a validation error", refType: domain.ReferenceTypeDeployment, withMirror: false, wantValid: true},
+		{name: "dual-write case stays on postgres", refType: domain.ReferenceTypeCase, withMirror: true, wantRepo: true},
+		{name: "dual-write incident stays on postgres", refType: domain.ReferenceTypeIncident, withMirror: true, wantRepo: true},
+		{name: "dual-write bogus type is a validation error", refType: "bogus", withMirror: true, wantValid: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			repoCalled := false
+			repo := &stubCaseRepo{
+				searchCaseAttachments: func(context.Context, string, domain.Pagination) ([]domain.Attachment, int, error) {
+					repoCalled = true
+					return nil, 0, nil
+				},
+				searchWorkItemAttachments: func(context.Context, string, domain.ReferenceType, domain.Pagination) ([]domain.Attachment, int, error) {
+					repoCalled = true
+					return nil, 0, nil
+				},
+			}
+			mirror := &stubAttachmentSearchMirror{
+				search: func(_ context.Context, req domain.SearchAttachmentsRequest) (domain.SearchAttachmentsResponse, error) {
+					if req.ReferenceID != testWorkItemID || req.ReferenceType != domain.ReferenceTypeDeployment {
+						t.Fatalf("mirror got %q/%q", req.ReferenceID, req.ReferenceType)
+					}
+					if tc.mirrorErr != nil {
+						return domain.SearchAttachmentsResponse{}, tc.mirrorErr
+					}
+					return mirrorResp, nil
+				},
+			}
+			var svc CaseService
+			if tc.withMirror {
+				svc = NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, nil, mirror, nil, "")
+			} else {
+				svc = NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
+			}
+			id := testWorkItemID
+			if tc.refType == domain.ReferenceTypeCase {
+				id = testCaseID
+			}
+			resp, err := svc.SearchCaseAttachments(context.Background(), domain.SearchAttachmentsRequest{ReferenceID: id, ReferenceType: tc.refType})
+
+			if mirror.calls != tc.wantMirror {
+				t.Fatalf("mirror calls = %d, want %d", mirror.calls, tc.wantMirror)
+			}
+			if repoCalled != tc.wantRepo {
+				t.Fatalf("repo called = %v, want %v", repoCalled, tc.wantRepo)
+			}
+			switch {
+			case tc.wantErr != nil:
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("err = %v, want %v", err, tc.wantErr)
+				}
+			case tc.wantValid:
+				var ve *apierror.ValidationError
+				if !errors.As(err, &ve) {
+					t.Fatalf("want ValidationError, got %v", err)
+				}
+			default:
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
+			if tc.wantMirrorR && (resp.Total != 1 || len(resp.Attachments) != 1 || resp.Attachments[0].ID != testAttachmentID) {
+				t.Fatalf("response not passed through from mirror: %+v", resp)
+			}
+		})
+	}
 }

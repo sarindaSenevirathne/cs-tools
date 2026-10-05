@@ -17,23 +17,31 @@
 import {
   AlertOctagon,
   AlertTriangle,
+  BarChart3,
   Briefcase,
+  BookOpen,
   Bug,
   Building2,
+  CalendarClock,
+  CalendarDays,
   ChartColumn,
   Clock,
   ClipboardList,
   Cog,
   FileWarning,
+  FolderKanban,
   GitPullRequest,
   Headset,
+  HeartPulse,
   KeyRound,
+  Layers,
   LifeBuoy,
   Megaphone,
   RefreshCw,
   Settings,
   Shield,
   UserCog,
+  UserSearch,
   Users,
   UsersRound,
 } from "@wso2/oxygen-ui-icons-react";
@@ -174,6 +182,12 @@ export const CSM_NAV_ITEMS: CsmNavSection[] = [
     icon: Briefcase,
   },
   {
+    id: "announcements",
+    label: "Announcements",
+    href: "/announcements",
+    icon: Megaphone,
+  },
+  {
     id: "security-center",
     label: "Security Center",
     href: "/security-center",
@@ -199,26 +213,6 @@ export const CSM_NAV_ITEMS: CsmNavSection[] = [
     ],
   },
   {
-    id: "updates",
-    label: "Updates",
-    href: "/updates",
-    requires: "canUseTimeCardsAndUpdates",
-    icon: RefreshCw,
-  },
-  {
-    id: "time-cards",
-    label: "Time cards",
-    href: "/time-cards",
-    requires: "canUseTimeCardsAndUpdates",
-    icon: Clock,
-  },
-  {
-    id: "announcements",
-    label: "Announcements",
-    href: "/announcements",
-    icon: Megaphone,
-  },
-  {
     id: "customers",
     label: "Customers",
     href: "/customers",
@@ -235,6 +229,62 @@ export const CSM_NAV_ITEMS: CsmNavSection[] = [
         href: "/customers/projects",
       },
     ],
+  },
+  {
+    id: "kb-articles",
+    label: "Knowledge",
+    href: "/knowledge",
+    icon: BookOpen,
+    children: [
+      {
+        id: "kb-articles.all",
+        label: "All",
+        href: "/knowledge/all",
+      },
+      {
+        id: "kb-articles.to-review",
+        label: "To Review",
+        href: "/knowledge/to-review",
+      },
+      {
+        id: "kb-articles.my",
+        label: "My",
+        href: "/knowledge/my-articles",
+      },
+      {
+        id: "kb-articles.admin",
+        label: "Admin",
+        href: "/knowledge/admin",
+      },
+    ],
+  },
+  // PLG Customer Success Portal. Declared in
+  // features/plg/config/plgNavItems so a change to PLG's pages does not
+  // touch this file. Hide the whole section with
+  // CSM_PORTAL_FEATURE_OVERRIDES: { "plg": "hidden" }.
+  PLG_NAV_SECTION,
+  {
+    id: "updates",
+    label: "Updates",
+    href: "/updates",
+    requires: "canUseTimeCardsAndUpdates",
+    icon: RefreshCw,
+  },
+  {
+    id: "time-cards",
+    label: "Time cards",
+    href: "/time-cards",
+    requires: "canUseTimeCardsAndUpdates",
+    icon: Clock,
+  },
+  {
+    id: "team-schedule",
+    label: "Team Schedule",
+    href: "/team-schedule",
+    // No `requires`: the rota is readable by everyone who can open the portal.
+    // Editing it is a lead's job and will gate on its own flag when the write
+    // routes land.
+    icon: CalendarDays,
   },
   {
     id: "admin",
@@ -356,11 +406,56 @@ export const CSM_NAV_ITEMS: CsmNavSection[] = [
       { id: "help.settings", label: "Settings", href: "/help#settings" },
     ],
   },
-  // PLG Customer Success Portal. Declared in
-  // features/plg/config/plgNavItems so a change to PLG's pages does not
-  // touch this file. Hide the whole section with
-  // CSM_PORTAL_FEATURE_OVERRIDES: { "plg": "hidden" }.
-  PLG_NAV_SECTION,
+  // Support Portal Lite — Sales/Solutions-Architecture staff only, ported
+  // from the former standalone apps/support-portal-lite/webapp. Rendered as
+  // its OWN exclusive left nav (this node's children, flattened, replacing
+  // the CS nav entirely) rather than merged into the CS section list above —
+  // see usePortalView.ts and CsmSideBar.tsx. Route access is still gated by
+  // useAccess (client-side Asgardeo groups), NOT this app's usual
+  // per-page feature-flag/roles mechanism — see App.tsx's RouteGuard for
+  // where that check actually happens; this section still exists in the
+  // tree unconditionally so CSM_PORTAL_FEATURE_OVERRIDES' WIP/hidden
+  // mechanism works on it too, on top of the audience gate.
+  {
+    id: "viewer",
+    label: "Sales / Solutions Architecture",
+    href: "/spl/cases",
+    icon: Layers,
+    children: [
+      { id: "viewer.cases", label: "Cases", href: "/spl/cases", icon: Layers },
+      {
+        id: "viewer.accounts",
+        label: "Accounts",
+        href: "/spl/accounts",
+        icon: Building2,
+        // /spl/my-accounts is the same feature (an in-page My/All toggle on
+        // AccountsPage, no nav entry of its own — see App.tsx) so it must
+        // roll up to this node too, or landing there would fall through to
+        // no active nav highlight at all.
+        routes: ["/spl/my-accounts"],
+      },
+      { id: "viewer.projects", label: "Projects", href: "/spl/projects", icon: FolderKanban },
+      {
+        id: "viewer.team-schedule",
+        label: "Team schedule",
+        href: "/spl/team-schedule",
+        icon: CalendarClock,
+      },
+      { id: "viewer.user-scan", label: "User scan", href: "/spl/user-scan", icon: UserSearch },
+      {
+        id: "viewer.usage-metrics",
+        label: "Usage metrics",
+        href: "/spl/usage-metrics",
+        icon: BarChart3,
+      },
+      {
+        id: "viewer.customer-health",
+        label: "Customer health",
+        href: "/spl/customer-health",
+        icon: HeartPulse,
+      },
+    ],
+  },
 ];
 
 /** The pathname part of `href`, dropping any query string or hash. */
@@ -436,6 +531,14 @@ export interface CsmNavMatch {
  * prefix. `/operations/incidents/42` resolves to the Incidents tab rather than
  * to Operations, which is what lets a single finished tab stay reachable inside
  * an otherwise-unfinished section.
+ *
+ * On a length tie, the later match wins (`>=`, not `>`) — `flattenNavNodes`
+ * yields parents before their children, and a section whose `href` is just an
+ * alias for its own landing child (e.g. "viewer"'s href and "viewer.cases"'s
+ * href are both "/spl/cases", since the section has no dedicated landing page of
+ * its own) would otherwise have the parent win a same-length tie against the
+ * more specific child it's aliasing — surfacing as the child never being the
+ * one reported active for its own path.
  */
 export function navNodeMatchForPath(pathname: string): CsmNavMatch | undefined {
   let best: CsmNavMatch | undefined;
@@ -444,7 +547,7 @@ export function navNodeMatchForPath(pathname: string): CsmNavMatch | undefined {
     for (const prefix of navNodeRoutes(node)) {
       if (
         matchesPrefix(pathname, prefix) &&
-        prefix.length > (best?.prefix.length ?? -1)
+        prefix.length >= (best?.prefix.length ?? -1)
       ) {
         best = { node, prefix };
       }

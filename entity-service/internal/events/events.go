@@ -37,27 +37,6 @@ const (
 	TypeCaseAcknowledged Type = "case.acknowledged"
 	TypeSeverityChanged  Type = "case.severity_changed"
 	TypeIncidentCreated  Type = "incident.created"
-	// TypeCaseBillableStatusChanged is Postgres-data-source-only (unlike
-	// every other type here, which is ServiceNow-only) — see
-	// CaseBillableStatusChangedPayload's own doc comment for what it's for
-	// and why the two data sources aren't symmetric here.
-	//
-	// TODO: the consumer group plumbing exists on the
-	// csm-notification-service side (its own dedicated consumer group,
-	// internal/timecardengine.Engine — not folded into dispatch.Dispatcher's
-	// group, since eventbus.Consumer.Run processes one record at a time,
-	// fully sequentially/blocking, and a bulk update over "several time
-	// cards" must not delay unrelated email/Chat delivery on the same
-	// consumer instance), but its Handle only logs today — the actual
-	// reaction (bulk-flip every time card on the case to match
-	// Payload.IsBillable) needs a time_cards table/repo/service on this
-	// data source first (it has none today; time cards are
-	// ServiceNow-only, see internal/service/sn_time_card_service.go).
-	// Publishing this event is therefore still commented out at its one
-	// call site (case_service.go's UpdateCase) — the detection logic is
-	// real and live, only the actual Publish call is inert, so there's
-	// nothing for that consumer to receive yet either.
-	TypeCaseBillableStatusChanged Type = "case.billable_status_changed"
 	// TypeProjectContactInvited is Postgres-data-source-only. Published by
 	// the Salesforce membership ingest (salesforceEventService) after a
 	// Project_Contact__c in state INVITED / RE-INVITED has been written to the
@@ -65,6 +44,24 @@ const (
 	// identity (via scim-operations-service) and send the invitation email —
 	// see ProjectContactInvitedPayload. Keyed by the Salesforce membership Id.
 	TypeProjectContactInvited Type = "project_contact.invited"
+	// TypeSLAClockRegister belongs to csm-notification-service's own
+	// internal/slaengine, not its internal/dispatch — see
+	// SLAClockRegisterPayload's own doc comment. Published once, from
+	// sn_case_service.go's publishCaseCreated; unlike every payload above,
+	// there is no separate "tier reached"/breach event type here —
+	// csm-notification-service's slaengine owns that half of the mechanism
+	// entirely (it also sends the Google Chat breach alert directly,
+	// without a second event round-trip through this topic).
+	TypeSLAClockRegister Type = "sla.clock.register"
+	// TypeKBArticlePublished is published when a KB article transitions
+	// to the published state, for csm-notification-service's Flow 2
+	// (embedding -> Pinecone) to consume on its own dedicated handling,
+	// same reasoning as TypeSLAClockRegister above -- not an email/Chat
+	// trigger, so no Recipients field.
+	TypeKBArticlePublished Type = "kb.article_published"
+	// TypeProjectContactRegistered is published when a membership moves into
+	// REGISTERED; csm-notification-service sends the Welcome email.
+	TypeProjectContactRegistered Type = "project_contact.registered"
 )
 
 // Envelope is the wire shape of every record on the case-events topic.
@@ -113,6 +110,46 @@ type CommentAddedPayload struct {
 	// distinct email layout for it.
 	IsInternalNote bool     `json:"isInternalNote,omitempty"`
 	Recipients     []string `json:"recipients"`
+	// AuthorEmail is the comment author's own resolved email -- already
+	// available at publish time (the same author lookup that resolves Name
+	// above), added so csm-notification-service can classify the author as
+	// internal/external (the same role-then-domain classification
+	// internal/recipientlinks already applies to a *recipient's* email) to
+	// decide whether to run frustration detection on this comment. Empty
+	// when the author couldn't be resolved -- csm-notification-service skips
+	// the check rather than guessing.
+	AuthorEmail string `json:"authorEmail,omitempty"`
+	// Product is the case's deployed product's display name (e.g. "WSO2 API
+	// Manager"), the same value CaseCreatedPayload.Product carries -- purely
+	// display, shown on a frustration-detection Chat alert's card, if one is
+	// sent.
+	Product string `json:"product,omitempty"`
+	// Team/IsEvaluationAccount/ProjectOnboardingStatus let
+	// csm-notification-service route a frustration-detection Chat alert
+	// through chataudience.Resolve the same way an SLA breach alert is
+	// routed -- team-based, with the Evaluation/Onboarding/Americas/weekend
+	// overlays -- rather than always the fixed Incident Monitor audience.
+	// Team is the case's account's CRE team display name (e.g. "Castor"),
+	// the same value CaseCreatedPayload.Team carries. IsEvaluationAccount/
+	// ProjectOnboardingStatus are Postgres-only facts (see
+	// CaseRepository.ProjectOnboardingInfo) and are the zero value on a pure
+	// ServiceNow deployment with no Postgres pool configured -- Resolve
+	// treats that the same as "not an evaluation account, no onboarding
+	// status," not an error.
+	Team                    string `json:"team,omitempty"`
+	IsEvaluationAccount     bool   `json:"isEvaluationAccount,omitempty"`
+	ProjectOnboardingStatus string `json:"projectOnboardingStatus,omitempty"`
+}
+
+// KBArticlePublishedPayload is the Payload shape for
+// TypeKBArticlePublished. KnowledgeArticleID mirrors Envelope's own
+// EntityID (validated to match, same pattern as CaseID on every other
+// payload here) -- kept as an explicit field anyway rather than relying
+// on EntityID alone, matching how every other payload in this file does
+// it, since a consumer decoding just the payload (without inspecting the
+// envelope) still gets a complete, self-describing record.
+type KBArticlePublishedPayload struct {
+	KnowledgeArticleID string `json:"knowledgeArticleId"`
 }
 
 // StatusChangedPayload is the Payload shape for TypeStatusChanged — mirrors
@@ -200,28 +237,6 @@ type SeverityChangedPayload struct {
 	Recipients []string `json:"recipients"`
 }
 
-// CaseBillableStatusChangedPayload is the Payload shape for
-// TypeCaseBillableStatusChanged — published (once a consumer exists — see
-// that type's own TODO) when a case's severity crosses into or out of LOW
-// on the Postgres data source. Type is always "case" and fixed forever for
-// a Postgres-backed case (see case_service.go's UpdateCase, which rejects
-// changing Type at all on this data source), so unlike the ServiceNow data
-// source — where Type can transfer between case/engagement/service_request
-// and severity is only ever meaningful for Type=="case" — the "does this
-// case count as S4 (WSO2's own support-policy tier for LOW severity, see
-// entity-service's sla_policy.go)" question collapses to a single check:
-// is the new severity LOW or not. IsBillable is the resulting target state
-// (true entering LOW, false leaving it) — precomputed here rather than left
-// for a consumer to re-derive from raw severity strings, since severity's
-// mapping to "billable" is business policy this service already owns (the
-// same reasoning sla_policy.go already established for SLA durations).
-// No Recipients/Product/Team: this event has no notification reaction at
-// all, only the (not yet built) time-card side effect.
-type CaseBillableStatusChangedPayload struct {
-	CaseID     string `json:"caseId"`
-	IsBillable bool   `json:"isBillable"`
-}
-
 // CaseCreatedPayload is the Payload shape for TypeCaseCreated — mirrors
 // csm-notification-service's own CaseCreatedPayload (its internal/events/
 // validate.go is the schema authority; keep this in sync by hand the same
@@ -250,11 +265,11 @@ type CaseCreatedPayload struct {
 	// dispatch.Dispatcher falls back to DEFAULT_CHAT_PRODUCT, same as before
 	// this field was populated.
 	Product string `json:"product,omitempty"`
-	// Team is the case's account's CRE team display name (e.g. "Team Nova")
+	// Team is the case's account's CRE team display name (e.g. "Castor")
 	// — cv.AccountDetails.CreTeam.Name, "" when the case has no account or
-	// the account has no CRE team assigned. A purely-display value in
-	// csm-notification-service's Chat cards, same as Product; unlike
-	// Product, it plays no role in routing. Depends on ServiceNow's
+	// the account has no CRE team assigned. Displayed in
+	// csm-notification-service's Chat cards — purely a display value there,
+	// no routing role (unlike Product). Depends on ServiceNow's
 	// case-embedded account object actually carrying creTeam/sreTeam — see
 	// caseTeamName's own doc comment for the current caveat around that.
 	Team        string   `json:"team,omitempty"`
@@ -318,5 +333,19 @@ type ProjectContactInvitedPayload struct {
 	// is what was actually asked for. Omitted on every ordinary invitation,
 	// so the wire shape is unchanged for them. Mirror any change here in
 	// csm-notification-service's own copy of this struct.
-	Resend bool `json:"resend,omitempty"`
+	Resend bool `json:"isResend,omitempty"`
+}
+
+// ProjectContactRegisteredPayload is the payload of TypeProjectContactRegistered.
+// csm-notification-service decodes it strictly: keep both copies identical.
+type ProjectContactRegisteredPayload struct {
+	MembershipSfID    string `json:"membershipSfId"`
+	ContactSfID       string `json:"contactSfId"`
+	Email             string `json:"email"`
+	GivenName         string `json:"givenName"`
+	FamilyName        string `json:"familyName"`
+	ProjectName       string `json:"projectName"`
+	ProjectKey        string `json:"projectKey"`
+	IsIntegrationUser bool   `json:"isIntegrationUser,omitempty"`
+	EventModifiedOn   string `json:"eventModifiedOn,omitempty"`
 }

@@ -46,7 +46,7 @@ an error, which is the single most confusing failure mode here.
 | `GITHUB_TOKEN` | yes | Needs **`repo` scope** — outbound calls `POST /repos/{owner}/{repo}/dispatches`. |
 | `GITHUB_INTEGRATION_LOGIN` | yes | The login this service raises issues under, from a case. **Not** `github-actions[bot]` — see §3. |
 | `CSM_PORTAL_BASE_URL` | yes | **Must be the Postgres-backed portal.** Every outbound comment embeds a link built from this; a host backed by another database cannot resolve the record id. |
-| `AUTH_INTERNAL_CLIENT_IDS` | yes* | Must include any client calling `POST /github/service-requests`; that endpoint rejects everything else. |
+| `M2M_CLIENT_IDS` | yes* | Must include any client calling `POST /github/service-requests`; that endpoint rejects everything else. |
 | `GITHUB_OUTBOUND_INTERVAL` | no | Worker poll interval, default **15s**. |
 | `GITHUB_LABEL_*`, `GITHUB_LABELS_CLASS` | no | Label overrides; defaults match `labels.yml`. An override that does not parse, or whose class value is outside *Normal / Standard / Emergency Change*, is a **startup error**, never a silent fallback. |
 
@@ -75,18 +75,18 @@ without it will pass validation and create nothing.
 
 ## 4. Migrations
 
-Apply `000067`–`000074` in order. Then verify the objects exist — applying
+Apply `0108`–`0115` in order. Then verify the objects exist — applying
 cleanly says nothing about what a migration contained:
 
 ```sql
--- the issue link lives on work_item, not on "case" (000071)
+-- the issue link lives on work_item, not on "case" (0112)
 SELECT 1 FROM information_schema.columns
  WHERE table_name='work_item' AND column_name='github_issue_number';
 
--- one record per issue, per account (000073)
+-- one record per issue, per account (0114)
 SELECT 1 FROM pg_indexes WHERE indexname='work_item_account_github_issue_uniq';
 
--- numbering for issue-raised records (000072)
+-- numbering for issue-raised records (0113)
 SELECT proname FROM pg_proc WHERE proname LIKE 'next_github_service_request%';
 --   next_github_service_request_number     -> SR-GH-000001
 --   next_github_service_request_wso2_id    -> WSO2-GH-000001  (required by
@@ -101,8 +101,8 @@ SELECT tgname FROM pg_trigger WHERE NOT tgisinternal AND tgname LIKE '%github%';
 --   service_request_created_github_notice   the "Created in CSM" announcement
 ```
 
-`000071` replaces four trigger functions **in the same transaction** that moves
-the column they read. That is deliberate: `000069` had already shipped, so
+`0112` replaces four trigger functions **in the same transaction** that moves
+the column they read. That is deliberate: `0110` had already shipped, so
 editing it in place would leave every existing database running the old bodies
 against a column that no longer exists.
 
@@ -187,8 +187,13 @@ routes unmount. To stop pushes without a deploy:
 UPDATE account_github_repo SET is_active = FALSE;   -- closes gate 1
 ```
 
-Queued rows stay queued and resume when re-enabled. `000067`–`000074` each have
-a working `.down.sql`; `000071`'s restores the shipped trigger bodies.
+Queued rows stay queued and resume when re-enabled. Schema rollback is a new
+forward migration under this repo's current convention (single forward-only
+`NNNN_<description>.sql` files — see `CLAUDE.md`'s "Database migrations"
+section), not a scripted `.down.sql`: reverting `0108`–`0115` means writing the
+inverse DDL as a new migration after the current tip, including restoring
+`0112`'s four trigger function bodies to what they were before it moved their
+column.
 
 ## 9. Known gaps
 

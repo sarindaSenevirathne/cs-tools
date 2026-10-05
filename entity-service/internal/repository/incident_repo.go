@@ -25,7 +25,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
@@ -37,11 +36,14 @@ import (
 //
 // IncidentView/SearchIncidentView render State/Priority/Category/Subcategory/
 // ContactType/ResolutionCode as plain, unvalidated strings (per those types'
-// own field comments), so reads need no enum reconciliation against
-// domain.IncidentState/IncidentPriority/etc at all -- the real enum column
-// text is simply passed through. Only the SEARCH FILTER path uses those
-// strict domain enums (SearchIncidentsFilters.Priorities, the generic
-// Filters array's "state"), and three of them have real, easy-to-miss
+// own field comments), and the real enum column text is passed through --
+// except where a label differs from the value the API accepts and the
+// ServiceNow data source returns: state 'CANCELED', resolution code
+// 'SOLVED_WORK_AROUND'/'NOT_ACTIONABLE_ALERT' and contact type 'SITE_24_7'
+// are mapped back on read (incidentStateFromEnum and its siblings), so a
+// client sees the same values in both data sources. The SEARCH FILTER path
+// uses the strict domain enums (SearchIncidentsFilters.Priorities, the
+// generic Filters array's "state"), and three of them have real, easy-to-miss
 // mismatches against their Postgres enum's actual labels:
 //   - incident_state_enum's "canceled" label is spelled with one L
 //     ('CANCELED'), not domain.IncidentStateCancelled's two ("CANCELLED").
@@ -52,11 +54,8 @@ import (
 //
 // See incidentStateToEnum/incidentPriorityToEnum for both mappings.
 //
-// CreateIncident (the plain, non-SN-first path)/UpdateIncident/
-// HandOffIncidentToSpecialist have no Postgres implementation: CreateIncident
-// needs work_item.number, which has no DB default or backing sequence
-// anywhere in migrations/ (same blocker as CaseRepository.CreateCase);
-// UpdateIncident touches several fields with no backing column at all
+// UpdateIncident/HandOffIncidentToSpecialist have no Postgres
+// implementation: UpdateIncident touches several fields with no backing column at all
 // (AssignmentGroupID, ConfigurationItemID, WatchList) alongside ones that do,
 // and would need comment-table side effects for AdditionalComments/WorkNotes
 // -- deferred as a unit rather than half-implemented;
@@ -69,6 +68,10 @@ import (
 // DATA_SOURCE=postgres-servicenow-dual-write's SN-first incident creation,
 // where identity comes from ServiceNow rather than being generated here.
 type IncidentRepository interface {
+	// SupportGroupOfService returns the service's support group id, or ""
+	// when the service has none or does not exist. CreateIncident uses it to
+	// derive an incident's assignment group from its service.
+	SupportGroupOfService(ctx context.Context, serviceID string) (string, error)
 	// SearchIncidents returns a filtered, sorted, paginated slice of
 	// incidents together with the total count of matching rows before
 	// pagination. priorities/states are the already-mapped Postgres enum
@@ -114,7 +117,7 @@ type IncidentRepository interface {
 	// incident creation (see incidentService.createIncidentSNFirst's own doc
 	// comment). Unlike CaseRepository.CreateCaseFromServiceNow, no wso2ID
 	// parameter exists here: work_item.wso2_id is only required (by the
-	// work_item_wso2_id_required_by_type CHECK constraint, migration 000016)
+	// work_item_wso2_id_required_by_type CHECK constraint, migration 0021)
 	// for CASE/SERVICE_REQUEST/ANNOUNCEMENT/ENGAGEMENT/
 	// SECURITY_REPORT_ANALYSIS -- INCIDENT is deliberately excluded from that
 	// list, and ServiceNow's own incident-create response
@@ -136,20 +139,80 @@ type IncidentRepository interface {
 	// "DOS/ DDOS"), which has no established mapping back from
 	// domain.IncidentSubcategory's enum spelling (e.g. IP_ADDRESS,
 	// DOS_DDOS) anywhere in this codebase yet -- same class of gap as
-	// incidentWhereClause's already-documented assignmentGroupId/productName
-	// "accepted but not applied" fields. req.ConfigurationItemID and
-	// req.AssignmentGroupID are also not applied, for the same
-	// no-backing-column reason UpdateIncident's own doc comment already
-	// gives.
+	// incidentWhereClause's already-documented productName "accepted but
+	// not applied" field. req.ConfigurationItemID is also not applied, for
+	// the same no-backing-column reason UpdateIncident's own doc comment
+	// already gives. req.AssignmentGroupID, by contrast, DOES have a
+	// backing column (work_item.assignment_group_id, migration 0075) and
+	// IS written here.
 	CreateIncidentFromServiceNow(ctx context.Context, req domain.CreateIncidentRequest, id, number, createdBy string) (domain.CreateIncidentResponse, error)
+	// CreateIncident inserts a new incident row (both work_item and
+	// "incident") for the plain-Postgres data source (no ServiceNow at all)
+	// -- createIncidentPortalQuery's own doc comment has the full
+	// field-by-field reasoning, which mirrors CreateIncidentFromServiceNow's
+	// exactly except identity (id/number) is generated here via
+	// gen_random_uuid()/next_portal_work_item_number() instead of being
+	// supplied by a prior ServiceNow response, and createdBy is the calling
+	// user's own resolved email rather than ServiceNow's echoed value.
+	//
+	// priority is the incident_priority_enum label the service derived from
+	// impact x urgency; subcategoryValue is the ServiceNow choice value of
+	// req.Subcategory (incident_subcategory.value), resolved to its row here.
+	// req.AdditionalComments/WorkNotes become COMMENT/WORK_NOTE rows and
+	// req.WatchList becomes work_item_watcher rows, all in the same
+	// transaction as the record itself.
+	CreateIncident(ctx context.Context, req domain.CreateIncidentRequest, priority string, subcategoryValue *string, createdBy string) (domain.CreateIncidentResponse, error)
+	// UpdateIncidentLifecycle writes an incident's state transition and the
+	// fields that travel with one -- the PATCH the portal sends to move an
+	// incident to In Progress (with an optional assignedEngineerId claim),
+	// On Hold, Resolved/Closed (with resolutionCode/resolutionNotes), or
+	// Cancelled. See IncidentLifecycleUpdate for the field-by-field rules.
+	// One transaction. Returns NotFoundError when id is not an incident the
+	// caller can see, and ValidationError for an unknown assignee/resolver or
+	// a Resolved/Closed target with no resolution code or notes.
+	UpdateIncidentLifecycle(ctx context.Context, id string, u IncidentLifecycleUpdate, actorEmail string) error
+}
+
+// IncidentLifecycleUpdate is UpdateIncidentLifecycle's input. Every field is
+// optional; nil leaves the column unchanged. Enum fields already carry their
+// Postgres label (the service maps domain values -- e.g. CANCELLED to
+// 'CANCELED', SOLVED_WORKAROUND to 'SOLVED_WORK_AROUND' -- before calling).
+//
+// The rules mirror what ServiceNow enforces on the same transitions: no
+// state requires an assignee or assignment group (In Progress included), and
+// no old-state -> new-state legality is checked (the portal's own
+// getLegalNextIncidentStates is a UI guardrail, not an SN rule). Resolved and
+// Closed need a resolution code and resolution notes, taken from the request
+// or already on the record. Entering Resolved stamps resolved_on, and
+// resolved_by_id from ResolvedByID, falling back to DefaultResolvedByID.
+type IncidentLifecycleUpdate struct {
+	State               *string // incident_state_enum label
+	AssignedEngineerID  *string
+	ResolutionCode      *string // incident_resolution_code_enum label
+	ResolutionNotes     *string // incident.close_notes
+	ResolvedByID        *string
+	DefaultResolvedByID *string // the acting user, used only when entering Resolved without ResolvedByID
 }
 
 type incidentRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
+}
+
+// SupportGroupOfService implements IncidentRepository.
+func (r *incidentRepo) SupportGroupOfService(ctx context.Context, serviceID string) (string, error) {
+	var group *string
+	err := r.db.QueryRow(ctx, `SELECT support_group_id::text FROM service WHERE id = $1::uuid`, serviceID).Scan(&group)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && group == nil) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read support group of service %s: %w", serviceID, err)
+	}
+	return *group, nil
 }
 
 // NewIncidentRepository constructs an IncidentRepository backed by the given connection pool.
-func NewIncidentRepository(db *pgxpool.Pool) IncidentRepository {
+func NewIncidentRepository(db *Scoped) IncidentRepository {
 	return &incidentRepo{db: db}
 }
 
@@ -272,7 +335,7 @@ func scanSearchIncidentView(row interface{ Scan(...any) error }) (domain.SearchI
 	}
 	v := domain.SearchIncidentView{
 		ID: &id, Number: &number, Subject: &subject,
-		Priority: priority, State: state, Category: category,
+		Priority: priority, State: incidentStateFromEnum(state), Category: category,
 		CreatedOn: createdOn.UTC().Format(time.RFC3339), CreatedBy: createdBy,
 		UpdatedOn: updatedOn.UTC().Format(time.RFC3339), UpdatedBy: updatedBy,
 	}
@@ -400,6 +463,9 @@ func (r *incidentRepo) AggregateIncidents(ctx context.Context, req domain.Search
 		if err := rows.Scan(&key, &count); err != nil {
 			return domain.AggregateResponse{}, fmt.Errorf("scan incident bucket: %w", err)
 		}
+		if groupBy == "state" {
+			key = *incidentStateFromEnum(&key)
+		}
 		lowerKey := strings.ToLower(key)
 		buckets = append(buckets, domain.AggregateBucket{Key: lowerKey, Label: lowerKey, Count: count})
 		totalRecords += count
@@ -439,9 +505,11 @@ func (r *incidentRepo) GetIncidentByID(ctx context.Context, id string) (domain.I
 		       caused_by_cr.id, caused_by_wi.number,
 		       inc.resolution_code::TEXT, inc.close_notes,
 		       rb.id, COALESCE(rb.name, NULLIF(TRIM(CONCAT_WS(' ', rb.first_name, rb.last_name)), '')),
-		       inc.resolved_on, inc.incident_report,
-		       wi.created_on, wi.created_by, wi.updated_on, wi.updated_by
+		       inc.resolved_on, inc.incident_report, wi.description,
+		       wi.created_on, wi.created_by, wi.updated_on, wi.updated_by,
+		       ag.id, ag.name
 		` + incidentFromJoins + `
+		LEFT JOIN "group" ag ON ag.id = wi.assignment_group_id
 		WHERE wi.id = $1 AND wi.type = 'INCIDENT'`
 
 	var (
@@ -461,8 +529,10 @@ func (r *incidentRepo) GetIncidentByID(ctx context.Context, id string) (domain.I
 		rbID, rbName                       *string
 		resolvedOn                         *time.Time
 		incidentReport                     *string
+		description                        *string
 		createdOn, updatedOn               time.Time
 		createdBy, updatedBy               string
+		agID, agName                       *string
 	)
 	err := r.db.QueryRow(ctx, query, id).Scan(
 		&id2, &number, &subject, &openedOn,
@@ -478,8 +548,9 @@ func (r *incidentRepo) GetIncidentByID(ctx context.Context, id string) (domain.I
 		&causedByID, &causedByNumber,
 		&resolutionCode, &closeNotes,
 		&rbID, &rbName,
-		&resolvedOn, &incidentReport,
+		&resolvedOn, &incidentReport, &description,
 		&createdOn, &createdBy, &updatedOn, &updatedBy,
+		&agID, &agName,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.IncidentView{}, &apierror.NotFoundError{Msg: "incident not found"}
@@ -490,9 +561,10 @@ func (r *incidentRepo) GetIncidentByID(ctx context.Context, id string) (domain.I
 
 	v := domain.IncidentView{
 		ID: &id2, Number: &number, Subject: &subject,
-		Priority: priority, State: state, Category: category, Subcategory: subcatL,
-		ContactType: contactType, Impact: impact, Urgency: urgency,
-		ResolutionCode: resolutionCode, ResolutionNotes: closeNotes, IncidentReport: incidentReport,
+		Priority: priority, State: incidentStateFromEnum(state), Category: category, Subcategory: subcatL,
+		ContactType: incidentContactTypeFromEnum(contactType), Impact: impact, Urgency: urgency,
+		ResolutionCode: incidentResolutionCodeFromEnum(resolutionCode), ResolutionNotes: closeNotes, IncidentReport: incidentReport,
+		Description:           description,
 		WatchList:             []domain.IncidentWatchListItem{},
 		LinkedServiceRequests: []domain.LinkedServiceRequestRef{},
 		CreatedOn:             createdOn.UTC().Format(time.RFC3339), CreatedBy: createdBy,
@@ -517,6 +589,9 @@ func (r *incidentRepo) GetIncidentByID(ctx context.Context, id string) (domain.I
 	}
 	if aeID != nil {
 		v.AssignedTo = &domain.EntityRef{ID: *aeID, Name: stringOrEmpty(aeName)}
+	}
+	if agID != nil {
+		v.AssignmentGroup = &domain.EntityRef{ID: *agID, Name: stringOrEmpty(agName)}
 	}
 	if svcID != nil {
 		v.Service = &domain.EntityRef{ID: *svcID, Name: stringOrEmpty(svcName)}
@@ -663,7 +738,7 @@ func (r *incidentRepo) SearchIncidentActivities(ctx context.Context, req domain.
 }
 
 // incidentContactTypeToEnum maps domain.IncidentContactType to
-// incident_contact_type_enum's real labels (migration 000058) -- identity
+// incident_contact_type_enum's real labels (migration 0058) -- identity
 // for every value except "Site 24/7", where the enum spells it
 // 'SITE_24_7' but domain.IncidentContactTypeSite247 spells it "SITE_247".
 func incidentContactTypeToEnum(c domain.IncidentContactType) string {
@@ -671,6 +746,51 @@ func incidentContactTypeToEnum(c domain.IncidentContactType) string {
 		return "SITE_24_7"
 	}
 	return string(c)
+}
+
+// incidentContactTypeFromEnum is incidentContactTypeToEnum's inverse, for
+// reads: the enum's 'SITE_24_7' goes back out as "SITE_247", so a channel
+// (the UI's name for contact type) round-trips to the same value the API
+// accepted, and the one the webapp's/microapp's option lists use. Every
+// other label is passed through unchanged.
+func incidentContactTypeFromEnum(label *string) *string {
+	if label != nil && *label == "SITE_24_7" {
+		v := string(domain.IncidentContactTypeSite247)
+		return &v
+	}
+	return label
+}
+
+// incidentStateFromEnum is incidentStateToEnum's (incident_service.go)
+// inverse, for reads: the enum's 'CANCELED' goes back out as "CANCELLED",
+// the value the API accepts and the ServiceNow data source returns. Every
+// other label is passed through unchanged.
+func incidentStateFromEnum(label *string) *string {
+	if label != nil && *label == "CANCELED" {
+		v := string(domain.IncidentStateCancelled)
+		return &v
+	}
+	return label
+}
+
+// incidentResolutionCodeFromEnum is incidentResolutionCodeToEnum's
+// (incident_service.go) inverse, for reads: 'SOLVED_WORK_AROUND' and
+// 'NOT_ACTIONABLE_ALERT' go back out as "SOLVED_WORKAROUND" and
+// "NOT_ACTIONABLE". Every other label is passed through unchanged.
+func incidentResolutionCodeFromEnum(label *string) *string {
+	if label == nil {
+		return nil
+	}
+	var v string
+	switch *label {
+	case "SOLVED_WORK_AROUND":
+		v = string(domain.IncidentResolutionCodeSolvedWorkaround)
+	case "NOT_ACTIONABLE_ALERT":
+		v = string(domain.IncidentResolutionCodeNotActionable)
+	default:
+		return label
+	}
+	return &v
 }
 
 // createIncidentCommentQuery mirrors createCaseCommentQuery's (case_repo.go,
@@ -720,6 +840,320 @@ func (r *incidentRepo) CreateIncidentComment(ctx context.Context, incidentID str
 	return c, nil
 }
 
+// incidentLifecycleFKField names the request field behind each foreign key
+// UpdateIncidentLifecycle can trip, so a bad id reads as a ValidationError
+// on that field instead of a 500.
+var incidentLifecycleFKField = map[string]string{
+	"work_item_assigned_to_id_fkey": "assignedEngineerId",
+	"incident_resolved_by_id_fkey":  "resolvedById",
+}
+
+// UpdateIncidentLifecycle implements IncidentRepository.
+func (r *incidentRepo) UpdateIncidentLifecycle(ctx context.Context, id string, u IncidentLifecycleUpdate, actorEmail string) error {
+	_, err := InTxReturning(ctx, r.db, func(tx pgx.Tx) (struct{}, error) {
+		return struct{}{}, r.updateIncidentLifecycleTx(ctx, tx, id, u, actorEmail)
+	})
+	if err == nil {
+		return nil
+	}
+	var ve *apierror.ValidationError
+	var nfe *apierror.NotFoundError
+	if errors.As(err, &ve) || errors.As(err, &nfe) {
+		return err
+	}
+	if IsRLSPolicyViolation(err) {
+		return &apierror.NotFoundError{Msg: "incident not found"}
+	}
+	if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "23503" {
+		field := incidentLifecycleFKField[pgErr.ConstraintName]
+		if field == "" {
+			field = "a referenced id"
+		}
+		return &apierror.ValidationError{Msg: field + " does not identify an existing user"}
+	}
+	return fmt.Errorf("update incident: %w", err)
+}
+
+// updateIncidentLifecycleTx is UpdateIncidentLifecycle's body: lock the
+// incident row, check the Resolved/Closed resolution requirement against the
+// request plus what is already on record, then update work_item (always,
+// for updated_on/updated_by, plus the assignee) and incident (state and
+// resolution columns, only when one is being set).
+func (r *incidentRepo) updateIncidentLifecycleTx(ctx context.Context, tx pgx.Tx, id string, u IncidentLifecycleUpdate, actorEmail string) error {
+	var currentState string
+	var currentCode, currentNotes *string
+	err := tx.QueryRow(ctx, `
+		SELECT inc.state::text, inc.resolution_code::text, inc.close_notes
+		FROM incident inc
+		JOIN work_item wi ON wi.id = inc.id
+		WHERE inc.id = $1
+		FOR UPDATE OF inc`, id).Scan(&currentState, &currentCode, &currentNotes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return &apierror.NotFoundError{Msg: "incident not found"}
+	}
+	if err != nil {
+		return fmt.Errorf("update incident: read current state: %w", err)
+	}
+
+	if u.State != nil && (*u.State == "RESOLVED" || *u.State == "CLOSED") {
+		code, notes := currentCode, currentNotes
+		if u.ResolutionCode != nil {
+			code = u.ResolutionCode
+		}
+		if u.ResolutionNotes != nil {
+			notes = u.ResolutionNotes
+		}
+		if code == nil || *code == "" || notes == nil || strings.TrimSpace(*notes) == "" {
+			return &apierror.ValidationError{Msg: "resolutionCode and resolutionNotes are required to move an incident to " + *u.State}
+		}
+	}
+
+	wiSets := []string{"updated_on = NOW()", "updated_by = $1"}
+	wiArgs := []any{actorEmail}
+	if u.AssignedEngineerID != nil {
+		wiSets = append(wiSets, fmt.Sprintf("assigned_to_id = $%d::uuid", len(wiArgs)+1))
+		wiArgs = append(wiArgs, *u.AssignedEngineerID)
+	}
+	wiArgs = append(wiArgs, id)
+	var wiID string
+	if err := tx.QueryRow(ctx,
+		fmt.Sprintf(`UPDATE work_item SET %s WHERE id = $%d AND type = 'INCIDENT' RETURNING id`, strings.Join(wiSets, ", "), len(wiArgs)),
+		wiArgs...,
+	).Scan(&wiID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return &apierror.NotFoundError{Msg: "incident not found"}
+		}
+		return err
+	}
+
+	var incSets []string
+	var incArgs []any
+	addInc := func(assignment string, val any) {
+		incArgs = append(incArgs, val)
+		incSets = append(incSets, fmt.Sprintf(assignment, len(incArgs)))
+	}
+	if u.State != nil {
+		addInc("state = $%d::incident_state_enum", *u.State)
+	}
+	if u.ResolutionCode != nil {
+		addInc("resolution_code = $%d::incident_resolution_code_enum", *u.ResolutionCode)
+	}
+	if u.ResolutionNotes != nil {
+		addInc("close_notes = $%d", *u.ResolutionNotes)
+	}
+	enteringResolved := u.State != nil && *u.State == "RESOLVED" && currentState != "RESOLVED"
+	resolvedBy := u.ResolvedByID
+	if resolvedBy == nil && enteringResolved {
+		resolvedBy = u.DefaultResolvedByID
+	}
+	if resolvedBy != nil {
+		addInc("resolved_by_id = $%d::uuid", *resolvedBy)
+	}
+	if enteringResolved {
+		incSets = append(incSets, "resolved_on = NOW()")
+	}
+	if len(incSets) == 0 {
+		return nil
+	}
+	incArgs = append(incArgs, id)
+	if _, err := tx.Exec(ctx,
+		fmt.Sprintf(`UPDATE incident SET %s WHERE id = $%d`, strings.Join(incSets, ", "), len(incArgs)),
+		incArgs...,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+// createIncidentPortalQuery is CreateIncident's (the plain-Postgres,
+// caller-initiated path) insert of both halves of the row -- structurally
+// identical to createIncidentFromServiceNowQuery except id/number are
+// generated here (gen_random_uuid()/next_portal_work_item_number(), migration
+// 0140) instead of supplied by a prior ServiceNow response. incident.state is
+// left to its own column default ('NEW'), which is the state ServiceNow's
+// IncidentUtils.createIncident hard-sets.
+//
+// Column/output order matches the trailing SELECT exactly.
+const createIncidentPortalQuery = `
+	WITH inserted_work_item AS (
+		INSERT INTO work_item (
+			id, created_on, updated_on, created_by, updated_by,
+			number, subject, type, parent_id, assignment_group_id, assigned_to_id
+		)
+		VALUES (
+			gen_random_uuid(), NOW(), NOW(), $1, $1,
+			next_portal_work_item_number(), $2, 'INCIDENT'::work_item_type_enum, $3::uuid, $4::uuid, $18::uuid
+		)
+		RETURNING id, number, subject, created_on, updated_on, created_by
+	),
+	inserted_incident AS (
+		INSERT INTO incident (
+			id, caller_id, category, impact, urgency,
+			service_id, service_offering_id, contact_type,
+			change_request_id, caused_by_id, parent_incident_id, problem_id,
+			opened_on, correlation_id, environment,
+			priority, subcategory_id, cmdb_ci_id
+		)
+		SELECT id, $5::uuid, $6::incident_category_enum, $7::incident_impact_enum, $8::incident_urgency_enum,
+		       $9::uuid, $10::uuid, $11::incident_contact_type_enum,
+		       $12::uuid, $13::uuid, $14::uuid, $15::uuid,
+		       NOW(), $16, $17,
+		       $19::incident_priority_enum, $20::uuid, $21::uuid
+		FROM inserted_work_item
+		RETURNING id
+	)
+	SELECT iwi.id, iwi.number, iwi.subject, iwi.created_on, iwi.updated_on, iwi.created_by
+	FROM inserted_work_item iwi
+	JOIN inserted_incident ii ON ii.id = iwi.id`
+
+// CreateIncident implements IncidentRepository.
+//
+// One transaction, in the order ServiceNow's IncidentUtils.createIncident
+// does it: the record (with its watch list) first, then the customer-visible
+// comment and the work note as journal entries against the new record.
+func (r *incidentRepo) CreateIncident(ctx context.Context, req domain.CreateIncidentRequest, priority string, subcategoryValue *string, createdBy string) (domain.CreateIncidentResponse, error) {
+	var contactType *string
+	if req.ContactType != nil {
+		v := incidentContactTypeToEnum(*req.ContactType)
+		contactType = &v
+	}
+
+	resp, err := InTxReturning(ctx, r.db, func(tx pgx.Tx) (domain.CreateIncidentResponse, error) {
+		var subcategoryID *string
+		if subcategoryValue != nil {
+			var id string
+			err := tx.QueryRow(ctx,
+				`SELECT id::text FROM incident_subcategory WHERE category = $1::incident_category_enum AND value = $2`,
+				string(req.Category), *subcategoryValue,
+			).Scan(&id)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.CreateIncidentResponse{}, &apierror.ValidationError{
+					Msg: fmt.Sprintf("subcategory %s does not belong to category %s", *req.Subcategory, req.Category),
+				}
+			}
+			if err != nil {
+				return domain.CreateIncidentResponse{}, fmt.Errorf("resolve incident subcategory: %w", err)
+			}
+			subcategoryID = &id
+		}
+
+		watcherIDs, err := resolveIncidentWatchers(ctx, tx, req.WatchList)
+		if err != nil {
+			return domain.CreateIncidentResponse{}, err
+		}
+
+		var (
+			outID, outNumber, outSubject, outCreatedBy string
+			outCreatedOn, outUpdatedOn                 time.Time
+		)
+		if err := tx.QueryRow(ctx, createIncidentPortalQuery,
+			createdBy, req.Subject, req.ParentID, req.AssignmentGroupID,
+			req.CallerID, string(req.Category), string(req.Impact), string(req.Urgency),
+			req.ServiceID, req.ServiceOfferingID, contactType,
+			req.ChangeRequestID, req.CausedByID, req.ParentIncidentID, req.ProblemID,
+			req.CorrelationID, req.Environment,
+			req.AssignedEngineerID, priority, subcategoryID, req.ConfigurationItemID,
+		).Scan(&outID, &outNumber, &outSubject, &outCreatedOn, &outUpdatedOn, &outCreatedBy); err != nil {
+			return domain.CreateIncidentResponse{}, err
+		}
+
+		for _, userID := range watcherIDs {
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO work_item_watcher (id, work_item_id, user_id) VALUES (gen_random_uuid(), $1, $2)`,
+				outID, userID,
+			); err != nil {
+				return domain.CreateIncidentResponse{}, err
+			}
+		}
+
+		journal := []struct {
+			commentType domain.CommentType
+			content     *string
+		}{
+			{domain.CommentTypeComment, req.AdditionalComments},
+			{domain.CommentTypeWorkNote, req.WorkNotes},
+		}
+		for _, j := range journal {
+			if j.content == nil || strings.TrimSpace(*j.content) == "" {
+				continue
+			}
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO comment (id, created_on, created_by, type, work_item_id, content)
+				 VALUES (gen_random_uuid(), NOW(), $1, $2::comment_type_enum, $3, $4)`,
+				createdBy, caseCommentTypeEnum[j.commentType], outID, *j.content,
+			); err != nil {
+				return domain.CreateIncidentResponse{}, fmt.Errorf("insert incident %s: %w", j.commentType, err)
+			}
+		}
+
+		resp := domain.CreateIncidentResponse{Message: "Incident created successfully."}
+		resp.Incident.ID = outID
+		resp.Incident.Number = outNumber
+		resp.Incident.CreatedOn = outCreatedOn.UTC().Format(time.RFC3339)
+		resp.Incident.CreatedBy = outCreatedBy
+		return resp, nil
+	})
+	if err != nil {
+		var ve *apierror.ValidationError
+		if errors.As(err, &ve) {
+			return domain.CreateIncidentResponse{}, err
+		}
+		// incident_deny_all_insert (migration 0148) permits only an internal
+		// caller -- incident has no project concept at all, so there is no
+		// project-member OR-branch the way case/change_request have.
+		// POST /incidents is already gated internalOnly at the route, so this
+		// should not be reachable in practice, but map it defensively rather
+		// than leaving a theoretical 42501 to surface as a raw 500.
+		if IsRLSPolicyViolation(err) {
+			return domain.CreateIncidentResponse{}, &apierror.NotFoundError{Msg: "incident not found"}
+		}
+		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "23503": // foreign_key_violation -- one of the referenced IDs does not exist
+				return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "one or more referenced IDs do not exist: " + pgErr.Detail}
+			case "P0001": // raise_exception from integrity triggers
+				return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: pgErr.Message}
+			}
+		}
+		return domain.CreateIncidentResponse{}, fmt.Errorf("create incident: %w", err)
+	}
+	return resp, nil
+}
+
+// resolveIncidentWatchers turns a create request's watch list into user ids.
+// Entries may be user ids or email addresses, the two forms ServiceNow's own
+// create path accepts (watchListEmails). Every entry must name an existing
+// user: ServiceNow resolves each one before inserting, and an unresolvable
+// entry fails the request there too. Duplicates collapse to one watcher.
+func resolveIncidentWatchers(ctx context.Context, tx pgx.Tx, entries []string) ([]string, error) {
+	seen := make(map[string]bool, len(entries))
+	ids := make([]string, 0, len(entries))
+	for _, raw := range entries {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		var id string
+		var err error
+		if strings.Contains(entry, "@") {
+			err = tx.QueryRow(ctx, `SELECT id::text FROM "user" WHERE lower(email) = lower($1) ORDER BY id LIMIT 1`, entry).Scan(&id)
+		} else {
+			err = tx.QueryRow(ctx, `SELECT id::text FROM "user" WHERE id = $1::uuid`, entry).Scan(&id)
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, &apierror.ValidationError{Msg: "watchList contains an unknown user: " + entry}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("resolve incident watcher: %w", err)
+		}
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
 // createIncidentFromServiceNowQuery inserts both halves of an incident row
 // (work_item + incident, the same shared-primary-key pattern
 // createCaseFromServiceNowQuery documents) in one round trip via a CTE,
@@ -739,11 +1173,11 @@ const createIncidentFromServiceNowQuery = `
 	WITH inserted_work_item AS (
 		INSERT INTO work_item (
 			id, created_on, updated_on, created_by, updated_by,
-			number, subject, type, parent_id
+			number, subject, type, parent_id, assignment_group_id
 		)
 		VALUES (
 			$1, NOW(), NOW(), $2, $2,
-			$3, $4, 'INCIDENT'::work_item_type_enum, $5::uuid
+			$3, $4, 'INCIDENT'::work_item_type_enum, $5::uuid, $6::uuid
 		)
 		RETURNING id, number, subject, created_on, updated_on, created_by
 	),
@@ -755,10 +1189,10 @@ const createIncidentFromServiceNowQuery = `
 			opened_on, correlation_id, environment
 		)
 		VALUES (
-			$1, $6::uuid, $7::incident_category_enum, $8::incident_impact_enum, $9::incident_urgency_enum,
-			$10::uuid, $11::uuid, $12::incident_contact_type_enum,
-			$13::uuid, $14::uuid, $15::uuid, $16::uuid,
-			NOW(), $17, $18
+			$1, $7::uuid, $8::incident_category_enum, $9::incident_impact_enum, $10::incident_urgency_enum,
+			$11::uuid, $12::uuid, $13::incident_contact_type_enum,
+			$14::uuid, $15::uuid, $16::uuid, $17::uuid,
+			NOW(), $18, $19
 		)
 		RETURNING id
 	)
@@ -774,13 +1208,21 @@ func (r *incidentRepo) CreateIncidentFromServiceNow(ctx context.Context, req dom
 		contactType = &v
 	}
 
+	// WithSystemIdentity: this insert never sets a project_id on the new
+	// work_item row at all (incidents have no project concept -- see this
+	// file's own package doc comment), so work_item's INSERT policy
+	// (migration 0147) can only be satisfied by is_internal, not
+	// is_project_member(NULL). Same reasoning as CreateChangeRequestFromServiceNow/
+	// CreateCaseFromServiceNow's own identical stamps: this insert only ever
+	// runs after ServiceNow's own workflow already accepted the create.
+	ctx = WithSystemIdentity(ctx)
 	var (
 		outID, outNumber, outSubject, outCreatedBy string
 		outCreatedOn, outUpdatedOn                 time.Time
 	)
 	err := r.db.QueryRow(ctx, createIncidentFromServiceNowQuery,
 		id, createdBy,
-		number, req.Subject, req.ParentID,
+		number, req.Subject, req.ParentID, req.AssignmentGroupID,
 		req.CallerID, string(req.Category), string(req.Impact), string(req.Urgency),
 		req.ServiceID, req.ServiceOfferingID, contactType,
 		req.ChangeRequestID, req.CausedByID, req.ParentIncidentID, req.ProblemID,

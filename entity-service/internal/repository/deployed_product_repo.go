@@ -27,14 +27,13 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
 )
 
 // DeployedProductRepository defines the persistence operations for the
-// deployed_product table (migration 000014).
+// deployed_product table (migration 0019).
 type DeployedProductRepository interface {
 	// SearchDeployedProducts returns a filtered, paginated slice of enriched deployed-product
 	// views together with the total count of matching rows before pagination.
@@ -42,7 +41,7 @@ type DeployedProductRepository interface {
 	SearchDeployedProducts(ctx context.Context, req domain.SearchDeployedProductsRequest) ([]domain.DeployedProductView, int, error)
 
 	// SearchDeployedProductMetrics returns per-day CORES readings (from
-	// hourly_usage_summary, migration 000054) for every deployment_node resolved to
+	// hourly_usage_summary, migration 0054) for every deployment_node resolved to
 	// the given deployed product and deployment. A NotFoundError is returned
 	// if the deployed product doesn't exist or isn't linked to deploymentID.
 	SearchDeployedProductMetrics(ctx context.Context, id, deploymentID, startDate, endDate string) (domain.DeployedProductMetricsResponse, error)
@@ -54,7 +53,7 @@ type DeployedProductRepository interface {
 
 	// SearchProjectsByProductVersion returns the deduplicated, paginated set
 	// of projects with a deployed_product on the given product+version,
-	// joining deployed_product directly to project (migration 000014's
+	// joining deployed_product directly to project (migration 0019's
 	// project_id FK) rather than going through deployment the way
 	// SearchDeployedProducts does -- there's no deployment-name/id to
 	// display here, only the owning project. excludeClosureStates/
@@ -86,6 +85,31 @@ type DeployedProductRepository interface {
 	// a live search) -- a mismatch is indistinguishable from "not found" and
 	// returns the same NotFoundError.
 	UpdateDeployedProductFields(ctx context.Context, req domain.UpdateDeployedProductRequest, updatedBy string) (domain.UpdatedDeployedProduct, error)
+
+	// GetDeployedProductCategory returns the deployed product's own
+	// product_category (lower-case, e.g. "ms"; nil when unset), or a
+	// NotFoundError when no such row exists. A single-row lookup, not the
+	// list/filter machinery SearchDeployedProducts already has -- used by
+	// caseService's own project-type category allow-list enforcement at
+	// case/SR creation time, which only ever checks one id at a time.
+	GetDeployedProductCategory(ctx context.Context, id string) (*string, error)
+}
+
+// GetDeployedProductCategory implements DeployedProductRepository.
+func (r *deployedProductRepo) GetDeployedProductCategory(ctx context.Context, id string) (*string, error) {
+	var category *string
+	err := r.db.QueryRow(ctx, `SELECT product_category::TEXT FROM deployed_product WHERE id = $1`, id).Scan(&category)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, &apierror.NotFoundError{Msg: "deployed product not found"}
+		}
+		return nil, fmt.Errorf("get deployed product category: %w", err)
+	}
+	if category != nil {
+		lower := strings.ToLower(*category)
+		category = &lower
+	}
+	return category, nil
 }
 
 // resolveDeployedProductNodes looks up the given deployed product, confirms
@@ -363,11 +387,13 @@ func (r *deployedProductRepo) SearchDeployedProductUsageCounts(ctx context.Conte
 }
 
 type deployedProductRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewDeployedProductRepository constructs a DeployedProductRepository backed by the given connection pool.
-func NewDeployedProductRepository(db *pgxpool.Pool) DeployedProductRepository {
+// NewDeployedProductRepository constructs a DeployedProductRepository whose
+// every query runs under the caller identity on ctx (deployed_product has
+// row-level security, migration 0176).
+func NewDeployedProductRepository(db *Scoped) DeployedProductRepository {
 	return &deployedProductRepo{db: db}
 }
 
@@ -384,7 +410,14 @@ func (r *deployedProductRepo) SearchDeployedProducts(ctx context.Context, req do
 	// DeployedProductView.Deployment/Product are non-pointer EntityRef
 	// values, so switching to LEFT joins isn't a safe alternative -- that
 	// would need a response-contract change and nullable scan handling.
-	where := "WHERE dp.deployment_id IS NOT NULL AND dp.product_id IS NOT NULL"
+	//
+	// dp.active is how a deployed product is soft-deleted (PATCH .../products/{id}
+	// {active: false} -- see DeployedProductRepository.UpdateDeployedProductFields).
+	// This query never filtered on it at all, so a deactivated product kept
+	// showing up in every list exactly as before, making "delete" appear to
+	// silently do nothing. NULL counts as active, the same convention
+	// AccessService.ResolveScope already uses for "user".is_active.
+	where := "WHERE dp.deployment_id IS NOT NULL AND dp.product_id IS NOT NULL AND (dp.active IS NULL OR dp.active = TRUE)"
 
 	if len(req.DeploymentIDs) > 0 {
 		where += fmt.Sprintf(" AND dp.deployment_id = ANY($%d::uuid[])", argIdx)
@@ -392,24 +425,39 @@ func (r *deployedProductRepo) SearchDeployedProducts(ctx context.Context, req do
 		argIdx++
 	}
 
-	// TODO(phase 2): req.ProductCategories is not applied here. The deployed_product
-	// schema has no category column today, so deployedProductService rejects any
-	// non-empty ProductCategories before this method is ever called (see
-	// deployed_product_service.go) rather than silently ignoring it. Filter it in here
-	// once the Postgres cohort's product-category modeling lands, and drop that
-	// rejection at the same time.
+	// deployed_product.product_category (deployed_product_category_enum:
+	// PDP/MS/PS/CL/PC) is already selected below -- the request's own
+	// lowercase values (SearchDeployedProductsRequest.ProductCategories'
+	// doc comment: e.g. "pdp") are upper-cased before the enum cast, same
+	// convention every other enum-array filter in this codebase uses.
+	//
+	// A NULL category is treated as a wildcard (matches any requested
+	// category), not excluded -- the same fail-open treatment this
+	// codebase already gives sr_category_routing_rule's own classification
+	// match, adopted there specifically because real deployed_product rows
+	// were found mostly uncategorized. Without this, a project type that
+	// restricts SR categories (ProjectFeatures.SrProductCategories) hid the
+	// overwhelming majority of real, active deployed products from the SR
+	// creation product dropdown -- "Product Version: Not available" even
+	// with active products on the deployment -- purely because nothing has
+	// ever backfilled this column, not because the product's category
+	// genuinely doesn't match.
+	if len(req.ProductCategories) > 0 {
+		categories := make([]string, len(req.ProductCategories))
+		for i, c := range req.ProductCategories {
+			categories[i] = strings.ToUpper(c)
+		}
+		where += fmt.Sprintf(" AND (dp.product_category IS NULL OR dp.product_category = ANY($%d::text[]::deployed_product_category_enum[]))", argIdx)
+		filterArgs = append(filterArgs, categories)
+		argIdx++
+	}
 
 	countQuery := "SELECT COUNT(*) FROM deployed_product dp " + where
 
-	// update_level_info (JSONB) -- domain.DeployedProductView.Updates -- is
-	// deliberately not selected here: its actual JSON shape isn't confirmed
-	// against any real payload, so it's left unpopulated (nil, the correct
-	// "none recorded" value per that field's own doc comment) rather than
-	// guessed at. cores/tps/category, in contrast, are plain scalar columns
-	// with an unambiguous mapping, so they are selected.
 	dataQuery := fmt.Sprintf(
 		`SELECT dp.id, dp.created_on, dp.updated_on,
 		        dp.core_count, dp.tps_count, dp.product_category::TEXT,
+		        dp.description, dp.update_level_info,
 		        d.id, d.name,
 		        p.id, p.name, p.code,
 		        pv.id, pv.version, pv.release_date, pv.support_eol_date
@@ -449,9 +497,13 @@ func (r *deployedProductRepo) SearchDeployedProducts(ctx context.Context, req do
 			// Version fields are nullable (LEFT JOIN).
 			var pvID, pvName *string
 			var pvReleaseDate, pvEoLDate *time.Time
+			// update_level_info is nullable JSONB; decoded below into
+			// dp.Updates once the row is scanned.
+			var updateLevelInfo []byte
 			if err := rows.Scan(
 				&dp.ID, &dp.CreatedOn, &dp.UpdatedOn,
 				&dp.Cores, &dp.TPS, &dp.Category,
+				&dp.Description, &updateLevelInfo,
 				&dp.Deployment.ID, &dp.Deployment.Name,
 				&dp.Product.ID, &dp.Product.Name, &dp.Product.Abbreviation,
 				&pvID, &pvName, &pvReleaseDate, &pvEoLDate,
@@ -464,6 +516,16 @@ func (r *deployedProductRepo) SearchDeployedProducts(ctx context.Context, req do
 					Name:           *pvName,
 					ReleasedDate:   pvReleaseDate,
 					SupportEoLDate: pvEoLDate,
+				}
+			}
+			dp.Category = lowercaseCategory(dp.Category)
+			if len(updateLevelInfo) > 0 {
+				var updates []domain.ProductUpdateEntry
+				if err := json.Unmarshal(updateLevelInfo, &updates); err != nil {
+					return fmt.Errorf("unmarshal deployed product update_level_info: %w", err)
+				}
+				if len(updates) > 0 {
+					dp.Updates = updates
 				}
 			}
 			result = append(result, dp)
@@ -480,6 +542,21 @@ func (r *deployedProductRepo) SearchDeployedProducts(ctx context.Context, req do
 	}
 
 	return deployedProducts, total, nil
+}
+
+// lowercaseCategory converts deployed_product_category_enum's UPPER-case
+// label ("MS", "PDP", ...) read from the database into the lower-case code
+// the rest of the contract uses: the search request's ProductCategories
+// filter values and ProjectFeatures.SrProductCategories/
+// DefaultCaseProductCategories are all lower case, and clients compare the
+// returned category against them case-sensitively. A nil (NULL) category
+// stays nil, never an empty string. The input is not mutated.
+func lowercaseCategory(c *string) *string {
+	if c == nil {
+		return nil
+	}
+	v := strings.ToLower(*c)
+	return &v
 }
 
 // SearchProjectsByProductVersion implements DeployedProductRepository.
@@ -611,7 +688,7 @@ func (r *deployedProductRepo) SearchProjectsByProductVersion(ctx context.Context
 }
 
 // deployedProductCreateFKField maps deployed_product's own foreign-key
-// constraint names (migration 000014's auto-generated
+// constraint names (migration 0019's auto-generated
 // "<table>_<column>_fkey" names) to the request field that referenced the
 // missing row, for CreateDeployedProductFromServiceNow's 23503 handling --
 // same map-based convention as change_request_repo.go's
@@ -628,30 +705,41 @@ const createDeployedProductFromServiceNowQuery = `
 		id, created_on, updated_on, created_by, updated_by,
 		number, description, active,
 		core_count, tps_count,
-		project_id, deployment_id, product_id, version_id
+		project_id, deployment_id, product_id, version_id,
+		product_category
 	)
 	VALUES (
 		$1, $2, $2, $3, $3,
 		$4, $5, TRUE,
 		$6, $7,
-		$8::uuid, $9::uuid, $10::uuid, $11::uuid
+		$8::uuid, $9::uuid, $10::uuid, $11::uuid,
+		$12::text::deployed_product_category_enum
 	)
 	RETURNING id, created_on, created_by`
 
 // CreateDeployedProductFromServiceNow implements DeployedProductRepository.
-// name/life_cycle_stage/life_cycle_stage_status/product_category/update_level_info
-// are left NULL -- CreateDeployedProductRequest carries no fields for them
-// (SN's own create payload doesn't send them either, see
+// name/life_cycle_stage/life_cycle_stage_status/update_level_info are left
+// NULL -- CreateDeployedProductRequest carries no fields for them (SN's own
+// create payload doesn't send them either, see
 // snCreateDeployedProductPayload), matching parity between the two data
 // sources rather than inventing values ServiceNow itself doesn't set on
-// create.
+// create. product_category is the one exception: see
+// domain.CreateDeployedProductRequest.Category's own doc comment for why
+// it's written here despite having no SN-side equivalent.
 func (r *deployedProductRepo) CreateDeployedProductFromServiceNow(ctx context.Context, req domain.CreateDeployedProductRequest, id, number, createdBy string, createdOn time.Time) (domain.CreatedDeployedProduct, error) {
+	var category *string
+	if req.Category != nil {
+		c := strings.ToUpper(*req.Category)
+		category = &c
+	}
+
 	var created domain.CreatedDeployedProduct
 	err := r.db.QueryRow(ctx, createDeployedProductFromServiceNowQuery,
 		id, createdOn, createdBy,
 		number, req.Description,
 		req.Cores, req.TPS,
 		req.ProjectID, req.DeploymentID, req.ProductID, req.VersionID,
+		category,
 	).Scan(&created.ID, &created.CreatedOn, &created.CreatedBy)
 	if err != nil {
 		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) {
@@ -702,7 +790,8 @@ const updateDeployedProductFieldsQuery = `
 		tps_count = COALESCE($4, tps_count),
 		description = CASE WHEN $5 THEN $6 ELSE description END,
 		update_level_info = CASE WHEN $7 THEN $8::jsonb ELSE update_level_info END,
-		active = COALESCE($9, active)
+		active = COALESCE($9, active),
+		product_category = COALESCE($11::text::deployed_product_category_enum, product_category)
 	WHERE id = $1::uuid
 	AND ($10::uuid IS NULL OR deployment_id = $10::uuid)
 	RETURNING id, updated_on, updated_by`
@@ -745,6 +834,12 @@ func (r *deployedProductRepo) UpdateDeployedProductFields(ctx context.Context, r
 		}
 	}
 
+	var category *string
+	if req.Category != nil {
+		c := strings.ToUpper(*req.Category)
+		category = &c
+	}
+
 	var updated domain.UpdatedDeployedProduct
 	err = r.db.QueryRow(ctx, updateDeployedProductFieldsQuery,
 		req.ID, updatedBy,
@@ -753,6 +848,7 @@ func (r *deployedProductRepo) UpdateDeployedProductFields(ctx context.Context, r
 		updatesProvided, updatesJSON,
 		req.Active,
 		req.DeploymentID,
+		category,
 	).Scan(&updated.ID, &updated.UpdatedOn, &updated.UpdatedBy)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if req.DeploymentID != nil {

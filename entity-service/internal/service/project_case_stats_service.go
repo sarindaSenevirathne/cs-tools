@@ -28,7 +28,7 @@ import (
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
 )
 
-// case_state_enum labels (migration 000018) this aggregation classifies by.
+// case_state_enum labels (migration 0023) this aggregation classifies by.
 // Spelled as the raw enum labels because that is what caseLikeStateColumn
 // returns, and what GET /projects/{id}/metadata's caseStates already exposes
 // in Postgres mode -- so a caller can join stateCount to that list directly.
@@ -106,7 +106,7 @@ func (s *projectCaseStatsService) GetProjectCaseStats(
 
 	// Scope before existence: the id is caller-controlled, so a project the
 	// caller may not see must be indistinguishable from one that is not there.
-	if err := authorizeProject(ctx, s.access, projectID); err != nil {
+	if _, err := authorizeProject(ctx, s.access, projectID); err != nil {
 		return domain.ProjectCaseStatsResponse{}, err
 	}
 

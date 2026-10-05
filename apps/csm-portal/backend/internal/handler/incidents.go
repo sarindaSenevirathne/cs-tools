@@ -106,7 +106,6 @@ type createIncidentRequest struct {
 	ContactType         string   `json:"contactType"`
 	Impact              string   `json:"impact"`
 	Urgency             string   `json:"urgency"`
-	AssignmentGroupID   string   `json:"assignmentGroupId"`
 	AssignedEngineerID  string   `json:"assignedEngineerId"`
 	Subject             string   `json:"subject"`
 	WatchList           []string `json:"watchList"`
@@ -150,9 +149,6 @@ func validateCreateIncidentBody(body []byte) bool {
 		return false
 	}
 	if !validIncidentUrgencies[req.Urgency] {
-		return false
-	}
-	if req.AssignmentGroupID != "" && !uuidRe.MatchString(req.AssignmentGroupID) {
 		return false
 	}
 	if req.AssignedEngineerID != "" && !uuidRe.MatchString(req.AssignedEngineerID) {
@@ -350,11 +346,25 @@ func validateHandOffIncidentBody(body []byte) bool {
 // entity service for data access.
 type IncidentHandler struct {
 	entity entityIncidentClient
+	// access backs the inline-image redaction in every read response — see
+	// WithAccessGuard and CaseHandler's own field of the same name/reasoning.
+	// nil fails that check closed (redacts), never open.
+	access *AccessGuard
 }
 
 // NewIncidentHandler creates an IncidentHandler backed by the given entity client.
 func NewIncidentHandler(entity entityIncidentClient) *IncidentHandler {
 	return &IncidentHandler{entity: entity}
+}
+
+// WithAccessGuard wires the same guard that authorises every route into this
+// handler, so every read response can redact an embedded raw base64 inline
+// image (see redactRawBase64Images's own doc comment) for a caller who
+// lacks PermDownloadAttachment. Returns h for chaining at the construction
+// site.
+func (h *IncidentHandler) WithAccessGuard(g *AccessGuard) *IncidentHandler {
+	h.access = g
+	return h
 }
 
 // SearchIncidents handles POST /incidents/search.
@@ -392,6 +402,9 @@ func (h *IncidentHandler) SearchIncidents(w http.ResponseWriter, r *http.Request
 		slog.ErrorContext(r.Context(), "entity SearchIncidents failed", "userID", user.UserID, "err", err)
 		mapUpstreamErrorGeneric(w, err, "Failed to search incidents.")
 		return
+	}
+	if shouldRedactInlineImages(h.access, user.Roles) {
+		result = redactRawBase64Images(result)
 	}
 
 	// TODO: Unmarshal result and filter to only the fields required by the frontend.
@@ -497,6 +510,9 @@ func (h *IncidentHandler) GetIncident(w http.ResponseWriter, r *http.Request) {
 		slog.ErrorContext(r.Context(), "entity GetIncident failed", "userID", user.UserID, "incidentID", id, "err", err)
 		mapUpstreamErrorGeneric(w, err, "Failed to retrieve incident.")
 		return
+	}
+	if shouldRedactInlineImages(h.access, user.Roles) {
+		result = redactRawBase64Images(result)
 	}
 
 	writeJSON(w, http.StatusOK, result)
@@ -643,6 +659,9 @@ func (h *IncidentHandler) SearchIncidentActivities(w http.ResponseWriter, r *htt
 		mapUpstreamErrorGeneric(w, err, "Failed to search incident activities.")
 		return
 	}
+	if shouldRedactInlineImages(h.access, user.Roles) {
+		result = redactRawBase64Images(result)
+	}
 
 	writeJSON(w, http.StatusOK, result)
 }
@@ -691,6 +710,9 @@ func (h *IncidentHandler) SearchIncidentComments(w http.ResponseWriter, r *http.
 		slog.ErrorContext(r.Context(), "entity SearchComments failed", "userID", user.UserID, "incidentID", id, "err", err)
 		mapUpstreamErrorGeneric(w, err, "Failed to search incident comments.")
 		return
+	}
+	if shouldRedactInlineImages(h.access, user.Roles) {
+		result = redactRawBase64Images(result)
 	}
 
 	writeJSON(w, http.StatusOK, result)

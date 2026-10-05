@@ -737,6 +737,13 @@ struct actually carries it), and a stray extra check on `PATCH` would just be de
   swallowing them loses real, actionable detail for no security benefit. 401/403/404 still always
   use a fixed message regardless of the upstream body — never pass through upstream text for those
   statuses.
+- **`GetMe` maps an upstream 404 to 403, not 404.** A 404 here means the caller's own authenticated
+  identity has no backing user row — not a missing resource the caller asked for by ID — and the
+  webapp's data-fetching hook for this endpoint had no handling for a bare 404, so it spun forever
+  instead of showing anything. Since "you don't have permission" is already a handled UI state,
+  `GetMe` treats this upstream 404 as 403 for the response while still logging the real cause at
+  `ERROR`. Follow this same substitution if another identity-bound "fetch my own X" endpoint hits
+  the same failure mode.
 - **Logging**: use `slog.ErrorContext` with `summarizeErr(err)`, never the raw error — an
   unrecognized error can stringify with the full request URL including query params.
   `summarizeErr` DOES include the upstream status and message for a typed `*apierror.Error` (e.g.
@@ -750,6 +757,27 @@ struct actually carries it), and a stray extra check on `PATCH` would just be de
   isn't the expected `{"message": "..."}` shape, relying on each caller's existing "empty Body → generic
   fallback" logic (`mapUpstreamError`'s 400 case, `writeUpstreamMessage`) — never add a new
   upstream-error construction site that falls back to a raw excerpt instead of calling this function.
+
+## ServiceNow-to-CSM cutover flags
+
+Flags named `CSM_MIGRATION_*` belong to the migration off ServiceNow onto the CSM database. They are **opt-in** — on only when the environment value is exactly `"true"` — and off in every environment until cutover day, which is a config change rather than a release. "Off" is stronger than "does nothing": the guarded block is never entered, so no client is built and no request leaves the process, and the portal's behaviour is bit-for-bit what it is today. Don't add one that defaults on, and don't fold one into an existing `!= "false"` killswitch, whose default is the opposite.
+
+`CSM_MIGRATION_FIRST_ACCESS_ENABLED` (`UserHandler`) — after `GET /users/me` has written its response, calls entity-service `POST /users/me/memberships/register`, which completes onboarding for any membership of the caller still in state `INVITED`: it clears the contact's Salesforce "Locked Out" flag, sets the membership to `REGISTERED` and refreshes the CSM database. Three deliberate properties, all of them load-bearing:
+
+- **It runs after the response.** `GetMe` writes the profile first and only then starts the call, on `context.WithoutCancel(r.Context())` with its own timeout, so it can neither delay the profile nor be killed when the request ends.
+- **Its failure is a log line.** entity-service being down — or not registering the route at all, which is the normal state before cutover — must be invisible. The Salesforce event that follows an invitation reaches entity-service by its own path anyway, so nothing is lost.
+- **It is a no-op for almost every call.** The profile is loaded on every page, but entity-service answers immediately for a caller with nothing `INVITED`, which is every caller after their first sign-in.
+
+The portal deliberately does **not** write to Salesforce itself for this. entity-service already holds the Sales Entity client and the ingest, so the logic lives there and the portal stays free of Salesforce write credentials.
+
+`CSM_MIGRATION_PORTAL_CONTACTS_ENABLED` (`ContactHandler`) — moves project contacts off the pre-cutover onboarding service: the contact list and the admin check read the CSM database, and the writes go to entity-service, which updates Postgres and Salesforce in one transaction. It is one flag on purpose: the admin check behind every write reads the same list, so the list and the writes must never point at different sources. The invite pre-check (`POST /projects/{id}/contacts/validate`) follows it too: on, it calls entity-service's dry run `POST /projects/{id}/contacts/validate` (same `InvitationValidator` as the invite, no writes) after `requireProjectAdmin`, and maps the verdict onto the unchanged webapp contract (200 + `isContactValid`, 409 with the fixed conflict message, 403/400 with entity-service's user-facing message; a failed check gets a generic message via `mapUpstreamError`).
+
+- **Invite, role change and remove** each have both paths. Off, they take the pre-cutover path unchanged, so the rollback is this flag. The flag is ANDed with the entity client being non-nil, so a misconfiguration cannot select a path with no client behind it.
+- **The portal authorizes every write itself.** entity-service only checks that the caller is an allow-listed internal client, so `requireProjectAdmin` refuses with `403` unless the caller both holds an account admin role (`customer_admin` or `partner_admin`, from `GET /users/me`) and has an active membership on the project being changed. Admin is a property of the person, as in ServiceNow; the membership check is what ties it to a project, since `user_role` has no project column. A per-project `ADMIN` role alone does not count. Never add a write on this path without it.
+- **Writes outlive the request.** Each entity-service write runs on `entityWriteContext`: the request's values without its cancellation, bounded by `entityWriteTimeout`. A closed tab or dropped connection must not abandon a write that has already reached Salesforce. When the invite outlasts the entity client's 25-second timeout, `CreateProjectContact` answers `202` with `status: PROCESSING` instead of an error, because entity-service keeps going and commits; the webapp keeps the row pending and refreshes the list. Role change, remove and resend still report a timeout as an error.
+- **Resend invitation** (`POST /projects/{id}/contacts/{email}/resend-invitation`) exists only on the new path, so with the flag off it answers `404` rather than pretending to have resent anything.
+- **Roles change vocabulary at the boundary.** The portal's wire contract is four booleans; entity-service takes the raw Salesforce `Role__c` labels. `internal/dto/membership_roles.go` is the only place the two meet, and its labels must equal entity-service's own constants exactly, because Salesforce matches the picklist by literal string.
+- **The contact list is read from the CSM database too.** `GET /projects/{id}/contacts` calls entity-service `POST /projects/{id}/contacts/search`, paging through its 50-row limit, instead of the onboarding service's live Salesforce query. The database row has no integration-user flag, no split first and last name and no account block, so `dto.MapEntityProjectContact` splits the name at its first space, reports `isCsIntegrationUser` as false and omits the partner badge.
 
 ## Security
 

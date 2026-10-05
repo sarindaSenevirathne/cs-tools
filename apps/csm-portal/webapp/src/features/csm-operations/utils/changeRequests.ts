@@ -162,6 +162,101 @@ export function approvalStatusColor(status?: string | null): ChipColor {
   return APPROVAL_STATUS_COLOR[status.toUpperCase()] ?? "default";
 }
 
+/**
+ * Display labels for the approval stages of the change-request flow:
+ * Normal changes go Peer Approval -> CAB Approval; Emergency changes have only
+ * an ECAB Approval; Standard changes have neither. The backend decides which
+ * stages exist -- this only maps a stage name it returned to its label, so
+ * both the legacy ServiceNow-style names ("Assess", "Authorize") and the
+ * explicit ones ("Peer Approval", "CAB Approval", "Emergency CAB") read the
+ * same; the post-implementation "Review" stage keeps its own name. Matching is case/space/punctuation-insensitive.
+ */
+const KNOWN_APPROVAL_STAGE_LABELS: Record<string, string> = {
+  assess: "Peer Approval",
+  peer: "Peer Approval",
+  peerapproval: "Peer Approval",
+  authorize: "CAB Approval",
+  cab: "CAB Approval",
+  cabapproval: "CAB Approval",
+  ecab: "ECAB Approval",
+  ecabapproval: "ECAB Approval",
+  review: "Review",
+  emergencycab: "ECAB Approval",
+  emergencycabapproval: "ECAB Approval",
+};
+
+function knownApprovalStageLabel(stage?: string | null): string | null {
+  if (!stage) return null;
+  return KNOWN_APPROVAL_STAGE_LABELS[stage.toLowerCase().replace(/[^a-z]/g, "")] ?? null;
+}
+
+/** Label for an approval stage name, e.g. `Authorize` -> `CAB Approval`.
+ * Unrecognised stages (e.g. `Customer Approval`) render as the backend sent them. */
+export function approvalStageLabel(stage?: string | null): string {
+  return knownApprovalStageLabel(stage) ?? (stage?.trim() || "Approval");
+}
+
+/**
+ * The three change types a new change request can be created as, in the order
+ * the ServiceNow "What type of change is required?" screen lists them. `value`
+ * is the backend's `ChangeRequestType` enum value (entity-service
+ * `domain.ChangeRequestType*`: "normal" / "standard" / "emergency"); the
+ * create form requires exactly one of these. The type drives the approval
+ * flow server-side: Normal = Peer -> CAB, Standard = none, Emergency = ECAB.
+ */
+export const CHANGE_REQUEST_CREATE_TYPE_OPTIONS: ReadonlyArray<{
+  value: Extract<BeChangeRequestType, "normal" | "standard" | "emergency">;
+  label: string;
+  description: string;
+}> = [
+  {
+    value: "normal",
+    label: "Normal",
+    description:
+      "Normal Changes are a general purpose change type that requires one or more approvals.",
+  },
+  {
+    value: "standard",
+    label: "Standard",
+    description:
+      "Preapproved, repeatable changes that follow an established template. These changes do not require approval.",
+  },
+  {
+    value: "emergency",
+    label: "Emergency",
+    description:
+      "Emergency Changes are a change type that must be implemented as soon as possible.",
+  },
+];
+
+/** True when `value` is one of the three types a change request can be created as. */
+export function isCreatableChangeRequestType(value: string | null | undefined): boolean {
+  return CHANGE_REQUEST_CREATE_TYPE_OPTIONS.some((o) => o.value === value);
+}
+
+/**
+ * Whether the signed-in user is the creator/requester of this change request.
+ * The backend refuses approvals from the creator (Peer, CAB and ECAB alike);
+ * this lets the UI say so up front rather than offering a control that will
+ * 403. Defensive on purpose: the detail only carries `requestedBy` (an entity
+ * ref) and `createdBy` (a display string whose shape -- id, email or name --
+ * the backend may change), so it compares each against the user's id and
+ * email and never throws on a missing field. Returns false when nothing
+ * matches or the user hasn't loaded, i.e. it never hides controls on a guess.
+ */
+export function isChangeRequestCreator(
+  cr: { requestedBy?: { id?: string | null } | null; createdBy?: string | null },
+  user: { id?: string | null; email?: string | null } | undefined,
+): boolean {
+  if (!user) return false;
+  const id = user.id?.trim().toLowerCase();
+  const email = user.email?.trim().toLowerCase();
+  const candidates = [cr.requestedBy?.id, cr.createdBy]
+    .map((c) => c?.trim().toLowerCase())
+    .filter((c): c is string => !!c);
+  return candidates.some((c) => (!!id && c === id) || (!!email && c === email));
+}
+
 /** Stage-level statuses that mean the stage is actively waiting on someone. */
 const WAITING_APPROVAL_STATUSES = new Set(["PENDING", "REQUESTED"]);
 
@@ -177,13 +272,63 @@ const WAITING_APPROVAL_STATUSES = new Set(["PENDING", "REQUESTED"]);
  */
 export function changeRequestBlockingReason(
   approvals: BeChangeRequestApproval[] | undefined,
+  state?: string | null,
 ): string | null {
+  // The customer gates are states of their own, not approval stages the
+  // internal approvers list carries, so they are named from the state.
+  if (state === "customer_approval") return "Awaiting customer approval";
+  if (state === "customer_review") return "Awaiting customer review";
   const waiting = approvals?.find((a) => WAITING_APPROVAL_STATUSES.has(a.status.trim().toUpperCase()));
   if (!waiting) return null;
+  // A recognised stage (Peer / CAB / ECAB) is named by its stage label, which
+  // already ends in "Approval" -- so this reads "Awaiting CAB Approval" and
+  // never "Awaiting CAB approval approval".
+  const stageLabel = knownApprovalStageLabel(waiting.stage);
+  if (stageLabel) return `Awaiting ${stageLabel}`;
   const who = waiting.approverName?.trim() || waiting.stage;
   // Approver-group names sometimes already say "Approval" ("Devops
   // Approval"); avoid a doubled "approval approval" in that case.
   return /approval/i.test(who) ? `Awaiting ${who}` : `Awaiting ${who} approval`;
+}
+
+/**
+ * States from which the "Customer Approval" checkbox can no longer be changed:
+ * the gate it controls (between internal approval and scheduling) is either
+ * being worked (`customer_approval`) or already behind the CR (`scheduled` and
+ * everything after it, including the off-ramps). Mirrors the backend, which
+ * refuses a late edit with a 400; this only lets the UI say so up front.
+ */
+const CUSTOMER_APPROVAL_LOCKED_STATES: readonly string[] = [
+  "customer_approval",
+  "scheduled",
+  "implement",
+  "review",
+  "customer_review",
+  "closed",
+  "rollback",
+  "canceled",
+];
+
+/** States from which the "Customer Review" checkbox can no longer be changed. */
+const CUSTOMER_REVIEW_LOCKED_STATES: readonly string[] = [
+  "customer_review",
+  "closed",
+  "rollback",
+  "canceled",
+];
+
+/** Why the Customer Approval checkbox is locked in `state`, or `null` when it is editable. */
+export function customerApprovalLockedReason(state?: string | null): string | null {
+  return state && CUSTOMER_APPROVAL_LOCKED_STATES.includes(state)
+    ? "Locked: the change request has already reached the customer approval step or later."
+    : null;
+}
+
+/** Why the Customer Review checkbox is locked in `state`, or `null` when it is editable. */
+export function customerReviewLockedReason(state?: string | null): string | null {
+  return state && CUSTOMER_REVIEW_LOCKED_STATES.includes(state)
+    ? "Locked: the change request has already reached the customer review step or later."
+    : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -197,7 +342,7 @@ export function changeRequestBlockingReason(
 
 /**
  * Action-phrased label for a transition *into* a given state. Phrased as the
- * action being taken ("Schedule", "Mark implemented"), not as the destination,
+ * action being taken ("Request Approval", "Mark implemented"), not as the destination,
  * because the state chip next to the action bar already names the state —
  * same "no invented verbs for the state itself" convention as
  * `IncidentActionBar`/`CaseActionBar`.
@@ -208,8 +353,16 @@ export function changeRequestBlockingReason(
  * {@link changeRequestTransitionLabel}, so they still render and still work.
  */
 const TRANSITION_LABEL: Record<string, string> = {
-  assess: "Request approval",
-  scheduled: "Schedule",
+  // New -> Assess is the "Request Approval" action: it sends the CR into its
+  // approval flow (Peer -> CAB for Normal, ECAB for Emergency, straight to
+  // Scheduled for Standard -- all the backend's call).
+  assess: "Request Approval",
+  // There is deliberately no generic entry for `scheduled`: a CR is moved to
+  // Scheduled automatically when its approval is granted, never by a manual
+  // "Schedule" action. The one exception is leaving `customer_approval`,
+  // where the move *is* recording the customer's approval -- see
+  // `changeRequestTransitionLabel`'s `fromState` and `NEVER_OFFERED_TARGETS`
+  // in ChangeRequestActionBar.
   implement: "Start implementation",
   review: "Mark implemented",
   customer_review: "Send for customer review",
@@ -233,7 +386,12 @@ function sentenceCase(raw: string): string {
 }
 
 /** The action-phrased label for a transition target, curated or generic. */
-export function changeRequestTransitionLabel(target: string): string {
+export function changeRequestTransitionLabel(target: string, fromState?: string | null): string {
+  // Leaving `customer_approval` for `scheduled` is how the customer's approval
+  // is recorded; it is the only place `scheduled` is ever an action.
+  if (target === "scheduled" && fromState === "customer_approval") {
+    return "Record customer approval";
+  }
   return TRANSITION_LABEL[target] ?? sentenceCase(target);
 }
 
@@ -383,6 +541,12 @@ export interface CloneChangeRequestNavState {
   assignedEngineerId?: string;
   /** Display label for `assignedEngineerId` until a fresh search resolves it. */
   assignedEngineerLabel?: string;
+  /** The source's "Customer Approval" / "Customer Review" checkbox settings.
+   * These are configuration of the flow (which steps the change goes through),
+   * not an approval outcome, so a clone carries them; the customer's actual
+   * confirmation (`hasCustomerApproved`/`hasCustomerReviewed`) is never copied. */
+  customerApprovalRequired?: boolean;
+  customerReviewRequired?: boolean;
 }
 
 /** Rich-text field carried into the clone form only when it has real content. */
@@ -394,7 +558,8 @@ function cloneableHtml(html?: string | null): string | undefined {
 /**
  * Builds the router-state payload for a change request's "Clone" action.
  * Deliberately omits: environment/deployment, state, approval fields
- * (`hasCustomerApproved`/`hasCustomerReviewed`/`approvedBy`/`approvedOn`),
+ * (`hasCustomerApproved`/`hasCustomerReviewed`/`approvedBy`/`approvedOn`; the
+ * `customerApprovalRequired`/`customerReviewRequired` settings ARE carried),
  * planned start/end, and every auto-numbered/timestamp/created-by field —
  * per this feature's requirement that promoting a change to a new
  * environment must never silently carry an approval or a stale schedule
@@ -414,6 +579,8 @@ export function buildCloneChangeRequestNavState(
     impact: (cr.impact as BeChangeRequestImpact) ?? undefined,
     assignedEngineerId: cr.assignedEngineer?.id || undefined,
     assignedEngineerLabel: cr.assignedEngineer?.name || undefined,
+    customerApprovalRequired: cr.customerApprovalRequired ?? undefined,
+    customerReviewRequired: cr.customerReviewRequired ?? undefined,
   };
 }
 
@@ -424,7 +591,7 @@ export function buildCloneChangeRequestNavState(
  * wants a preview) and the create page stay in sync.
  */
 export const CLONE_SOURCE_GAP_MESSAGE =
-  "Copied the subject, description, justification, test plan, type, impact, and assigned engineer. " +
+  "Copied the subject, description, justification, test plan, type, impact, assigned engineer, and customer approval/review settings. " +
   "Priority, implementation plan, risk/impact analysis, backout plan, assignment group, " +
   "linked project/case, and affected product aren't available to copy and need to be re-entered. " +
   "Deployment, schedule, and approval fields are intentionally left blank for you to set for the new environment.";
@@ -535,7 +702,6 @@ export interface ChangeRequestDraft {
   type: string;
   impact: string;
   priority: string;
-  state: string;
   plannedStartDate: string;
   plannedEndDate: string;
   description: string;
@@ -545,6 +711,9 @@ export interface ChangeRequestDraft {
   backoutPlan: string;
   testPlan: string;
   isPlanningVisibleToCustomers: boolean;
+  /** Optional: a draft saved before these checkboxes existed lacks them. */
+  customerApprovalRequired?: boolean;
+  customerReviewRequired?: boolean;
   groupId: string;
   assignedEngineerId: string;
   requestedById: string;

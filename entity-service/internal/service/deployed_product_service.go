@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
@@ -72,20 +73,20 @@ type deployedProductSNCreator interface {
 }
 
 // SearchDeployedProducts implements DeployedProductService.
+//
+// Deliberately reads from Postgres even under DATA_SOURCE=postgres-servicenow-dual-write
+// -- see deploymentService.SearchDeployments' own doc comment for the
+// reasoning: only deployed products this Postgres mirror actually knows
+// about should be selectable, so case creation (whose deployed_product_id
+// FK requires a matching Postgres row) can never be offered one it would
+// then fail to link. A deployed product created before dual-write launched
+// won't appear here until Postgres is backfilled.
 func (s *deployedProductService) SearchDeployedProducts(ctx context.Context, req domain.SearchDeployedProductsRequest) (domain.SearchDeployedProductsResponse, error) {
 	if err := normalizePagination(&req.Pagination); err != nil {
 		return domain.SearchDeployedProductsResponse{}, err
 	}
 	if err := validateUUIDs("deploymentIds", req.DeploymentIDs); err != nil {
 		return domain.SearchDeployedProductsResponse{}, err
-	}
-	// The PostgreSQL-backed deployed_products schema has no category column yet
-	// (see the repository's TODO(phase 2)), so a category filter can't be honored here.
-	// Reject it explicitly rather than silently ignoring it and returning products
-	// outside the requested category.
-	if len(req.ProductCategories) > 0 {
-		return domain.SearchDeployedProductsResponse{},
-			&apierror.ValidationError{Msg: "productCategories filtering is not supported for the PostgreSQL data source"}
 	}
 
 	views, total, err := s.repo.SearchDeployedProducts(ctx, req)
@@ -103,7 +104,7 @@ func (s *deployedProductService) SearchDeployedProducts(ctx context.Context, req
 }
 
 // SearchProjectsByProductVersion implements DeployedProductService.
-// deployed_product.project_id (migration 000014) is a direct FK to project,
+// deployed_product.project_id (migration 0019) is a direct FK to project,
 // so unlike the ServiceNow implementation this doesn't need to page through
 // deployments platform-wide to resolve the join -- the repository does it
 // in one query. The same mandatoryExcludeClosureStates/
@@ -161,6 +162,10 @@ func (s *deployedProductService) CreateDeployedProduct(ctx context.Context, req 
 // generator for it, the exact same unresolved problem
 // CreateDeploymentFromServiceNow already solves for deployment.number.
 func (s *deployedProductService) createDeployedProductSNFirst(ctx context.Context, req domain.CreateDeployedProductRequest) (domain.CreateDeployedProductResponse, error) {
+	if err := validateDeployedProductCategory(req.Category); err != nil {
+		return domain.CreateDeployedProductResponse{}, err
+	}
+
 	creator, ok := s.snMirror.(deployedProductSNCreator)
 	if !ok {
 		// Cannot happen with the real constructor (routes.go always passes a
@@ -272,19 +277,50 @@ func validateUpdateDeployedProductRequest(req domain.UpdateDeployedProductReques
 			return err
 		}
 	}
+	if err := validateDeployedProductCategory(req.Category); err != nil {
+		return err
+	}
 
-	hasDetailFields := req.Cores != nil || req.TPS != nil || len(req.Description) > 0 || req.Updates != nil
+	hasDetailFields := req.Cores != nil || req.TPS != nil || len(req.Description) > 0 || req.Updates != nil || req.Category != nil
 	if !hasDetailFields && req.Active == nil {
-		return &apierror.ValidationError{Msg: "at least one of cores, tps, or description must be provided, or active must be set to false"}
+		return &apierror.ValidationError{Msg: "at least one of cores, tps, description, or category must be provided, or active must be set to false"}
 	}
 	if req.Active != nil && *req.Active {
 		return &apierror.ValidationError{Msg: "active can only be set to false"}
 	}
 	if req.Active != nil && hasDetailFields {
-		return &apierror.ValidationError{Msg: "cores, tps, and description must not be provided when deactivating"}
+		return &apierror.ValidationError{Msg: "cores, tps, description, and category must not be provided when deactivating"}
 	}
 	if err := validateProductUpdates(req.Updates); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validDeployedProductCategory is the lower-case vocabulary
+// SearchDeployedProductsRequest.ProductCategories already accepts, matching
+// deployed_product_category_enum (PDP/MS/PS/CL/PC) case-folded. Shared by
+// create and update so a caller can never write a category value no filter
+// in this codebase would ever match.
+var validDeployedProductCategory = map[string]bool{
+	"pdp": true,
+	"ms":  true,
+	"ps":  true,
+	"cl":  true,
+	"pc":  true,
+}
+
+// validateDeployedProductCategory rejects an unrecognized category before it
+// ever reaches ServiceNow (create is SN-first -- see
+// createDeployedProductSNFirst's own doc comment on why a failed SN call
+// here would be worse than catching it first) or the database (which would
+// otherwise reject it as a raw, caller-unfriendly enum-cast error).
+func validateDeployedProductCategory(category *string) error {
+	if category == nil {
+		return nil
+	}
+	if !validDeployedProductCategory[strings.ToLower(*category)] {
+		return &apierror.ValidationError{Msg: "category must be one of pdp, ms, ps, cl, pc"}
 	}
 	return nil
 }
@@ -307,10 +343,19 @@ func (s *deployedProductService) resolveActorEmail(ctx context.Context) (string,
 }
 
 // SearchDeployedProductMetrics implements DeployedProductService, backed by
-// hourly_usage_summary (migration 000054) -- see DeployedProductRepository's own doc
+// hourly_usage_summary (migration 0054) -- see DeployedProductRepository's own doc
 // comment on resolveDeployedProductNodes for how a deployed product's
 // instances are resolved.
 func (s *deployedProductService) SearchDeployedProductMetrics(ctx context.Context, id string, req domain.DeployedProductMetricsRequest) (domain.DeployedProductMetricsResponse, error) {
+	// DATA_SOURCE=postgres-servicenow-dual-write reads from ServiceNow, not
+	// hourly_usage_summary/deployment_information -- those tables have no
+	// row linked to a real deployment_node anywhere in this database (a
+	// confirmed, environment-wide gap, not specific to any one deployment),
+	// while ServiceNow has always had the complete history.
+	if s.snMirror != nil {
+		return s.snMirror.SearchDeployedProductMetrics(ctx, id, req)
+	}
+
 	if err := validateUUIDs("id", []string{id}); err != nil {
 		return domain.DeployedProductMetricsResponse{}, err
 	}
@@ -325,8 +370,13 @@ func (s *deployedProductService) SearchDeployedProductMetrics(ctx context.Contex
 }
 
 // SearchDeployedProductUsageCounts implements DeployedProductService, same
-// resolution and validation as SearchDeployedProductMetrics.
+// resolution and validation as SearchDeployedProductMetrics -- and the same
+// dual-write ServiceNow-read reasoning.
 func (s *deployedProductService) SearchDeployedProductUsageCounts(ctx context.Context, id string, req domain.DeployedProductUsageCountsRequest) (domain.DeployedProductUsageCountsResponse, error) {
+	if s.snMirror != nil {
+		return s.snMirror.SearchDeployedProductUsageCounts(ctx, id, req)
+	}
+
 	if err := validateUUIDs("id", []string{id}); err != nil {
 		return domain.DeployedProductUsageCountsResponse{}, err
 	}

@@ -54,14 +54,22 @@ const caseStatsProjectID = "11111111-1111-1111-1111-111111111111"
 // RESPONSE SLA. Everything is removed afterwards, so the test is re-runnable.
 func seedCaseStats(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	ctx := context.Background()
+	// WithSystemIdentity: sla's RLS policies (migration 0142) require an
+	// identity on every statement now, including this seed/cleanup's own
+	// writes -- an internal identity is what makes them (and sla_delete,
+	// the internal-only DELETE policy) succeed regardless of which project
+	// caseStatsProjectID belongs to. scoped, not just pool, backs mustExec
+	// below so every seed statement carries it uniformly (harmless for the
+	// non-RLS tables it also inserts into).
+	ctx := repository.WithSystemIdentity(context.Background())
+	scoped := repository.NewScoped(pool)
 
 	cleanup := func() {
 		// work_item children cascade; sla/sla_policy do not reference it by
 		// a cascading FK in both directions, so drop them explicitly first.
-		_, _ = pool.Exec(ctx, `DELETE FROM sla WHERE created_by = 'case-stats-test'`)
+		_, _ = scoped.Exec(ctx, `DELETE FROM sla WHERE created_by = 'case-stats-test'`)
 		_, _ = pool.Exec(ctx, `DELETE FROM sla_policy WHERE created_by = 'case-stats-test'`)
-		_, _ = pool.Exec(ctx, `DELETE FROM work_item WHERE created_by IN ('owner@wso2.com', 'other@wso2.com')`)
+		_, _ = scoped.Exec(ctx, `DELETE FROM work_item WHERE created_by IN ('owner@wso2.com', 'other@wso2.com')`)
 		_, _ = pool.Exec(ctx, `DELETE FROM project WHERE id = $1`, caseStatsProjectID)
 	}
 	cleanup()
@@ -69,7 +77,7 @@ func seedCaseStats(t *testing.T, pool *pgxpool.Pool) {
 
 	mustExec := func(sql string, args ...any) {
 		t.Helper()
-		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+		if _, err := scoped.Exec(ctx, sql, args...); err != nil {
 			t.Fatalf("seed (%s): %v", sql, err)
 		}
 	}
@@ -95,7 +103,7 @@ func seedCaseStats(t *testing.T, pool *pgxpool.Pool) {
 
 	for i, it := range items {
 		// wso2_id is required by the work_item_wso2_id_required_by_type CHECK
-		// for every case-like type (migration 000016).
+		// for every case-like type (migration 0021).
 		suffix := string(rune('1' + i))
 		mustExec(`INSERT INTO work_item (id, created_on, updated_on, created_by, updated_by, number, wso2_id, subject, type, project_id)
 		          VALUES ($1, `+it.createdAt+`, now(), $2, $2, $3, $4, 'seeded', $5::work_item_type_enum, $6)`,
@@ -128,8 +136,11 @@ func TestCaseStatsIntegration_Aggregations(t *testing.T) {
 	pool := caseStatsPool(t)
 	seedCaseStats(t, pool)
 
-	ctx := context.Background()
-	repo := repository.NewProjectCaseStatsRepository(pool)
+	// WithSystemIdentity: this fixture never seeds a project_contact for
+	// caseStatsProjectID, so an internal identity is what makes its rows
+	// visible under sla's/announcement's RLS policies.
+	ctx := repository.WithSystemIdentity(context.Background())
+	repo := repository.NewProjectCaseStatsRepository(repository.NewScoped(pool))
 	all := repository.ProjectCaseStatsFilter{ProjectID: caseStatsProjectID}
 
 	t.Run("StateSeverityCounts", func(t *testing.T) {

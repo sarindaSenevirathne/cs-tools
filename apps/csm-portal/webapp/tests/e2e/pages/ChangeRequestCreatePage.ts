@@ -17,11 +17,15 @@
 import { type Locator, type Page, expect } from "@playwright/test";
 import { CHANGE_REQUEST_CREATE } from "../utils/selectors";
 
+/** The three change types the create form offers, in on-screen order. */
+export type ChangeType = "Normal" | "Standard" | "Emergency";
+
 /**
- * Page object for `/operations/change-requests/new`. Subject is the only
- * required field (Type/Impact come pre-selected with sensible defaults —
- * see CreateChangeRequestPage.tsx), so the happy path only needs to fill
- * Subject and submit. There is no delete endpoint for change requests, so
+ * Page object for `/operations/change-requests/new`. Two fields are required:
+ * the change type ("What type of change is required?" -- exactly Normal,
+ * Standard or Emergency, no default) and the Subject. Impact comes
+ * pre-selected, so the happy path only needs to pick a type, fill Subject
+ * and submit. There is no delete endpoint for change requests, so
  * every CR this creates is a permanent staging record — the subject must
  * always be E2E-tagged (see `e2eChangeRequestSubject`).
  */
@@ -35,6 +39,29 @@ export class ChangeRequestCreatePage {
     ).toBeVisible();
   }
 
+  /** The "What type of change is required?" radio group. */
+  typeGroup(): Locator {
+    return this.page.getByRole("group", { name: /what type of change is required/i });
+  }
+
+  typeRadio(type: ChangeType): Locator {
+    return this.typeGroup().getByRole("radio", { name: new RegExp(`^${type}`) });
+  }
+
+  async selectType(type: ChangeType): Promise<void> {
+    await this.typeRadio(type).check();
+  }
+
+  /** The "Customer Approval" checkbox (a real checkbox, unchecked by default). */
+  customerApprovalCheckbox(): Locator {
+    return this.page.getByRole("checkbox", { name: "Customer Approval" });
+  }
+
+  /** The "Customer Review" checkbox (a real checkbox, unchecked by default). */
+  customerReviewCheckbox(): Locator {
+    return this.page.getByRole("checkbox", { name: "Customer Review" });
+  }
+
   /** MUI's required-field asterisk (a thin-space + `*` folded into the
    * computed accessible name) makes an exact "Subject" match find nothing —
    * this anchored, marker-tolerant regex matches either way. */
@@ -42,8 +69,8 @@ export class ChangeRequestCreatePage {
     return this.page.getByRole("textbox", { name: /^Subject\s*\*?$/ });
   }
 
-  /** Reads a pre-selected enum dropdown's current visible value (Type,
-   * Impact, Priority) without opening it. */
+  /** Reads a pre-selected enum dropdown's current visible value (Impact,
+   * Priority) without opening it. */
   selectValue(label: string): Locator {
     const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return this.page.getByRole("combobox", { name: new RegExp(`^${escaped}\\s*\\*?$`) });
@@ -53,15 +80,22 @@ export class ChangeRequestCreatePage {
     return this.page.getByRole("button", { name: "Create change request" });
   }
 
-  /** Fills the only required field and submits. Returns once the app has
+  /** Picks the change type, fills the subject and submits. Returns once the app has
    * navigated to the new CR's detail page (`/operations/change-requests/:id`).
    * The id segment must not match the literal "new" of this very create
    * route — a bare `[^/]+$` is satisfied by `/operations/change-requests/new`
    * itself, which would let this assertion pass instantly on a still-pending
    * (or failed) submit, before the app ever navigates to the created
    * record's real id. */
-  async fillSubjectAndSubmit(subject: string): Promise<void> {
+  async fillSubjectAndSubmit(
+    subject: string,
+    type: ChangeType = "Normal",
+    opts: { customerApproval?: boolean; customerReview?: boolean } = {},
+  ): Promise<void> {
+    await this.selectType(type);
     await this.subjectField().fill(subject);
+    if (opts.customerApproval) await this.customerApprovalCheckbox().check();
+    if (opts.customerReview) await this.customerReviewCheckbox().check();
     await expect(this.createButton()).toBeEnabled();
     await this.createButton().click();
     await expect(this.page).toHaveURL(/\/operations\/change-requests\/(?!new(?:[/?#]|$))[^/]+$/, {

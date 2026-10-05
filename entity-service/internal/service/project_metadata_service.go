@@ -30,17 +30,19 @@ import (
 // Postgres enum type names backing ProjectMetadataResponse's choice lists,
 // named exactly as their CREATE TYPE migration defines them.
 const (
-	caseStateEnumType             = "case_state_enum"              // migrations/000018_case_table.up.sql
-	caseSeverityEnumType          = "case_severity_enum"           // migrations/000018_case_table.up.sql
-	caseIssueTypeEnumType         = "case_issue_type_enum"         // migrations/000018_case_table.up.sql
-	deploymentTypeEnumType        = "deployment_type_enum"         // migrations/000013_deployment_table.up.sql
-	engagementTypeEnumType        = "engagement_type_enum"         // migrations/000019_work_item_extensions.up.sql
-	engagementPaymentTypeEnumType = "engagement_payment_type_enum" // migrations/000019_work_item_extensions.up.sql
-	changeRequestStateEnumType    = "change_request_state_enum"    // migrations/000047_change_request_table.up.sql
-	changeRequestImpactEnumType   = "change_request_impact_enum"   // migrations/000047_change_request_table.up.sql
-	timeCardStateEnumType         = "time_card_state_enum"         // migrations/000039_time_card_tables.up.sql
-	conversationStateEnumType     = "conversation_state_enum"      // migrations/000057_conversation_table.up.sql
-	callRequestStateEnumType      = "customer_call_state_enum"     // migrations/000072_customer_call_table.up.sql
+	caseStateEnumType             = "case_state_enum"              // migrations/0023_case_table.sql
+	caseSeverityEnumType          = "case_severity_enum"           // migrations/0023_case_table.sql
+	caseIssueTypeEnumType         = "case_issue_type_enum"         // migrations/0023_case_table.sql
+	deploymentTypeEnumType        = "deployment_type_enum"         // migrations/0018_deployment_table.sql
+	engagementTypeEnumType        = "engagement_type_enum"         // migrations/0024_work_item_extensions.sql
+	engagementPaymentTypeEnumType = "engagement_payment_type_enum" // migrations/0024_work_item_extensions.sql
+	changeRequestStateEnumType    = "change_request_state_enum"    // migrations/0043_change_request_details_table.sql
+	changeRequestImpactEnumType   = "change_request_impact_enum"   // migrations/0043_change_request_details_table.sql
+	timeCardStateEnumType         = "time_card_state_enum"         // migrations/0041_time_card_tables.sql
+	conversationStateEnumType     = "conversation_state_enum"      // migrations/0057_conversation_table.sql
+	callRequestStateEnumType      = "customer_call_state_enum"     // migrations/0073_customer_call_table.sql
+	caseResolutionCodeEnumType    = "case_resolution_code_enum"    // migrations/0023_case_table.sql
+	caseCauseEnumType             = "case_cause_enum"              // migrations/0023_case_table.sql
 )
 
 // projectMetadataEnumTypes is every enum EnumLabels is asked for in one
@@ -50,6 +52,7 @@ var projectMetadataEnumTypes = []string{
 	deploymentTypeEnumType, engagementTypeEnumType, engagementPaymentTypeEnumType,
 	changeRequestStateEnumType, changeRequestImpactEnumType,
 	timeCardStateEnumType, conversationStateEnumType, callRequestStateEnumType,
+	caseResolutionCodeEnumType, caseCauseEnumType,
 }
 
 // caseTypeRefItems is the fixed vocabulary case_service.go's own
@@ -85,6 +88,48 @@ func callRequestStateChoices(labels []string) []domain.ChoiceListItem {
 			continue
 		}
 		out = append(out, domain.ChoiceListItem{ID: st.ID, Label: st.Label})
+	}
+	return out
+}
+
+// resolutionCodeChoices converts case_resolution_code_enum labels to choice
+// items keyed by the canonical domain.CaseResolutionCode value PATCH
+// /cases/{id} actually accepts (repository.CaseResolutionCodeFromEnum) --
+// not the raw label itself, which doesn't always match (see that function's
+// own doc comment on the one long-form exception). A label with no domain
+// mapping is skipped and logged, same posture as callRequestStateChoices.
+func resolutionCodeChoices(ctx context.Context, labels []string) []domain.ChoiceListItem {
+	out := make([]domain.ChoiceListItem, 0, len(labels))
+	for _, l := range labels {
+		code := repository.CaseResolutionCodeFromEnum(l)
+		if code == "" {
+			slog.WarnContext(ctx, "project metadata: case_resolution_code_enum label has no domain mapping", "label", l)
+			continue
+		}
+		out = append(out, domain.ChoiceListItem{ID: string(code), Label: humanizeSnakeCase(strings.ToLower(string(code)))})
+	}
+	return out
+}
+
+// causeChoices converts case_cause_enum labels to choice items. Unlike
+// resolution codes, domain.CaseCause's values match the enum's own labels by
+// identity (verified against validCaseCause), so the raw label doubles as
+// the id with no lookup table needed.
+//
+// A label with no entry in snCauseKey is skipped and logged: migration 0108
+// added case_cause_enum's USER_MISTAKE value with no matching ServiceNow
+// picklist entry, so offering it here would let a caller pick a cause the
+// dual-write mirror's own patchCaseFields then rejects with "cause contains
+// invalid value" -- a choice list must never offer a value the write path
+// can't actually accept.
+func causeChoices(ctx context.Context, labels []string) []domain.ChoiceListItem {
+	out := make([]domain.ChoiceListItem, 0, len(labels))
+	for _, l := range labels {
+		if _, ok := snCauseKey[domain.CaseCause(l)]; !ok {
+			slog.WarnContext(ctx, "project metadata: case_cause_enum label has no ServiceNow mapping", "label", l)
+			continue
+		}
+		out = append(out, domain.ChoiceListItem{ID: l, Label: humanizeSnakeCase(strings.ToLower(l))})
 	}
 	return out
 }
@@ -132,7 +177,7 @@ func (s *projectMetadataService) GetProjectMetadata(ctx context.Context, project
 		AcceptedSeverityValues: make([]domain.ChoiceListItem, 0),
 	}
 	// projectType's Has*Access/severity/category fields are already resolved
-	// by GetProjectByID's join against project_type (migration 000085) --
+	// by GetProjectByID's join against project_type (migration 0130) --
 	// all false/empty for a project with no type, or a type FEATURE_MATRIX
 	// itself has no entry for (Cloud Support - Platformer, Internal,
 	// Platformer Subscription, Regular), same as before this migration
@@ -173,6 +218,8 @@ func (s *projectMetadataService) GetProjectMetadata(ctx context.Context, project
 		CaseTypes:                   caseTypeRefItems,
 		EngagementTypes:             choiceListFromLabels(labels[engagementTypeEnumType]),
 		EngagementPaymentTypes:      choiceListFromLabels(labels[engagementPaymentTypeEnumType]),
+		ResolutionCodes:             resolutionCodeChoices(ctx, labels[caseResolutionCodeEnumType]),
+		Causes:                      causeChoices(ctx, labels[caseCauseEnumType]),
 		Features:                    features,
 	}, nil
 }
@@ -214,7 +261,7 @@ func severityChoiceItems(ctx context.Context, enumLabels []string) []domain.Choi
 }
 
 // lowercaseAll converts deployed_product_category_enum's UPPER_SNAKE labels
-// (migration 000014) to the lowercase form ProjectFeatures.
+// (migration 0019) to the lowercase form ProjectFeatures.
 // DefaultCaseProductCategories/SrProductCategories have always carried --
 // matches the webapp's own ProductCategory enum (features/project-details/
 // types/deployments.ts: CLOUD = "cl", PDP = "pdp"). A nil slice stays nil,

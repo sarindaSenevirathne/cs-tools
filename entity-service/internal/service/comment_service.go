@@ -27,7 +27,7 @@ import (
 )
 
 // commentTypeToEnum maps the CommentType values this Postgres data source can
-// represent to comment_type_enum's labels (migration 000037: APPROVAL_HISTORY,
+// represent to comment_type_enum's labels (migration 0040: APPROVAL_HISTORY,
 // COMMENT, WORK_NOTE). CommentTypeActivity maps to APPROVAL_HISTORY for
 // filtering/read-back, but CreateComment refuses to write one: APPROVAL_HISTORY
 // only ever arises from ServiceNow's own audit trail, never from a
@@ -43,10 +43,10 @@ var commentTypeToEnum = map[domain.CommentType]string{
 // any other non-empty value rather than trusting it at face value.
 const commentCreatedByAgent = "agent"
 
-// commentAdminRoleName is the role.name (migration 000004's seed data, joined
+// commentAdminRoleName is the role.name (migration 0008's seed data, joined
 // through user_role) that grants a caller admin-level access to comment
 // edit/delete/visibility decisions on this data source -- confirmed against
-// this service's own existing role checks (migration 000007's
+// this service's own existing role checks (migration 0011's
 // recompute_user_type trigger and user_repo_test.go both use the literal
 // "admin"), not the CSM portal backend's own DefaultRoles vocabulary (a
 // different layer, apps/csm-portal/backend/internal/directory/roles.go),
@@ -106,7 +106,7 @@ func commentRowToDomain(row repository.CommentRow) domain.Comment {
 		CreatedOn:    row.CreatedOn,
 		LastEditedOn: row.LastEditedAt,
 		IsDeleted:    row.DeletedAt != nil,
-		// comment.created_by (migration 000037) is a free-text VARCHAR, not a
+		// comment.created_by (migration 0040) is a free-text VARCHAR, not a
 		// foreign key into "user" -- it mirrors ServiceNow's sys_journal_field
 		// author string, which can be an integration/automation account with
 		// no local user row. This data source writes the resolved caller's

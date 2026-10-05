@@ -227,16 +227,68 @@ func TestSNCaseService_CreateCase_SkipsPublishWhenNoWatchers(t *testing.T) {
 	}
 }
 
-// TestSNCaseService_CreateCase_SkipsPublishWhenNoSeverity verifies that a
-// created record with no severity does not publish case.created at all --
+// TestSNCaseService_CreateCase_CaseTypeSkipsPublishWhenNoSeverity verifies
+// that a created record of type "case" still does not publish case.created
+// at all when GetCaseByID's own enrichment comes back with no severity --
 // CaseCreatedPayload.Priority has no omitempty (a consumer always expects a
-// real value), and "" is not a real priority. Uses type "announcement"
-// specifically: severity is a required, validated field for type "case"
-// (validateCreateCaseRequest), so this scenario can only occur for one of
-// the other four types this shared function also serves -- none of
-// which have a severity concept at all (case-only field). Deliberate,
-// not an oversight: those four never publish case.created as a result.
-func TestSNCaseService_CreateCase_SkipsPublishWhenNoSeverity(t *testing.T) {
+// real value), and "" is not a real priority. This guard is specific to
+// type "case": the other four types this shared function also serves never
+// have a severity concept at all (case-only field) and publish regardless
+// -- see the tests below.
+func TestSNCaseService_CreateCase_CaseTypeSkipsPublishWhenNoSeverity(t *testing.T) {
+	const caseSysid = "9999999999999999999999999999dddd"
+	const projectSysid = "8888888888888888888888888888eeee"
+	const watcherSysid = "7777777777777777777777777777ffff"
+
+	getCaseBody := `{
+		"id": "` + caseSysid + `",
+		"internalId": "WSO2-024",
+		"number": "CS0024001",
+		"title": "No severity here",
+		"description": "d",
+		"createdOn": "2026-01-02 10:00:00",
+		"createdBy": "jane.doe@example.com",
+		"createdByFullName": "Jane Doe",
+		"project": {"id": "` + projectSysid + `", "name": "Project Zeta"},
+		"deployment": {"id": "", "name": ""},
+		"deployedProduct": {"id": "", "name": "", "version": ""},
+		"state": {"id": 1, "label": "Open"},
+		"watchList": [
+			{"id": "` + watcherSysid + `", "userName": "jroe", "name": "John Roe", "email": "john.roe@example.com"}
+		]
+	}`
+
+	client := newTestCreateCaseClient(t, caseSysid, getCaseBody)
+	publisher := &mockEventPublisher{}
+	svc := NewServiceNowCaseService(client, nil, publisher, nil, nil, "", nil)
+
+	req := domain.CreateCaseRequest{
+		Type:              "case",
+		ProjectID:         testProjectUUID,
+		DeploymentID:      testDeploymentUUID,
+		DeployedProductID: testDeployedProdID,
+		Subject:           "No severity here",
+		Description:       "d",
+		Severity:          domain.CaseSeverityHigh,
+		IssueType:         domain.CaseIssueTypeQuestion,
+	}
+
+	if _, err := svc.CreateCase(contextWithUserIDToken("token"), req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(publisher.calls) != 0 {
+		t.Fatalf("expected no publish call for a case with no severity, got %d", len(publisher.calls))
+	}
+}
+
+// TestSNCaseService_CreateCase_AnnouncementFallsBackToWatchListWhenNoRoleMatch
+// verifies that an announcement case still publishes case.created using the
+// case's own watch list emails when ProjectContactEmailsByRole resolves no
+// contact for the requested role (here: no Postgres pgFallback configured
+// at all, which resolves to an empty slice the same as a real "no matching
+// contact" result) -- a project with nobody in the requested role must
+// still notify someone, not silently notify no one.
+func TestSNCaseService_CreateCase_AnnouncementFallsBackToWatchListWhenNoRoleMatch(t *testing.T) {
 	const caseSysid = "9999999999999999999999999999dddd"
 	const projectSysid = "8888888888888888888888888888eeee"
 	const watcherSysid = "7777777777777777777777777777ffff"
@@ -273,8 +325,157 @@ func TestSNCaseService_CreateCase_SkipsPublishWhenNoSeverity(t *testing.T) {
 	if _, err := svc.CreateCase(contextWithUserIDToken("token"), req); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(publisher.calls) != 0 {
-		t.Fatalf("expected no publish call for a record with no severity, got %d", len(publisher.calls))
+	if len(publisher.calls) != 1 {
+		t.Fatalf("expected 1 publish call, got %d", len(publisher.calls))
+	}
+	var payload events.CaseCreatedPayload
+	if err := json.Unmarshal(publisher.calls[0].payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if len(payload.Recipients) != 1 || payload.Recipients[0] != "john.roe@example.com" {
+		t.Errorf("Recipients = %v, want [john.roe@example.com] (the watch list fallback)", payload.Recipients)
+	}
+}
+
+// TestSNCaseService_CreateCase_AnnouncementResolvesRoleBasedRecipients
+// verifies an announcement's Recipients come from ProjectContactEmailsByRole
+// (SECURITY_CONTACT when IsSecurityAnnouncement, else PORTAL_USER),
+// bypassing the watch list entirely when a role match exists.
+func TestSNCaseService_CreateCase_AnnouncementResolvesRoleBasedRecipients(t *testing.T) {
+	const caseSysid = "9999999999999999999999999999dddd"
+	const projectSysid = "8888888888888888888888888888eeee"
+	const watcherSysid = "7777777777777777777777777777ffff"
+
+	getCaseBody := `{
+		"id": "` + caseSysid + `",
+		"internalId": "WSO2-024",
+		"number": "CS0024001",
+		"title": "Security notice",
+		"description": "d",
+		"createdOn": "2026-01-02 10:00:00",
+		"createdBy": "jane.doe@example.com",
+		"createdByFullName": "Jane Doe",
+		"project": {"id": "` + projectSysid + `", "name": "Project Zeta"},
+		"deployment": {"id": "", "name": ""},
+		"deployedProduct": {"id": "", "name": "", "version": ""},
+		"state": {"id": 1, "label": "Open"},
+		"watchList": [
+			{"id": "` + watcherSysid + `", "userName": "jroe", "name": "John Roe", "email": "john.roe@example.com"}
+		]
+	}`
+
+	testCases := []struct {
+		name           string
+		isSecurity     bool
+		wantRole       string
+		wantRecipients []string
+	}{
+		{"security announcement resolves SECURITY_CONTACT", true, "SECURITY_CONTACT", []string{"security@example.com"}},
+		{"regular announcement resolves PORTAL_USER", false, "PORTAL_USER", []string{"portal-user@example.com"}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newTestCreateCaseClient(t, caseSysid, getCaseBody)
+			publisher := &mockEventPublisher{}
+			var gotRole string
+			pgFallback := &stubMirrorCaseService{
+				projectContactEmailsByRoleFn: func(_ context.Context, gotProjectID, role string) ([]string, error) {
+					if gotProjectID != testProjectUUID {
+						t.Errorf("projectID = %q, want %q", gotProjectID, testProjectUUID)
+					}
+					gotRole = role
+					return tc.wantRecipients, nil
+				},
+			}
+			svc := NewServiceNowCaseService(client, pgFallback, publisher, nil, nil, "", nil)
+
+			req := domain.CreateCaseRequest{
+				Type:                   "announcement",
+				ProjectID:              testProjectUUID,
+				Subject:                "Security notice",
+				Description:            "d",
+				IsSecurityAnnouncement: tc.isSecurity,
+			}
+
+			if _, err := svc.CreateCase(contextWithUserIDToken("token"), req); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if gotRole != tc.wantRole {
+				t.Errorf("role = %q, want %q", gotRole, tc.wantRole)
+			}
+			if len(publisher.calls) != 1 {
+				t.Fatalf("expected 1 publish call, got %d", len(publisher.calls))
+			}
+			var payload events.CaseCreatedPayload
+			if err := json.Unmarshal(publisher.calls[0].payload, &payload); err != nil {
+				t.Fatalf("unmarshal payload: %v", err)
+			}
+			if len(payload.Recipients) != 1 || payload.Recipients[0] != tc.wantRecipients[0] {
+				t.Errorf("Recipients = %v, want %v (never the watch list, since a role match was found)", payload.Recipients, tc.wantRecipients)
+			}
+		})
+	}
+}
+
+// TestSNCaseService_CreateCase_ServiceRequestPublishesWithoutSeverity
+// verifies that service_request/engagement/security_report_analysis --
+// like announcement, but using the ordinary watch-list-based Recipients
+// path rather than project-contact-role resolution -- now publish
+// case.created despite having no severity, using the case's watch list as
+// Recipients. This used to be unconditionally skipped for every non-"case"
+// type; see publishCaseCreatedEvent's own doc comment for the fix.
+func TestSNCaseService_CreateCase_ServiceRequestPublishesWithoutSeverity(t *testing.T) {
+	const caseSysid = "9999999999999999999999999999dddd"
+	const projectSysid = "8888888888888888888888888888eeee"
+	const watcherSysid = "7777777777777777777777777777ffff"
+
+	getCaseBody := `{
+		"id": "` + caseSysid + `",
+		"internalId": "WSO2-024",
+		"number": "CS0024001",
+		"title": "Need a new sandbox",
+		"description": "d",
+		"createdOn": "2026-01-02 10:00:00",
+		"createdBy": "jane.doe@example.com",
+		"createdByFullName": "Jane Doe",
+		"project": {"id": "` + projectSysid + `", "name": "Project Zeta"},
+		"deployment": {"id": "", "name": ""},
+		"deployedProduct": {"id": "", "name": "", "version": ""},
+		"state": {"id": 1, "label": "Open"},
+		"watchList": [
+			{"id": "` + watcherSysid + `", "userName": "jroe", "name": "John Roe", "email": "john.roe@example.com"}
+		]
+	}`
+
+	client := newTestCreateCaseClient(t, caseSysid, getCaseBody)
+	publisher := &mockEventPublisher{}
+	svc := NewServiceNowCaseService(client, nil, publisher, nil, nil, "", nil)
+
+	req := domain.CreateCaseRequest{
+		Type:              "service_request",
+		ProjectID:         testProjectUUID,
+		DeploymentID:      testDeploymentUUID,
+		DeployedProductID: testDeployedProdID,
+		Subject:           "Need a new sandbox",
+		Description:       "d",
+		CatalogID:         "44444444-4444-4444-4444-444444444444",
+		CatalogItemID:     "55555555-5555-5555-5555-555555555555",
+		Variables:         []domain.Variable{{ID: "66666666-6666-6666-6666-666666666667", Value: "v"}},
+	}
+
+	if _, err := svc.CreateCase(contextWithUserIDToken("token"), req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(publisher.calls) != 1 {
+		t.Fatalf("expected 1 publish call, got %d", len(publisher.calls))
+	}
+	var payload events.CaseCreatedPayload
+	if err := json.Unmarshal(publisher.calls[0].payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if len(payload.Recipients) != 1 || payload.Recipients[0] != "john.roe@example.com" {
+		t.Errorf("Recipients = %v, want [john.roe@example.com]", payload.Recipients)
 	}
 }
 

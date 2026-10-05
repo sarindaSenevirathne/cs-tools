@@ -25,14 +25,13 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
 )
 
 // DeploymentRepository defines the persistence operations for the
-// deployment table (migration 000013).
+// deployment table (migration 0018).
 type DeploymentRepository interface {
 	// SearchDeployments returns a filtered, paginated slice of enriched deployment
 	// views together with the total count of matching rows before pagination.
@@ -53,11 +52,13 @@ type DeploymentRepository interface {
 }
 
 type deploymentRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewDeploymentRepository constructs a DeploymentRepository backed by the given connection pool.
-func NewDeploymentRepository(db *pgxpool.Pool) DeploymentRepository {
+// NewDeploymentRepository constructs a DeploymentRepository whose every query
+// runs under the caller identity on ctx (deployment has row-level security,
+// migration 0176).
+func NewDeploymentRepository(db *Scoped) DeploymentRepository {
 	return &deploymentRepo{db: db}
 }
 
@@ -66,7 +67,7 @@ func (r *deploymentRepo) SearchDeployments(ctx context.Context, req domain.Searc
 	filterArgs := []any{}
 	argIdx := 1
 
-	// deployment.project_id is nullable (migration 000013 sets it NULL when
+	// deployment.project_id is nullable (migration 0018 sets it NULL when
 	// the owning project is deleted). The data query below inner-joins
 	// project and so can never return such a row; without this predicate
 	// the count query would still include it, inflating total relative to
@@ -123,11 +124,19 @@ func (r *deploymentRepo) SearchDeployments(ctx context.Context, req domain.Searc
 	// returns a row -- CreatedBy comes back nil rather than a fabricated
 	// EntityRef with an empty id (see the domain package's own
 	// "empty strings must never appear" convention).
+	// deployedProductCount was never selected at all, so it stayed at its Go
+	// zero value on every row -- the customer portal's Usage Metrics page
+	// filters its deployment tabs on productCount > 0, so every deployment
+	// silently looked like it had zero products regardless of how many
+	// deployed_product rows actually existed under it. A correlated
+	// subquery, not a JOIN + GROUP BY, since every other selected column
+	// here is per-deployment and a join would multiply rows.
 	dataQuery := fmt.Sprintf(
 		`SELECT d.id, d.number, d.name, d.type::TEXT, d.description,
 		        d.created_on, d.updated_on,
 		        u.id, COALESCE(u.name, NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '')),
-		        p.id, p.name
+		        p.id, p.name,
+		        (SELECT COUNT(*) FROM deployed_product dp WHERE dp.deployment_id = d.id)
 		 FROM deployment d
 		 LEFT JOIN "user" u ON LOWER(u.email) = LOWER(d.created_by)
 		 JOIN project p ON d.project_id = p.id
@@ -167,10 +176,11 @@ func (r *deploymentRepo) SearchDeployments(ctx context.Context, req domain.Searc
 				&d.CreatedOn, &d.UpdatedOn,
 				&creatorID, &creatorName,
 				&d.Project.ID, &d.Project.Name,
+				&d.DeployedProductCount,
 			); err != nil {
 				return fmt.Errorf("scan deployment: %w", err)
 			}
-			// deployment.type (migration 000013) has no NOT NULL constraint --
+			// deployment.type (migration 0018) has no NOT NULL constraint --
 			// 38 of 2859 rows are NULL on staging, checked live -- but
 			// DeploymentView.Type is a required (non-pointer) field on the
 			// wire, matching the OpenAPI contract every consumer already

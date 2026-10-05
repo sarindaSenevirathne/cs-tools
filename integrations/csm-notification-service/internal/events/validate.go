@@ -91,8 +91,8 @@ func Validate(entityID string, t Type, raw json.RawMessage) error {
 		// Requiring it unconditionally used to reject case.created outright
 		// for every one of those types, before it ever reached dispatch's
 		// own CaseType branching — no email or Chat alert ever went out for
-		// them as a result. RenderCaseCreatedEmail already renders an empty
-		// Priority as a blank value with no ill effect, and
+		// them as a result. RenderCaseCreatedEmail drops its Priority row
+		// entirely (not just blank) when it's empty, and
 		// SendSecurityReportAnalysisAlert/SendCaseCreatedAlert both already
 		// omit their severity-derived line entirely when it's empty.
 		if p.ReporterName == "" || p.ProjectName == "" || p.ProjectID == "" || p.CaseID == "" || p.CaseTitle == "" ||
@@ -180,18 +180,20 @@ func Validate(entityID string, t Type, raw json.RawMessage) error {
 		}
 		// entityID is required here (unlike its role for the case.* types
 		// above, where it's checked against the payload's own CaseID
-		// instead): dispatch.handleIncidentCreated builds the Chat alert's
-		// portal link directly from it (recipientlinks.Resolver.IncidentLink),
-		// so an empty entityID would produce a broken link on an otherwise
-		// "valid" event rather than being caught here.
+		// instead) — this event has no payload field of its own to compare
+		// it against, but it's still the Kafka partition key (see
+		// events.Envelope's own doc comment) and identifies the incident, so
+		// an empty value is still rejected.
 		if entityID == "" || p.Title == "" || p.ShortDescription == "" {
 			return fmt.Errorf("events: missing required field for %s", t)
 		}
-		// Product and CallTo are optional: a publisher that can't determine
-		// which Chat space or on-call number applies (e.g. entity-service)
-		// may omit them, and dispatch substitutes its own configured
-		// defaults. A non-empty CallTo must still be a valid E.164 number —
-		// this only relaxes "absent," not "malformed."
+		// CallTo is optional: a publisher that can't determine which on-call
+		// number applies (e.g. entity-service) may omit it, and dispatch
+		// substitutes its own configured default. A non-empty CallTo must
+		// still be a valid E.164 number — this only relaxes "absent," not
+		// "malformed." Product is accepted on the wire (decode-compatibility)
+		// but is otherwise unconstrained — see IncidentCreatedPayload's own
+		// doc comment.
 		if p.CallTo != "" && !e164Pattern.MatchString(p.CallTo) {
 			return fmt.Errorf("events: %s callTo %q is not a valid E.164 phone number", t, p.CallTo)
 		}
@@ -202,17 +204,6 @@ func Validate(entityID string, t Type, raw json.RawMessage) error {
 		}
 		if p.CaseID == "" || p.ClockType == "" || !validSLATier[p.Tier] {
 			return fmt.Errorf("events: missing or invalid required field for %s", t)
-		}
-		if p.CaseID != entityID {
-			return fmt.Errorf("events: payload caseId %q does not match entityId %q", p.CaseID, entityID)
-		}
-	case TypeCaseBillableStatusChanged:
-		var p CaseBillableStatusChangedPayload
-		if err := decodeStrict(raw, &p); err != nil {
-			return err
-		}
-		if p.CaseID == "" {
-			return fmt.Errorf("events: missing required field for %s", t)
 		}
 		if p.CaseID != entityID {
 			return fmt.Errorf("events: payload caseId %q does not match entityId %q", p.CaseID, entityID)
@@ -239,6 +230,23 @@ func Validate(entityID string, t Type, raw json.RawMessage) error {
 		case p.Kind == "rejected" && p.Audience == "customer":
 		default:
 			return fmt.Errorf("events: %s has kind %q that does not go with audience %q", t, p.Kind, p.Audience)
+		}
+		if !validRecipients(p.Recipients) {
+			return fmt.Errorf("events: invalid recipients for %s", t)
+		}
+	case TypeOutageNotificationDue, TypeOutageCommunicationDue:
+		var p OutageNoticePayload
+		if err := decodeStrict(raw, &p); err != nil {
+			return err
+		}
+		if p.OutageID == "" || p.Number == "" || p.Subject == "" || p.Body == "" {
+			return fmt.Errorf("events: missing required field for %s", t)
+		}
+		if p.OutageID != entityID {
+			return fmt.Errorf("events: payload outageId %q does not match entityId %q", p.OutageID, entityID)
+		}
+		if !validOutageKind[t][p.Kind] {
+			return fmt.Errorf("events: %s has unknown kind %q", t, p.Kind)
 		}
 		if !validRecipients(p.Recipients) {
 			return fmt.Errorf("events: invalid recipients for %s", t)
@@ -288,6 +296,22 @@ func Validate(entityID string, t Type, raw json.RawMessage) error {
 				return fmt.Errorf("events: eventModifiedOn %q is not RFC 3339: %w", p.EventModifiedOn, err)
 			}
 		}
+	case TypeProjectContactRegistered:
+		var p ProjectContactRegisteredPayload
+		if err := decodeStrict(raw, &p); err != nil {
+			return err
+		}
+		if p.MembershipSfID == "" || !emailPattern.MatchString(p.Email) {
+			return fmt.Errorf("events: missing or invalid required field for %s", t)
+		}
+		if p.MembershipSfID != entityID {
+			return fmt.Errorf("events: payload membershipSfId %q does not match entityId %q", p.MembershipSfID, entityID)
+		}
+		if p.EventModifiedOn != "" {
+			if _, err := time.Parse(time.RFC3339Nano, p.EventModifiedOn); err != nil {
+				return fmt.Errorf("events: eventModifiedOn %q is not RFC 3339: %w", p.EventModifiedOn, err)
+			}
+		}
 	default:
 		return fmt.Errorf("events: unknown event type %q", t)
 	}
@@ -310,4 +334,12 @@ func decodeStrict(raw json.RawMessage, v any) error {
 		return fmt.Errorf("events: unexpected trailing data after payload")
 	}
 	return nil
+}
+
+// validOutageKind is which kinds each outage email can carry: the internal
+// notification has an Update arm between declaration and resolution, the
+// outage communication does not.
+var validOutageKind = map[Type]map[string]bool{
+	TypeOutageNotificationDue:  {"DECLARED": true, "UPDATE": true, "RESOLVED": true},
+	TypeOutageCommunicationDue: {"DECLARED": true, "RESOLVED": true},
 }

@@ -173,6 +173,7 @@ import { caseIdLabel } from "@features/csm-cases/utils/caseIdentity";
 import { useReportCaseTabDraft } from "@features/case-tabs/hooks/useReportCaseTabDraft";
 import { useReportCaseTabMeta } from "@features/case-tabs/hooks/useReportCaseTabMeta";
 import { useCaseRouteOverride } from "@context/case-tabs/CaseRouteOverrideContext";
+import { replaceUuids } from "@utils/redactIds";
 import { formatAbsoluteForUser } from "@utils/dateTime";
 import {
   isBlankHtml,
@@ -621,6 +622,7 @@ export default function CsmCaseDetailPage(): JSX.Element {
   const {
     data: caseProject,
     isLoading: isCaseProjectLoading,
+    isError: isCaseProjectError,
     refetch: refetchCaseProject,
     isFetching: isFetchingCaseProject,
   } = useGetProject(data?.projectId);
@@ -1711,12 +1713,14 @@ export default function CsmCaseDetailPage(): JSX.Element {
               sticky: false,
             }),
           onError: (err) => {
-            // The watch-list 400s name the offending value (an unknown or
-            // malformed user id), which is far more actionable than a generic
-            // string — same treatment as every other 4xx on this page.
+            // The watch-list 4xx messages name the offending user by id, which
+            // is meaningful to a log but not to the person reading the toast, so
+            // the id is swapped for "that user". The rest of the message (e.g.
+            // "... is not a contact on this case's project") is the actionable
+            // part and is kept.
             const msg =
               err instanceof BackendApiError && err.status < 500 && err.message
-                ? err.message
+                ? replaceUuids(err.message, "user")
                 : action === "add"
                   ? "Could not add the watcher."
                   : "Could not remove the watcher.";
@@ -2740,11 +2744,15 @@ export default function CsmCaseDetailPage(): JSX.Element {
                   feedback={caseFeedback ?? []}
                   callRequests={callRequests ?? []}
                   onDownloadAttachment={canDownloadAttachment ? onDownloadAttachment : undefined}
-                  preview={{
-                    onGetPreviewContent: getAttachmentPreviewContent,
-                    previewTarget,
-                    onPreviewTargetChange: setPreviewTarget,
-                  }}
+                  preview={
+                    canDownloadAttachment
+                      ? {
+                          onGetPreviewContent: getAttachmentPreviewContent,
+                          previewTarget,
+                          onPreviewTargetChange: setPreviewTarget,
+                        }
+                      : undefined
+                  }
                   onEditComment={onEditComment}
                   onDeleteComment={onDeleteComment}
                 />
@@ -3003,11 +3011,15 @@ export default function CsmCaseDetailPage(): JSX.Element {
             onDownload={canDownloadAttachment ? onDownloadAttachment : undefined}
             onDelete={canWrite ? setPendingDelete : undefined}
             deletingId={deleteAttachment.isPending ? pendingDelete?.id : null}
-            preview={{
-              onGetPreviewContent: getAttachmentPreviewContent,
-              previewTarget,
-              onPreviewTargetChange: setPreviewTarget,
-            }}
+            preview={
+              canDownloadAttachment
+                ? {
+                    onGetPreviewContent: getAttachmentPreviewContent,
+                    previewTarget,
+                    onPreviewTargetChange: setPreviewTarget,
+                  }
+                : undefined
+            }
           />
         </Box>
       )}
@@ -3167,6 +3179,10 @@ export default function CsmCaseDetailPage(): JSX.Element {
           currentDeployedProductId={c.productContext.deployedProductId}
           isSaving={patchCase.isPending}
           onClose={() => setEditDetailsOpen(false)}
+          onAllSaved={() => {
+            setEditDetailsOpen(false);
+            setFeedback({ message: "Case details saved.", severity: "success", sticky: false });
+          }}
           onSubmit={onEditCaseDetails}
         />
       )}
@@ -3296,6 +3312,13 @@ export default function CsmCaseDetailPage(): JSX.Element {
           defaultTitle={c.subject}
           defaultDescription={c.description}
           showRepoField={isCloudSupportSubscription(caseProject?.subscriptionType)}
+          productName={c.productCatalogueName || c.product}
+          onboardingInProgress={caseProject?.onboardingStatus === "In-Progress"}
+          projectStatusPending={Boolean(c.projectId) && caseProject === undefined && !isCaseProjectError}
+          projectStatusFailed={Boolean(c.projectId) && isCaseProjectError}
+          onRetryProjectStatus={() => {
+            void refetchCaseProject();
+          }}
           onClose={() => {
             setGithubIssueOpen(false);
             setGithubIssueError(null);
@@ -3315,6 +3338,23 @@ export default function CsmCaseDetailPage(): JSX.Element {
                   // done reading the confirmation.
                   setActiveTab("activities");
                   setGithubIssueResult(res);
+                  const tagLabels = ["s_dp"];
+                  if (payload.regression) tagLabels.push("s_rg");
+                  if (payload.reason === "migration") tagLabels.push("migration");
+                  // Each mutateAsync promise is handled on its own. Per-call
+                  // callbacks on mutate are replaced by the next call.
+                  void Promise.all(
+                    tagLabels.map(async (label) => {
+                      try {
+                        await addTag.mutateAsync(label);
+                      } catch (err) {
+                        showError(
+                          `The GitHub issue was created, but the case tag "${label}" could not be added.`,
+                          err,
+                        );
+                      }
+                    }),
+                  );
                 },
                 onError: (err) => {
                   // Surface the backend's own message on 4xx (invalid state,
