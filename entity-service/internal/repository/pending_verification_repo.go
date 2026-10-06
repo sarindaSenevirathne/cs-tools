@@ -35,7 +35,10 @@ import (
 type PendingVerificationRepository interface {
 	// Create inserts a new entry. WorkItemID must reference an existing
 	// work_item row — a foreign-key violation surfaces as a
-	// *apierror.ValidationError.
+	// *apierror.ValidationError. A work item that already has an unverified
+	// entry (pending_verification_one_unverified_per_work_item, migration
+	// 0191) surfaces as a *apierror.ConflictError — there is at most one
+	// unverified entry per work item at a time.
 	Create(ctx context.Context, req domain.CreatePendingVerificationRequest) (domain.PendingVerification, error)
 	// GetWorkItemType returns work_item.type (e.g. "CASE") for workItemID --
 	// used by CreatePendingVerification to enforce the Case-only scope before
@@ -132,8 +135,13 @@ func (r *pendingVerificationRepo) Create(ctx context.Context, req domain.CreateP
 		if IsRLSPolicyViolation(err) {
 			return domain.PendingVerification{}, &apierror.ValidationError{Msg: "workItemId does not reference an existing record"}
 		}
-		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "23503" {
-			return domain.PendingVerification{}, &apierror.ValidationError{Msg: "workItemId does not reference an existing record"}
+		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "23503": // foreign_key_violation on work_item_id
+				return domain.PendingVerification{}, &apierror.ValidationError{Msg: "workItemId does not reference an existing record"}
+			case "23505": // unique_violation on pending_verification_one_unverified_per_work_item
+				return domain.PendingVerification{}, &apierror.ConflictError{Msg: "this case already has an unverified pending verification entry"}
+			}
 		}
 		return domain.PendingVerification{}, fmt.Errorf("create pending_verification: %w", err)
 	}

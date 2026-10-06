@@ -621,6 +621,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        "409":
+          description: >-
+            This work item already has an unverified Pending Verification
+            entry (pending_verification_one_unverified_per_work_item) —
+            calling this endpoint twice for the same closure event does not
+            create a second entry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         "500":
           description: Internal server error.
           content:
