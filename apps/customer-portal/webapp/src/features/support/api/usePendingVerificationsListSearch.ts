@@ -19,6 +19,7 @@ import { useAsgardeo } from "@asgardeo/react";
 import { useAuthApiClient } from "@/hooks/useAuthApiClient";
 import { ApiQueryKeys } from "@constants/apiConstants";
 import type {
+  PendingVerificationAddedReason,
   PendingVerificationRecordType,
   PendingVerificationSearchRequest,
   PendingVerificationSearchResponse,
@@ -26,6 +27,7 @@ import type {
 
 export interface PendingVerificationsListFilters {
   recordTypes?: PendingVerificationRecordType[];
+  addedReason?: PendingVerificationAddedReason;
   searchQuery?: string;
   includeVerified?: boolean;
   /** Overrides includeVerified entirely — narrows to verified rows only. */
@@ -77,6 +79,7 @@ export function usePendingVerificationsListSearch(
         pagination,
         filters: {
           recordTypes: filters.recordTypes,
+          addedReason: filters.addedReason,
           searchQuery: filters.searchQuery,
           includeVerified: filters.includeVerified ?? false,
           verifiedOnly: filters.verifiedOnly ?? false,

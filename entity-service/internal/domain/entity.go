@@ -8350,6 +8350,11 @@ type VerifyPendingVerificationResponse struct {
 // (e.g. a Security-role user who may only ever see SRA records) enforces
 // that by only ever sending the types it's allowed to ask for — this
 // service has no identity/role layer of its own to enforce it independently.
+// Kept on the wire for backward compatibility with callers still sending it,
+// but the feature is now scoped to Case only (product decision, 2026-10-06):
+// every search unconditionally returns CASE rows regardless of this field's
+// value -- see buildSearchWhere's own hardcoded wi.type predicate. Remove
+// this field once every caller has stopped sending it.
 // VerifiedOnly, when true, overrides IncludeVerified entirely and narrows to
 // one row per work_item_id — that work item's LATEST verification cycle
 // (by added_on, not verified_on) — INCLUDED only when that latest cycle is
@@ -8366,12 +8371,17 @@ type VerifyPendingVerificationResponse struct {
 // still available, undeduped, via IncludeVerified=true (what the
 // Verifications tab history panel uses).
 type PendingVerificationSearchFilters struct {
-	ProjectID       string   `json:"projectId"`
-	WorkItemID      *string  `json:"workItemId,omitempty"`
-	WorkItemTypes   []string `json:"workItemTypes,omitempty"`
-	SearchQuery     string   `json:"searchQuery,omitempty"`
-	IncludeVerified bool     `json:"includeVerified,omitempty"`
-	VerifiedOnly    bool     `json:"verifiedOnly,omitempty"`
+	ProjectID     string   `json:"projectId"`
+	WorkItemID    *string  `json:"workItemId,omitempty"`
+	WorkItemTypes []string `json:"workItemTypes,omitempty"`
+	// AddedReason narrows to entries added for this one reason (AUTO_CLOSED
+	// or MANUAL) — backs the Support page's Auto-closed/Manual stat boxes,
+	// which link straight into a pre-filtered view of the list rather than
+	// landing on the unfiltered Unverified tab.
+	AddedReason     *PendingVerificationAddedReason `json:"addedReason,omitempty"`
+	SearchQuery     string                           `json:"searchQuery,omitempty"`
+	IncludeVerified bool                             `json:"includeVerified,omitempty"`
+	VerifiedOnly    bool                             `json:"verifiedOnly,omitempty"`
 }
 
 // SearchPendingVerificationsRequest is the input for

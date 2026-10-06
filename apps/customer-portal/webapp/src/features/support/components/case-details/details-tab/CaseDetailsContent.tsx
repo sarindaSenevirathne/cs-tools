@@ -237,7 +237,12 @@ export default function CaseDetailsContent({
   // React Query dedupes both to one network call) for the tab's own timeline.
   const isCaseClosed = !!data?.closedOn || statusLabel === "Closed";
   const { data: projectDetails } = useGetProjectDetails(resolvedProjectId);
-  const verificationEnabled = !!projectDetails?.verificationEnabled;
+  // Pending Verification is scoped to Case only (product decision,
+  // 2026-10-06) -- Engagement/Service Request/Security Report Analysis all
+  // render through this same shared component, so the record-type check has
+  // to live here rather than being removed at a per-route call site.
+  const isCaseRecord = !isEngagementRoute && !isServiceRequest && !isSecurityReportAnalysis;
+  const verificationEnabled = !!projectDetails?.verificationEnabled && isCaseRecord;
   const { data: verificationData } = usePendingVerificationsSearch(
     resolvedProjectId,
     caseId,

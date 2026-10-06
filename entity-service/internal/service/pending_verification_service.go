@@ -93,6 +93,19 @@ func (s *pendingVerificationService) CreatePendingVerification(ctx context.Conte
 		return domain.CreatePendingVerificationResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("previousStatus must be one of Solution Proposed/Awaiting Info, got %q", *req.PreviousStatus)}
 	}
 
+	// The feature is scoped to Case only (product decision, 2026-10-06) --
+	// read through the same Scoped/RLS-protected lookup every other caller
+	// uses, so a work item this caller can't even see fails exactly like one
+	// that doesn't exist, rather than leaking its existence via a different
+	// error shape.
+	workItemType, err := s.repo.GetWorkItemType(ctx, req.WorkItemID)
+	if err != nil {
+		return domain.CreatePendingVerificationResponse{}, err
+	}
+	if workItemType != "CASE" {
+		return domain.CreatePendingVerificationResponse{}, &apierror.ValidationError{Msg: "workItemId must reference a Case -- Pending Verification is scoped to cases only"}
+	}
+
 	email, err := resolveCallerEmail(ctx)
 	if err != nil {
 		return domain.CreatePendingVerificationResponse{}, err
@@ -130,6 +143,9 @@ func (s *pendingVerificationService) SearchPendingVerifications(ctx context.Cont
 		if !validPendingVerificationRecordType[t] {
 			return domain.SearchPendingVerificationsResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("filters.workItemTypes contains an unsupported record type: %q", t)}
 		}
+	}
+	if req.Filters.AddedReason != nil && !validPendingVerificationAddedReason[*req.Filters.AddedReason] {
+		return domain.SearchPendingVerificationsResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("filters.addedReason must be one of auto-closed/manual, got %q", *req.Filters.AddedReason)}
 	}
 
 	return s.repo.Search(ctx, req)

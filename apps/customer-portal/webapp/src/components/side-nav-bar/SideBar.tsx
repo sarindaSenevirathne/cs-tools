@@ -22,7 +22,6 @@ import useInfiniteProjects, { flattenProjectPages } from "@api/useGetProjects";
 import useGetProjectDetails from "@api/useGetProjectDetails";
 import useGetProjectFeatures from "@api/useGetProjectFeatures";
 import useGetMetadata from "@api/useGetMetadata";
-import { usePendingVerificationsListSearch } from "@features/support/api/usePendingVerificationsListSearch";
 import { APP_SHELL_NAV_ITEMS } from "@features/project-hub/constants/appLayoutConstants";
 import type { AppShellNavItem } from "@features/project-hub/types/appLayout";
 import { getProjectPermissions } from "@utils/permission";
@@ -63,17 +62,6 @@ export default function SideBar({
   const usageMetricsEnabled =
     portalMetadata?.featureFlags?.usageMetricsEnabled === true;
 
-  // Live unverified-record count for the "Pending Verification" nav badge —
-  // limit: 1 since only totalRecords (aggregated over the full filtered set,
-  // not just the page) is needed.
-  const { data: pendingVerificationData } = usePendingVerificationsListSearch(
-    projectId || "",
-    { includeVerified: false },
-    { limit: 1, offset: 0 },
-    !!projectId && !!projectDetails?.verificationEnabled,
-  );
-  const pendingVerificationCount = pendingVerificationData?.totalRecords ?? 0;
-
   const projectTypeLabel =
     selectedProject?.type?.label ?? projectDetails?.type?.label;
   const isProjectTypeResolved =
@@ -113,12 +101,6 @@ export default function SideBar({
       items = items.filter((item: AppShellNavItem) => item.id !== "updates");
     }
 
-    if (!projectDetails?.verificationEnabled) {
-      items = items.filter(
-        (item: AppShellNavItem) => item.id !== "verifications",
-      );
-    }
-
     // Feature flags alone, as before RBAC: the security_admin permission had
     // no holder, so including it hid Security Center from everyone.
     if (
@@ -142,7 +124,6 @@ export default function SideBar({
     permissions.hasComponentAnalysis,
     permissions.hasUsageMetrics,
     usageMetricsEnabled,
-    projectDetails?.verificationEnabled,
   ]);
 
   return (
@@ -183,14 +164,6 @@ export default function SideBar({
                 >
                   {item.label}
                 </Sidebar.ItemLabel>
-                {item.id === "verifications" && pendingVerificationCount > 0 && (
-                  <Sidebar.ItemBadge
-                    color="success"
-                    sx={{ flexShrink: 0 }}
-                  >
-                    {pendingVerificationCount}
-                  </Sidebar.ItemBadge>
-                )}
               </Sidebar.Item>
             </Link>
           ))}

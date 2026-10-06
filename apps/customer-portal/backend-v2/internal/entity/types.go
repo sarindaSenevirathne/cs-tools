@@ -2893,6 +2893,7 @@ type PendingVerificationSearchFilters struct {
 	ProjectID       string   `json:"projectId"`
 	WorkItemID      *string  `json:"workItemId,omitempty"`
 	WorkItemTypes   []string `json:"workItemTypes,omitempty"`
+	AddedReason     *string  `json:"addedReason,omitempty"`
 	SearchQuery     string   `json:"searchQuery,omitempty"`
 	IncludeVerified bool     `json:"includeVerified,omitempty"`
 	VerifiedOnly    bool     `json:"verifiedOnly,omitempty"`

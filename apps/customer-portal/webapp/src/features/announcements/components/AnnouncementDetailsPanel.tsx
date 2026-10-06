@@ -29,10 +29,6 @@ import { ArrowLeft, Calendar, FileText } from "@wso2/oxygen-ui-icons-react";
 import { INLINE_COMMENT_HTML_PURIFY } from "@features/support/utils/support";
 import type { JSX } from "react";
 import CaseDetailsActionRow from "@features/support/components/case-details/header/CaseDetailsActionRow";
-import VerificationStatusChip from "@features/support/components/case-details/verifications-tab/VerificationStatusChip";
-import CaseVerificationsPanel from "@features/support/components/case-details/verifications-tab/CaseVerificationsPanel";
-import useGetProjectDetails from "@api/useGetProjectDetails";
-import { usePendingVerificationsSearch } from "@features/support/api/usePendingVerificationsSearch";
 import {
   getStatusColor,
   resolveColorFromTheme,
@@ -70,14 +66,6 @@ export default function AnnouncementDetailsPanel({
 }: AnnouncementDetailsPanelProps): JSX.Element {
   const theme = useTheme();
   const isDarkMode = useDarkMode();
-
-  const { data: projectDetails } = useGetProjectDetails(projectId);
-  const verificationEnabled = !!projectDetails?.verificationEnabled;
-  const { data: verificationData } = usePendingVerificationsSearch(
-    projectId,
-    caseId,
-    !!projectId && !!caseId && verificationEnabled,
-  );
 
   if (isLoading) {
     return (
@@ -129,17 +117,6 @@ export default function AnnouncementDetailsPanel({
   const resolvedStatusColor = resolveColorFromTheme(statusColorPath, theme);
   const updatedOnLabel = formatAnnouncementDateDisplay(data.updatedOn);
   const isClosed = statusLabel?.toLowerCase() === "closed";
-
-  const verificationRecords = verificationData?.pendingVerifications ?? [];
-  const unverifiedRecord = verificationRecords.find((r) => !r.verifiedAt);
-  const hasVerifiedRecord = verificationRecords.some((r) => !!r.verifiedAt);
-  const isPendingVerification = verificationEnabled && !!unverifiedRecord;
-  const isVerified = !isPendingVerification && verificationEnabled && hasVerifiedRecord;
-  // Allows re-adding after a prior cycle was verified — gated on "nothing
-  // currently pending", not "never had an entry".
-  const canAddToVerification = verificationEnabled && isClosed && !isPendingVerification;
-  const showVerificationActions =
-    verificationEnabled && (canAddToVerification || isPendingVerification);
 
   // announcementType is the real classification (entity-service's
   // announcement.announcement_type column); the tag fallback stays for
@@ -219,20 +196,16 @@ export default function AnnouncementDetailsPanel({
                   </Typography>
                 </Box>
               )}
-              <VerificationStatusChip
-                isPendingVerification={isPendingVerification}
-                isVerified={isVerified}
-              />
             </Box>
-            {(!isClosed || showVerificationActions) && (
+            {!isClosed && (
               <CaseDetailsActionRow
                 projectId={projectId}
                 caseId={caseId}
                 statusLabel={data.status?.label}
                 isCaseClosed={isClosed}
-                canAddToVerification={canAddToVerification}
-                isPendingVerification={isPendingVerification}
-                pendingVerificationId={unverifiedRecord?.id ?? null}
+                canAddToVerification={false}
+                isPendingVerification={false}
+                pendingVerificationId={null}
                 assignedEngineer={data.assignedEngineer}
                 engineerInitials={
                   typeof data.assignedEngineer === "object" &&
@@ -357,12 +330,6 @@ export default function AnnouncementDetailsPanel({
           </Typography>
         )}
       </Paper>
-
-      {verificationEnabled && projectId && caseId && (
-        <Paper variant="outlined" elevation={0} sx={{ p: 4 }}>
-          <CaseVerificationsPanel projectId={projectId} caseId={caseId} />
-        </Paper>
-      )}
     </Box>
   );
 }

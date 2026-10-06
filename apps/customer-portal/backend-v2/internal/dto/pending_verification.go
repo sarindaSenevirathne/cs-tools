@@ -187,11 +187,16 @@ func MapPendingVerificationCreate(r entity.CreatePendingVerificationResponse) Pe
 // round -- the full multi-round history stays available, undeduped, via
 // IncludeVerified=true).
 type PendingVerificationSearchFilters struct {
-	WorkItemID      *string  `json:"workItemId,omitempty"`
-	RecordTypes     []string `json:"recordTypes,omitempty"`
-	SearchQuery     string   `json:"searchQuery,omitempty"`
-	IncludeVerified bool     `json:"includeVerified,omitempty"`
-	VerifiedOnly    bool     `json:"verifiedOnly,omitempty"`
+	WorkItemID  *string  `json:"workItemId,omitempty"`
+	RecordTypes []string `json:"recordTypes,omitempty"`
+	// AddedReason takes the doc's display values ("auto-closed"/"manual"),
+	// translated to entity-service's enum vocabulary below -- backs the
+	// Support page's Auto-closed/Manual stat boxes, which link straight into
+	// a pre-filtered view of the list.
+	AddedReason     *string `json:"addedReason,omitempty"`
+	SearchQuery     string  `json:"searchQuery,omitempty"`
+	IncludeVerified bool    `json:"includeVerified,omitempty"`
+	VerifiedOnly    bool    `json:"verifiedOnly,omitempty"`
 }
 
 // PendingVerificationSearchRequest is the portal's request shape for
@@ -210,12 +215,18 @@ func BuildEntitySearchPendingVerificationsRequest(req PendingVerificationSearchR
 	for _, t := range req.Filters.RecordTypes {
 		workItemTypes = append(workItemTypes, mapOrPassthrough(t, pendingVerificationRecordTypeToEntity))
 	}
+	var addedReason *string
+	if req.Filters.AddedReason != nil {
+		mapped := mapOrPassthrough(*req.Filters.AddedReason, pendingVerificationAddedReasonToEntity)
+		addedReason = &mapped
+	}
 	return entity.SearchPendingVerificationsRequest{
 		Pagination: req.Pagination,
 		Filters: entity.PendingVerificationSearchFilters{
 			ProjectID:       req.ProjectID,
 			WorkItemID:      req.Filters.WorkItemID,
 			WorkItemTypes:   workItemTypes,
+			AddedReason:     addedReason,
 			SearchQuery:     req.Filters.SearchQuery,
 			IncludeVerified: req.Filters.IncludeVerified,
 			VerifiedOnly:    req.Filters.VerifiedOnly,

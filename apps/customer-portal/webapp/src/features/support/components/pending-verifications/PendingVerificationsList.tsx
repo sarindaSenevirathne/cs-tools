@@ -14,20 +14,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import {
-  Accordion,
-  AccordionDetails,
-  AccordionSummary,
-  Box,
-  Chip,
-  Stack,
-  Typography,
-  colors,
-} from "@wso2/oxygen-ui";
-import { ChevronDown } from "@wso2/oxygen-ui-icons-react";
-import { useMemo, useState, type JSX } from "react";
+import { Box, Stack, Typography } from "@wso2/oxygen-ui";
+import type { JSX } from "react";
 import type { PendingVerificationView } from "@features/support/types/pendingVerification";
-import { RECORD_TYPE_ICONS } from "@features/support/utils/pendingVerification";
 import PendingVerificationCard from "@features/support/components/pending-verifications/PendingVerificationCard";
 import ListSkeleton from "@components/list-view/ListSkeleton";
 import ErrorIndicator from "@components/error-indicator/ErrorIndicator";
@@ -44,13 +33,15 @@ export interface PendingVerificationsListProps {
 }
 
 /**
- * PendingVerificationsList groups records by recordType into expandable/
- * collapsible Accordion sections (mirroring DeploymentCard.tsx's controlled-
- * accordion pattern), each with a count chip, plus the loading/error/empty
- * states.
+ * PendingVerificationsList renders a flat list of cards, plus the loading/
+ * error/empty states. Pending Verification is scoped to Case only (product
+ * decision, 2026-10-06) -- with a single record type, the per-recordType
+ * accordion grouping this used to have added a header around every card for
+ * no real benefit, so it was removed rather than left always collapsed to
+ * one group.
  *
  * @param {PendingVerificationsListProps} props - Records array and loading state.
- * @returns {JSX.Element} The rendered grouped list.
+ * @returns {JSX.Element} The rendered list.
  */
 export default function PendingVerificationsList({
   records,
@@ -60,18 +51,6 @@ export default function PendingVerificationsList({
   onViewCase,
   onMarkVerified,
 }: PendingVerificationsListProps): JSX.Element {
-  const groups = useMemo(() => {
-    const byType = new Map<string, PendingVerificationView[]>();
-    for (const record of records) {
-      const list = byType.get(record.recordType) ?? [];
-      list.push(record);
-      byType.set(record.recordType, list);
-    }
-    return Array.from(byType.entries());
-  }, [records]);
-
-  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
-
   if (isLoading) {
     return <ListSkeleton />;
   }
@@ -110,62 +89,14 @@ export default function PendingVerificationsList({
 
   return (
     <Stack spacing={2}>
-      {groups.map(([recordType, groupRecords]) => {
-        const expanded = !collapsedGroups[recordType];
-        return (
-          <Accordion
-            key={recordType}
-            expanded={expanded}
-            onChange={(_, isExpanded) =>
-              setCollapsedGroups((prev) => ({ ...prev, [recordType]: !isExpanded }))
-            }
-            disableGutters
-            elevation={0}
-            TransitionProps={{ unmountOnExit: true }}
-            sx={{
-              border: "1px solid",
-              borderColor: "divider",
-              borderRadius: 1,
-              overflow: "hidden",
-              "&:before": { display: "none" },
-              "&.Mui-expanded": { margin: 0 },
-            }}
-          >
-            <AccordionSummary
-              expandIcon={<ChevronDown size={18} color={colors.grey?.[500] ?? "#6B7280"} />}
-              sx={{
-                px: 2,
-                bgcolor: "action.hover",
-                "& .MuiAccordionSummary-content": { m: 0, alignItems: "center", gap: 1 },
-              }}
-            >
-              {(() => {
-                const GroupIcon =
-                  RECORD_TYPE_ICONS[recordType as keyof typeof RECORD_TYPE_ICONS];
-                return GroupIcon ? <GroupIcon size={16} /> : null;
-              })()}
-              <Typography variant="subtitle2" fontWeight={600} color="primary.main">
-                {recordType}
-              </Typography>
-              <Chip
-                label={groupRecords.length}
-                size="small"
-                sx={{ height: 20, fontSize: "0.7rem" }}
-              />
-            </AccordionSummary>
-            <AccordionDetails sx={{ p: 2, display: "flex", flexDirection: "column", gap: 2 }}>
-              {groupRecords.map((record) => (
-                <PendingVerificationCard
-                  key={record.id}
-                  record={record}
-                  onViewCase={onViewCase}
-                  onMarkVerified={onMarkVerified}
-                />
-              ))}
-            </AccordionDetails>
-          </Accordion>
-        );
-      })}
+      {records.map((record) => (
+        <PendingVerificationCard
+          key={record.id}
+          record={record}
+          onViewCase={onViewCase}
+          onMarkVerified={onMarkVerified}
+        />
+      ))}
     </Stack>
   );
 }

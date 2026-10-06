@@ -37,6 +37,13 @@ type PendingVerificationRepository interface {
 	// work_item row — a foreign-key violation surfaces as a
 	// *apierror.ValidationError.
 	Create(ctx context.Context, req domain.CreatePendingVerificationRequest) (domain.PendingVerification, error)
+	// GetWorkItemType returns work_item.type (e.g. "CASE") for workItemID --
+	// used by CreatePendingVerification to enforce the Case-only scope before
+	// inserting. Reads through the same Scoped/RLS-protected path as every
+	// other work_item query, so a work item that exists but is outside the
+	// caller's scope returns *apierror.NotFoundError, identical to one that
+	// doesn't exist at all.
+	GetWorkItemType(ctx context.Context, workItemID string) (string, error)
 	// Search returns the page of entries matching req.Filters, plus the
 	// counts SearchPendingVerificationsResponse needs for the summary tiles
 	// and the type-filter dropdown.
@@ -114,6 +121,17 @@ func (r *pendingVerificationRepo) Create(ctx context.Context, req domain.CreateP
 	var id string
 	err := r.db.QueryRow(ctx, query, req.WorkItemID, req.AddedReason, req.PreviousStatus, req.AddedBy, req.Note).Scan(&id)
 	if err != nil {
+		// IsRLSPolicyViolation: the pending_verification_write WITH CHECK
+		// policy (migration 0190) rejects a work_item_id outside the
+		// caller's own project scope -- mapped the same way as the
+		// foreign-key check just below (never reveal existence to a caller
+		// outside scope). In practice CreatePendingVerification's own
+		// GetWorkItemType pre-check already catches this earlier via
+		// work_item's own RLS, so this branch mainly guards a direct API
+		// caller or a future call site that skips that pre-check.
+		if IsRLSPolicyViolation(err) {
+			return domain.PendingVerification{}, &apierror.ValidationError{Msg: "workItemId does not reference an existing record"}
+		}
 		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "23503" {
 			return domain.PendingVerification{}, &apierror.ValidationError{Msg: "workItemId does not reference an existing record"}
 		}
@@ -121,6 +139,19 @@ func (r *pendingVerificationRepo) Create(ctx context.Context, req domain.CreateP
 	}
 
 	return r.getByID(ctx, id)
+}
+
+// GetWorkItemType implements PendingVerificationRepository.
+func (r *pendingVerificationRepo) GetWorkItemType(ctx context.Context, workItemID string) (string, error) {
+	var workItemType string
+	err := r.db.QueryRow(ctx, `SELECT type::TEXT FROM work_item WHERE id = $1`, workItemID).Scan(&workItemType)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", &apierror.ValidationError{Msg: "workItemId does not reference an existing record"}
+		}
+		return "", fmt.Errorf("get work_item type: %w", err)
+	}
+	return workItemType, nil
 }
 
 func (r *pendingVerificationRepo) getByID(ctx context.Context, id string) (domain.PendingVerification, error) {
@@ -160,9 +191,19 @@ func (r *pendingVerificationRepo) Verify(ctx context.Context, req domain.VerifyP
 // type-filter dropdown's own per-type counts, since those must reflect every
 // other active filter without being narrowed by the type filter itself.
 func buildSearchWhere(f domain.PendingVerificationSearchFilters, includeTypeFilter bool) (string, []any) {
-	where := "WHERE wi.project_id = $1"
+	// Pending Verification is scoped to Case only (product decision,
+	// 2026-10-06) -- hardcoded, not driven by f.WorkItemTypes, which stays on
+	// the wire only for backward compatibility with callers still sending it
+	// (see PendingVerificationSearchFilters' own doc comment).
+	where := "WHERE wi.project_id = $1 AND wi.type = 'CASE'::work_item_type_enum"
 	args := []any{f.ProjectID}
 	argIdx := 2
+
+	if f.AddedReason != nil {
+		where += fmt.Sprintf(" AND pv.added_reason = $%d::pending_verification_added_reason_enum", argIdx)
+		args = append(args, *f.AddedReason)
+		argIdx++
+	}
 
 	// VerifiedOnly deliberately does NOT filter on pv.verified_on here -- the
 	// dedupe branches in Search need every row (verified or not) to find each

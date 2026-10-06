@@ -15,19 +15,8 @@
 // under the License.
 
 import { useEffect, useMemo, useState, type JSX } from "react";
-import { useLocation, useParams } from "react-router";
-import {
-  Box,
-  Checkbox,
-  FormControl,
-  InputLabel,
-  MenuItem,
-  Select,
-  Stack,
-  Typography,
-  type SelectChangeEvent,
-} from "@wso2/oxygen-ui";
-import { ShieldCheck, CircleCheck } from "@wso2/oxygen-ui-icons-react";
+import { useLocation, useParams, useSearchParams } from "react-router";
+import { Stack } from "@wso2/oxygen-ui";
 import { useModifierAwareNavigate } from "@hooks/useModifierAwareNavigate";
 import { useDebouncedValue } from "@hooks/useDebouncedValue";
 import useGetProjectDetails from "@api/useGetProjectDetails";
@@ -35,35 +24,19 @@ import { usePendingVerificationsListSearch } from "@features/support/api/usePend
 import { useVerifyPendingVerification } from "@features/support/api/useVerifyPendingVerification";
 import { useErrorBanner } from "@context/error-banner/ErrorBannerContext";
 import { useSuccessBanner } from "@context/success-banner/SuccessBannerContext";
-import { PENDING_VERIFICATION_STAT_CONFIGS } from "@features/support/constants/supportConstants";
-import {
-  buildPendingVerificationRecordPath,
-  RECORD_TYPE_ICONS,
-} from "@features/support/utils/pendingVerification";
-import { hasListSearchOrFilters, countListSearchAndFilters } from "@features/support/utils/listView";
+import { buildPendingVerificationRecordPath } from "@features/support/utils/pendingVerification";
 import type {
-  PendingVerificationRecordType,
+  PendingVerificationAddedReason,
   PendingVerificationView,
 } from "@features/support/types/pendingVerification";
 import ListPageHeader from "@components/list-view/ListPageHeader";
-import ListStatGrid from "@components/list-view/ListStatGrid";
 import ListSearchBar from "@components/list-view/ListSearchBar";
 import ListResultsBar from "@components/list-view/ListResultsBar";
 import ListPagination from "@components/list-view/ListPagination";
 import PendingVerificationsList from "@features/support/components/pending-verifications/PendingVerificationsList";
 import CaseStateConfirmDialog from "@features/support/components/case-details/dialogs/CaseStateConfirmDialog";
-import TabBar from "@components/tab-bar/TabBar";
 
 type VerificationTab = "unverified" | "verified";
-
-const RECORD_TYPES: PendingVerificationRecordType[] = [
-  "Case",
-  "Security Report",
-  "Engagement",
-  "Service Request",
-  "Change Request",
-  "Announcement",
-];
 
 // High enough that ListPagination (which hides itself once totalRecords <=
 // rowsPerPage) naturally disappears for realistic per-project backlogs,
@@ -72,8 +45,9 @@ const RECORD_TYPES: PendingVerificationRecordType[] = [
 const ROWS_PER_PAGE = 50;
 
 /**
- * PendingVerificationsPage lists all pending-verification records for the
- * current project, grouped by record type, with inline "View Case"/
+ * PendingVerificationsPage lists pending-verification records (Case only, as
+ * of the 2026-10-06 scope-down) for the current project, pre-scoped to
+ * whichever Support-page stat box was clicked, with inline "View Case"/
  * "Mark Verified" actions per record.
  *
  * @returns {JSX.Element} The rendered page.
@@ -85,49 +59,45 @@ export default function PendingVerificationsPage(): JSX.Element {
   const { showSuccess } = useSuccessBanner();
   const { showError } = useErrorBanner();
 
+  // Scope comes from the URL's own query params (?tab=&addedReason=), not
+  // navigation state -- set by SupportPage's stat boxes, and deliberately
+  // chosen over state specifically so the Back button from a record's detail
+  // page restores the exact same filtered view: `returnTo` there is built
+  // from location.pathname + location.search, which already carries these
+  // params along for free, whereas state would be silently dropped on the
+  // way back (CaseDetailsPage's handleBack only re-attaches `{fromBack:
+  // true}`). Absent on a direct URL visit, which just defaults to Unverified
+  // with no reason filter.
+  const [searchParams] = useSearchParams();
+  const activeTab: VerificationTab =
+    searchParams.get("tab") === "verified" ? "verified" : "unverified";
+  const addedReasonParam = searchParams.get("addedReason");
+  const addedReason: PendingVerificationAddedReason | undefined =
+    addedReasonParam === "auto-closed" || addedReasonParam === "manual"
+      ? addedReasonParam
+      : undefined;
+
   const [searchTerm, setSearchTerm] = useState("");
   const debouncedSearchTerm = useDebouncedValue(searchTerm, 300);
-  const [recordTypes, setRecordTypes] = useState<PendingVerificationRecordType[]>([]);
-  const [activeTab, setActiveTab] = useState<VerificationTab>("unverified");
-  // Independent per-tab page state — paginating Unverified to page 2, then
-  // switching to Verified and back, lands you back on Unverified page 2
-  // rather than snapping to page 1.
-  const [unverifiedPage, setUnverifiedPage] = useState(1);
-  const [verifiedPage, setVerifiedPage] = useState(1);
+  const [page, setPage] = useState(1);
   const [confirmingRecord, setConfirmingRecord] = useState<PendingVerificationView | null>(null);
-  const [isFiltersOpen, setIsFiltersOpen] = useState(
-    () => hasListSearchOrFilters(searchTerm, { recordTypes }),
-  );
 
-  const sharedFilters = useMemo(
-    () => ({
-      recordTypes: recordTypes.length > 0 ? recordTypes : undefined,
-      searchQuery: debouncedSearchTerm || undefined,
-    }),
-    [recordTypes, debouncedSearchTerm],
+  // addedReason only ever narrows the Unverified set -- it describes why an
+  // entry is still pending, which has no meaning once something is verified.
+  const filters = useMemo(
+    () =>
+      activeTab === "verified"
+        ? { searchQuery: debouncedSearchTerm || undefined, verifiedOnly: true }
+        : {
+            searchQuery: debouncedSearchTerm || undefined,
+            includeVerified: false,
+            addedReason,
+          },
+    [activeTab, debouncedSearchTerm, addedReason],
   );
-
-  // Two independent, always-live queries (not gated on activeTab) — each is
-  // both its own tab's row source AND its own true, unpaginated count source
-  // (totalRecords/autoClosedCount/manualCount are a separate COUNT(*) query
-  // server-side, unaffected by LIMIT/OFFSET — see pending_verification_repo.go's
-  // Search). Keeping both always-on is what lets both tab badges and the
-  // summary tiles stay accurate regardless of which tab is currently open.
-  const unverifiedFilters = useMemo(
-    () => ({ ...sharedFilters, includeVerified: false }),
-    [sharedFilters],
-  );
-  const verifiedFilters = useMemo(
-    () => ({ ...sharedFilters, verifiedOnly: true }),
-    [sharedFilters],
-  );
-  const unverifiedPagination = useMemo(
-    () => ({ limit: ROWS_PER_PAGE, offset: (unverifiedPage - 1) * ROWS_PER_PAGE }),
-    [unverifiedPage],
-  );
-  const verifiedPagination = useMemo(
-    () => ({ limit: ROWS_PER_PAGE, offset: (verifiedPage - 1) * ROWS_PER_PAGE }),
-    [verifiedPage],
+  const pagination = useMemo(
+    () => ({ limit: ROWS_PER_PAGE, offset: (page - 1) * ROWS_PER_PAGE }),
+    [page],
   );
 
   const { data: projectDetails } = useGetProjectDetails(projectId || "");
@@ -142,24 +112,16 @@ export default function PendingVerificationsPage(): JSX.Element {
     }
   }, [projectId, projectDetails, verificationEnabled, navigate]);
 
-  const unverifiedQuery = usePendingVerificationsListSearch(
+  const { data, isLoading, isError } = usePendingVerificationsListSearch(
     projectId || "",
-    unverifiedFilters,
-    unverifiedPagination,
-    !!projectId && verificationEnabled,
-  );
-  const verifiedQuery = usePendingVerificationsListSearch(
-    projectId || "",
-    verifiedFilters,
-    verifiedPagination,
+    filters,
+    pagination,
     !!projectId && verificationEnabled,
   );
 
-  const activeQuery = activeTab === "unverified" ? unverifiedQuery : verifiedQuery;
-  const { data, isLoading, isError } = activeQuery;
   const records = useMemo(() => data?.pendingVerifications ?? [], [data?.pendingVerifications]);
   const totalRecords = data?.totalRecords ?? 0;
-  const hasListRefinement = !!searchTerm || recordTypes.length > 0;
+  const hasListRefinement = !!searchTerm;
 
   // Single mutation instance, re-parameterized by whichever record is
   // currently pending confirmation — avoids instantiating one hook per card.
@@ -179,124 +141,31 @@ export default function PendingVerificationsPage(): JSX.Element {
 
   const handleSearchChange = (value: string): void => {
     setSearchTerm(value);
-    setUnverifiedPage(1);
-    setVerifiedPage(1);
+    setPage(1);
   };
-
-  const handleRecordTypesChange = (event: SelectChangeEvent<PendingVerificationRecordType[]>): void => {
-    const value = event.target.value;
-    setRecordTypes(typeof value === "string" ? (value.split(",") as PendingVerificationRecordType[]) : value);
-    setUnverifiedPage(1);
-    setVerifiedPage(1);
-  };
-
-  const handleClearFilters = (): void => {
-    setSearchTerm("");
-    setRecordTypes([]);
-    setUnverifiedPage(1);
-    setVerifiedPage(1);
-  };
-
-  // The active tab's own type breakdown — correctly reflects only what that
-  // tab would actually show (each tab now has its own real typeCounts,
-  // rather than always showing the combined-both-tabs breakdown).
-  const typeCountByType = useMemo(() => {
-    const map = new Map<string, number>();
-    for (const tc of data?.typeCounts ?? []) map.set(tc.recordType, tc.count);
-    return map;
-  }, [data?.typeCounts]);
-
-  const activeFiltersCount = countListSearchAndFilters(searchTerm, { recordTypes });
-
-  // total/autoClosed/manual describe the pending (unverified) backlog
-  // specifically, read straight from unverifiedQuery's own totalRecords/
-  // autoClosedCount/manualCount, a true full-backlog count against the
-  // current filters regardless of which page is loaded (see the comment on
-  // unverifiedFilters/verifiedFilters above). verified reads verifiedQuery's
-  // own totalRecords -- already deduped to one entry per case
-  // (15-dedupe-verified-tab.md), and already fetched regardless of which
-  // tab is active, so this tile is free.
-  const pendingStats = useMemo(
-    () => ({
-      total: unverifiedQuery.data?.totalRecords ?? 0,
-      autoClosed: unverifiedQuery.data?.autoClosedCount ?? 0,
-      manual: unverifiedQuery.data?.manualCount ?? 0,
-      verified: verifiedQuery.data?.totalRecords ?? 0,
-    }),
-    [unverifiedQuery.data, verifiedQuery.data],
-  );
-
-  const unverifiedTabCount = unverifiedQuery.data?.totalRecords ?? 0;
-  const verifiedTabCount = verifiedQuery.data?.totalRecords ?? 0;
 
   return (
     <Stack spacing={3} sx={{ minWidth: 0 }}>
       <ListPageHeader
         title="Pending Verification"
-        description="Closed records awaiting your sign-off, plus verification history for this project"
-      />
-
-      <ListStatGrid
-        isLoading={unverifiedQuery.isLoading || verifiedQuery.isLoading}
-        configs={PENDING_VERIFICATION_STAT_CONFIGS}
-        stats={pendingStats}
-        isError={unverifiedQuery.isError || verifiedQuery.isError}
-        entityName="pending verifications"
-      />
-
-      <TabBar
-        tabs={[
-          { id: "unverified", label: "Unverified", icon: ShieldCheck, count: unverifiedTabCount },
-          { id: "verified", label: "Verified", icon: CircleCheck, count: verifiedTabCount, badgeColor: "success.main" },
-        ]}
-        activeTab={activeTab}
-        onTabChange={(id) => setActiveTab(id as VerificationTab)}
+        description={
+          activeTab === "verified"
+            ? "Records you've already signed off on for this project"
+            : "Closed records awaiting your sign-off for this project"
+        }
+        onBack={() => navigate(`/projects/${projectId}/support`)}
       />
 
       <ListSearchBar
         searchPlaceholder="Search by ID, title, or description..."
         searchTerm={searchTerm}
         onSearchChange={handleSearchChange}
-        isFiltersOpen={isFiltersOpen}
-        onFiltersToggle={() => setIsFiltersOpen((prev) => !prev)}
-        activeFiltersCount={activeFiltersCount}
-        onClearFilters={handleClearFilters}
-        filtersContent={
-          <Stack direction={{ xs: "column", sm: "row" }} spacing={2} alignItems={{ xs: "stretch", sm: "center" }}>
-            <FormControl size="small" sx={{ minWidth: 260 }}>
-              <InputLabel id="pending-verification-type-label">Type</InputLabel>
-              <Select<PendingVerificationRecordType[]>
-                multiple
-                labelId="pending-verification-type-label"
-                label="Type"
-                value={recordTypes}
-                onChange={handleRecordTypesChange}
-                renderValue={(selected) => (selected.length === 0 ? "All types" : selected.join(", "))}
-              >
-                {RECORD_TYPES.map((type) => {
-                  const Icon = RECORD_TYPE_ICONS[type];
-                  const count = typeCountByType.get(type);
-                  return (
-                    <MenuItem key={type} value={type}>
-                      <Checkbox checked={recordTypes.includes(type)} size="small" />
-                      <Box sx={{ display: "flex", alignItems: "center", gap: 1, flex: 1, minWidth: 0 }}>
-                        <Icon size={14} />
-                        <Typography variant="body2" sx={{ flex: 1 }}>
-                          {type}
-                        </Typography>
-                        {count !== undefined && (
-                          <Typography variant="caption" color="text.secondary">
-                            {count}
-                          </Typography>
-                        )}
-                      </Box>
-                    </MenuItem>
-                  );
-                })}
-              </Select>
-            </FormControl>
-          </Stack>
-        }
+        isFiltersOpen={false}
+        onFiltersToggle={() => {}}
+        activeFiltersCount={0}
+        onClearFilters={() => {}}
+        filtersContent={null}
+        hideFiltersButton
       />
 
       <ListResultsBar
@@ -321,11 +190,9 @@ export default function PendingVerificationsPage(): JSX.Element {
 
       <ListPagination
         totalRecords={totalRecords}
-        page={activeTab === "unverified" ? unverifiedPage : verifiedPage}
+        page={page}
         rowsPerPage={ROWS_PER_PAGE}
-        onPageChange={(_e, value) =>
-          activeTab === "unverified" ? setUnverifiedPage(value) : setVerifiedPage(value)
-        }
+        onPageChange={(_e, value) => setPage(value)}
         onRowsPerPageChange={() => {
           /* fixed page size for this list */
         }}
@@ -342,4 +209,3 @@ export default function PendingVerificationsPage(): JSX.Element {
     </Stack>
   );
 }
-

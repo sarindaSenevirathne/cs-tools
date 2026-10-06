@@ -33,12 +33,15 @@ import useGetProjectFeatures from "@api/useGetProjectFeatures";
 import useGetProjectFilters from "@api/useGetProjectFilters";
 import { useGetProjectCasesPage } from "@api/useGetProjectCasesPage";
 import { useSearchConversations } from "@features/support/api/useSearchConversations";
+import { usePendingVerificationsListSearch } from "@features/support/api/usePendingVerificationsListSearch";
 import { useLogger } from "@hooks/useLogger";
 import {
   SUPPORT_OVERVIEW_CASES_LIMIT,
   SUPPORT_OVERVIEW_CHAT_LIMIT,
   CaseType,
+  PENDING_VERIFICATION_STAT_CONFIGS,
 } from "@features/support/constants/supportConstants";
+import ListStatGrid from "@components/list-view/ListStatGrid";
 import { getProjectPermissions } from "@utils/permission";
 import { isS0Case } from "@features/support/utils/support";
 import { SortOrder } from "@/types/common";
@@ -162,6 +165,62 @@ export default function SupportPage(): JSX.Element {
     }
   };
 
+  // Pending Verification is no longer in the sidebar -- these 4 boxes (shown
+  // only when the project has the feature enabled) are the sole entry point
+  // into that list now. Mirrors the Outstanding Cases/Active Chats stat row
+  // above: limit 1 since only each query's own aggregate totalRecords/
+  // autoClosedCount/manualCount is needed, not the rows themselves -- the
+  // same approach the list page's own header tiles already use.
+  const verificationEnabled = !!project?.verificationEnabled;
+  const unverifiedVerificationQuery = usePendingVerificationsListSearch(
+    projectId || "",
+    { includeVerified: false },
+    { limit: 1, offset: 0 },
+    !!projectId && verificationEnabled,
+  );
+  const verifiedVerificationQuery = usePendingVerificationsListSearch(
+    projectId || "",
+    { verifiedOnly: true },
+    { limit: 1, offset: 0 },
+    !!projectId && verificationEnabled,
+  );
+  const pendingVerificationStats = {
+    total: unverifiedVerificationQuery.data?.totalRecords ?? 0,
+    autoClosed: unverifiedVerificationQuery.data?.autoClosedCount ?? 0,
+    manual: unverifiedVerificationQuery.data?.manualCount ?? 0,
+    verified: verifiedVerificationQuery.data?.totalRecords ?? 0,
+  };
+
+  // Each box pre-scopes the list it links to -- Total/Auto-closed/Manual all
+  // land on the Unverified tab (the latter two additionally filtered by
+  // addedReason, a new filter added specifically for this), Verified lands
+  // on the Verified tab with no reason filter (not applicable once verified).
+  //
+  // Deliberately encoded as query params, not navigation state: clicking
+  // into a record's own detail page captures `returnTo` as
+  // `location.pathname + location.search` (see PendingVerificationsPage's
+  // own onViewCase) -- state would be silently dropped on the way back
+  // (CaseDetailsPage's handleBack only ever re-attaches `{fromBack: true}`),
+  // so putting the scope in the URL is what makes the Back button restore
+  // the exact same filtered view instead of resetting to everything.
+  const handlePendingVerificationStatClick = (key: string): void => {
+    const verificationsPath = `/projects/${projectId}/verifications`;
+    switch (key) {
+      case "total":
+        navigate(`${verificationsPath}?tab=unverified`);
+        break;
+      case "autoClosed":
+        navigate(`${verificationsPath}?tab=unverified&addedReason=auto-closed`);
+        break;
+      case "manual":
+        navigate(`${verificationsPath}?tab=unverified&addedReason=manual`);
+        break;
+      case "verified":
+        navigate(`${verificationsPath}?tab=verified`);
+        break;
+    }
+  };
+
   useEffect(() => {
     if (isError) {
       logger.error(`Failed to load support stats for project: ${projectId}`);
@@ -185,6 +244,18 @@ export default function SupportPage(): JSX.Element {
         stats={stats}
         onStatClick={handleStatClick}
       />
+
+      {verificationEnabled && (
+        <ListStatGrid
+          isLoading={unverifiedVerificationQuery.isLoading || verifiedVerificationQuery.isLoading}
+          isError={unverifiedVerificationQuery.isError || verifiedVerificationQuery.isError}
+          entityName="pending verifications"
+          stats={pendingVerificationStats}
+          configs={PENDING_VERIFICATION_STAT_CONFIGS}
+          onStatClick={handlePendingVerificationStatClick}
+        />
+      )}
+
       <Grid
         container
         spacing={3}

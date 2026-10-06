@@ -66,6 +66,9 @@ export interface CreatePendingVerificationResponse {
 export interface PendingVerificationSearchFilters {
   workItemId?: string;
   recordTypes?: PendingVerificationRecordType[];
+  /** Narrows to entries added for this one reason — backs the Support page's
+   * Auto-closed/Manual stat boxes, which link into a pre-filtered view. */
+  addedReason?: PendingVerificationAddedReason;
   searchQuery?: string;
   includeVerified?: boolean;
   /** Overrides includeVerified entirely — narrows to verified rows only. */

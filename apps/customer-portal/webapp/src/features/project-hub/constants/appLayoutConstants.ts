@@ -21,7 +21,6 @@ import {
   FolderOpen,
   Headset,
   LayoutDashboard,
-  ListChecks,
   Megaphone,
   RefreshCw,
   Shield,
@@ -58,12 +57,6 @@ export const APP_SHELL_NAV_ITEMS: AppShellNavItem[] = [
     label: "Announcements",
     path: "announcements",
     icon: Megaphone,
-  },
-  {
-    id: "verifications",
-    label: "Pending Verification",
-    path: "verifications",
-    icon: ListChecks,
   },
 ];
 
