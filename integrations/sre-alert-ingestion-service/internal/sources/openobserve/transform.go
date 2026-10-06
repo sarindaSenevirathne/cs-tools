@@ -112,12 +112,6 @@ func Transform(raw []byte, cfg Config) (Alert, error) {
 		severity = mapSeverity(rawImpact)
 	}
 
-	// Description keeps the raw payload, with the readable text first since downstream previews show only 500 characters.
-	desc := "Raw payload: " + utils.CompactJSON(raw)
-	if description != "" {
-		desc = description + "\n\n" + desc
-	}
-
 	alert := Alert{
 		Service:          configValue(cfg, "SERVICE", utils.Str(payload, "service")),
 		MetricName:       metricName,
@@ -127,11 +121,12 @@ func Transform(raw []byte, cfg Config) (Alert, error) {
 		Source:           source,
 		UniqueIdentifier: correlationID,
 		ShortDescription: utils.FirstNonEmpty(shortDescription, metricName),
-		Description:      desc,
-		Urgency:          rawUrgency,
-		Impact:           rawImpact,
-		CorrelationID:    correlationID,
-		CallerID:         callerID,
+		// The alert's own text, never the payload; the raw body is kept in raw_alerts.
+		Description:   description,
+		Urgency:       rawUrgency,
+		Impact:        rawImpact,
+		CorrelationID: correlationID,
+		CallerID:      callerID,
 	}
 	return alert, nil
 }

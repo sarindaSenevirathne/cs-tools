@@ -36,3 +36,37 @@ func TestConnStringKeepsReservedCharacters(t *testing.T) {
 		t.Fatalf("sslmode leaked into runtime params: %q", got)
 	}
 }
+
+// TestSizePool: unset derives poll.concurrency plus headroom, an explicit value at or above that is kept, and one leaving no headroom is refused.
+func TestSizePool(t *testing.T) {
+	cases := []struct {
+		name    string
+		max     int32
+		workers int
+		want    int32
+		wantErr bool
+	}{
+		{name: "unset derives", max: 0, workers: 64, want: 80},
+		{name: "explicit kept", max: 100, workers: 64, want: 100},
+		{name: "explicit at minimum", max: 80, workers: 64, want: 80},
+		{name: "explicit at workers", max: 64, workers: 64, wantErr: true},
+		{name: "explicit too small", max: 79, workers: 64, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := SizePool(Config{PoolMaxConns: tc.max}, tc.workers)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("SizePool should fail")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("SizePool: %v", err)
+			}
+			if got.PoolMaxConns != tc.want {
+				t.Errorf("PoolMaxConns = %d, want %d", got.PoolMaxConns, tc.want)
+			}
+		})
+	}
+}

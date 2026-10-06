@@ -41,6 +41,8 @@ type Config struct {
 	Postgres  PostgresConfig  `toml:"postgres"`
 	Wake      WakeConfig      `toml:"wake"`
 	Reject    RejectConfig    `toml:"reject"`
+	Log       LogConfig       `toml:"log"`
+	Payloads  PayloadsConfig  `toml:"payloads"`
 	// LegacyAuthSection flags a leftover [auth] table, no longer read now auth is AUTH_ENABLED.
 	LegacyAuthSection bool `toml:"-"`
 }
@@ -51,10 +53,12 @@ type ServerConfig struct {
 	DrainDelay     Duration `toml:"drain_delay"`
 	RequestWait    Duration `toml:"request_wait"`
 	AllocatorDrain Duration `toml:"allocator_drain"`
-	ReadTimeout    Duration `toml:"read_timeout"`
-	WriteTimeout   Duration `toml:"write_timeout"`
-	IdleTimeout    Duration `toml:"idle_timeout"`
-	MaxBodyBytes   int64    `toml:"max_body_bytes"`
+	// PayloadDrain is reserved after allocator_drain for the final raw_alerts insert.
+	PayloadDrain Duration `toml:"payload_drain"`
+	ReadTimeout  Duration `toml:"read_timeout"`
+	WriteTimeout Duration `toml:"write_timeout"`
+	IdleTimeout  Duration `toml:"idle_timeout"`
+	MaxBodyBytes int64    `toml:"max_body_bytes"`
 }
 
 // AllocatorConfig tunes the id allocator: queue depth, batch size, and writer concurrency.
@@ -74,11 +78,19 @@ type StoreConfig struct {
 	WriteDeadline   Duration `toml:"write_deadline"`
 }
 
-// PostgresConfig tunes startup connection retry, matching sre-alert-core-service.
+// PostgresConfig tunes startup connection retry, matching sre-alert-core-service, plus the warm pool floor and the credential check budget.
 type PostgresConfig struct {
 	ConnectMaxAttempts int      `toml:"connect_max_attempts"`
 	ConnectBaseDelay   Duration `toml:"connect_base_delay"`
 	ConnectTimeout     Duration `toml:"connect_timeout"`
+	// MinConns keeps this many connections open so a webhook after a quiet spell doesn't pay for a new TLS connection.
+	MinConns int `toml:"min_conns"`
+	// AuthTimeout bounds one integration_users refresh query.
+	AuthTimeout Duration `toml:"auth_timeout"`
+	// AuthRefreshInterval is how often the in-memory copy of integration_users is reloaded.
+	AuthRefreshInterval Duration `toml:"auth_refresh_interval"`
+	// AuthMaxStale is how long the last good copy serves while refreshes fail, before auth answers 503.
+	AuthMaxStale Duration `toml:"auth_max_stale"`
 }
 
 // WakeConfig bounds the fire-and-forget POST /alertz to alerts-core.
@@ -89,6 +101,19 @@ type WakeConfig struct {
 // RejectConfig tunes how much of a rejected webhook's body is kept for logging.
 type RejectConfig struct {
 	BodyPreviewChars int `toml:"body_preview_chars"`
+}
+
+// LogConfig bounds the raw webhook body logged before each transform.
+type LogConfig struct {
+	// PayloadMaxBytes caps the logged body; a longer one is logged truncated, and 0 turns the line off.
+	PayloadMaxBytes int64 `toml:"payload_max_bytes"`
+}
+
+// PayloadsConfig tunes the in-memory buffer of raw webhook bodies written to raw_alerts.
+type PayloadsConfig struct {
+	FlushInterval  Duration `toml:"flush_interval"`
+	MaxBufferBytes int64    `toml:"max_buffer_bytes"`
+	FlushTimeout   Duration `toml:"flush_timeout"`
 }
 
 // Duration wraps time.Duration so TOML values like "30s" decode via time.ParseDuration.
@@ -113,10 +138,11 @@ func (d Duration) Duration() time.Duration {
 func Defaults() Config {
 	return Config{
 		Server: ServerConfig{
-			ShutdownGrace:  Duration(25 * time.Second),
+			ShutdownGrace:  Duration(30 * time.Second),
 			DrainDelay:     Duration(5 * time.Second),
 			RequestWait:    Duration(10 * time.Second),
 			AllocatorDrain: Duration(10 * time.Second),
+			PayloadDrain:   Duration(5 * time.Second),
 			ReadTimeout:    Duration(10 * time.Second),
 			WriteTimeout:   Duration(30 * time.Second),
 			IdleTimeout:    Duration(60 * time.Second),
@@ -126,7 +152,7 @@ func Defaults() Config {
 			QueueSize:        10000,
 			QueueMaxBytes:    256 << 20,
 			MaxBatch:         500,
-			WriteConcurrency: 8,
+			WriteConcurrency: 16,
 		},
 		Store: StoreConfig{
 			InsertAttempts:  5,
@@ -136,12 +162,22 @@ func Defaults() Config {
 			WriteDeadline:   Duration(8 * time.Second),
 		},
 		Postgres: PostgresConfig{
-			ConnectMaxAttempts: 5,
-			ConnectBaseDelay:   Duration(2 * time.Second),
-			ConnectTimeout:     Duration(10 * time.Second),
+			ConnectMaxAttempts:  5,
+			ConnectBaseDelay:    Duration(2 * time.Second),
+			ConnectTimeout:      Duration(10 * time.Second),
+			MinConns:            2,
+			AuthTimeout:         Duration(5 * time.Second),
+			AuthRefreshInterval: Duration(30 * time.Second),
+			AuthMaxStale:        Duration(15 * time.Minute),
 		},
 		Wake:   WakeConfig{Timeout: Duration(2 * time.Second)},
 		Reject: RejectConfig{BodyPreviewChars: 500},
+		Log:    LogConfig{PayloadMaxBytes: 64 << 10},
+		Payloads: PayloadsConfig{
+			FlushInterval:  Duration(10 * time.Minute),
+			MaxBufferBytes: 32 << 20,
+			FlushTimeout:   Duration(30 * time.Second),
+		},
 	}
 }
 
@@ -178,8 +214,10 @@ func (c Config) Validate() error {
 		return fmt.Errorf("server.request_wait must be positive")
 	case c.Server.AllocatorDrain <= 0:
 		return fmt.Errorf("server.allocator_drain must be positive")
-	case c.Server.DrainDelay+c.Server.RequestWait+c.Server.AllocatorDrain > c.Server.ShutdownGrace:
-		return fmt.Errorf("server.drain_delay + request_wait + allocator_drain must not exceed shutdown_grace")
+	case c.Server.PayloadDrain <= 0:
+		return fmt.Errorf("server.payload_drain must be positive")
+	case c.Server.DrainDelay+c.Server.RequestWait+c.Server.AllocatorDrain+c.Server.PayloadDrain > c.Server.ShutdownGrace:
+		return fmt.Errorf("server.drain_delay + request_wait + allocator_drain + payload_drain must not exceed shutdown_grace")
 	case c.Server.ReadTimeout <= 0:
 		return fmt.Errorf("server.read_timeout must be positive")
 	case c.Server.WriteTimeout <= 0:
@@ -218,10 +256,26 @@ func (c Config) Validate() error {
 		return fmt.Errorf("postgres.connect_base_delay must be positive")
 	case c.Postgres.ConnectTimeout <= 0:
 		return fmt.Errorf("postgres.connect_timeout must be positive")
+	case c.Postgres.MinConns < 0:
+		return fmt.Errorf("postgres.min_conns must not be negative")
+	case c.Postgres.AuthTimeout <= 0:
+		return fmt.Errorf("postgres.auth_timeout must be positive")
+	case c.Postgres.AuthRefreshInterval <= 0:
+		return fmt.Errorf("postgres.auth_refresh_interval must be positive")
+	case c.Postgres.AuthMaxStale <= c.Postgres.AuthRefreshInterval:
+		return fmt.Errorf("postgres.auth_max_stale must exceed postgres.auth_refresh_interval, or one slow refresh would fail every request")
 	case c.Wake.Timeout <= 0:
 		return fmt.Errorf("wake.timeout must be positive")
 	case c.Reject.BodyPreviewChars <= 0:
 		return fmt.Errorf("reject.body_preview_chars must be positive")
+	case c.Log.PayloadMaxBytes < 0:
+		return fmt.Errorf("log.payload_max_bytes must not be negative")
+	case c.Payloads.FlushInterval <= 0:
+		return fmt.Errorf("payloads.flush_interval must be positive")
+	case c.Payloads.FlushTimeout <= 0:
+		return fmt.Errorf("payloads.flush_timeout must be positive")
+	case c.Payloads.MaxBufferBytes < 2*c.Server.MaxBodyBytes:
+		return fmt.Errorf("payloads.max_buffer_bytes must be at least 2 x server.max_body_bytes, so the largest body fits under the early-flush mark")
 	}
 	return nil
 }
@@ -237,9 +291,8 @@ type Env struct {
 	AuthAuditOnlyRaw string `env:"AUTH_AUDIT_ONLY"`
 	AuthEnabled      bool   `env:"-"`
 	AuthAuditOnly    bool   `env:"-"`
-	// WakeUsername/WakeSecret are an integration_users credential for the wake call, sent only over https.
-	WakeUsername string `env:"ALERT_CORE_WAKE_USERNAME"`
-	WakeSecret   string `env:"ALERT_CORE_WAKE_SECRET"`
+	// WakeToken is the shared ALERT_CORE_WAKE_TOKEN alerts-core checks on /alertz, sent only over https.
+	WakeToken string `env:"ALERT_CORE_WAKE_TOKEN"`
 }
 
 // LoadEnv parses Env.
@@ -249,8 +302,7 @@ func LoadEnv() (Env, error) {
 		return Env{}, fmt.Errorf("env config: %w", err)
 	}
 	e.WakeURL = strings.TrimSpace(e.WakeURL)
-	e.WakeUsername = strings.TrimSpace(e.WakeUsername)
-	e.WakeSecret = strings.TrimSpace(e.WakeSecret)
+	e.WakeToken = strings.TrimSpace(e.WakeToken)
 	var err error
 	if e.AuthEnabled, err = parseBool("AUTH_ENABLED", e.AuthEnabledRaw); err != nil {
 		return Env{}, err

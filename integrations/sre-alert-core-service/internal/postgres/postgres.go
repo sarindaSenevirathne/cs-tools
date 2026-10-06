@@ -38,8 +38,23 @@ type Config struct {
 	Password string `env:"PGPASSWORD,notEmpty"`
 	// SSLMode defaults to "require", matching Azure Flexible Server's minimum.
 	SSLMode string `env:"PGSSLMODE" envDefault:"require"`
-	// PoolMaxConns caps this replica's pgxpool connections; 0 leaves pgx's default, too small under load.
+	// PoolMaxConns caps this replica's main pool; 0 lets SizePool derive it from poll.concurrency.
 	PoolMaxConns int32 `env:"PGPOOLMAXCONNS" envDefault:"0"`
+}
+
+// PoolHeadroom is the main pool's room beyond the fold workers, for the claimer, ack flushes, delivery reads, retention and health checks.
+const PoolHeadroom = 16
+
+// SizePool derives an unset PGPOOLMAXCONNS from foldWorkers plus PoolHeadroom, and refuses an explicit one below that, since fold workers holding every connection would stall claims, acks and health checks.
+func SizePool(cfg Config, foldWorkers int) (Config, error) {
+	need := int32(foldWorkers + PoolHeadroom)
+	switch {
+	case cfg.PoolMaxConns == 0:
+		cfg.PoolMaxConns = need
+	case cfg.PoolMaxConns < need:
+		return Config{}, fmt.Errorf("PGPOOLMAXCONNS=%d is below poll.concurrency (%d) + %d; unset it or set at least %d", cfg.PoolMaxConns, foldWorkers, PoolHeadroom, need)
+	}
+	return cfg, nil
 }
 
 // ConfigFromEnv reads Config from the environment.

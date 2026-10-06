@@ -18,12 +18,12 @@
 package aws
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
+	"sre-alert-ingestion-service/internal/model"
 	"sre-alert-ingestion-service/internal/sources/jsonnum"
 	"sre-alert-ingestion-service/utils"
 )
@@ -39,19 +39,14 @@ var defaults = map[string]string{
 }
 
 // ErrMissingBody is returned when the webhook is called with no body, or a body that isn't valid JSON at all.
-var ErrMissingBody = errors.New("MISSING REQUEST BODY DATA")
+var ErrMissingBody = errors.New("missing or invalid request body")
+
+// ErrUnsupportedType is returned for an SNS message that is neither a Notification nor one of the
+// confirmations the SNS handler answers before the transform runs.
+var ErrUnsupportedType = errors.New("unsupported SNS message type")
 
 // Alert is the canonical alert model handed to the core component.
-type Alert struct {
-	Service          string `json:"service"`
-	MetricName       string `json:"metric_name"`
-	Severity         string `json:"severity"`
-	Category         string `json:"category"`
-	Environment      string `json:"environment"`
-	Source           string `json:"source"`
-	UniqueIdentifier string `json:"unique_identifier"`
-	Description      string `json:"description"`
-}
+type Alert = model.Alert
 
 // Config holds operator overrides, keyed lowercase like the ServiceNow "edge.api.aws.alert.config" property; empty fields fall back to defaults.
 type Config map[string]string
@@ -79,6 +74,9 @@ func Transform(raw []byte, cfg Config) (Alert, error) {
 	if err := jsonnum.Unmarshal(raw, &envelope); err != nil {
 		return Alert{}, fmt.Errorf("%w: %v", ErrMissingBody, err)
 	}
+	if t := utils.Str(envelope, "Type"); t != "" && t != "Notification" {
+		return Alert{}, fmt.Errorf("%w %q", ErrUnsupportedType, t)
+	}
 
 	base := Alert{
 		Service:     configValue(cfg, "service"),
@@ -87,6 +85,10 @@ func Transform(raw []byte, cfg Config) (Alert, error) {
 		Category:    configValue(cfg, "category"),
 		Environment: configValue(cfg, "environment"),
 		Source:      configValue(cfg, "source"),
+		// Where the notification came from, for the core's assignment-group routing; known
+		// even when the Message itself cannot be parsed.
+		SourceTopic:   utils.Str(envelope, "TopicArn"),
+		SourceAccount: arnAccount(utils.Str(envelope, "TopicArn")),
 	}
 
 	messageRaw := utils.Str(envelope, "Message")
@@ -94,7 +96,8 @@ func Transform(raw []byte, cfg Config) (Alert, error) {
 	if err := jsonnum.Unmarshal([]byte(messageRaw), &messageObj); err != nil {
 		// SNS Message isn't valid JSON; still produces a real alert, matching the reference script's own fallback.
 		base.MetricName = "SNS Message Parse Error"
-		base.Description = "Raw Payload Message: " + prettyJSON(raw)
+		// A non-JSON SNS Message is the human-readable text itself; the raw body is kept in raw_alerts.
+		base.Description = strings.TrimSpace(messageRaw)
 		return base, nil
 	}
 
@@ -120,21 +123,31 @@ func Transform(raw []byte, cfg Config) (Alert, error) {
 		Environment:      utils.FirstNonEmpty(utils.Str(alarmDesc, "environment"), base.Environment),
 		Source:           base.Source,
 		UniqueIdentifier: utils.Str(messageObj, "AlarmArn"),
-		Description:      prettyJSON([]byte(messageRaw)),
+		// The alarm's state reason, never the payload; the raw body is kept in raw_alerts.
+		Description: utils.Str(messageObj, "NewStateReason"),
+		// An alarm may name its own CSM assignment group in AlarmDescription; it beats every
+		// other routing signal the core has.
+		AssignmentGroup: strings.TrimSpace(utils.Str(alarmDesc, "assignment_group")),
+		SourceTopic:     base.SourceTopic,
+		SourceAccount: utils.FirstNonEmpty(
+			utils.Str(messageObj, "AWSAccountId"),
+			arnAccount(utils.Str(messageObj, "AlarmArn")),
+			base.SourceAccount,
+		),
 	}
 	return alert, nil
+}
+
+// arnAccount returns the account id of an ARN (arn:partition:service:region:account:resource), or "".
+func arnAccount(arn string) string {
+	parts := strings.SplitN(arn, ":", 6)
+	if len(parts) < 6 || parts[0] != "arn" {
+		return ""
+	}
+	return parts[4]
 }
 
 // configValue applies the 2-tier resolution: operator config, then the hardcoded default.
 func configValue(cfg Config, field string) string {
 	return utils.FirstNonEmpty(cfg[field], defaults[field])
-}
-
-// prettyJSON re-indents raw JSON bytes with a 2-space indent, operating on the raw bytes to preserve field order.
-func prettyJSON(raw []byte) string {
-	var buf bytes.Buffer
-	if err := json.Indent(&buf, raw, "", "  "); err != nil {
-		return string(raw)
-	}
-	return buf.String()
 }

@@ -112,6 +112,25 @@ func WithProductCategoryEnforcement(svc CaseService, referenceDataRepo repositor
 	return svc
 }
 
+// WithCSEngineerRole attaches CS_ENGINEER_ROLE to an already-constructed
+// CaseService built via the plain NewCaseService (which has no
+// csEngineerRole parameter at all -- unlike NewCaseServiceWithSNWriteback,
+// which already takes one). Without this, isSupportEngineerAuthor always
+// returns false on that path, so a comment's author can never be confirmed
+// as a support engineer: the response-SLA early-completion signal and
+// events.CommentAddedPayload.IsSupportEngineerResponse both silently stay
+// unset for every plain DATA_SOURCE=postgres deployment. Same post-
+// construction wiring shape as WithProductCategoryEnforcement, for the same
+// reason -- NewCaseService already has 60+ call sites (every test, every
+// other DataSource branch in routes.go), and a signature change would touch
+// all of them for a capability that's optional and nil-safe to omit.
+func WithCSEngineerRole(svc CaseService, csEngineerRole string) CaseService {
+	if cs, ok := svc.(*caseService); ok {
+		cs.csEngineerRole = csEngineerRole
+	}
+	return svc
+}
+
 // caseResolutionFields carries the resolution data that accompanies a
 // closed/solution_proposed transition to the ServiceNow mirror.
 type caseResolutionFields struct {
@@ -836,7 +855,14 @@ func (s *caseService) mirrorInitialSNComments(ctx context.Context, caseID string
 		// run. SearchCaseComments orders by created_on DESC, so stamping
 		// NOW() here instead would misorder mirrored comments relative to
 		// their real ServiceNow chronology (caught in review on PR #2204).
-		if _, err := s.repo.CreateCaseComment(ctx, domain.CreateCaseCommentRequest{
+		//
+		// Written as the system (CreateCaseCommentAsSystem): ServiceNow's
+		// initial comments can include WORK_NOTE rows, which an external
+		// caller may not write (migration 0191), and the customer who just
+		// created this case is the caller here. The case was created under that
+		// caller's identity, so only this mirror of ServiceNow's own rows is
+		// elevated.
+		if _, err := s.repo.CreateCaseCommentAsSystem(ctx, domain.CreateCaseCommentRequest{
 			CaseID:    caseID,
 			Type:      c.Type,
 			Content:   c.Content,
@@ -1121,25 +1147,45 @@ var validCommentType = map[domain.CommentType]bool{
 	domain.CommentTypeActivity: true,
 }
 
-// CreateCaseComment implements CaseService.
-func (s *caseService) CreateCaseComment(ctx context.Context, req domain.CreateCaseCommentRequest) (domain.CreateCaseCommentResponse, error) {
+// commentAuthor resolves who is writing from the x-user-id-token: their email
+// and display name.
+func (s *caseService) commentAuthor(ctx context.Context) (email, name string, err error) {
 	token := middleware.UserIDTokenFromContext(ctx)
 	if token == "" {
-		return domain.CreateCaseCommentResponse{}, &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
+		return "", "", &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
 	}
-	email, err := emailFromJWT(token)
+	email, err = emailFromJWT(token)
 	if err != nil {
-		return domain.CreateCaseCommentResponse{}, &apierror.ValidationError{Msg: "x-user-id-token: " + err.Error()}
+		return "", "", &apierror.ValidationError{Msg: "x-user-id-token: " + err.Error()}
 	}
 	user, err := s.userRepo.GetUserByEmail(ctx, email)
 	if err != nil {
+		return "", "", err
+	}
+	name = strings.TrimSpace(user.FirstName + " " + user.LastName)
+	if name == "" {
+		name = user.Email
+	}
+	return user.Email, name, nil
+}
+
+// CreateCaseComment implements CaseService.
+func (s *caseService) CreateCaseComment(ctx context.Context, req domain.CreateCaseCommentRequest) (domain.CreateCaseCommentResponse, error) {
+	email, name, err := s.commentAuthor(ctx)
+	if err != nil {
 		return domain.CreateCaseCommentResponse{}, err
 	}
-	authorName := strings.TrimSpace(user.FirstName + " " + user.LastName)
-	if authorName == "" {
-		authorName = user.Email
+	return s.createCaseCommentAs(ctx, req, email, name, false)
+}
+
+// CreateInternalCaseComment implements CaseService: CreateCaseComment with the
+// row itself written as the system identity (see the interface comment).
+func (s *caseService) CreateInternalCaseComment(ctx context.Context, req domain.CreateCaseCommentRequest) (domain.CreateCaseCommentResponse, error) {
+	email, name, err := s.commentAuthor(ctx)
+	if err != nil {
+		return domain.CreateCaseCommentResponse{}, err
 	}
-	return s.createCaseCommentAs(ctx, req, user.Email, authorName)
+	return s.createCaseCommentAs(ctx, req, email, name, true)
 }
 
 // CreateCaseCommentAs implements CaseService for a caller that already knows
@@ -1152,14 +1198,14 @@ func (s *caseService) CreateCaseComment(ctx context.Context, req domain.CreateCa
 // published event's author name rather than risking a hard failure over a
 // service account that was never expected to exist as a real user.
 func (s *caseService) CreateCaseCommentAs(ctx context.Context, req domain.CreateCaseCommentRequest, actorEmail string) (domain.CreateCaseCommentResponse, error) {
-	return s.createCaseCommentAs(ctx, req, actorEmail, actorEmail)
+	return s.createCaseCommentAs(ctx, req, actorEmail, actorEmail, false)
 }
 
 // createCaseCommentAs is the shared validation/create logic behind both
 // CreateCaseComment (token-resolved actor) and CreateCaseCommentAs (caller-
 // supplied actor) -- everything past actor resolution is identical between
 // the two.
-func (s *caseService) createCaseCommentAs(ctx context.Context, req domain.CreateCaseCommentRequest, actorEmail, authorName string) (domain.CreateCaseCommentResponse, error) {
+func (s *caseService) createCaseCommentAs(ctx context.Context, req domain.CreateCaseCommentRequest, actorEmail, authorName string, asSystem bool) (domain.CreateCaseCommentResponse, error) {
 	if err := validateUUIDs("caseId", []string{req.CaseID}); err != nil {
 		return domain.CreateCaseCommentResponse{}, err
 	}
@@ -1172,9 +1218,26 @@ func (s *caseService) createCaseCommentAs(ctx context.Context, req domain.Create
 	// comment.created_by (migration 0040) is a free-text VARCHAR, not a
 	// UUID FK -- see CaseRepository.CreateCaseComment's own doc comment.
 	req.CreatedBy = actorEmail
-	c, err := s.repo.CreateCaseComment(ctx, req, nil)
+	var c domain.CaseComment
+	var err error
+	if asSystem {
+		c, err = s.repo.CreateCaseCommentAsSystem(ctx, req, nil)
+	} else {
+		c, err = s.repo.CreateCaseComment(ctx, req, nil)
+	}
 	if err != nil {
 		return domain.CreateCaseCommentResponse{}, err
+	}
+
+	// Computed once, used by both the SLA-engine hook and the published
+	// event's own IsSupportEngineerResponse flag below -- see
+	// isSupportEngineerAuthor's own doc comment. Only resolved when at
+	// least one of them is actually configured, so a deployment with
+	// neither the native SLA engine nor Event Hub publishing enabled pays
+	// no extra lookup on every comment.
+	var isSupportEngineerResponse bool
+	if req.Type == domain.CommentTypeComment && (s.slaEngine != nil || s.publisher != nil) {
+		isSupportEngineerResponse = s.isSupportEngineerAuthor(ctx, req.CaseID, actorEmail)
 	}
 
 	// Best-effort, in-process only -- deliberately not gated on s.publisher
@@ -1183,7 +1246,7 @@ func (s *caseService) createCaseCommentAs(ctx context.Context, req domain.Create
 	// its own, separate ServiceNow-mode hook: a deployment without Event
 	// Hub configured must not lose SLA tracking as a side effect either.
 	if req.Type == domain.CommentTypeComment {
-		s.completeResponseSLAOnComment(ctx, req.CaseID, actorEmail)
+		s.completeResponseSLAOnComment(ctx, req.CaseID, isSupportEngineerResponse)
 	}
 
 	// Event publishing follows the write, not DATA_SOURCE -- see
@@ -1197,7 +1260,7 @@ func (s *caseService) createCaseCommentAs(ctx context.Context, req domain.Create
 			slog.ErrorContext(ctx, "create comment: enrich case for case.comment_added publish failed", "caseId", req.CaseID)
 		} else {
 			cv.WatchList = s.filterActiveWatchListUsers(ctx, cv, cv.WatchList)
-			publishCommentAddedEvent(ctx, s.publisher, s.AccountDefaultWatcherEmails, s.ProjectOnboardingInfo, cv, req, c.ID, authorName, actorEmail)
+			publishCommentAddedEvent(ctx, s.publisher, s.AccountDefaultWatcherEmails, s.ProjectOnboardingInfo, cv, req, c.ID, authorName, actorEmail, isSupportEngineerResponse)
 		}
 	}
 
@@ -1250,40 +1313,54 @@ func (s *caseService) createCaseCommentAs(ctx context.Context, req domain.Create
 // completeResponseSLAOnComment best-effort marks the case's CSM-native
 // "response" SLA clock complete (SLAEngineService.CompleteResponseClock,
 // idempotent -- see repository.SLAEngineRepository.CompleteClock's own doc
-// comment) when actorEmail holds s.csEngineerRole. This is caseService's
-// own equivalent of snCaseService.applyResponseSLAOnComment, which caseService
-// never reached before now -- a real, live-observed gap: a support
-// engineer's reply never stopped the response clock on this path, so it
-// kept running to breach regardless of how quickly the case was actually
-// answered. Shares the one CS_ENGINEER_ROLE config with that hook --
+// comment) when isSupportEngineerResponse is true (see
+// isSupportEngineerAuthor below for how that's decided). This is
+// caseService's own equivalent of snCaseService.applyResponseSLAOnComment,
+// which caseService never reached before now -- a real, live-observed gap: a
+// support engineer's reply never stopped the response clock on this path,
+// so it kept running to breach regardless of how quickly the case was
+// actually answered. Shares the one CS_ENGINEER_ROLE config with that hook --
 // "CS engineer" and "support engineer" are the same real-world role, just
 // checked here via a different lookup (GetUserRoles) than snCaseService's
 // own.
 //
-// Skips entirely, rather than guessing, when: s.slaEngine or
-// s.csEngineerRole is unset (no database, or the role name isn't
-// configured); actorEmail doesn't resolve to a real user row (the M2M
-// CreateCaseCommentAs path deliberately has none -- see that method's own
-// doc comment, "no GetUserByEmail lookup happens here"); or the role lookup
-// itself fails. None of these fail the comment creation itself -- the
-// comment has already been written by the time this runs.
-func (s *caseService) completeResponseSLAOnComment(ctx context.Context, caseID, actorEmail string) {
-	if s.slaEngine == nil || s.csEngineerRole == "" {
-		return
-	}
-	user, err := s.userRepo.GetUserByEmail(ctx, actorEmail)
-	if err != nil {
-		return
-	}
-	roles, err := s.userRepo.GetUserRoles(ctx, user.ID)
-	if err != nil {
-		slog.ErrorContext(ctx, "create comment: response SLA not evaluated, user role lookup failed", "caseId", caseID)
-		return
-	}
-	if !slices.Contains(roles, s.csEngineerRole) {
+// Skips entirely, rather than guessing, when s.slaEngine is unset (no
+// database) or isSupportEngineerResponse is false -- the latter already
+// covers every reason isSupportEngineerAuthor itself can't confirm
+// authorship (s.csEngineerRole unset, actorEmail not resolving to a real
+// user row, or the role lookup failing). None of these fail the comment
+// creation itself -- the comment has already been written by the time this
+// runs.
+func (s *caseService) completeResponseSLAOnComment(ctx context.Context, caseID string, isSupportEngineerResponse bool) {
+	if s.slaEngine == nil || !isSupportEngineerResponse {
 		return
 	}
 	s.slaEngine.CompleteResponseClock(ctx, caseID)
+}
+
+// isSupportEngineerAuthor resolves whether actorEmail belongs to a user
+// holding s.csEngineerRole -- shared by completeResponseSLAOnComment (the
+// CSM-native SLA engine's own response-clock completion, above) and the
+// published case.comment_added event's own IsSupportEngineerResponse flag,
+// computed once per comment rather than twice. s.csEngineerRole unset (no
+// database, or the role name isn't configured), an actorEmail that doesn't
+// resolve to a real user row (the M2M CreateCaseCommentAs path deliberately
+// has none -- see that method's own doc comment), or a failed role lookup
+// all answer false -- can't confirm, not an error.
+func (s *caseService) isSupportEngineerAuthor(ctx context.Context, caseID, actorEmail string) bool {
+	if s.csEngineerRole == "" {
+		return false
+	}
+	user, err := s.userRepo.GetUserByEmail(ctx, actorEmail)
+	if err != nil {
+		return false
+	}
+	roles, err := s.userRepo.GetUserRoles(ctx, user.ID)
+	if err != nil {
+		slog.ErrorContext(ctx, "create comment: support-engineer role lookup failed", "caseId", caseID)
+		return false
+	}
+	return slices.Contains(roles, s.csEngineerRole)
 }
 
 // SearchCaseComments implements CaseService.

@@ -22,13 +22,14 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/singleflight"
 )
@@ -42,122 +43,179 @@ const (
 	maxIterations = 200_000
 )
 
-// IntegrationUsers checks webhooks against integration_users, caching verified credentials for cacheTTL.
+// UsersConfig tunes the in-memory copy of integration_users.
+type UsersConfig struct {
+	// QueryTimeout bounds one refresh query.
+	QueryTimeout time.Duration
+	// RefreshInterval is how often the copy is reloaded; a new, disabled or rotated user takes up to this long to apply.
+	RefreshInterval time.Duration
+	// MaxStale is how long the last good copy keeps serving while refreshes fail; past it every request is ErrUnavailable.
+	MaxStale time.Duration
+	// CacheTTL is how long a verified secret skips PBKDF2; zero disables it.
+	CacheTTL time.Duration
+}
+
+// userRow is one integration_users row as the in-memory copy keeps it; users never expire.
+type userRow struct {
+	hash, salt string
+	iterations int
+	enabled    bool
+}
+
+type usersSnapshot struct {
+	users    map[string]userRow
+	loadedAt time.Time
+}
+
+// IntegrationUsers checks webhooks against an in-memory copy of integration_users, so no request waits on Postgres.
 type IntegrationUsers struct {
-	pool     *pgxpool.Pool
-	timeout  time.Duration
-	cacheTTL time.Duration
+	pool   *pgxpool.Pool
+	logger *slog.Logger
+	cfg    UsersConfig
+
+	snap atomic.Pointer[usersSnapshot]
 
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
-	// verify collapses concurrent cache misses for one credential into a single lookup and PBKDF2 check, so a burst costs one query instead of one per request.
+	// verify collapses concurrent checks of one credential into a single PBKDF2 run.
 	verify singleflight.Group
 }
 
-// cacheEntry holds a verified secret's SHA-256 (never the secret), expiring by the row's expires_at.
+// cacheEntry holds a verified secret's SHA-256 (never the secret) and the stored hash it matched, so a rotation invalidates it.
 type cacheEntry struct {
 	digest  [32]byte
+	hash    string
 	expires time.Time
 }
 
-// NewIntegrationUsers wraps pool for read-only checks; a zero cacheTTL disables caching.
-func NewIntegrationUsers(pool *pgxpool.Pool, queryTimeout, cacheTTL time.Duration) *IntegrationUsers {
-	return &IntegrationUsers{
-		pool:     pool,
-		timeout:  queryTimeout,
-		cacheTTL: cacheTTL,
-		cache:    make(map[string]cacheEntry),
+// NewIntegrationUsers returns an empty copy; call Refresh once at startup and Run in a goroutine.
+func NewIntegrationUsers(pool *pgxpool.Pool, logger *slog.Logger, cfg UsersConfig) *IntegrationUsers {
+	return &IntegrationUsers{pool: pool, logger: logger, cfg: cfg, cache: make(map[string]cacheEntry)}
+}
+
+// Refresh reloads every row in one query; a row with a NULL or unusable field is skipped and logged, so it can't block the others.
+func (a *IntegrationUsers) Refresh(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, a.cfg.QueryTimeout)
+	defer cancel()
+	rows, err := a.pool.Query(ctx, `SELECT username, secret_hash, salt, iterations, enabled FROM integration_users`)
+	if err != nil {
+		return fmt.Errorf("load integration_users: %w", err)
+	}
+	defer rows.Close()
+
+	users := make(map[string]userRow)
+	var skipped []string
+	for rows.Next() {
+		var (
+			username, hash, salt *string
+			iterations           *int32
+			enabled              *bool
+		)
+		if err := rows.Scan(&username, &hash, &salt, &iterations, &enabled); err != nil {
+			return fmt.Errorf("load integration_users: %w", err)
+		}
+		if username == nil || hash == nil || salt == nil || iterations == nil || enabled == nil {
+			name := "<null>"
+			if username != nil {
+				name = *username
+			}
+			skipped = append(skipped, name)
+			continue
+		}
+		users[*username] = userRow{hash: *hash, salt: *salt, iterations: int(*iterations), enabled: *enabled}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("load integration_users: %w", err)
+	}
+	if len(skipped) > 0 {
+		a.logger.Warn("integration_users rows with NULL fields skipped; those users get 401", "usernames", skipped)
+	}
+	a.snap.Store(&usersSnapshot{users: users, loadedAt: time.Now()})
+	return nil
+}
+
+// Run refreshes every RefreshInterval until ctx ends; a failed refresh keeps the last good copy.
+func (a *IntegrationUsers) Run(ctx context.Context) {
+	ticker := time.NewTicker(a.cfg.RefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if err := a.Refresh(ctx); err != nil && ctx.Err() == nil {
+			a.logger.Warn("integration_users refresh failed; keeping the last good copy", "error", err, "copy_age", a.age().Round(time.Second).String())
+		}
 	}
 }
 
-// Authenticate accepts an enabled, unexpired user with a matching secret; one credential suits every source.
+// age is how old the current copy is, or -1 before the first load.
+func (a *IntegrationUsers) age() time.Duration {
+	s := a.snap.Load()
+	if s == nil {
+		return -1
+	}
+	return time.Since(s.loadedAt)
+}
+
+// Authenticate accepts an enabled user with a matching secret; one credential suits every source.
 func (a *IntegrationUsers) Authenticate(r *http.Request, _ string) error {
 	username, secret, ok := parseCredentials(r)
 	if !ok {
 		return ErrUnauthorized
 	}
-	if a.cachedHit(username, secret) {
+	snap := a.snap.Load()
+	if snap == nil {
+		return fmt.Errorf("%w: integration_users not loaded yet", ErrUnavailable)
+	}
+	if age := time.Since(snap.loadedAt); age > a.cfg.MaxStale {
+		return fmt.Errorf("%w: integration_users copy is %v old", ErrUnavailable, age.Round(time.Second))
+	}
+	row, found := snap.users[username]
+	if !found || !row.enabled || row.iterations < minIterations || row.iterations > maxIterations {
+		return ErrUnauthorized
+	}
+	if a.cachedHit(username, secret, row.hash) {
 		return nil
 	}
 	digest := sha256.Sum256([]byte(secret))
-	// Keyed by the secret's digest too, so a wrong secret never shares a correct one's result.
-	key := username + "\x00" + string(digest[:])
-	ch := a.verify.DoChan(key, func() (any, error) {
-		// Detached from any one caller, so a single client hanging up can't fail the others waiting on this check.
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), a.timeout)
-		defer cancel()
-		return nil, a.check(ctx, username, secret)
+	// Keyed by the secret's digest and stored hash too, so a wrong secret or a rotated row never shares another check's result.
+	key := username + "\x00" + string(digest[:]) + "\x00" + row.hash
+	res, _, _ := a.verify.Do(key, func() (any, error) {
+		return verifySecret(secret, row.salt, row.hash, row.iterations), nil
 	})
-	select {
-	case res := <-ch:
-		return res.Err
-	case <-r.Context().Done():
-		return ErrUnavailable
-	}
-}
-
-// check looks the user up and verifies secret, caching a success; a lookup failure is ErrUnavailable, not a rejection.
-func (a *IntegrationUsers) check(ctx context.Context, username, secret string) error {
-	var (
-		hash, salt string
-		iterations int
-		enabled    bool
-		expiresAt  time.Time
-	)
-	err := a.pool.QueryRow(ctx,
-		`SELECT secret_hash, salt, iterations, enabled, expires_at FROM integration_users WHERE username = $1`,
-		username,
-	).Scan(&hash, &salt, &iterations, &enabled, &expiresAt)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !enabled) {
+	if !res.(bool) {
 		return ErrUnauthorized
 	}
-	if err != nil {
-		return errors.Join(ErrUnavailable, err)
-	}
-	if iterations < minIterations || iterations > maxIterations {
-		return ErrUnauthorized
-	}
-	// expires_at defaults to the Unix epoch in the schema, not NULL, so "at or before epoch" means unset.
-	if !expiresAt.IsZero() && expiresAt.After(time.Unix(0, 0)) && time.Now().After(expiresAt) {
-		return ErrUnauthorized
-	}
-	if !verifySecret(secret, salt, hash, iterations) {
-		return ErrUnauthorized
-	}
-	a.remember(username, secret, expiresAt)
+	a.remember(username, secret, row)
 	return nil
 }
 
-// cachedHit reports whether username's cached digest matches secret and is still fresh.
-func (a *IntegrationUsers) cachedHit(username, secret string) bool {
-	if a.cacheTTL <= 0 {
+// cachedHit reports whether username's cached digest matches secret, was verified against the current stored hash, and is still fresh.
+func (a *IntegrationUsers) cachedHit(username, secret, hash string) bool {
+	if a.cfg.CacheTTL <= 0 {
 		return false
 	}
 	a.mu.RLock()
 	e, ok := a.cache[username]
 	a.mu.RUnlock()
-	if !ok || time.Now().After(e.expires) {
+	if !ok || e.hash != hash || time.Now().After(e.expires) {
 		return false
 	}
 	got := sha256.Sum256([]byte(secret))
 	return subtle.ConstantTimeCompare(got[:], e.digest[:]) == 1
 }
 
-// remember caches secret capped at rowExpiresAt; a disable or rotation still takes up to cacheTTL.
-func (a *IntegrationUsers) remember(username, secret string, rowExpiresAt time.Time) {
-	if a.cacheTTL <= 0 {
+// remember caches secret for CacheTTL.
+func (a *IntegrationUsers) remember(username, secret string, row userRow) {
+	if a.cfg.CacheTTL <= 0 {
 		return
 	}
-	expires := time.Now().Add(a.cacheTTL)
-	if !rowExpiresAt.IsZero() && rowExpiresAt.After(time.Unix(0, 0)) && rowExpiresAt.Before(expires) {
-		expires = rowExpiresAt
-	}
+	expires := time.Now().Add(a.cfg.CacheTTL)
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.cache[username] = cacheEntry{
-		digest:  sha256.Sum256([]byte(secret)),
-		expires: expires,
-	}
+	a.cache[username] = cacheEntry{digest: sha256.Sum256([]byte(secret)), hash: row.hash, expires: expires}
 }
 
 // verifySecret recomputes the PBKDF2-HMAC-SHA256 hash and compares in constant time.

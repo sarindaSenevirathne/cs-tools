@@ -705,6 +705,65 @@ func TestConfig_Validate_CustomerEngagementFirefightingTypeID(t *testing.T) {
 	}
 }
 
+// TestConfig_Validate_RedisURL: a malformed REDIS_URL fails startup, and the
+// error never echoes the URL, since it carries the Redis password.
+func TestConfig_Validate_RedisURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{name: "unset", url: "", wantErr: false},
+		{name: "tls", url: "rediss://:s3cr3t%3D@cache.example.net:10000", wantErr: false},
+		{name: "plain", url: "redis://localhost:6379/0", wantErr: false},
+		{name: "wrong scheme", url: "https://:s3cr3t@cache.example.net", wantErr: true},
+		{name: "no host", url: "rediss://:s3cr3t@", wantErr: true},
+		{name: "unparseable", url: "rediss://:s3cr3t@[::1", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := baseValidConfig()
+			c.RedisURL = tt.url
+			err := c.Validate()
+			if tt.wantErr != (err != nil) {
+				t.Fatalf("Validate() = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil && strings.Contains(err.Error(), "s3cr3t") {
+				t.Errorf("Validate() error leaks the password: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoad_Redis(t *testing.T) {
+	t.Setenv("REDIS_URL", "")
+	t.Setenv("REDIS_ADDR", "")
+	t.Setenv("USER_CACHE_TTL", "")
+	c := Load()
+	if c.HasRedis() {
+		t.Error("HasRedis() = true with neither REDIS_URL nor REDIS_ADDR set")
+	}
+	if c.UserCacheTTL != 10*time.Minute {
+		t.Errorf("UserCacheTTL = %v, want the 10m default", c.UserCacheTTL)
+	}
+
+	t.Setenv("REDIS_ADDR", " localhost:6379 ")
+	t.Setenv("USER_CACHE_TTL", "90s")
+	c = Load()
+	if !c.HasRedis() || c.RedisAddr != "localhost:6379" {
+		t.Errorf("HasRedis() = %v, RedisAddr = %q; want true, %q", c.HasRedis(), c.RedisAddr, "localhost:6379")
+	}
+	if c.UserCacheTTL != 90*time.Second {
+		t.Errorf("UserCacheTTL = %v, want 90s", c.UserCacheTTL)
+	}
+
+	t.Setenv("REDIS_ADDR", "")
+	t.Setenv("REDIS_URL", "rediss://:pw@cache.example.net:10000")
+	if !Load().HasRedis() {
+		t.Error("HasRedis() = false with REDIS_URL set")
+	}
+}
+
 // dsnSearchPath extracts the search_path value DSN embedded in its "options"
 // query parameter, so a test can assert on the schema alone rather than the
 // whole connection string.

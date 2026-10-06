@@ -20,8 +20,8 @@
 #
 # Backstop cadence; POST /alertz normally wakes the poller sooner.
 interval = "10s"
-# Fingerprint-sharded fold workers per replica; each holds one data connection while folding, so keep PGPOOLMAXCONNS at or above this.
-concurrency = 64
+# Fingerprint-sharded fold workers per replica; each holds one data connection while folding, and the main pool is sized to this plus 16.
+concurrency = 128
 # Seed rows per claim; siblings sharing a seed's fingerprint can add as many again, and 2 x max_batch alerts can be in flight.
 max_batch = 500
 # How long a claimed but unfinished alert is held before any replica may reclaim it (recovers a crashed replica's work).
@@ -56,11 +56,11 @@ csm_retry_multiplier = 2
 # Caps the CSM create retry wait, so a recovered CSM gets the backlog within this long.
 csm_retry_max_delay = "15m"
 # How long CSM gets to confirm a new incident before it is posted to the Chat fallback; "0s" posts on the first CSM failure.
-chat_fallback_delay = "60s"
+chat_fallback_delay = "25s"
 # Each incident's Chat fallback card gets its own thread, and Duplicate/OK alerts become one digest reply per delivery pass.
 chat_threading_enabled = true
 # Incidents each replica delivers to CSM/Chat in parallel; each holds one lock connection for its CSM/Chat calls.
-delivery_concurrency = 32
+delivery_concurrency = 64
 
 [server]
 # Bounds how long SIGTERM/SIGINT waits for in-flight work before forcing exit.
@@ -73,7 +73,7 @@ dedup_window = "5m"
 [retention]
 # How often one replica purges expired rows.
 interval = "1h"
-# How long processed alert rows are kept.
+# How long processed alert rows, and raw webhook bodies in raw_alerts, are kept.
 alerts = "168h"
 # How long an incident with nothing left to deliver is kept after its last alert.
 incidents = "720h"

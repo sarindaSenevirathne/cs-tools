@@ -15,7 +15,7 @@
 // under the License.
 
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { useEffect, useState, type JSX } from "react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router";
@@ -27,6 +27,7 @@ import { CaseTabsProvider, useCaseTabsController } from "@context/case-tabs/Case
 import { CaseTabsBehaviorProvider } from "@context/case-tabs/CaseTabsBehaviorContext";
 import { useCaseTabCloseConfirm } from "@features/case-tabs/hooks/useCaseTabCloseConfirm";
 import LoggerProvider from "@context/logger/LoggerProvider";
+import { clearUserPreferredTimeZone, setUserPreferredTimeZone } from "@utils/dateTime";
 
 const navigateMock = vi.fn();
 const useGetChangeRequestMock = vi.fn();
@@ -114,6 +115,11 @@ vi.mock("@features/csm-operations/api/useGetChangeRequestApprovals", () => ({
     useFakeBackendTick();
     return useGetChangeRequestApprovalsMock();
   },
+}));
+// The group page opened from an Assignment group on the Approval tab.
+const useGroupDetailMock = vi.fn();
+vi.mock("@features/csm-operations/api/useGroupDetail", () => ({
+  useGroupDetail: (id: string | undefined) => useGroupDetailMock(id),
 }));
 const decideApprovalMutateMock = vi.fn();
 vi.mock("@features/csm-operations/api/useDecideChangeRequestApproval", () => ({
@@ -214,6 +220,7 @@ beforeEach(() => {
   patchResetMock.mockClear();
   editChangeRequestDialogMock.mockClear();
   approvalsPanelMock.mockClear();
+  useGroupDetailMock.mockReset();
   patchMutateAsyncMock.mockReset();
   patchMutateAsyncMock.mockResolvedValue({ id: "chg-1" });
   postCommentMutateAsyncMock.mockReset();
@@ -302,6 +309,100 @@ describe("CsmChangeRequestDetailPage", () => {
     mockQueryResult({ data: { ...BASE_CR, state: "implement" } });
     renderPage();
     expect(screen.getByRole("list", { name: /change request lifecycle/i })).toBeInTheDocument();
+  });
+});
+
+describe("CsmChangeRequestDetailPage — project, deployments, deployment products, customer group, category", () => {
+  const cell = (label: string): HTMLElement => screen.getByText(label).parentElement!;
+  const SCOPED = {
+    ...BASE_CR,
+    project: { id: "proj-a", name: "Acme Project" },
+    deployments: [
+      { id: "dep-prod", name: "Acme Production" },
+      { id: "dep-stg", name: "Acme Staging" },
+    ],
+    deploymentProducts: [
+      { id: "dp-apim", name: "API Manager 4.3.0" },
+      { id: "dp-is", name: "Identity Server 7.0.0" },
+    ],
+    customerContacts: [
+      { id: "pc-1", name: "Alice Aaron" },
+      { id: "pc-2", name: "Bob Bell" },
+    ],
+    category: "devops",
+  };
+
+  it("shows each of them in the Overview", () => {
+    mockQueryResult({ data: SCOPED });
+    renderPage();
+    expect(within(cell("Customer Project")).getByText("Acme Project")).toBeInTheDocument();
+    const deployments = within(cell("Deployments"));
+    expect(deployments.getByText("Acme Production")).toBeInTheDocument();
+    expect(deployments.getByText("Acme Staging")).toBeInTheDocument();
+    const products = within(cell("Deployment products"));
+    expect(products.getByText("API Manager 4.3.0")).toBeInTheDocument();
+    expect(products.getByText("Identity Server 7.0.0")).toBeInTheDocument();
+    // The Customer Group is the project's registered contacts, read-only.
+    const group = within(cell("Customer group"));
+    expect(group.getByText("Alice Aaron")).toBeInTheDocument();
+    expect(group.getByText("Bob Bell")).toBeInTheDocument();
+    expect(within(cell("Category")).getByText("DevOps")).toBeInTheDocument();
+  });
+
+  it("shows a dash for each when the change request has none", () => {
+    mockQueryResult({
+      data: {
+        ...BASE_CR,
+        project: undefined,
+        deployments: [],
+        deploymentProducts: [],
+        customerContacts: [],
+        category: null,
+      },
+    });
+    renderPage();
+    for (const label of [
+      "Customer Project",
+      "Deployments",
+      "Deployment products",
+      "Customer group",
+      "Category",
+    ]) {
+      expect(within(cell(label)).getByText("—")).toBeInTheDocument();
+    }
+  });
+
+  it("shows a dash when the backend omits the lists entirely (an older response)", () => {
+    mockQueryResult({
+      data: { ...BASE_CR, deployments: undefined, deploymentProducts: undefined, customerContacts: undefined },
+    });
+    renderPage();
+    expect(within(cell("Deployments")).getByText("—")).toBeInTheDocument();
+    expect(within(cell("Deployment products")).getByText("—")).toBeInTheDocument();
+    expect(within(cell("Customer group")).getByText("—")).toBeInTheDocument();
+  });
+
+  it("has no Environments field", () => {
+    mockQueryResult({ data: SCOPED });
+    renderPage();
+    expect(screen.queryByText("Environments")).not.toBeInTheDocument();
+  });
+
+  it("reads the category from an entity-ref response too", () => {
+    mockQueryResult({ data: { ...SCOPED, category: { id: "regular_release_cloud", name: "Regular Release - Cloud" } } });
+    renderPage();
+    expect(within(cell("Category")).getByText("Regular Release - Cloud")).toBeInTheDocument();
+  });
+
+  it("lists each only once: Category and Customer group are not repeated under SRE details", () => {
+    mockQueryResult({ data: SCOPED });
+    renderPage();
+    fireEvent.click(screen.getByRole("tab", { name: /plan/i }));
+    expect(screen.getByText("SRE details")).toBeInTheDocument();
+    expect(screen.getAllByText("Category")).toHaveLength(1);
+    expect(screen.getAllByText("Customer group")).toHaveLength(1);
+    expect(screen.getAllByText("Deployments")).toHaveLength(1);
+    expect(screen.getAllByText("Deployment products")).toHaveLength(1);
   });
 });
 
@@ -461,6 +562,33 @@ describe("CsmChangeRequestDetailPage — Clone", () => {
         }),
       }),
     );
+  });
+
+  it("carries the project and category into the clone, but not the deployments / products / customer group", () => {
+    mockQueryResult({
+      data: {
+        ...BASE_CR,
+        project: { id: "proj-a", name: "Acme Project" },
+        customerContacts: [{ id: "pc-1", name: "Alice Aaron" }],
+        category: "devops",
+        deployments: [{ id: "dep-prod", name: "Acme Production" }],
+        deploymentProducts: [{ id: "dp-apim", name: "API Manager 4.3.0" }],
+      },
+    });
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /clone/i }));
+    const [, options] = navigateMock.mock.calls[0];
+    expect(options.state).toMatchObject({
+      projectId: "proj-a",
+      projectLabel: "Acme Project",
+      category: "devops",
+    });
+    const keys = Object.keys(options.state);
+    expect(keys).not.toContain("deployments");
+    expect(keys).not.toContain("customerContacts");
+    expect(keys).not.toContain("customerGroupId");
+    expect(keys).not.toContain("environments");
+    expect(keys).not.toContain("deploymentProducts");
   });
 
   it("never puts the deployment, state, or approval fields into the clone's router state", () => {
@@ -1026,14 +1154,32 @@ describe("CsmChangeRequestDetailPage — reports its own draft state to the tab 
 
 const LC_CREATOR = { id: "u-creator", email: "casey@example.com", name: "Casey Creator" };
 const LC_PEER = { id: "u-peer", email: "pat@example.com", name: "Pat Peer" };
+const LC_PEER_TWO = { id: "u-peer2", email: "quinn@example.com", name: "Quinn Peer" };
 const LC_CAB = { id: "u-cab", email: "cam@example.com", name: "Cam Cab" };
 const LC_ECAB = { id: "u-ecab", email: "eli@example.com", name: "Eli Ecab" };
+
+const LC_CUST_ONE = { id: "u-cust1", email: "mia@acme.example", name: "Mia Member" };
+const LC_CUST_TWO = { id: "u-cust2", email: "max@acme.example", name: "Max Member" };
 
 interface LcFake {
   cr: BeChangeRequestDetail;
   approvals: BeChangeRequestApproval[];
+  /** Approvers the backend would provision from the CR's project contacts (empty = no eligible contact). */
+  customerMembers: Array<{ id: string; name: string }>;
 }
 let lc: LcFake;
+
+/** True for the stages the backend provisions for the customer group. */
+function lcIsCustomerStage(name: string): boolean {
+  return name === "Customer Approval" || name === "Customer Review";
+}
+
+/** A customer-group stage is live while it still has REQUESTED approvers. */
+function lcHasLiveCustomerStage(): boolean {
+  return (lc?.approvals ?? []).some(
+    (a) => lcIsCustomerStage(a.stage) && a.status === "REQUESTED",
+  );
+}
 /** Whether the fake backend sends `approvers[].canDecide` (Postgres source) or
  * omits it (older backend / ServiceNow source), exercising the UI fallback. */
 let lcEmitsCanDecide = true;
@@ -1053,15 +1199,18 @@ function lcLegalNextStates(
     case "authorize":
       return ["canceled"];
     case "customer_approval":
-      return ["scheduled", "canceled"]; // scheduled = "Record customer approval"
+      // A live customer stage means the customer group decides: only cancel is
+      // offered. Without one the manual "Record customer approval" remains.
+      // "authorize" here is Re-schedule, offered either way.
+      return lcHasLiveCustomerStage() ? ["authorize", "canceled"] : ["scheduled", "authorize", "canceled"];
     case "scheduled":
       return ["implement", "canceled"];
     case "implement":
       return ["review", "canceled"];
     case "review":
-      return flags.review ? ["customer_review", "canceled"] : ["closed", "canceled"];
+      return flags.review ? ["customer_review", "rollback", "canceled"] : ["closed", "rollback", "canceled"];
     case "customer_review":
-      return ["closed", "canceled"];
+      return lcHasLiveCustomerStage() ? ["canceled"] : ["closed", "rollback", "canceled"];
     default:
       return [];
   }
@@ -1082,7 +1231,77 @@ function lcStage(name: string, group: string, who: { id: string; name: string })
   };
 }
 
+/** The one state in which each stage can be decided (the backend's approvalStageDecidableState). */
+const LC_STAGE_STATE: Record<string, string> = {
+  "Peer Approval": "assess",
+  "CAB Approval": "authorize",
+  "ECAB Approval": "authorize",
+  Review: "review",
+  "Customer Approval": "customer_approval",
+  "Customer Review": "customer_review",
+};
+
+/** "customer_review" -> "Customer Review", for the refusal message. */
+function lcStateName(state: string): string {
+  return state
+    .split("_")
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+/** Whether the CR has left the state this stage can be decided in. */
+function lcStageOutOfState(stage: string): boolean {
+  const decidable = LC_STAGE_STATE[stage];
+  return decidable !== undefined && decidable !== lc.cr.state;
+}
+
+/**
+ * The backend's `reconcileStaleApprovers`: after every state change the
+ * still-REQUESTED rows of every stage the CR has left are cancelled -- all of
+ * them once it is closed / canceled / rollback (the stage stays, reported
+ * PENDING). Entering Review on a Normal change provisions the Review stage
+ * (the assigned group's internal members) first.
+ */
+function lcReconcile(): void {
+  const final = ["closed", "canceled", "rollback"].includes(lc.cr.state ?? "");
+  lc.approvals = lc.approvals.map((a) => {
+    if (!final && !lcStageOutOfState(a.stage)) return a;
+    if (!a.approvers.some((p) => p.status === "REQUESTED")) return a;
+    return {
+      ...a,
+      status: a.status === "REQUESTED" ? "PENDING" : a.status,
+      approvers: a.approvers.map((p) => (p.status === "REQUESTED" ? { ...p, status: "CANCELLED" } : p)),
+    };
+  });
+}
+
 function lcSetState(state: string): void {
+  if (state === "review" && lc.cr.type === "normal" && !lc.approvals.some((a) => a.stage === "Review")) {
+    lc.approvals = [
+      ...lc.approvals,
+      {
+        stage: "Review",
+        approverType: "STATIC_GROUP",
+        approverName: "Peers",
+        status: "REQUESTED",
+        approvers: [LC_PEER, LC_PEER_TWO].map((u) => ({ id: u.id, name: u.name, status: "REQUESTED" })),
+      },
+    ];
+  }
+  // Entering a customer gate provisions the group's stage (when the CR has a
+  // customer group with at least one member), like the backend does.
+  if ((state === "customer_approval" || state === "customer_review") && lc.customerMembers.length > 0) {
+    lc.approvals = [
+      ...lc.approvals,
+      {
+        stage: state === "customer_approval" ? "Customer Approval" : "Customer Review",
+        approverType: "STATIC_GROUP",
+        approverName: "Customer Group",
+        status: "REQUESTED",
+        approvers: lc.customerMembers.map((m) => ({ id: m.id, name: m.name, status: "REQUESTED" })),
+      },
+    ];
+  }
   lc.cr = { ...lc.cr, state, legalNextStates: lcLegalNextStates(state) };
 }
 
@@ -1096,11 +1315,13 @@ function lcPublish(): void {
           lcEmitsCanDecide
             ? {
                 ...a,
-                // true only on the caller's own REQUESTED row, and never for the creator
+                // true only on the caller's own REQUESTED row of a stage the CR is
+                // still in the state of, and never for the creator
                 canDecide:
                   a.id === mockCurrentUser.id &&
                   a.status === "REQUESTED" &&
-                  mockCurrentUser.id !== lc.cr.requestedBy?.id,
+                  mockCurrentUser.id !== lc.cr.requestedBy?.id &&
+                  !lcStageOutOfState(stage.stage),
               }
             : a,
         ),
@@ -1116,6 +1337,14 @@ function lcPublish(): void {
 function lcSeed(
   type: "normal" | "emergency" | "standard",
   flags: { approval: boolean; review: boolean } = { approval: false, review: false },
+  // The project's registered contacts (the read-only Customer Group): `members`
+  // are the eligible ones the backend asks; `contacts` (default: the members)
+  // lets a test have contacts who are all ineligible (e.g. only the creator).
+  // `null` = the project has no registered contacts.
+  customerGroup?: {
+    members: Array<{ id: string; name: string }>;
+    contacts?: Array<{ id: string; name: string }>;
+  } | null,
 ): void {
   lcEmitsCanDecide = true;
   lc = {
@@ -1127,12 +1356,16 @@ function lcSeed(
       createdBy: LC_CREATOR.email,
       customerApprovalRequired: flags.approval,
       customerReviewRequired: flags.review,
+      customerContacts: customerGroup ? (customerGroup.contacts ?? customerGroup.members) : [],
+      plannedStartOn: "2030-03-01 09:00:00",
+      plannedEndOn: "2030-03-01 11:00:00",
       legalNextStates: lcLegalNextStates("new", flags),
     },
     approvals: [],
+    customerMembers: customerGroup?.members ?? [],
   };
   // The page's own PATCH (Request Approval, Start implementation, ...) drives the fake.
-  patchMutateMock.mockImplementation((input: { patch: { state?: string } }) => {
+  const applyPatch = (input: { patch: { state?: string } }): void => {
     const target = input.patch.state;
     if (target === "assess") {
       if (lc.cr.type === "standard") lcSetState(lcAfterInternalApproval());
@@ -1144,31 +1377,117 @@ function lcSeed(
         lc.approvals = [lcStage("Peer Approval", "Peers", LC_PEER)];
       }
     } else if (target === "scheduled" && lc.cr.state === "customer_approval") {
+      if (lcHasLiveCustomerStage()) throw new Error("400: the customer group must decide");
       lcSetState("scheduled"); // the customer's approval was recorded
-    } else if (target && target !== "scheduled" && target !== "authorize" && target !== "customer_approval") {
+    } else if (target === "closed" && lc.cr.state === "customer_review" && lcHasLiveCustomerStage()) {
+      throw new Error("400: the customer group must decide");
+    } else if (target === "authorize") {
+      // Re-schedule: only from Customer Approval, only with a changed window.
+      if (lc.cr.state !== "customer_approval") {
+        throw new BackendApiError(
+          400,
+          'state "authorize" cannot be set manually: it is reached automatically through the approval flow (Request Approval, then peer approval); it can only be set by hand to re-schedule a change from customer_approval',
+        );
+      }
+      const win = input.patch as { plannedStartOn?: string; plannedEndOn?: string };
+      const changed =
+        (!!win.plannedStartOn && win.plannedStartOn !== lc.cr.plannedStartOn) ||
+        (!!win.plannedEndOn && win.plannedEndOn !== lc.cr.plannedEndOn);
+      if (!changed) {
+        throw new BackendApiError(400, "re-scheduling requires a changed planned start or end");
+      }
+      lc.cr = {
+        ...lc.cr,
+        plannedStartOn: win.plannedStartOn ?? lc.cr.plannedStartOn,
+        plannedEndOn: win.plannedEndOn ?? lc.cr.plannedEndOn,
+      };
+      // The customer's pending request is superseded: its rows are cancelled
+      // (the stage stays as a record; the backend reports it PENDING).
+      lc.approvals = lc.approvals.map((a) =>
+        lcIsCustomerStage(a.stage) && a.status === "REQUESTED"
+          ? { ...a, status: "PENDING", approvers: a.approvers.map((ap) => ({ ...ap, status: "CANCELLED" })) }
+          : a,
+      );
+      if (lc.cr.type === "standard") {
+        lcSetState("customer_approval"); // nothing internal to repeat: ask the customer again
+      } else {
+        lcSetState("authorize");
+        lc.approvals = [
+          ...lc.approvals,
+          lc.cr.type === "emergency" ? lcStage("ECAB Approval", "ECAB", LC_ECAB) : lcStage("CAB Approval", "CAB", LC_CAB),
+        ];
+      }
+    } else if (target === "rollback") {
+      // Backend rule: only from the review states, and the customer group
+      // decides while its review request is live.
+      if (lc.cr.state !== "review" && lc.cr.state !== "customer_review") {
+        throw new Error('400: state "rollback" can only be set from review or customer_review');
+      }
+      if (lcHasLiveCustomerStage()) throw new Error("400: the customer group must decide");
+      lcSetState("rollback"); // the closing reconcile cancels every still-requested row
+    } else if (target && target !== "scheduled" && target !== "customer_approval") {
       lcSetState(target);
     } else {
       throw new Error(`illegal manual transition to ${String(target)}`);
     }
+    lcReconcile();
     lcPublish();
+  };
+  patchMutateMock.mockImplementation(applyPatch);
+  // Destructive transitions (Cancel change, Roll back) go through mutateAsync.
+  patchMutateAsyncMock.mockImplementation(async (input) => {
+    applyPatch(input as { patch: { state?: string } });
+    return { id: "chg-1" };
   });
   // The approvals panel's Approve/Reject drives the fake as the signed-in user.
   decideApprovalMutateMock.mockImplementation((input: { decision: "approved" | "rejected" }) => {
-    const current = lc.approvals.find((a) => a.status === "REQUESTED");
+    // The caller's pending stage: their row on a stage decidable in the CR's
+    // current state, else (all of theirs are stale) their first one.
+    const mine = lc.approvals.filter(
+      (a) => a.status === "REQUESTED" && a.approvers.some((p) => p.id === mockCurrentUser.id && p.status === "REQUESTED"),
+    );
+    const current = mine.find((a) => !lcStageOutOfState(a.stage)) ?? mine[0];
     const row = current?.approvers.find((a) => a.id === mockCurrentUser.id && a.status === "REQUESTED");
     if (!current || !row || mockCurrentUser.id === lc.cr.requestedBy?.id) {
       throw new Error("403: only a non-creator approver with a pending row may decide");
     }
+    if (lcStageOutOfState(current.stage)) {
+      // The backend's 409: nothing is changed.
+      throw new BackendApiError(
+        409,
+        `this approval is no longer pending: the change request is in ${lcStateName(lc.cr.state ?? "")}, but the ${current.stage} stage can only be decided while it is in ${lcStateName(LC_STAGE_STATE[current.stage]!)}`,
+      );
+    }
     row.status = input.decision === "approved" ? "APPROVED" : "REJECTED";
     current.status = row.status;
-    if (input.decision === "approved") {
+    if (!lcIsCustomerStage(current.stage)) {
+      // A resolving decision cancels the stage's other pending approvers.
+      current.approvers.forEach((a) => {
+        if (a !== row && a.status === "REQUESTED") a.status = "CANCELLED";
+      });
+    }
+    if (lcIsCustomerStage(current.stage)) {
+      // One member's decision settles the stage; the others are no longer needed.
+      current.approvers.forEach((a) => {
+        if (a !== row && a.status === "REQUESTED") a.status = "NOT_REQUIRED";
+      });
+      if (input.decision === "approved") {
+        lcSetState(current.stage === "Customer Approval" ? "scheduled" : "closed");
+      } else {
+        // Backend rule: a declined Customer Approval cancels the change; a
+        // rejected Customer Review moves it to rollback (terminal, no actions).
+        lcSetState(current.stage === "Customer Approval" ? "canceled" : "rollback");
+      }
+    } else if (input.decision === "approved") {
       if (current.stage === "Peer Approval") {
         lcSetState("authorize");
         lc.approvals = [...lc.approvals, lcStage("CAB Approval", "CAB", LC_CAB)];
-      } else {
+      } else if (current.stage === "CAB Approval" || current.stage === "ECAB Approval") {
         lcSetState(lcAfterInternalApproval()); // CAB / ECAB approval moves the CR on itself
       }
+      // Review: the answer is recorded and the CR stays in review.
     }
+    lcReconcile();
     lcPublish();
   });
   lcPublish();
@@ -1189,13 +1508,30 @@ function currentStep(): string {
 }
 
 function expectNoManualSchedule(): void {
-  expect(screen.queryByRole("button", { name: /schedule/i })).not.toBeInTheDocument();
-  expect(screen.queryByRole("menuitem", { name: /schedule/i })).not.toBeInTheDocument();
+  // "Re-schedule" (from Customer Approval) is a different action: anchor at the start.
+  expect(screen.queryByRole("button", { name: /^schedule/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("menuitem", { name: /^schedule/i })).not.toBeInTheDocument();
   expect(screen.queryByText(/move to assess/i)).not.toBeInTheDocument();
 }
 
+/** The table row of an approver. (A customer contact's name also shows as a chip in the Overview, so only table rows count.) */
 function approvalsRow(name: string): HTMLElement {
-  return screen.getByText(name).closest("tr") as HTMLElement;
+  const row = screen
+    .getAllByText(name)
+    .map((el) => el.closest("tr"))
+    .find((tr): tr is HTMLTableRowElement => tr !== null);
+  if (!row) throw new Error(`no approvals row for ${name}`);
+  return row;
+}
+
+/** The approvals row of `name` that belongs to `stage` (a member can have one per stage). */
+function approvalsRowInStage(name: string, stage: string): HTMLElement {
+  const row = screen
+    .getAllByText(name)
+    .map((el) => el.closest("tr"))
+    .find((tr): tr is HTMLTableRowElement => tr !== null && within(tr).queryByText(stage) !== null);
+  if (!row) throw new Error(`no ${stage} row for ${name}`);
+  return row;
 }
 
 /** The labels of the lifecycle stepper's steps, in order. */
@@ -1263,7 +1599,7 @@ function runNormalLifecycle(approval: boolean, review: boolean): void {
   view = lcOpenAs(LC_CREATOR, view);
   if (approval) {
     expect(currentStep()).toBe("Customer Approval");
-    expect(screen.getByText("Awaiting customer approval")).toBeInTheDocument();
+    expect(screen.getByText("Awaiting Customer Approval")).toBeInTheDocument();
     // Neither Start implementation nor a Schedule button yet: only recording the approval (and Cancel).
     expect(screen.queryByRole("button", { name: /start implementation/i })).not.toBeInTheDocument();
     expectNoManualSchedule();
@@ -1297,7 +1633,7 @@ function runNormalLifecycle(approval: boolean, review: boolean): void {
     fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
     fireEvent.click(screen.getByRole("button", { name: /^send for customer review$/i }));
     expect(currentStep()).toBe("Customer Review");
-    expect(screen.getByText("Awaiting customer review")).toBeInTheDocument();
+    expect(screen.getByText("Awaiting Customer Review")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /^send for customer review$/i })).not.toBeInTheDocument();
   } else {
     // Review offers only Close (no customer review) when not required.
@@ -1348,6 +1684,491 @@ describe("CsmChangeRequestDetailPage — lifecycle: Normal (Request Approval -> 
     expect(screen.getByRole("button", { name: /^reject$/i })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
     expect(decideApprovalMutateMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * An approval is only actionable while the change is in its stage's state
+ * (reported bug: a reviewer kept Approve / Reject on the Review stage of a
+ * change that was already Closed, and during Customer Review). The fake backend
+ * cancels the Review rows when the change leaves Review, like the real one, and
+ * reports canDecide=false on a REQUESTED row of a stage the change has left.
+ */
+describe("CsmChangeRequestDetailPage — lifecycle: a Review approver's Approve / Reject follow the state", () => {
+  /** Drives a fresh Normal change to Review (peers, CAB, implementation) with the real clicks. */
+  function driveToReview(
+    review: boolean,
+    customerGroup?: { members: Array<{ id: string; name: string }> },
+  ): ReturnType<typeof render> {
+    lcSeed("normal", { approval: false, review }, customerGroup);
+    let view = lcOpenAs(LC_CREATOR);
+    fireEvent.click(screen.getByRole("button", { name: "Request Approval" }));
+    view = lcOpenAs(LC_PEER, view);
+    fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    view = lcOpenAs(LC_CAB, view);
+    fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    view = lcOpenAs(LC_CREATOR, view);
+    fireEvent.click(screen.getByRole("button", { name: /^start implementation$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^mark implemented$/i }));
+    expect(currentStep()).toBe("Review");
+    return view;
+  }
+
+  const reviewControls = (name: string) => {
+    const row = approvalsRowInStage(name, "Review");
+    return {
+      approve: within(row).queryByRole("button", { name: /^approve$/i }),
+      reject: within(row).queryByRole("button", { name: /^reject$/i }),
+      status: within(row).getByText(/^(Requested|Cancelled|Approved|Rejected)$/).textContent,
+    };
+  };
+
+  it("offers Approve / Reject on the Review rows of the assigned group's members while the change is in Review, and to nobody else", () => {
+    let view = driveToReview(false);
+    // The creator: no Review row to decide (the creator cannot approve).
+    expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument();
+    for (const [user, name] of [[LC_PEER, "Pat Peer"], [LC_PEER_TWO, "Quinn Peer"]] as const) {
+      view = lcOpenAs(user, view);
+      const c = reviewControls(name);
+      expect(c.status).toBe("Requested");
+      expect(c.approve).toBeEnabled();
+      expect(c.reject).toBeEnabled();
+      // ...only on their own row: the other member's row has no controls.
+      expect(screen.getAllByRole("button", { name: /^approve$/i })).toHaveLength(1);
+    }
+    // A CAB member (decided long ago, not in the assigned group) has nothing to decide.
+    view = lcOpenAs(LC_CAB, view);
+    expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument();
+    view.unmount();
+  });
+
+  it("takes the controls away from every Review approver the moment the change goes to Customer Review, and Closed after the customer answers", () => {
+    let view = driveToReview(true, { members: [LC_CUST_ONE, LC_CUST_TWO] });
+    view = lcOpenAs(LC_PEER, view);
+    expect(reviewControls("Pat Peer").approve).toBeEnabled();
+
+    // The creator moves the change on to the customer's review.
+    view = lcOpenAs(LC_CREATOR, view);
+    fireEvent.click(screen.getByRole("button", { name: /^send for customer review$/i }));
+    expect(currentStep()).toBe("Customer Review");
+    expect(lc.approvals.find((a) => a.stage === "Review")?.approvers.map((a) => a.status)).toEqual(["CANCELLED", "CANCELLED"]);
+
+    for (const [user, name] of [[LC_PEER, "Pat Peer"], [LC_PEER_TWO, "Quinn Peer"]] as const) {
+      view = lcOpenAs(user, view);
+      const c = reviewControls(name);
+      expect(c.status).toBe("Cancelled");
+      expect(c.approve).toBeNull();
+      expect(c.reject).toBeNull();
+      expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^reject$/i })).not.toBeInTheDocument();
+    }
+
+    // The customer is who answers now.
+    view = lcOpenAs(LC_CUST_ONE, view);
+    expect(screen.getAllByRole("button", { name: /^approve$/i })).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    expect(currentStep()).toBe("Closed");
+    // Closed: nothing is requested anywhere, and nobody has controls.
+    expect(lc.approvals.flatMap((a) => a.approvers).filter((a) => a.status === "REQUESTED")).toEqual([]);
+    for (const user of [LC_PEER, LC_PEER_TWO, LC_CAB, LC_CUST_TWO, LC_CUST_ONE]) {
+      view = lcOpenAs(user, view);
+      expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^reject$/i })).not.toBeInTheDocument();
+    }
+  });
+
+  it.each([
+    ["closed", "closes straight from Review", (): void => { fireEvent.click(screen.getByRole("button", { name: /^close$/i })); }],
+    ["rollback", "is rolled back", (): void => { patchMutateMock({ id: "chg-1", patch: { state: "rollback" } }); }],
+    ["canceled", "is cancelled", (): void => { patchMutateMock({ id: "chg-1", patch: { state: "canceled" } }); }],
+  ] as const)("takes the controls away when the change %s -> %s", (state, _what, moveOn) => {
+    let view = driveToReview(false);
+    view = lcOpenAs(LC_PEER, view);
+    expect(reviewControls("Pat Peer").approve).toBeEnabled();
+
+    view = lcOpenAs(LC_CREATOR, view);
+    moveOn();
+    expect(lc.cr.state).toBe(state);
+    expect(lc.approvals.flatMap((a) => a.approvers).filter((a) => a.status === "REQUESTED")).toEqual([]);
+
+    for (const [user, name] of [[LC_PEER, "Pat Peer"], [LC_PEER_TWO, "Quinn Peer"]] as const) {
+      view = lcOpenAs(user, view);
+      const c = reviewControls(name);
+      expect(c.status).toBe("Cancelled");
+      expect(c.approve).toBeNull();
+      expect(c.reject).toBeNull();
+    }
+  });
+
+  it("deciding Review records the answer, cancels the other members and leaves the change in Review", () => {
+    let view = driveToReview(false);
+    view = lcOpenAs(LC_PEER, view);
+    fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    expect(currentStep()).toBe("Review"); // a human moves it on
+    expect(reviewControls("Pat Peer").status).toBe("Approved");
+    expect(reviewControls("Quinn Peer").status).toBe("Cancelled");
+    view = lcOpenAs(LC_PEER_TWO, view);
+    expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument();
+    view.unmount();
+  });
+
+  it("disables a REQUESTED Review row the backend flags canDecide=false (a legacy row the change moved past), and never submits from it", () => {
+    let view = driveToReview(false);
+    // The change moved on without the sweep (a row written before it existed).
+    lc.cr = { ...lc.cr, state: "closed", legalNextStates: [] };
+    const decisionsBefore = decideApprovalMutateMock.mock.calls.length;
+    view = lcOpenAs(LC_PEER, view);
+    const c = reviewControls("Pat Peer");
+    expect(c.status).toBe("Requested");
+    expect(c.approve).toBeDisabled();
+    expect(c.reject).toBeDisabled();
+    fireEvent.click(c.approve!);
+    fireEvent.click(c.reject!);
+    expect(decideApprovalMutateMock.mock.calls.length).toBe(decisionsBefore);
+    view.unmount();
+  });
+
+  it("refuses a decision on a stale Review row with the backend's 409 and changes nothing", () => {
+    const view = driveToReview(true, { members: [LC_CUST_ONE] });
+    lc.cr = { ...lc.cr, state: "customer_review", legalNextStates: [] };
+    mockCurrentUser = { id: LC_PEER.id, email: LC_PEER.email };
+    expect(() => decideApprovalMutateMock({ decision: "approved" })).toThrow(
+      "this approval is no longer pending: the change request is in Customer Review, but the Review stage can only be decided while it is in Review",
+    );
+    expect(lc.approvals.find((a) => a.stage === "Review")?.approvers.map((a) => a.status)).toEqual(["REQUESTED", "REQUESTED"]);
+    view.unmount();
+  });
+});
+
+/**
+ * Roll back: the failed-review off-ramp. Offered next to the forward move from
+ * Review and Customer Review only, as a destructive menu item that needs a
+ * stated reason (posted as a comment, then PATCH {state: "rollback"}).
+ */
+describe("CsmChangeRequestDetailPage — lifecycle: Roll back", () => {
+  /** Normal change, no customer approval, driven by real clicks to Review. */
+  function runToReview(review: boolean): ReturnType<typeof render> {
+    lcSeed("normal", { approval: false, review });
+    let view = lcOpenAs(LC_CREATOR);
+    expect(currentStep()).toBe("New");
+    fireEvent.click(screen.getByRole("button", { name: "Request Approval" }));
+    expect(currentStep()).toBe("Assess");
+    view = lcOpenAs(LC_PEER, view);
+    fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    expect(currentStep()).toBe("Authorize");
+    view = lcOpenAs(LC_CAB, view);
+    fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    view = lcOpenAs(LC_CREATOR, view);
+    expect(currentStep()).toBe("Scheduled");
+    // Roll back is not on offer before the review.
+    fireEvent.click(screen.getByRole("button", { name: /change state/i }));
+    expect(screen.queryByRole("menuitem", { name: /roll back/i })).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: /^start implementation$/i }));
+    expect(currentStep()).toBe("Implement");
+    fireEvent.click(screen.getByRole("button", { name: /change state/i }));
+    expect(screen.queryByRole("menuitem", { name: /roll back/i })).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: /^mark implemented$/i }));
+    expect(currentStep()).toBe("Review");
+    return view;
+  }
+
+  /** Opens Roll back from the menu, types a reason and confirms. */
+  async function rollBackWith(reason: string): Promise<void> {
+    fireEvent.click(screen.getByRole("button", { name: /change state/i }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /roll back/i }));
+    expect(screen.getByRole("heading", { name: /roll back this change/i })).toBeInTheDocument();
+    // A reason is required: confirm is disabled until one is typed.
+    expect(screen.getByRole("button", { name: /^roll back$/i })).toBeDisabled();
+    expect(patchMutateAsyncMock).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText(/reason/i), { target: { value: reason } });
+    fireEvent.click(screen.getByRole("button", { name: /^roll back$/i }));
+    await waitFor(() => expect(lc.cr.state).toBe("rollback"));
+  }
+
+  function expectRolledBack(): void {
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    // The stepper shows the off-ramp, not a step on the line.
+    expect(screen.getByText(/diverted from the standard path/i)).toBeInTheDocument();
+    expect(screen.getAllByText("Rollback", { selector: ".MuiChip-label" }).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("button", { name: /change state/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/awaiting/i)).not.toBeInTheDocument();
+  }
+
+  it.each([false, true])("rolls back from Review (customer review required: %s) with a reason, then offers no actions", async (review) => {
+    const view = runToReview(review);
+    // Review offers Roll back next to its forward move, never as the primary button.
+    expect(screen.getByRole("button", { name: review ? /send for customer review/i : /^close$/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /roll back/i })).not.toBeInTheDocument();
+    await rollBackWith("Smoke test failed after the deployment.");
+
+    expect(postCommentMutateAsyncMock).toHaveBeenCalledWith({
+      changeRequestId: "chg-1",
+      bodyHtml: "Smoke test failed after the deployment.",
+      internal: true,
+    });
+    expect(patchMutateAsyncMock).toHaveBeenCalledWith({ id: "chg-1", patch: { state: "rollback" } });
+    expect(postCommentMutateAsyncMock.mock.invocationCallOrder[0]).toBeLessThan(
+      patchMutateAsyncMock.mock.invocationCallOrder[0],
+    );
+    expectRolledBack();
+    view.unmount();
+  });
+
+  it("rolls back from Customer Review (manual fallback, no customer group) with a reason", async () => {
+    const view = runToReview(true);
+    fireEvent.click(screen.getByRole("button", { name: /^send for customer review$/i }));
+    expect(currentStep()).toBe("Customer Review");
+    expect(screen.getByText("Awaiting Customer Review")).toBeInTheDocument();
+    // Close is the primary move; Roll back sits in the menu with Cancel.
+    expect(screen.getByRole("button", { name: /^close$/i })).toBeInTheDocument();
+    await rollBackWith("The customer rejected the result.");
+    expect(patchMutateAsyncMock).toHaveBeenLastCalledWith({ id: "chg-1", patch: { state: "rollback" } });
+    expectRolledBack();
+    view.unmount();
+  });
+
+  it("does not offer Roll back while a customer group's review is pending (its members decide)", () => {
+    lcSeed("normal", { approval: false, review: true }, { members: LC_MEMBERS });
+    lcSetState("customer_review");
+    lcPublish();
+    const view = lcOpenAs(LC_CREATOR);
+    expect(currentStep()).toBe("Customer Review");
+    fireEvent.click(screen.getByRole("button", { name: /change state/i }));
+    expect(screen.getByRole("menuitem", { name: /cancel change/i })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /roll back/i })).not.toBeInTheDocument();
+    view.unmount();
+  });
+
+  it("surfaces the backend's refusal and keeps the state when the rollback PATCH fails", async () => {
+    const view = runToReview(false);
+    patchMutateAsyncMock.mockRejectedValueOnce(
+      new BackendApiError(400, 'state "rollback" can only be set from review or customer_review'),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /change state/i }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /roll back/i }));
+    fireEvent.change(screen.getByLabelText(/reason/i), { target: { value: "Failed." } });
+    fireEvent.click(screen.getByRole("button", { name: /^roll back$/i }));
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(/can only be set from review or customer_review/i),
+    );
+    expect(lc.cr.state).toBe("review");
+    view.unmount();
+  });
+});
+
+/**
+ * Re-schedule: the diagram's Time Change loop. In Customer Approval the creator
+ * can re-plan the change -- a dialog collects the new window (at least one end
+ * must change) and an optional reason; the change goes back to Authorize for
+ * CAB / ECAB approval again, then the customer is asked again.
+ */
+describe("CsmChangeRequestDetailPage — lifecycle: Re-schedule", () => {
+  beforeEach(() => setUserPreferredTimeZone("UTC"));
+  afterEach(() => clearUserPreferredTimeZone());
+
+  function windowPicker(label: string): HTMLInputElement {
+    const group = within(screen.getByRole("dialog")).getAllByText(label)[0].closest(".MuiFormControl-root") as HTMLElement;
+    return group.querySelector("input") as HTMLInputElement;
+  }
+  const dialogSubmit = (): HTMLElement =>
+    within(screen.getByRole("dialog")).getByRole("button", { name: "Re-schedule" });
+
+  /** Normal change with Customer Approval, driven by clicks to Customer Approval. */
+  function runToCustomerApproval(
+    customerGroup: { members: Array<{ id: string; name: string }> } | null,
+    type: "normal" | "emergency" | "standard" = "normal",
+  ): ReturnType<typeof render> {
+    lcSeed(type, { approval: true, review: false }, customerGroup);
+    let view = lcOpenAs(LC_CREATOR);
+    fireEvent.click(screen.getByRole("button", { name: "Request Approval" }));
+    if (type === "normal") {
+      view = lcOpenAs(LC_PEER, view);
+      fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    }
+    if (type !== "standard") {
+      view = lcOpenAs(type === "emergency" ? LC_ECAB : LC_CAB, view);
+      fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    }
+    view = lcOpenAs(LC_CREATOR, view);
+    expect(currentStep()).toBe("Customer Approval");
+    return view;
+  }
+
+  it("Normal with a customer group: Customer Approval -> Re-schedule -> Authorize (CAB again) -> CAB approves -> Customer Approval (asked again) -> member approves -> Scheduled", async () => {
+    let view = runToCustomerApproval({ members: LC_MEMBERS });
+    expect(screen.getByText("Awaiting Customer Approval")).toBeInTheDocument();
+    // Re-schedule sits next to nothing primary (the customer group decides) and Cancel stays in the menu.
+    expect(screen.getByRole("button", { name: "Re-schedule" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Record customer approval" })).not.toBeInTheDocument();
+    expectOnlyCancelOffered();
+
+    // The dialog starts on the current window and will not submit without a change.
+    fireEvent.click(screen.getByRole("button", { name: "Re-schedule" }));
+    expect(screen.getByRole("heading", { name: /re-schedule this change/i })).toBeInTheDocument();
+    expect(windowPicker("Planned start").value).toBe("03/01/2030 09:00 AM");
+    expect(windowPicker("Planned end").value).toBe("03/01/2030 11:00 AM");
+    expect(dialogSubmit()).toBeDisabled();
+    expect(patchMutateAsyncMock).not.toHaveBeenCalled();
+
+    fireEvent.change(windowPicker("Planned start"), { target: { value: "03/08/2030 09:00 AM" } });
+    fireEvent.change(windowPicker("Planned end"), { target: { value: "03/08/2030 11:00 AM" } });
+    fireEvent.change(screen.getByLabelText(/reason \(optional\)/i), { target: { value: "Customer freeze next week." } });
+    fireEvent.click(dialogSubmit());
+    await waitFor(() => expect(lc.cr.state).toBe("authorize"));
+
+    // The reason is recorded first, then the state + window are patched.
+    expect(postCommentMutateAsyncMock).toHaveBeenCalledWith({
+      changeRequestId: "chg-1",
+      bodyHtml: "Customer freeze next week.",
+      internal: true,
+    });
+    expect(patchMutateAsyncMock).toHaveBeenCalledWith({
+      id: "chg-1",
+      patch: { state: "authorize", plannedStartOn: "2030-03-08 09:00:00", plannedEndOn: "2030-03-08 11:00:00" },
+    });
+    expect(postCommentMutateAsyncMock.mock.invocationCallOrder[0]).toBeLessThan(
+      patchMutateAsyncMock.mock.invocationCallOrder[0],
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+
+    // Back at Authorize, waiting on a fresh CAB stage -- not on the superseded customer stage.
+    expect(currentStep()).toBe("Authorize");
+    expect(screen.getByText("Awaiting CAB Approval")).toBeInTheDocument();
+    expect(screen.queryByText("Awaiting Customer Approval")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Re-schedule" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Record customer approval" })).not.toBeInTheDocument();
+    expect(screen.getAllByText("CAB Approval", { selector: "td" })).toHaveLength(2);
+    expect(within(approvalsRowInStage("Mia Member", "Customer Approval")).getByText("Cancelled")).toBeInTheDocument();
+
+    // The new CAB approval asks the customer group again.
+    view = lcOpenAs(LC_CAB, view);
+    expect(screen.getAllByRole("button", { name: /^approve$/i })).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    expect(lc.cr.state).toBe("customer_approval");
+    view = lcOpenAs(LC_CREATOR, view);
+    expect(currentStep()).toBe("Customer Approval");
+    expect(screen.getByText("Awaiting Customer Approval")).toBeInTheDocument();
+    expect(screen.getAllByText("Customer Approval", { selector: "td" })).toHaveLength(4); // 2 cancelled + 2 fresh member rows
+
+    view = lcOpenAs(LC_CUST_ONE, view);
+    fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    expect(lc.cr.state).toBe("scheduled");
+    view.unmount();
+  });
+
+  it("Normal without a customer group (manual fallback): Re-schedule sits next to Record customer approval; the loop repeats", async () => {
+    let view = runToCustomerApproval(null);
+    expect(screen.getByRole("button", { name: "Record customer approval" })).toBeInTheDocument();
+    for (const [start, end] of [["03/08/2030 09:00 AM", "03/08/2030 11:00 AM"], ["03/15/2030 09:00 AM", "03/15/2030 11:00 AM"]]) {
+      fireEvent.click(screen.getByRole("button", { name: "Re-schedule" }));
+      fireEvent.change(windowPicker("Planned start"), { target: { value: start } });
+      fireEvent.change(windowPicker("Planned end"), { target: { value: end } });
+      fireEvent.click(dialogSubmit());
+      await waitFor(() => expect(lc.cr.state).toBe("authorize"));
+      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+      expect(currentStep()).toBe("Authorize");
+      expect(screen.getByText("Awaiting CAB Approval")).toBeInTheDocument();
+      expect(postCommentMutateAsyncMock).not.toHaveBeenCalled(); // no reason given, none recorded
+
+      view = lcOpenAs(LC_CAB, view);
+      fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+      view = lcOpenAs(LC_CREATOR, view);
+      expect(currentStep()).toBe("Customer Approval");
+      expect(screen.getByRole("button", { name: "Record customer approval" })).toBeInTheDocument();
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Record customer approval" }));
+    expect(currentStep()).toBe("Scheduled");
+    view.unmount();
+  });
+
+  it("Emergency goes back to Authorize for ECAB approval", async () => {
+    const view = runToCustomerApproval(null, "emergency");
+    fireEvent.click(screen.getByRole("button", { name: "Re-schedule" }));
+    expect(screen.getByText(/ECAB approval again/i)).toBeInTheDocument();
+    fireEvent.change(windowPicker("Planned end"), { target: { value: "03/01/2030 01:00 PM" } });
+    fireEvent.click(dialogSubmit());
+    await waitFor(() => expect(lc.cr.state).toBe("authorize"));
+    expect(screen.getByText("Awaiting ECAB Approval")).toBeInTheDocument();
+    view.unmount();
+  });
+
+  it("Standard stays in Customer Approval and the customer is asked again", async () => {
+    const view = runToCustomerApproval({ members: LC_MEMBERS }, "standard");
+    fireEvent.click(screen.getByRole("button", { name: "Re-schedule" }));
+    expect(screen.getByText(/stays in Customer Approval/i)).toBeInTheDocument();
+    fireEvent.change(windowPicker("Planned start"), { target: { value: "02/28/2030 09:00 AM" } });
+    fireEvent.click(dialogSubmit());
+    await waitFor(() => expect(lc.cr.plannedStartOn).toBe("2030-02-28 09:00:00"));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(currentStep()).toBe("Customer Approval");
+    expect(screen.getByText("Awaiting Customer Approval")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Re-schedule" })).toBeInTheDocument();
+    view.unmount();
+  });
+
+  it("shows the backend's 400 verbatim in the dialog and keeps the state", async () => {
+    const view = runToCustomerApproval(null);
+    patchMutateAsyncMock.mockRejectedValueOnce(
+      new BackendApiError(400, "re-scheduling requires a changed planned start or end"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Re-schedule" }));
+    fireEvent.change(windowPicker("Planned end"), { target: { value: "03/01/2030 12:00 PM" } });
+    fireEvent.click(dialogSubmit());
+    await waitFor(() =>
+      expect(within(screen.getByRole("dialog")).getByRole("alert")).toHaveTextContent(
+        "re-scheduling requires a changed planned start or end",
+      ),
+    );
+    expect(lc.cr.state).toBe("customer_approval");
+    // Backing out leaves everything alone.
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(currentStep()).toBe("Customer Approval");
+    view.unmount();
+  });
+
+  it("after a failed re-schedule the recorded reason is locked and a retry never posts it twice", async () => {
+    const view = runToCustomerApproval(null);
+    fireEvent.click(screen.getByRole("button", { name: "Re-schedule" }));
+    fireEvent.change(windowPicker("Planned start"), { target: { value: "03/08/2030 09:00 AM" } });
+    fireEvent.change(windowPicker("Planned end"), { target: { value: "03/08/2030 11:00 AM" } });
+    fireEvent.change(screen.getByLabelText(/reason \(optional\)/i), { target: { value: "Customer freeze next week." } });
+
+    patchMutateAsyncMock.mockRejectedValueOnce(new BackendApiError(409, "Rejected"));
+    fireEvent.click(dialogSubmit());
+    await waitFor(() => expect(within(screen.getByRole("dialog")).getByRole("alert")).toBeInTheDocument());
+    expect(postCommentMutateAsyncMock).toHaveBeenCalledTimes(1);
+
+    // The reason is now recorded: the field is locked so an edit can't be silently dropped.
+    expect(screen.getByLabelText(/reason \(optional\)/i)).toBeDisabled();
+    expect(
+      screen.getByText("Already recorded as a work note — retrying will only re-schedule."),
+    ).toBeInTheDocument();
+
+    fireEvent.click(dialogSubmit());
+    await waitFor(() => expect(lc.cr.state).toBe("authorize"));
+    expect(patchMutateAsyncMock).toHaveBeenCalledTimes(2);
+    expect(postCommentMutateAsyncMock).toHaveBeenCalledTimes(1);
+    view.unmount();
+  });
+
+  it("is not offered anywhere but Customer Approval", () => {
+    lcSeed("normal", { approval: true, review: true });
+    for (const state of ["new", "assess", "authorize", "scheduled", "implement", "review", "customer_review"]) {
+      lcSetState(state);
+      // Even if a backend listed it, the bar does not render authorize.
+      lc.cr = { ...lc.cr, legalNextStates: [...(lc.cr.legalNextStates ?? []), "authorize"] };
+      lcPublish();
+      const view = lcOpenAs(LC_CREATOR);
+      expect(screen.queryByRole("button", { name: /re-schedule/i }), state).not.toBeInTheDocument();
+      if (screen.queryByRole("button", { name: /change state/i })) {
+        fireEvent.click(screen.getByRole("button", { name: /change state/i }));
+        expect(screen.queryByRole("menuitem", { name: /re-schedule|authorize/i }), state).not.toBeInTheDocument();
+      }
+      view.unmount();
+    }
   });
 });
 
@@ -1423,7 +2244,7 @@ describe("CsmChangeRequestDetailPage — lifecycle: Emergency with Customer Appr
     view = lcOpenAs(LC_ECAB, view);
     fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
     expect(currentStep()).toBe("Customer Approval");
-    expect(screen.getByText("Awaiting customer approval")).toBeInTheDocument();
+    expect(screen.getByText("Awaiting Customer Approval")).toBeInTheDocument();
     expect(screen.queryByText("Peer Approval")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /start implementation/i })).not.toBeInTheDocument();
     expectNoManualSchedule();
@@ -1448,7 +2269,7 @@ describe("CsmChangeRequestDetailPage — lifecycle: Standard with Customer Appro
     fireEvent.click(screen.getByRole("button", { name: "Request Approval" }));
 
     expect(currentStep()).toBe("Customer Approval");
-    expect(screen.getByText("Awaiting customer approval")).toBeInTheDocument();
+    expect(screen.getByText("Awaiting Customer Approval")).toBeInTheDocument();
     expect(screen.getByText(/no approval stages recorded/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /start implementation/i })).not.toBeInTheDocument();
     expectNoManualSchedule();
@@ -1586,12 +2407,350 @@ describe("CsmChangeRequestDetailPage — blocking reason for the customer states
   it("shows 'Awaiting customer approval' in the header for a customer_approval CR with no pending approver", () => {
     mockQueryResult({ data: { ...BASE_CR, state: "customer_approval", customerApprovalRequired: true } });
     renderPage();
-    expect(screen.getByText("Awaiting customer approval")).toBeInTheDocument();
+    expect(screen.getByText("Awaiting Customer Approval")).toBeInTheDocument();
   });
 
   it("shows 'Awaiting customer review' in the header for a customer_review CR", () => {
     mockQueryResult({ data: { ...BASE_CR, state: "customer_review", customerReviewRequired: true } });
     renderPage();
-    expect(screen.getByText("Awaiting customer review")).toBeInTheDocument();
+    expect(screen.getByText("Awaiting Customer Review")).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Customer group: the people a customer-gated change request is directed to
+//
+// The Customer Group is the change request's project's registered contacts
+// (`customerContacts`, derived by the backend, read-only). When a CR whose
+// project has eligible contacts enters `customer_approval` / `customer_review`,
+// the backend provisions a "Customer Approval" / "Customer Review" stage whose
+// approvers are those contacts. While that stage is live `legalNextStates`
+// offers only `canceled`; a contact's decision moves the CR (approve ->
+// scheduled / closed, reject -> canceled). With no registered contacts, or none
+// eligible, no stage exists and the manual Record-customer-approval / Close
+// paths stay. The fake above encodes exactly that.
+// ---------------------------------------------------------------------------
+
+const LC_MEMBERS = [
+  { id: LC_CUST_ONE.id, name: LC_CUST_ONE.name },
+  { id: LC_CUST_TWO.id, name: LC_CUST_TWO.name },
+];
+
+/** Drives a seeded CR from New to the point its internal approval is granted. */
+function lcGoThroughInternalApproval(view: ReturnType<typeof render>): ReturnType<typeof render> {
+  view = lcOpenAs(LC_CREATOR, view);
+  fireEvent.click(screen.getByRole("button", { name: "Request Approval" }));
+  view = lcOpenAs(LC_PEER, view);
+  fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+  view = lcOpenAs(LC_CAB, view);
+  fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+  return view;
+}
+
+/** Cancel is the only action: no primary button, one menu item. */
+function expectOnlyCancelOffered(): void {
+  expect(screen.queryByRole("button", { name: "Record customer approval" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /^close$/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /start implementation/i })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: /change state/i }));
+  expect(screen.getAllByRole("menuitem")).toHaveLength(1);
+  expect(screen.getByRole("menuitem", { name: /cancel change/i })).toBeInTheDocument();
+  fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+}
+
+describe("CsmChangeRequestDetailPage — customer group: Normal with Customer Approval and Customer Review", () => {
+  it("walks the whole lifecycle, asserting state, stage rows and buttons for the creator, a group member and a non-member after every step", { timeout: 30000 }, () => {
+    lcSeed("normal", { approval: true, review: true }, { members: LC_MEMBERS });
+
+    let view = lcGoThroughInternalApproval(lcOpenAs(LC_CREATOR));
+
+    // --- customer_approval, creator: customer stage provisioned, Cancel only.
+    view = lcOpenAs(LC_CREATOR, view);
+    expect(currentStep()).toBe("Customer Approval");
+    expect(screen.getByText("Awaiting Customer Approval")).toBeInTheDocument();
+    // No "no registered contacts" helper: the project has contacts.
+    expect(screen.queryByText(/no registered customer contacts/i)).not.toBeInTheDocument();
+    for (const member of [LC_CUST_ONE, LC_CUST_TWO]) {
+      const row = approvalsRow(member.name);
+      expect(within(row).getByText("Customer Approval")).toBeInTheDocument();
+      expect(within(row).getByText("Customer Group")).toBeInTheDocument();
+      expect(within(row).getByText("Requested")).toBeInTheDocument();
+    }
+    expect(within(approvalsRow("Pat Peer")).getByText("Peer Approval")).toBeInTheDocument();
+    expect(within(approvalsRow("Cam Cab")).getByText("CAB Approval")).toBeInTheDocument();
+    // The creator never decides.
+    expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^reject$/i })).not.toBeInTheDocument();
+    expectOnlyCancelOffered();
+    expectNoManualSchedule();
+
+    // --- customer_approval, non-member (the CAB approver): sees rows, no Approve/Reject.
+    view = lcOpenAs(LC_CAB, view);
+    expect(currentStep()).toBe("Customer Approval");
+    // (The contact is listed twice: as a Customer Group chip and as an approver row.)
+    expect(within(approvalsRow("Mia Member")).getByText("Requested")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^reject$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Record customer approval" })).not.toBeInTheDocument();
+
+    // --- customer_approval, group member: Approve/Reject on their own row only.
+    view = lcOpenAs(LC_CUST_ONE, view);
+    expect(screen.getAllByRole("button", { name: /^approve$/i })).toHaveLength(1);
+    expect(screen.getByRole("button", { name: /^approve$/i })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /^reject$/i })).toBeEnabled();
+    expect(within(approvalsRow("Mia Member")).getByRole("button", { name: /^approve$/i })).toBeInTheDocument();
+    // No decision controls for a non-member (the row's Assignment group is a link-button of its own now).
+    expect(within(approvalsRow("Max Member")).queryByRole("button", { name: /^(approve|reject)$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Record customer approval" })).not.toBeInTheDocument();
+
+    // --- member approves -> Scheduled, no manual PATCH involved.
+    const patchCallsBefore = patchMutateMock.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    expect(decideApprovalMutateMock).toHaveBeenLastCalledWith(
+      { id: "chg-1", decision: "approved" },
+      expect.anything(),
+    );
+    expect(patchMutateMock.mock.calls.length).toBe(patchCallsBefore);
+    expect(currentStep()).toBe("Scheduled");
+    expect(screen.queryByText(/awaiting/i)).not.toBeInTheDocument();
+    expect(within(approvalsRow("Mia Member")).getByText("Approved")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^start implementation$/i })).toBeInTheDocument();
+    expectNoManualSchedule();
+
+    // --- engineer tail up to Review.
+    view = lcOpenAs(LC_CREATOR, view);
+    fireEvent.click(screen.getByRole("button", { name: /^start implementation$/i }));
+    expect(currentStep()).toBe("Implement");
+    fireEvent.click(screen.getByRole("button", { name: /^mark implemented$/i }));
+    expect(currentStep()).toBe("Review");
+    expect(screen.getByRole("button", { name: /^send for customer review$/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^close$/i })).not.toBeInTheDocument();
+
+    // --- customer_review: a Customer Review stage for the same group.
+    fireEvent.click(screen.getByRole("button", { name: /^send for customer review$/i }));
+    expect(currentStep()).toBe("Customer Review");
+    expect(screen.getByText("Awaiting Customer Review")).toBeInTheDocument();
+    expect(within(approvalsRowInStage("Max Member", "Customer Review")).getByText("Customer Group")).toBeInTheDocument();
+    expect(within(approvalsRowInStage("Mia Member", "Customer Review")).getByText("Requested")).toBeInTheDocument();
+    // The settled Customer Approval rows stay in the panel.
+    expect(within(approvalsRowInStage("Mia Member", "Customer Approval")).getByText("Approved")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument(); // creator
+    expectOnlyCancelOffered(); // no manual Close while the stage is live
+
+    // --- customer_review, non-member: nothing to decide.
+    view = lcOpenAs(LC_PEER, view);
+    expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^reject$/i })).not.toBeInTheDocument();
+
+    // --- customer_review, other member approves -> Closed.
+    view = lcOpenAs(LC_CUST_TWO, view);
+    expect(screen.getAllByRole("button", { name: /^approve$/i })).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    expect(currentStep()).toBe("Closed");
+    expect(screen.queryByText(/awaiting/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /change state/i })).not.toBeInTheDocument();
+    view.unmount();
+  });
+
+  it("a member rejecting the Customer Approval cancels the change request", () => {
+    lcSeed("normal", { approval: true, review: false }, { members: LC_MEMBERS });
+    let view = lcGoThroughInternalApproval(lcOpenAs(LC_CREATOR));
+
+    view = lcOpenAs(LC_CUST_TWO, view);
+    expect(currentStep()).toBe("Customer Approval");
+    fireEvent.click(screen.getByRole("button", { name: /^reject$/i }));
+    expect(decideApprovalMutateMock).toHaveBeenLastCalledWith(
+      { id: "chg-1", decision: "rejected" },
+      expect.anything(),
+    );
+    expect(lc.cr.state).toBe("canceled");
+    expect(screen.queryByText(/awaiting/i)).not.toBeInTheDocument();
+    expect(within(approvalsRow("Max Member")).getByText("Rejected")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /change state/i })).not.toBeInTheDocument();
+    view.unmount();
+  });
+
+  it("a member rejecting the Customer Review moves the change request to Rollback (terminal, no actions left)", () => {
+    lcSeed("normal", { approval: false, review: true }, { members: LC_MEMBERS });
+    let view = lcGoThroughInternalApproval(lcOpenAs(LC_CREATOR));
+    view = lcOpenAs(LC_CREATOR, view);
+    expect(currentStep()).toBe("Scheduled");
+    fireEvent.click(screen.getByRole("button", { name: /^start implementation$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^mark implemented$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^send for customer review$/i }));
+    expect(currentStep()).toBe("Customer Review");
+
+    view = lcOpenAs(LC_CUST_ONE, view);
+    fireEvent.click(screen.getByRole("button", { name: /^reject$/i }));
+    expect(lc.cr.state).toBe("rollback");
+    expect(screen.queryByText(/awaiting/i)).not.toBeInTheDocument();
+    expect(screen.getAllByText("Rollback", { selector: ".MuiChip-label" }).length).toBeGreaterThan(0);
+    expect(within(approvalsRowInStage("Mia Member", "Customer Review")).getByText("Rejected")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /change state/i })).not.toBeInTheDocument();
+    view.unmount();
+  });
+
+  it("shows a non-creator, non-member no Approve/Reject on a live customer stage even if the backend sends canDecide=false for every row", () => {
+    lcSeed("normal", { approval: true, review: false }, { members: LC_MEMBERS });
+    let view = lcGoThroughInternalApproval(lcOpenAs(LC_CREATOR));
+    view = lcOpenAs(LC_PEER, view);
+    expect(screen.queryByText(/approve|reject/i, { selector: "button" })).not.toBeInTheDocument();
+    view.unmount();
+  });
+});
+
+describe("CsmChangeRequestDetailPage — customer group: no registered customer contacts (manual fallback)", () => {
+  it("customer_approval with no registered contacts: no customer stage, the helper explains why, and Record customer approval still works", () => {
+    lcSeed("normal", { approval: true, review: false }, null);
+    let view = lcGoThroughInternalApproval(lcOpenAs(LC_CREATOR));
+
+    view = lcOpenAs(LC_CREATOR, view);
+    expect(currentStep()).toBe("Customer Approval");
+    expect(screen.getByText("Awaiting Customer Approval")).toBeInTheDocument();
+    // Only the settled internal stages; no customer-stage rows.
+    expect(screen.queryAllByText("Customer Approval", { selector: "td" })).toHaveLength(0);
+    expect(screen.getByText(/^No registered customer contacts are assigned to this change request's project, so no customer approvers were assigned\./)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Record customer approval" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Record customer approval" }));
+    expect(patchMutateMock).toHaveBeenLastCalledWith({ id: "chg-1", patch: { state: "scheduled" } }, expect.anything());
+    expect(currentStep()).toBe("Scheduled");
+    expect(screen.queryByText(/no registered customer contacts/i)).not.toBeInTheDocument();
+    view.unmount();
+  });
+
+  it("customer_review with no registered contacts: helper shown and manual Close still offered", () => {
+    lcSeed("normal", { approval: false, review: true }, null);
+    let view = lcGoThroughInternalApproval(lcOpenAs(LC_CREATOR));
+    view = lcOpenAs(LC_CREATOR, view);
+    fireEvent.click(screen.getByRole("button", { name: /^start implementation$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^mark implemented$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^send for customer review$/i }));
+
+    expect(currentStep()).toBe("Customer Review");
+    expect(screen.getByText("Awaiting Customer Review")).toBeInTheDocument();
+    expect(screen.getByText(/no registered customer contacts/i)).toBeInTheDocument();
+    expect(screen.queryAllByText("Customer Review", { selector: "td" })).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: /^close$/i }));
+    expect(currentStep()).toBe("Closed");
+    view.unmount();
+  });
+
+  it("registered contacts none of whom is eligible (e.g. only the creator) provision no stage, so the manual path stays and no helper nags", () => {
+    lcSeed("normal", { approval: true, review: false }, { members: [], contacts: [{ id: LC_CREATOR.id, name: LC_CREATOR.name }] });
+    let view = lcGoThroughInternalApproval(lcOpenAs(LC_CREATOR));
+    view = lcOpenAs(LC_CREATOR, view);
+    expect(currentStep()).toBe("Customer Approval");
+    expect(screen.queryAllByText("Customer Approval", { selector: "td" })).toHaveLength(0);
+    expect(screen.queryByText(/no registered customer contacts/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Record customer approval" })).toBeInTheDocument();
+    view.unmount();
+  });
+
+  it("stays silent about the customer contacts when the payload omits the field (another data source)", () => {
+    mockQueryResult({ data: { ...BASE_CR, state: "customer_approval", customerApprovalRequired: true } });
+    renderPage();
+    expect(screen.getByText("Awaiting Customer Approval")).toBeInTheDocument();
+    expect(screen.queryByText(/no registered customer contacts/i)).not.toBeInTheDocument();
+  });
+
+  it("does not show the helper outside the customer gates, even with no registered contacts", () => {
+    mockQueryResult({ data: { ...BASE_CR, state: "scheduled", customerContacts: [] } });
+    renderPage();
+    expect(screen.queryByText(/no registered customer contacts/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("CsmChangeRequestDetailPage — opening an Assignment group on the Approval tab", () => {
+  const CAB_GROUP_ID = "22222222-2222-4222-8222-222222222222";
+
+  const approvals = (): BeChangeRequestApproval[] => [
+    {
+      stage: "CAB Approval",
+      approverType: "STATIC_GROUP",
+      approverName: "CAB Approval",
+      assignmentGroup: { id: CAB_GROUP_ID, name: "CAB Approval" },
+      status: "REQUESTED",
+      approvers: [{ id: "c1", name: "Cam Cab", status: "REQUESTED" }],
+    },
+    {
+      stage: "Customer Approval",
+      approverType: "STATIC_GROUP",
+      approverName: "Customer Group",
+      assignmentGroup: null,
+      status: "REQUESTED",
+      approvers: [{ id: "u-mia", name: "Mia Member", status: "REQUESTED" }],
+    },
+  ];
+
+  beforeEach(() => {
+    mockQueryResult({
+      data: {
+        ...BASE_CR,
+        state: "customer_approval",
+        customerContacts: [
+          { id: "k1", name: "Mia Member", email: "mia.member@acme.example" },
+          { id: "k2", name: "Max Member", email: "max.member@acme.example" },
+        ],
+      },
+    });
+    useGetChangeRequestApprovalsMock.mockReturnValue({
+      data: { approvals: approvals() },
+      isLoading: false,
+      isError: false,
+      error: null,
+    });
+    useGroupDetailMock.mockReturnValue({
+      data: {
+        id: CAB_GROUP_ID,
+        name: "CAB Approval",
+        members: [
+          { id: "c1", name: "Cam Cab", email: "cam.cab@example.com", role: "member" },
+          { id: "c2", name: "Cleo Cab", email: "cleo.cab@example.com", role: "lead" },
+        ],
+        total: 2,
+      },
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: vi.fn(),
+    });
+  });
+
+  it("hands the change request's customerContacts to the approvals panel", () => {
+    renderPage();
+    expect(approvalsPanelMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customerContacts: [
+          { id: "k1", name: "Mia Member", email: "mia.member@acme.example" },
+          { id: "k2", name: "Max Member", email: "max.member@acme.example" },
+        ],
+      }),
+    );
+  });
+
+  it("opens the CAB group from its stage row and lists the members", () => {
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: "View members of CAB Approval" }));
+
+    const dialog = screen.getByRole("dialog", { name: "CAB Approval" });
+    expect(useGroupDetailMock).toHaveBeenCalledWith(CAB_GROUP_ID);
+    expect(within(dialog).getByRole("heading", { name: "Group Members (2)" })).toBeInTheDocument();
+    expect(within(dialog).getByText("Cleo Cab")).toBeInTheDocument();
+    expect(within(dialog).getByText("Lead")).toBeInTheDocument();
+  });
+
+  it("opens the Customer Group from the customer stage and lists the project's registered contacts, with no group request", () => {
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: "View members of Customer Group" }));
+
+    const dialog = screen.getByRole("dialog", { name: "Customer Group" });
+    expect(within(dialog).getByRole("heading", { name: "Group Members (2)" })).toBeInTheDocument();
+    expect(within(dialog).getByText("max.member@acme.example")).toBeInTheDocument();
+    expect(useGroupDetailMock).not.toHaveBeenCalled();
   });
 });

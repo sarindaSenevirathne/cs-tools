@@ -49,11 +49,6 @@ import { useGetKBArticleHistory } from "@features/csm-kb-articles/api/useGetKBAr
 import { useDeleteKBArticle } from "@features/csm-kb-articles/api/useDeleteKBArticle";
 import KBArticleHistoryPanel from "@features/csm-kb-articles/components/KBArticleHistoryPanel";
 
-// Hardcoded until the KB picker is built (needs a GET /knowledge-bases
-// list endpoint, not yet implemented). Matches the API Manager KB seeded
-// locally for testing.
-const DEFAULT_KNOWLEDGE_BASE_ID = "752eaea7-79e3-4899-9d42-ba37d342779b";
-
 // Read-only status messaging for the author's own view -- never a button,
 // just a plain sentence describing where the article currently stands.
 const STATUS_LABELS: Record<string, string> = {
@@ -125,7 +120,7 @@ export default function CsmKBArticleEditorPage(): JSX.Element {
   // Only knowledge bases currently accepting new articles -- the backend
   // enforces this too (a deactivated KB rejects article creation outright),
   // this just keeps a deactivated one from ever being offered as a choice.
-  const activeKnowledgeBases = (kbList?.knowledgeBases ?? []).filter((kb) => kb.active);
+  const activeKnowledgeBases = (kbList?.knowledgeBases ?? []).filter((kb) => kb.isActive);
 
   const [kbDefaulted, setKbDefaulted] = useState(false);
   if (isCreateMode && !kbDefaulted && activeKnowledgeBases.length) {
@@ -395,7 +390,7 @@ export default function CsmKBArticleEditorPage(): JSX.Element {
               <Select labelId="kb-select-label" label="Knowledge base" value={knowledgeBaseId} onChange={handleKbChange}>
                 {activeKnowledgeBases.map((kb) => (
                   <MenuItem key={kb.id} value={kb.id}>
-                    {kb.title}
+                    {kb.name}
                   </MenuItem>
                 ))}
               </Select>

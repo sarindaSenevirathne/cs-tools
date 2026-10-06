@@ -128,7 +128,11 @@ func TestCreateChangeRequest(t *testing.T) {
 	})
 
 	t.Run("upstream errors are mapped correctly", func(t *testing.T) {
-		for _, tc := range upstreamErrorsGeneric("Failed to create change request.") {
+		// Create uses mapUpstreamError (like PATCH), not the Generic variant: the
+		// entity service's 400 explains why a project / deployments /
+		// environments combination was refused, and the form must show it. 5xx
+		// and unmapped statuses still map to the generic message.
+		for _, tc := range upstreamErrors("Failed to create change request.") {
 			t.Run(tc.name, func(t *testing.T) {
 				t.Parallel()
 				client := &mockEntityChangeRequestClient{
@@ -595,7 +599,84 @@ func TestDecideChangeRequestApproval(t *testing.T) {
 		assertStatus(t, w, http.StatusForbidden)
 		assertErrorMessage(t, w, "the creator of a change request cannot approve it")
 	})
+
+	// A decision on an approval whose stage the change has moved past (Review's
+	// approver while the change is in Customer Review / Closed) is a 409 from the
+	// entity service whose reason is shown: the approver must be able to read why
+	// the button no longer works. A 409 with no readable envelope stays generic.
+	t.Run("a 409 carrying the entity service's reason shows it", func(t *testing.T) {
+		const msg = "this approval is no longer pending: the change request is in Closed, but the Review stage can only be decided while it is in Review"
+		client := &mockEntityChangeRequestClient{
+			decideChangeRequestApprovalFn: func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+				return nil, &apierror.Error{StatusCode: http.StatusConflict, Body: `{"code":409,"message":` + jsonQuote(msg) + `}`}
+			},
+		}
+		h := NewChangeRequestHandler(client)
+		r := withUser(httptest.NewRequest(http.MethodPost, "/change-requests/"+testCRID+"/approvals/decision", strings.NewReader(`{"decision":"approved"}`)))
+		r.SetPathValue("id", testCRID)
+		w := httptest.NewRecorder()
+		h.DecideChangeRequestApproval(w, r)
+		assertStatus(t, w, http.StatusConflict)
+		assertErrorMessage(t, w, msg)
+		assertContentType(t, w, "application/json")
+	})
+
+	t.Run("a 409 without a readable reason stays generic", func(t *testing.T) {
+		for _, body := range []string{"", "conflict upstream message", `{"code":409}`} {
+			client := &mockEntityChangeRequestClient{
+				decideChangeRequestApprovalFn: func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+					return nil, &apierror.Error{StatusCode: http.StatusConflict, Body: body}
+				},
+			}
+			h := NewChangeRequestHandler(client)
+			r := withUser(httptest.NewRequest(http.MethodPost, "/change-requests/"+testCRID+"/approvals/decision", strings.NewReader(`{"decision":"approved"}`)))
+			r.SetPathValue("id", testCRID)
+			w := httptest.NewRecorder()
+			h.DecideChangeRequestApproval(w, r)
+			assertStatus(t, w, http.StatusConflict)
+			assertErrorMessage(t, w, "Failed to submit change request approval decision.")
+		}
+	})
 }
+
+// Customer Approval / Customer Review are answered by the change's customer
+// group (the registered contacts of its project) through the approvals. A non-member's refusal and the
+// refusal of the manual state change must reach the caller readable.
+func TestCustomerGroupApprovalMessages(t *testing.T) {
+	t.Run("a non-contact's decision is refused with the reason", func(t *testing.T) {
+		const msg = `only members of the customer group (the registered contacts of this change request's project) can approve or reject the customer's approval of this change request`
+		client := &mockEntityChangeRequestClient{
+			decideChangeRequestApprovalFn: func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+				return nil, &apierror.Error{StatusCode: http.StatusForbidden, Body: `{"code":403,"message":` + jsonQuote(msg) + `}`}
+			},
+		}
+		h := NewChangeRequestHandler(client)
+		r := withUser(httptest.NewRequest(http.MethodPost, "/change-requests/"+testCRID+"/approvals/decision", strings.NewReader(`{"decision":"approved"}`)))
+		r.SetPathValue("id", testCRID)
+		w := httptest.NewRecorder()
+		h.DecideChangeRequestApproval(w, r)
+		assertStatus(t, w, http.StatusForbidden)
+		assertErrorMessage(t, w, msg)
+	})
+
+	t.Run("a manual scheduled/closed while the customer group's request is pending is a readable 400", func(t *testing.T) {
+		const msg = `state "scheduled" cannot be set manually: the customer's approval has been requested from the customer group (the registered contacts of the change request's project) and is given by one of them approving or rejecting it in the change request's approvals (POST /change-requests/{id}/approvals/decision)`
+		client := &mockEntityChangeRequestClient{
+			patchChangeRequestFn: func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+				return nil, &apierror.Error{StatusCode: http.StatusBadRequest, Body: `{"code":400,"message":` + jsonQuote(msg) + `}`}
+			},
+		}
+		h := NewChangeRequestHandler(client)
+		r := withUser(httptest.NewRequest(http.MethodPatch, "/change-requests/"+testCRID, strings.NewReader(`{"state":"scheduled"}`)))
+		r.SetPathValue("id", testCRID)
+		w := httptest.NewRecorder()
+		h.PatchChangeRequest(w, r)
+		assertStatus(t, w, http.StatusBadRequest)
+		assertErrorMessage(t, w, msg)
+	})
+}
+
+func jsonQuote(s string) string { b, _ := json.Marshal(s); return string(b) }
 
 func TestSearchChangeRequests(t *testing.T) {
 	t.Run("requires authenticated user", func(t *testing.T) {
@@ -958,7 +1039,7 @@ func TestPatchChangeRequest_CustomerGateFlags(t *testing.T) {
 		client := &mockEntityChangeRequestClient{
 			patchChangeRequestFn: func(_ context.Context, _ string, body []byte) ([]byte, error) {
 				capturedBody = body
-				return []byte(`{"message":"ok","changeRequest":{"state":"review","customerApprovalRequired":true,"customerReviewRequired":true,"legalNextStates":["customer_review","canceled"]}}`), nil
+				return []byte(`{"message":"ok","changeRequest":{"state":"review","customerApprovalRequired":true,"customerReviewRequired":true,"legalNextStates":["customer_review","rollback","canceled"]}}`), nil
 			},
 		}
 		w := patch(NewChangeRequestHandler(client), reqPayload)
@@ -970,6 +1051,50 @@ func TestPatchChangeRequest_CustomerGateFlags(t *testing.T) {
 		cr, _ := resp["changeRequest"].(map[string]any)
 		if cr["customerApprovalRequired"] != true || cr["customerReviewRequired"] != true {
 			t.Errorf("response flags = %v/%v, want true/true", cr["customerApprovalRequired"], cr["customerReviewRequired"])
+		}
+	})
+
+	// Roll back is a plain state PATCH (the entity service owns where it is
+	// legal); the BFF forwards the body untouched.
+	t.Run("forwards a rollback state change verbatim", func(t *testing.T) {
+		const reqPayload = `{"state":"rollback"}`
+		var capturedBody []byte
+		client := &mockEntityChangeRequestClient{
+			patchChangeRequestFn: func(_ context.Context, _ string, body []byte) ([]byte, error) {
+				capturedBody = body
+				return []byte(`{"message":"ok","changeRequest":{"state":"rollback","legalNextStates":null}}`), nil
+			},
+		}
+		w := patch(NewChangeRequestHandler(client), reqPayload)
+		assertStatus(t, w, http.StatusOK)
+		if string(capturedBody) != reqPayload {
+			t.Errorf("upstream received body %q, want %q", capturedBody, reqPayload)
+		}
+		resp := decodeJSON[map[string]any](t, w)
+		if cr, _ := resp["changeRequest"].(map[string]any); cr["state"] != "rollback" {
+			t.Errorf("response state = %v, want rollback", cr["state"])
+		}
+	})
+
+	// Re-schedule is a plain state PATCH carrying the new window (and an
+	// optional work note); the BFF forwards the body untouched.
+	t.Run("forwards a re-schedule (authorize + new window) verbatim", func(t *testing.T) {
+		const reqPayload = `{"state":"authorize","plannedStartOn":"2030-03-08 09:00:00","plannedEndOn":"2030-03-08 11:00:00","workNote":"Customer asked for next week."}`
+		var capturedBody []byte
+		client := &mockEntityChangeRequestClient{
+			patchChangeRequestFn: func(_ context.Context, _ string, body []byte) ([]byte, error) {
+				capturedBody = body
+				return []byte(`{"message":"ok","changeRequest":{"state":"authorize","legalNextStates":["canceled"]}}`), nil
+			},
+		}
+		w := patch(NewChangeRequestHandler(client), reqPayload)
+		assertStatus(t, w, http.StatusOK)
+		if string(capturedBody) != reqPayload {
+			t.Errorf("upstream received body %q, want %q", capturedBody, reqPayload)
+		}
+		resp := decodeJSON[map[string]any](t, w)
+		if cr, _ := resp["changeRequest"].(map[string]any); cr["state"] != "authorize" {
+			t.Errorf("response state = %v, want authorize", cr["state"])
 		}
 	})
 
@@ -1020,6 +1145,18 @@ func TestPatchChangeRequest_CustomerGateFlags(t *testing.T) {
 				`{"state":"closed"}`,
 				`state "closed" cannot be set from review: customer review is required for this change request (customerReviewRequired is true); move it to customer_review first`,
 			},
+			"authorize outside customer_approval": {
+				`{"state":"authorize","plannedStartOn":"2030-03-08 09:00:00"}`,
+				`state "authorize" cannot be set manually: it is reached automatically through the approval flow (Request Approval, then peer approval); it can only be set by hand to re-schedule a change from customer_approval`,
+			},
+			"re-schedule without a changed window": {
+				`{"state":"authorize","plannedStartOn":"2030-03-01 09:00:00"}`,
+				`re-scheduling requires a changed planned start or end: send plannedStartOn and/or plannedEndOn with a value different from the stored one`,
+			},
+			"rollback outside the review states": {
+				`{"state":"rollback"}`,
+				`state "rollback" can only be set from review or customer_review`,
+			},
 			"scheduled outside customer_approval": {
 				`{"state":"scheduled"}`,
 				`state "scheduled" cannot be set manually: it is reached automatically through the approval flow (Request Approval, then peer/CAB approval); it can only be set by hand to record the customer's approval, from customer_approval`,
@@ -1060,4 +1197,216 @@ func TestGetChangeRequest_ReturnsCustomerGateFlags(t *testing.T) {
 	if len(states) != 2 || states[0] != "scheduled" {
 		t.Errorf("legalNextStates = %v, want [scheduled canceled] passed through untouched", states)
 	}
+}
+
+const (
+	scopeProjectID    = "11111111-2222-3333-4444-555555555555"
+	scopeDeploymentID = "66666666-7777-8888-9999-aaaaaaaaaaaa"
+)
+
+// The customer-scope fields (project, deployments, deployment products) and the
+// journal entries are shape-checked at the
+// BFF on both create and PATCH, so a stray string/null reaches the form as a
+// readable 400 instead of an upstream decode failure; valid ones are forwarded
+// byte-for-byte.
+func TestChangeRequestScopeFieldValidation(t *testing.T) {
+	bad := map[string]string{
+		`"projectId":"not-a-uuid"`:                       "projectId must be a UUID string",
+		`"projectId":null`:                               "projectId must be a UUID string",
+		`"projectId":7`:                                  "projectId must be a UUID string",
+		`"deploymentIds":"` + scopeDeploymentID + `"`:    "deploymentIds must be an array of UUID strings",
+		`"deploymentIds":null`:                           "deploymentIds must be an array of UUID strings",
+		`"deploymentIds":{"0":"x"}`:                      "deploymentIds must be an array of UUID strings",
+		`"deploymentIds":["not-a-uuid"]`:                 "deploymentIds must be an array of UUID strings",
+		`"deploymentIds":[1]`:                            "deploymentIds must be an array of UUID strings",
+		`"environmentIds":["` + scopeDeploymentID + `"]`: errMsgEnvironmentIDsRemoved,
+		`"environmentIds":[]`:                            errMsgEnvironmentIDsRemoved,
+		`"environmentIds":null`:                          errMsgEnvironmentIDsRemoved,
+		`"customerGroupId":"` + scopeProjectID + `"`:     errMsgCustomerGroupIDRemoved,
+		`"customerGroupId":null`:                         errMsgCustomerGroupIDRemoved,
+		`"deploymentProductIds":true`:                    "deploymentProductIds must be an array of UUID strings",
+		`"customerGroupId":"x"`:                          errMsgCustomerGroupIDRemoved,
+		`"category":3`:                                   "category must be a string",
+		`"comment":5`:                                    "comment must be a string",
+		`"workNote":["a"]`:                               "workNote must be a string",
+		`"deploymentIds":[` + strings.TrimSuffix(strings.Repeat(`"`+scopeDeploymentID+`",`, 101), ",") + `]`: "deploymentIds must contain at most 100 entries",
+	}
+	for field, wantMsg := range bad {
+		field, wantMsg := field, wantMsg
+		t.Run("create rejects "+field[:min(len(field), 40)], func(t *testing.T) {
+			called := false
+			client := &mockEntityChangeRequestClient{createChangeRequestFn: func(_ context.Context, _ []byte) ([]byte, error) {
+				called = true
+				return []byte(`{}`), nil
+			}}
+			h := NewChangeRequestHandler(client)
+			r := withUser(httptest.NewRequest(http.MethodPost, "/change-requests", strings.NewReader(`{"subject":"s","type":"normal",`+field+`}`)))
+			w := httptest.NewRecorder()
+			h.CreateChangeRequest(w, r)
+			assertStatus(t, w, http.StatusBadRequest)
+			assertErrorMessage(t, w, wantMsg)
+			if called {
+				t.Fatal("the entity service was called for a rejected body")
+			}
+		})
+		t.Run("patch rejects "+field[:min(len(field), 40)], func(t *testing.T) {
+			called := false
+			client := &mockEntityChangeRequestClient{patchChangeRequestFn: func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+				called = true
+				return []byte(`{}`), nil
+			}}
+			h := NewChangeRequestHandler(client)
+			r := withUser(httptest.NewRequest(http.MethodPatch, "/change-requests/"+testCRID, strings.NewReader(`{`+field+`}`)))
+			r.SetPathValue("id", testCRID)
+			w := httptest.NewRecorder()
+			h.PatchChangeRequest(w, r)
+			assertStatus(t, w, http.StatusBadRequest)
+			assertErrorMessage(t, w, wantMsg)
+			if called {
+				t.Fatal("the entity service was called for a rejected body")
+			}
+		})
+	}
+
+	t.Run("patch rejects blank journal entries, create ignores them", func(t *testing.T) {
+		for _, field := range []string{`"comment":""`, `"comment":"  "`, `"workNote":"\n"`} {
+			h := NewChangeRequestHandler(&mockEntityChangeRequestClient{})
+			r := withUser(httptest.NewRequest(http.MethodPatch, "/change-requests/"+testCRID, strings.NewReader(`{`+field+`}`)))
+			r.SetPathValue("id", testCRID)
+			w := httptest.NewRecorder()
+			h.PatchChangeRequest(w, r)
+			assertStatus(t, w, http.StatusBadRequest)
+		}
+		h := NewChangeRequestHandler(&mockEntityChangeRequestClient{})
+		r := withUser(httptest.NewRequest(http.MethodPost, "/change-requests", strings.NewReader(`{"subject":"s","type":"normal","comment":"","workNote":" "}`)))
+		w := httptest.NewRecorder()
+		h.CreateChangeRequest(w, r)
+		assertStatus(t, w, http.StatusCreated)
+	})
+
+	t.Run("valid scope fields are forwarded unchanged; null clears category on patch", func(t *testing.T) {
+		createBody := `{"subject":"s","type":"normal","projectId":"` + scopeProjectID + `","deploymentIds":["` + scopeDeploymentID + `"],"deploymentProductIds":[],"category":"devops","comment":"c","workNote":"w"}`
+		var gotCreate string
+		h := NewChangeRequestHandler(&mockEntityChangeRequestClient{createChangeRequestFn: func(_ context.Context, b []byte) ([]byte, error) {
+			gotCreate = string(b)
+			return []byte(`{"changeRequest":{"id":"x"}}`), nil
+		}})
+		w := httptest.NewRecorder()
+		h.CreateChangeRequest(w, withUser(httptest.NewRequest(http.MethodPost, "/change-requests", strings.NewReader(createBody))))
+		assertStatus(t, w, http.StatusCreated)
+		if gotCreate != createBody {
+			t.Fatalf("forwarded create body = %s, want unchanged", gotCreate)
+		}
+
+		patchBody := `{"projectId":"` + scopeProjectID + `","deploymentIds":[],"category":null,"comment":"c"}`
+		var gotPatch string
+		h = NewChangeRequestHandler(&mockEntityChangeRequestClient{patchChangeRequestFn: func(_ context.Context, _ string, b []byte) ([]byte, error) {
+			gotPatch = string(b)
+			return []byte(`{}`), nil
+		}})
+		r := withUser(httptest.NewRequest(http.MethodPatch, "/change-requests/"+testCRID, strings.NewReader(patchBody)))
+		r.SetPathValue("id", testCRID)
+		w = httptest.NewRecorder()
+		h.PatchChangeRequest(w, r)
+		assertStatus(t, w, http.StatusOK)
+		if gotPatch != patchBody {
+			t.Fatalf("forwarded patch body = %s, want unchanged", gotPatch)
+		}
+	})
+
+	t.Run("a refused combination surfaces the entity service's message on create and patch", func(t *testing.T) {
+		upstream := &apierror.Error{StatusCode: http.StatusBadRequest, Body: `{"message":"deploymentIds contains a deployment that does not belong to the selected project: ` + scopeDeploymentID + `"}`}
+		want := "deploymentIds contains a deployment that does not belong to the selected project: " + scopeDeploymentID
+		h := NewChangeRequestHandler(&mockEntityChangeRequestClient{
+			createChangeRequestFn: func(_ context.Context, _ []byte) ([]byte, error) { return nil, upstream },
+			patchChangeRequestFn:  func(_ context.Context, _ string, _ []byte) ([]byte, error) { return nil, upstream },
+		})
+		w := httptest.NewRecorder()
+		h.CreateChangeRequest(w, withUser(httptest.NewRequest(http.MethodPost, "/change-requests", strings.NewReader(`{"subject":"s","type":"normal"}`))))
+		assertStatus(t, w, http.StatusBadRequest)
+		assertErrorMessage(t, w, want)
+		r := withUser(httptest.NewRequest(http.MethodPatch, "/change-requests/"+testCRID, strings.NewReader(`{"comment":"c"}`)))
+		r.SetPathValue("id", testCRID)
+		w = httptest.NewRecorder()
+		h.PatchChangeRequest(w, r)
+		assertStatus(t, w, http.StatusBadRequest)
+		assertErrorMessage(t, w, want)
+	})
+}
+
+// POST /change-requests/link-options: the form's Customer Project ->
+// Deployments -> Deployment products lookup, plus the read-only Customer Group.
+func TestChangeRequestLinkOptions(t *testing.T) {
+	post := func(h *ChangeRequestHandler, body string, authed bool) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/change-requests/link-options", strings.NewReader(body))
+		if authed {
+			r = withUser(r)
+		}
+		w := httptest.NewRecorder()
+		h.GetChangeRequestLinkOptions(w, r)
+		return w
+	}
+
+	t.Run("requires authenticated user", func(t *testing.T) {
+		w := post(NewChangeRequestHandler(&mockEntityChangeRequestClient{}), `{"projectId":"`+scopeProjectID+`"}`, false)
+		assertStatus(t, w, http.StatusUnauthorized)
+		assertErrorMessage(t, w, ErrMsgUnauthorized)
+	})
+
+	for name, tc := range map[string]struct{ body, msg string }{
+		"not json":                {`nope`, ErrMsgBadRequest},
+		"not an object":           {`[]`, ErrMsgBadRequest},
+		"missing projectId":       {`{"deploymentIds":[]}`, "projectId is required"},
+		"projectId not a uuid":    {`{"projectId":"p-1"}`, "projectId must be a UUID string"},
+		"projectId null":          {`{"projectId":null}`, "projectId must be a UUID string"},
+		"deploymentIds not array": {`{"projectId":"` + scopeProjectID + `","deploymentIds":"` + scopeDeploymentID + `"}`, "deploymentIds must be an array of UUID strings"},
+		"deploymentIds bad entry": {`{"projectId":"` + scopeProjectID + `","deploymentIds":["x"]}`, "deploymentIds must be an array of UUID strings"},
+	} {
+		tc := tc
+		t.Run("rejects "+name, func(t *testing.T) {
+			called := false
+			h := NewChangeRequestHandler(&mockEntityChangeRequestClient{getChangeRequestLinkOptionsFn: func(_ context.Context, _ []byte) ([]byte, error) {
+				called = true
+				return []byte(`{}`), nil
+			}})
+			w := post(h, tc.body, true)
+			assertStatus(t, w, http.StatusBadRequest)
+			assertErrorMessage(t, w, tc.msg)
+			if called {
+				t.Fatal("the entity service was called for a rejected body")
+			}
+		})
+	}
+
+	t.Run("forwards the body and returns the entity response as is, customerContacts included", func(t *testing.T) {
+		body := `{"projectId":"` + scopeProjectID + `","deploymentIds":["` + scopeDeploymentID + `"]}`
+		const resp = `{"deployments":[{"id":"d1","name":"Prod","type":"primary_production"}],"deploymentProducts":[{"id":"p1","name":"APIM 4.3.0","deployment":{"id":"d1","name":"Prod"}}],"customerContacts":[{"id":"c1","name":"Jane Doe","email":"jane.doe@example.com"}]}`
+		var got string
+		h := NewChangeRequestHandler(&mockEntityChangeRequestClient{getChangeRequestLinkOptionsFn: func(_ context.Context, b []byte) ([]byte, error) {
+			got = string(b)
+			return []byte(resp), nil
+		}})
+		w := post(h, body, true)
+		assertStatus(t, w, http.StatusOK)
+		if got != body {
+			t.Fatalf("forwarded body = %s, want %s", got, body)
+		}
+		if strings.TrimSpace(w.Body.String()) != resp {
+			t.Fatalf("response = %s, want the entity response", w.Body.String())
+		}
+	})
+
+	t.Run("upstream errors are mapped: 400 message surfaced, 5xx generic", func(t *testing.T) {
+		for _, tc := range upstreamErrors("Failed to load change request options.") {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				h := NewChangeRequestHandler(&mockEntityChangeRequestClient{getChangeRequestLinkOptionsFn: func(_ context.Context, _ []byte) ([]byte, error) {
+					return nil, tc.err
+				}})
+				w := post(h, `{"projectId":"`+scopeProjectID+`"}`, true)
+				assertStatus(t, w, tc.wantCode)
+				assertErrorMessage(t, w, tc.wantMsg)
+			})
+		}
+	})
 }

@@ -112,6 +112,10 @@ type IncidentRepository interface {
 	// method's doc comment), so the caller (incidentService.UpdateIncident)
 	// resolves the actor and passes the email straight through.
 	CreateIncidentComment(ctx context.Context, incidentID string, commentType domain.CommentType, content, createdBy string) (domain.CaseComment, error)
+	// CreateIncidentNotes inserts a work note and/or a public comment on an incident in one
+	// transaction: both are saved or neither is, so a retried request never saves one twice.
+	// nil or blank texts are skipped.
+	CreateIncidentNotes(ctx context.Context, incidentID string, workNotes, additionalComments *string, createdBy string) error
 	// CreateIncidentFromServiceNow inserts a new incident row (both work_item
 	// and "incident"), for DATA_SOURCE=postgres-servicenow-dual-write's SN-first
 	// incident creation (see incidentService.createIncidentSNFirst's own doc
@@ -185,6 +189,9 @@ type IncidentRepository interface {
 // Closed need a resolution code and resolution notes, taken from the request
 // or already on the record. Entering Resolved stamps resolved_on, and
 // resolved_by_id from ResolvedByID, falling back to DefaultResolvedByID.
+// Entering Closed or Canceled also closes the incident's open incident tasks,
+// as ServiceNow's "Cascade closure of Incident Tasks" does (see
+// cascadeIncidentTaskClosure).
 type IncidentLifecycleUpdate struct {
 	State               *string // incident_state_enum label
 	AssignedEngineerID  *string
@@ -192,6 +199,11 @@ type IncidentLifecycleUpdate struct {
 	ResolutionNotes     *string // incident.close_notes
 	ResolvedByID        *string
 	DefaultResolvedByID *string // the acting user, used only when entering Resolved without ResolvedByID
+
+	// WorkNotes and AdditionalComments are written as comment rows in the same transaction as the
+	// state change, so a failed note leaves the state change unsaved too. Nil or blank writes nothing.
+	WorkNotes          *string
+	AdditionalComments *string
 }
 
 type incidentRepo struct {
@@ -840,6 +852,38 @@ func (r *incidentRepo) CreateIncidentComment(ctx context.Context, incidentID str
 	return c, nil
 }
 
+// CreateIncidentNotes implements IncidentRepository.
+func (r *incidentRepo) CreateIncidentNotes(ctx context.Context, incidentID string, workNotes, additionalComments *string, createdBy string) error {
+	return r.db.InTx(ctx, func(tx pgx.Tx) error {
+		return insertIncidentNotesTx(ctx, tx, incidentID, workNotes, additionalComments, createdBy)
+	})
+}
+
+// insertIncidentNotesTx inserts the non-blank work note and public comment on incidentID inside tx,
+// with createIncidentCommentQuery's own existence check: an incident that is not there is a
+// ValidationError, and rolls the whole transaction back.
+func insertIncidentNotesTx(ctx context.Context, tx pgx.Tx, incidentID string, workNotes, additionalComments *string, createdBy string) error {
+	for _, note := range []struct {
+		text *string
+		kind domain.CommentType
+	}{{workNotes, domain.CommentTypeWorkNote}, {additionalComments, domain.CommentTypeComment}} {
+		if note.text == nil || strings.TrimSpace(*note.text) == "" {
+			continue
+		}
+		var id string
+		err := tx.QueryRow(ctx, `WITH c AS (`+createIncidentCommentQuery+`) SELECT id FROM c`,
+			createdBy, caseCommentTypeEnum[note.kind], incidentID, *note.text,
+		).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return &apierror.ValidationError{Msg: "incident not found: " + incidentID}
+		}
+		if err != nil {
+			return fmt.Errorf("create incident %s: %w", strings.ToLower(string(note.kind)), err)
+		}
+	}
+	return nil
+}
+
 // incidentLifecycleFKField names the request field behind each foreign key
 // UpdateIncidentLifecycle can trip, so a bad id reads as a ValidationError
 // on that field instead of a 500.
@@ -851,7 +895,10 @@ var incidentLifecycleFKField = map[string]string{
 // UpdateIncidentLifecycle implements IncidentRepository.
 func (r *incidentRepo) UpdateIncidentLifecycle(ctx context.Context, id string, u IncidentLifecycleUpdate, actorEmail string) error {
 	_, err := InTxReturning(ctx, r.db, func(tx pgx.Tx) (struct{}, error) {
-		return struct{}{}, r.updateIncidentLifecycleTx(ctx, tx, id, u, actorEmail)
+		if err := r.updateIncidentLifecycleTx(ctx, tx, id, u, actorEmail); err != nil {
+			return struct{}{}, err
+		}
+		return struct{}{}, insertIncidentNotesTx(ctx, tx, id, u.WorkNotes, u.AdditionalComments, actorEmail)
 	})
 	if err == nil {
 		return nil
@@ -874,20 +921,82 @@ func (r *incidentRepo) UpdateIncidentLifecycle(ctx context.Context, id string, u
 	return fmt.Errorf("update incident: %w", err)
 }
 
+// Work notes ServiceNow's OOB "Cascade closure of Incident Tasks" writes on
+// each task it closes (incident, after insert/update, state changes to
+// Closed or Canceled; on when com.snc.incident.incident_task.closure is
+// "true", as it is on WSO2's instance). Discovery scripts 57-59 in
+// integrations/csm-flow-service/docs/servicenow-discovery have the evidence.
+const (
+	incidentTaskClosedOnCloseNote  = "Incident Task is Closed Incomplete based on closure of %s."
+	incidentTaskClosedOnCancelNote = "Incident Task is Closed Skipped based on cancelation of %s."
+)
+
+// cascadeIncidentTaskClosure ports "Cascade closure of Incident Tasks": when
+// the incident moves to CLOSED every active, open incident task becomes
+// CLOSED_INCOMPLETE; when it moves to CANCELED they become CLOSED_SKIPPED.
+// Each gets ServiceNow's work note, written as the acting user. Tasks
+// already in a closed state are left alone, as is a task with
+// is_active = false (ServiceNow's addActiveQuery). A NULL state counts as
+// open.
+//
+// The task side effects match ServiceNow's task rules ("mark closed" and
+// "Set Closure Fields"): is_active false, and closed_on / closed_by_id set
+// only when empty.
+func cascadeIncidentTaskClosure(ctx context.Context, tx pgx.Tx, incidentID, incidentNumber, incidentState, actorEmail string) error {
+	var taskState, note string
+	switch incidentState {
+	case "CLOSED":
+		taskState, note = "CLOSED_INCOMPLETE", fmt.Sprintf(incidentTaskClosedOnCloseNote, incidentNumber)
+	case "CANCELED":
+		taskState, note = "CLOSED_SKIPPED", fmt.Sprintf(incidentTaskClosedOnCancelNote, incidentNumber)
+	default:
+		return nil
+	}
+	closed := make([]string, 0, len(domain.IncidentTaskClosedStates))
+	for s := range domain.IncidentTaskClosedStates {
+		closed = append(closed, s)
+	}
+	if _, err := tx.Exec(ctx, `
+		WITH closed AS (
+			UPDATE incident_task it
+			SET state = $2::TEXT::incident_task_state_enum,
+			    is_active = FALSE,
+			    closed_on = COALESCE(it.closed_on, NOW()),
+			    closed_by_id = COALESCE(it.closed_by_id, (SELECT id FROM "user" WHERE LOWER(email) = LOWER($3) LIMIT 1))
+			WHERE it.incident_id = $1
+			  AND it.is_active = TRUE
+			  AND (it.state IS NULL OR NOT (it.state::TEXT = ANY($4::text[])))
+			RETURNING it.id
+		), touched AS (
+			UPDATE work_item wi
+			SET updated_on = NOW(), updated_by = $3
+			FROM closed
+			WHERE wi.id = closed.id
+			RETURNING wi.id
+		)
+		INSERT INTO comment (id, created_on, created_by, type, work_item_id, content)
+		SELECT gen_random_uuid(), NOW(), $3, $5::comment_type_enum, touched.id, $6
+		FROM touched`,
+		incidentID, taskState, actorEmail, closed, caseCommentTypeEnum[domain.CommentTypeWorkNote], note); err != nil {
+		return fmt.Errorf("update incident: close incident tasks: %w", err)
+	}
+	return nil
+}
+
 // updateIncidentLifecycleTx is UpdateIncidentLifecycle's body: lock the
 // incident row, check the Resolved/Closed resolution requirement against the
 // request plus what is already on record, then update work_item (always,
 // for updated_on/updated_by, plus the assignee) and incident (state and
 // resolution columns, only when one is being set).
 func (r *incidentRepo) updateIncidentLifecycleTx(ctx context.Context, tx pgx.Tx, id string, u IncidentLifecycleUpdate, actorEmail string) error {
-	var currentState string
+	var currentState, number string
 	var currentCode, currentNotes *string
 	err := tx.QueryRow(ctx, `
-		SELECT inc.state::text, inc.resolution_code::text, inc.close_notes
+		SELECT inc.state::text, inc.resolution_code::text, inc.close_notes, wi.number
 		FROM incident inc
 		JOIN work_item wi ON wi.id = inc.id
 		WHERE inc.id = $1
-		FOR UPDATE OF inc`, id).Scan(&currentState, &currentCode, &currentNotes)
+		FOR UPDATE OF inc`, id).Scan(&currentState, &currentCode, &currentNotes, &number)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return &apierror.NotFoundError{Msg: "incident not found"}
 	}
@@ -961,6 +1070,10 @@ func (r *incidentRepo) updateIncidentLifecycleTx(ctx context.Context, tx pgx.Tx,
 		incArgs...,
 	); err != nil {
 		return err
+	}
+	// After the incident's own write, as ServiceNow's cascade is an after rule.
+	if u.State != nil && *u.State != currentState {
+		return cascadeIncidentTaskClosure(ctx, tx, id, number, *u.State, actorEmail)
 	}
 	return nil
 }

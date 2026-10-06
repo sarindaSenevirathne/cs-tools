@@ -32,20 +32,14 @@ paths:
       operationId: postAwsAlert
       summary: Receive an AWS alert webhook
       description: >-
-        An SNS SubscriptionConfirmation is confirmed and emailed to the team named by ?team=
-        (answers 200, stores nothing); notifications are stored as alerts.
-      parameters:
-        - name: team
-          in: query
-          required: false
-          description: Team to email about SNS subscription confirmations (default "Default").
-          schema:
-            type: string
+        An SNS SubscriptionConfirmation is verified and confirmed, and an UnsubscribeConfirmation is
+        logged; both answer 200 and store nothing. Notifications are stored as alerts; any other SNS
+        message type is rejected with 400.
       requestBody:
         $ref: '#/components/requestBodies/SourcePayload'
       responses:
         '200':
-          description: SNS subscription confirmation handled; nothing stored.
+          description: SNS subscribe or unsubscribe confirmation handled; nothing stored.
         '201':
           $ref: '#/components/responses/Stored'
         '400':
@@ -323,14 +317,16 @@ components:
         status:
           type: string
           example: OK
+        alt_id:
+          type: string
+          description: The stored alert's id. Present when the request stored exactly one alert.
+          example: ALT000000123
         alt_ids:
           type: array
+          description: Every stored alert's id, in request order. Present only for a multi-alert request that stored several alerts.
           items:
             type: string
             example: ALT000000123
-        count:
-          type: integer
-          example: 1
     Error:
       type: object
       properties:

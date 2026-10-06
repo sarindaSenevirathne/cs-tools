@@ -2637,6 +2637,26 @@ export type BeChangeRequestType =
 
 export type BeChangeRequestPriority = "critical" | "high" | "moderate" | "low";
 
+/**
+ * Change-request `category` as accepted by `POST /change-requests` (the
+ * ServiceNow `category` choice list). The legacy ServiceNow form defaults it
+ * to `other`.
+ */
+export type BeChangeRequestCategory =
+  | "hardware"
+  | "software"
+  | "service"
+  | "system_software"
+  | "applications_software"
+  | "network"
+  | "telecom"
+  | "documentation"
+  | "other"
+  | "regular_release_cloud"
+  | "hotfix_release_cloud"
+  | "devops"
+  | "cloud_computing";
+
 /** List-item / shared shape for a change request (`POST /change-requests/search`). */
 export interface BeChangeRequestSearchView {
   id: string;
@@ -2710,7 +2730,13 @@ export interface BeChangeRequestDetail extends BeChangeRequestSearchView {
    * {@link BeCreateChangeRequestPayload}; this is the read-back. */
   implementationPlan?: string | null;
   priority?: { id: number; label: string } | null;
-  category?: { id: string; label: string } | null;
+  /** The `category` enum value (`other`, `devops`, ...) as the Postgres data
+   * source returns it, or an `{ id, label }` ref as the ServiceNow-backed
+   * response did — read both through `changeRequestCategoryValue` /
+   * `changeRequestCategoryLabel`. Writable through
+   * {@link BeCreateChangeRequestPayload} / {@link BePatchChangeRequestPayload}
+   * `category`. */
+  category?: string | { id: string; label?: string; name?: string } | null;
   requestedBy?: BeEntityRef | null;
 
   /** Real SRE content the ServiceNow layer previously never surfaced. */
@@ -2719,9 +2745,15 @@ export interface BeChangeRequestDetail extends BeChangeRequestSearchView {
   /** Free-form; e.g. `"10 mins"`. Parsing into a structured duration, if
    * ever needed, is CSM policy, not something ServiceNow enforces. */
   rollbackDurationText?: string | null;
-  environments?: BeEntityRef[];
   deploymentProducts?: BeEntityRef[];
-  customerGroup?: BeEntityRef | null;
+  /**
+   * The change request's "Customer Group": the REGISTERED portal-user contacts
+   * of its Customer Project, derived live by the backend and READ-ONLY (never
+   * picked or sent back). Always an array on the PostgreSQL data source (empty
+   * without a project or without registered contacts); absent on other data
+   * sources. They are the customer's approvers at Customer Approval / Review.
+   */
+  customerContacts?: BeCustomerContact[];
 
   /**
    * Read-through only — no write path is exposed anywhere in the stack for
@@ -2777,11 +2809,22 @@ export interface BeChangeRequestApprover {
   /**
    * Set by the backend (Postgres source): true only on the caller's own
    * REQUESTED row, and only when they may decide it (not the creator, not an
-   * SRE on the peer stage). `false` makes the UI disable Approve/Reject for
+   * external user on an internal stage, and the change request is still in the
+   * state the row's stage belongs to -- a REQUESTED row of a stage the change
+   * has moved past is `false`). `false` makes the UI disable Approve/Reject for
    * that row; absent (ServiceNow source / older backend) means "unknown", and
-   * the UI falls back to its own creator check plus the backend's 403.
+   * the UI falls back to its own creator check plus the backend's 403 / 409.
    */
   canDecide?: boolean;
+}
+
+/**
+ * The group an approval stage is assigned to (`assignmentGroup` on
+ * {@link BeChangeRequestApproval}); its `id` opens `GET /groups/{id}`.
+ */
+export interface BeChangeRequestApprovalGroup {
+  id: string;
+  name: string;
 }
 
 /** One approval stage on a change request, with its individual approvers. */
@@ -2789,6 +2832,14 @@ export interface BeChangeRequestApproval {
   stage: string;
   approverType: BeChangeRequestApproverType | string;
   approverName?: string | null;
+  /**
+   * The group this stage was provisioned from (PostgreSQL data source), so its
+   * members can be listed. `null`/absent for the Customer Approval / Customer
+   * Review stages -- their approvers are the project's registered contacts
+   * (`BeChangeRequestDetail.customerContacts`), not a group -- and on the
+   * ServiceNow data source.
+   */
+  assignmentGroup?: BeChangeRequestApprovalGroup | null;
   status: string;
   approvers: BeChangeRequestApprover[];
 }
@@ -2796,6 +2847,31 @@ export interface BeChangeRequestApproval {
 /** `GET /change-requests/{id}/approvals` response. */
 export interface BeChangeRequestApprovalsView {
   approvals: BeChangeRequestApproval[];
+}
+
+/** One active member of a group (`GET /groups/{id}`). */
+export interface BeGroupMember {
+  /** The member's user id. */
+  id: string;
+  name: string;
+  email?: string | null;
+  /** INTERNAL, EXTERNAL, ... ; null when unset. */
+  userType?: string | null;
+  /** `"lead"` when the user leads the group, else `"member"`. */
+  role?: "member" | "lead" | string | null;
+}
+
+/** `GET /groups/{id}` response: a group and its active members (name order). */
+export interface BeGroupDetail {
+  id: string;
+  name: string;
+  description?: string | null;
+  /** The group email. */
+  email?: string | null;
+  manager?: { id: string; name: string } | null;
+  members: BeGroupMember[];
+  /** Number of members. */
+  total: number;
 }
 
 /** Caller's decision on their own pending change-request approval. */
@@ -2823,15 +2899,25 @@ export interface BeChangeRequestApprovalDecisionResponse {
  * CR can't be created already past its own approval flow.
  * `plannedStartDate`/`plannedEndDate` are `YYYY-MM-DD HH:MM:SS` strings.
  *
- * `category`, `serviceId`, `serviceOfferingId`, `configurationItemId` and
- * `risk` are deliberately not part of this type even though the backend
- * still accepts them: the live ServiceNow CR form has no `Service`/
- * `Service offering`/`Configuration item`/`Risk` fields at all, and
- * `category` is left at its default on 99.9% of real change requests, so
- * neither belongs as an editable control in this portal (see
- * `notes/2026-08-19-sn-prod-cr-form-spec.md` and the field-usage census in
- * the planning repo). The backend contract is left untouched — only the
- * webapp stops sending them.
+ * `serviceId`, `serviceOfferingId`, `configurationItemId` and `risk` are
+ * deliberately not part of this type even though the backend still accepts
+ * them: the live ServiceNow CR form has no `Service`/`Service offering`/
+ * `Configuration item`/`Risk` fields at all (see
+ * `notes/2026-08-19-sn-prod-cr-form-spec.md` in the planning repo). The
+ * backend contract is left untouched — only the webapp stops sending them.
+ *
+ * `projectId`, `deploymentIds`, `deploymentProductIds`, `category`, `comment`
+ * and `workNote` mirror the real ServiceNow CR form's Customer Project /
+ * Deployments / Deployment products / Category / Additional comments
+ * (customer visible) / Work notes fields. Deployments and deployment products
+ * are scoped to the chosen project; the backend rejects an inconsistent
+ * combination with a 400 whose message the form shows verbatim. Every one is
+ * optional and is omitted (arrays when empty) rather than sent blank.
+ *
+ * There is deliberately no `customerGroupId` and no `environmentIds`: the
+ * Customer Group is derived from the project's registered contacts (read-only,
+ * see {@link BeCustomerContact}) and a deployment carries its environment; the
+ * backend answers a client that still sends either with a 400.
  */
 export interface BeCreateChangeRequestPayload {
   subject: string;
@@ -2852,8 +2938,18 @@ export interface BeCreateChangeRequestPayload {
   testPlan?: string;
   plannedStartDate?: string;
   plannedEndDate?: string;
+  /** "Additional comments (Customer visible)". */
   comment?: string;
+  /** "Work notes" (internal). */
   workNote?: string;
+  /** "Customer Project". */
+  projectId?: string;
+  /** Deployments of {@link projectId}. */
+  deploymentIds?: string[];
+  /** Deployment products derived from the chosen deployments. */
+  deploymentProductIds?: string[];
+  /** Defaults to `other` on the legacy ServiceNow form. */
+  category?: BeChangeRequestCategory;
   /** "Implementation Plan visible to customers" in this portal's UI. */
   isPlanningVisibleToCustomers?: boolean;
   /** "Customer Approval" checkbox: adds a customer approval step after
@@ -2862,6 +2958,52 @@ export interface BeCreateChangeRequestPayload {
   /** "Customer Review" checkbox: adds a customer review step after Review,
    * before closing. The create form always sends it. */
   customerReviewRequired?: boolean;
+}
+
+/**
+ * `POST /change-requests/link-options` body: the lookup behind the change
+ * request form's Customer Project -> Deployments -> Deployment products
+ * cascade, plus the project's read-only Customer Group.
+ */
+export interface BeChangeRequestLinkOptionsPayload {
+  /** The selected Customer Project. */
+  projectId: string;
+  /** Deployments chosen so far; the response derives the deployment products
+   * from them. */
+  deploymentIds?: string[];
+}
+
+/** One selectable deployment of the project. */
+export interface BeChangeRequestDeploymentOption {
+  id: string;
+  name: string;
+  /** Deployment type, i.e. its environment role (primary_production, staging, qa, ...). */
+  type?: string;
+}
+
+/** A registered portal-user contact of a project: a member of the change request's read-only Customer Group. */
+export interface BeCustomerContact {
+  id: string;
+  name: string;
+  email?: string;
+}
+
+/** One deployment product (deployed product) that follows from the chosen deployments. */
+export interface BeChangeRequestDeploymentProductOption {
+  id: string;
+  /** "<product> <version>". */
+  name: string;
+  /** The chosen deployment this product is deployed in. */
+  deployment?: BeEntityRef;
+}
+
+export interface BeChangeRequestLinkOptionsResponse {
+  /** The project's deployments (all of them, regardless of the chosen ones). */
+  deployments: BeChangeRequestDeploymentOption[];
+  /** Deployment products that follow from the chosen deployments. */
+  deploymentProducts: BeChangeRequestDeploymentProductOption[];
+  /** The project's registered contacts — the read-only Customer Group (name order, empty when none). */
+  customerContacts?: BeCustomerContact[];
 }
 
 /** `POST /change-requests` response — the created identifiers. */
@@ -3070,20 +3212,14 @@ export interface BePatchChangeRequestPayload {
   // The regular (non-bypass) branch on `PATCH /change-requests/{id}` still
   // only accepts `plannedStartOn`/`isCustomerApproved`/`isCustomerReviewed`/
   // `requestApproval`, unchanged; every CSM engineer using this portal is a
-  // bypass user, so these six reach the backend. `categoryKey`/`priorityKey`,
-  // `environmentIds`/`deploymentProductIds`, `comment`/`workNote` and
-  // `durationInput` are also accepted by the backend but are deliberately
-  // NOT modeled here yet:
-  //   - `categoryKey` never gets an editable control (see the doc comment on
-  //     `BeChangeRequestDetail.category`).
+  // bypass user, so these keys reach the backend. `priorityKey` and
+  // `durationInput` are also accepted by the backend but are deliberately NOT
+  // modeled here yet:
   //   - `priorityKey` has no picker in this portal yet (no metadata endpoint
   //     for the 4 SN priority choices) — left for a follow-up.
-  //   - `environmentIds`/`deploymentProductIds` have no search endpoint at
-  //     this BFF (`/environments/search`, `/deployment-products/search` do
-  //     not exist) — a picker cannot be built until one does.
-  //   - `comment`/`workNote` are journal fields; the existing CR comments
+  //   - `comment`/`workNote` append journal entries; the existing CR comments
   //     feature (`useCsmChangeRequestComments`, `/change-requests/{id}/comments`)
-  //     already covers that surface — this dialog should not duplicate it.
+  //     already covers that surface — the edit dialog does not duplicate it.
   //   - `durationInput` only succeeds when it exactly matches the effective
   //     planned window in whole seconds (see `CHANGES-cr-field-parity.md`
   //     §"durationInput"); building that validation is deferred rather than
@@ -3093,8 +3229,19 @@ export interface BePatchChangeRequestPayload {
   affectedServicesText?: string;
   affectedComponentsText?: string;
   rollbackDurationText?: string;
-  customerGroupId?: string;
   requestedById?: string;
+  category?: BeChangeRequestCategory;
+  /**
+   * Customer Project / Deployments / Deployment products. The
+   * backend validates them as a unit (deployments must belong to the project,
+   * deployment products must be exactly those of the chosen deployments) and
+   * refuses (400) any
+   * change once the CR has reached `implement`, so the edit dialog sends them
+   * together, and only when one of them changed.
+   */
+  projectId?: string;
+  deploymentIds?: string[];
+  deploymentProductIds?: string[];
   /** "Implementation Plan visible to customers" in this portal's UI. */
   isPlanningVisibleToCustomers?: boolean;
   /** Customer Approval checkbox. The backend refuses (400) a change once the
@@ -3691,11 +3838,8 @@ export interface BePatchProblemResponse {
 }
 
 /**
- * List-item shape for `POST /incident-tasks/search`. No dedicated detail
- * page exists for incident tasks in this app (unlike problem/incident), so
- * there is no separate `BeIncidentTaskDetail` type yet — `description`,
- * `priority`, `openedOn`, `closedOn` are on the backend's own
- * `GET /incident-tasks/{id}` response but have no frontend consumer today.
+ * List-item shape for `POST /incident-tasks/search`. The detail page reads
+ * `GET /incident-tasks/{id}` instead (`BeIncidentTaskDetail`).
  * `stateLabel` is a pre-humanized display string the data source already
  * resolves server-side — prefer it over trying to humanize `state` (a raw,
  * data-source-specific integer with no stable domain enum here; see the
@@ -3715,6 +3859,32 @@ export interface BeIncidentTaskSearchView {
   incident?: BeCaseNumberRef | null;
   assignmentGroup?: BeEntityRef | null;
   assignedTo?: BeEntityRef | null;
+}
+
+/** `GET /incident-tasks/{id}` response: the search view plus the fields only
+ * the detail page shows. */
+export interface BeIncidentTaskDetail extends BeIncidentTaskSearchView {
+  description?: string | null;
+  /** CRITICAL | HIGH | MODERATE | LOW | PLANNING on Postgres. */
+  priority?: string | null;
+  openedOn?: string | null;
+  closedOn?: string | null;
+  closeNotes?: string | null;
+}
+
+/** incident_task_state_enum labels, as Postgres returns them in `state`. */
+export type BeIncidentTaskState =
+  | "PENDING"
+  | "OPEN"
+  | "WORK_IN_PROGRESS"
+  | "CLOSED_COMPLETE"
+  | "CLOSED_INCOMPLETE"
+  | "CLOSED_SKIPPED";
+
+/** `PATCH /incident-tasks/{id}` body; at least one field. Returns `BeIncidentTaskDetail`. */
+export interface BeUpdateIncidentTaskPayload {
+  state?: BeIncidentTaskState;
+  closeNotes?: string;
 }
 
 /** `POST /incident-tasks/search` body. The only per-incident filter is the

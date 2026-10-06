@@ -42,7 +42,7 @@ type Config struct {
 type RetentionConfig struct {
 	// Interval is how often one replica purges expired rows.
 	Interval Duration `toml:"interval"`
-	// Alerts is how long a processed alert row is kept.
+	// Alerts is how long a processed alert row, and a raw_alerts webhook body, is kept.
 	Alerts Duration `toml:"alerts"`
 	// Incidents is how long an incident with nothing left to deliver is kept after its last alert.
 	Incidents Duration `toml:"incidents"`
@@ -129,7 +129,7 @@ func defaults() Config {
 	return Config{
 		Poll: PollConfig{
 			Interval:    Duration(10 * time.Second),
-			Concurrency: 64,
+			Concurrency: 128,
 			MaxBatch:    500,
 			ClaimTTL:    Duration(2 * time.Minute),
 		},
@@ -151,8 +151,8 @@ func defaults() Config {
 			CSMRetryMultiplier:   2,
 			CSMRetryMaxDelay:     Duration(15 * time.Minute),
 			ChatThreadingEnabled: true,
-			ChatFallbackDelay:    Duration(60 * time.Second),
-			DeliveryConcurrency:  32,
+			ChatFallbackDelay:    Duration(25 * time.Second),
+			DeliveryConcurrency:  64,
 		},
 		Server: ServerConfig{
 			ShutdownGrace: Duration(15 * time.Second),

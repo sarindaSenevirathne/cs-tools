@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"strings"
 
+	"sre-alert-ingestion-service/internal/model"
 	"sre-alert-ingestion-service/internal/sources/jsonnum"
 	"sre-alert-ingestion-service/utils"
 )
@@ -61,16 +62,7 @@ var severityMap = map[string]string{
 var ErrInvalidStructure = errors.New("invalid prometheus alert payload structure")
 
 // Alert is the canonical alert model handed to the core component.
-type Alert struct {
-	Service          string `json:"service"`
-	MetricName       string `json:"metric_name"`
-	Severity         string `json:"severity"`
-	Category         string `json:"category"`
-	Environment      string `json:"environment"`
-	Source           string `json:"source"`
-	UniqueIdentifier string `json:"unique_identifier"`
-	Description      string `json:"description"`
-}
+type Alert = model.Alert
 
 // Config holds operator overrides mirroring "edge.api.prometheus.alert.config"; unlike other fields, "severity" and "source" are looked up lowercase.
 type Config map[string]string
@@ -100,7 +92,6 @@ func Transform(raw []byte, cfg Config) ([]Alert, error) {
 		return nil, ErrInvalidStructure
 	}
 
-	description := utils.CompactJSON(raw)
 	receiver := utils.Str(payload, "receiver")
 	batchStatus := utils.Str(payload, "status") // fallback for alerts without their own status
 
@@ -110,12 +101,12 @@ func Transform(raw []byte, cfg Config) ([]Alert, error) {
 		if !ok {
 			continue
 		}
-		alerts = append(alerts, transformOne(alertMap, cfg, receiver, batchStatus, description))
+		alerts = append(alerts, transformOne(alertMap, cfg, receiver, batchStatus))
 	}
 	return alerts, nil
 }
 
-func transformOne(alert map[string]any, cfg Config, receiver, batchStatus, description string) Alert {
+func transformOne(alert map[string]any, cfg Config, receiver, batchStatus string) Alert {
 	labels, _ := alert["labels"].(map[string]any)
 	annotations, _ := alert["annotations"].(map[string]any)
 
@@ -152,7 +143,8 @@ func transformOne(alert map[string]any, cfg Config, receiver, batchStatus, descr
 		Environment:      configValue(cfg, "ENVIRONMENT", utils.FirstNonEmpty(utils.Str(labels, "environment"), utils.Str(labels, "cluster"))),
 		Source:           alertSource,
 		UniqueIdentifier: utils.Str(alert, "fingerprint"),
-		Description:      description,
+		// The alert's own annotation text, never the payload; the raw body is kept in raw_alerts.
+		Description: utils.FirstNonEmpty(utils.Str(annotations, "description"), utils.Str(annotations, "summary")),
 	}
 }
 

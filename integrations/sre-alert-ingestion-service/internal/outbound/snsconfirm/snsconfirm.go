@@ -16,7 +16,7 @@
 // Package snsconfirm handles AWS SNS subscription confirmations the way the ServiceNow AWS Alert
 // API did (AWSSNSNotificationUtils): confirm the subscription by fetching its SubscribeURL. No
 // alert is stored. Unlike ServiceNow, the SNS signature is verified first; an unsigned or forged
-// confirmation is ignored.
+// confirmation is ignored. An unsubscribe confirmation is logged and never fetched.
 package snsconfirm
 
 import (
@@ -55,32 +55,57 @@ func isSNSURL(u *url.URL) bool {
 // noRedirects keeps every fetch on the SNS host that was checked.
 func noRedirects(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
-// HandleIfConfirmation handles raw if it is an SNS SubscriptionConfirmation and reports whether it was one.
+// HandleIfConfirmation handles raw if it is an SNS SubscriptionConfirmation or UnsubscribeConfirmation
+// and reports whether it was one.
 func (h *Handler) HandleIfConfirmation(raw []byte) bool {
 	var msg message
-	if json.Unmarshal(raw, &msg) != nil || msg.Type != "SubscriptionConfirmation" {
+	if json.Unmarshal(raw, &msg) != nil {
 		return false
 	}
+	switch msg.Type {
+	case "SubscriptionConfirmation":
+		h.subscribe(msg)
+	case "UnsubscribeConfirmation":
+		h.unsubscribed(msg)
+	default:
+		return false
+	}
+	return true
+}
+
+// unsubscribed logs a verified unsubscribe: the topic stops delivering here. Its SubscribeURL is never
+// fetched, since that would subscribe the topic again.
+func (h *Handler) unsubscribed(msg message) {
+	if err := h.verifier.verify(msg); err != nil {
+		h.logger.Warn("SNS unsubscribe confirmation failed signature check; ignored",
+			"topic_arn", msg.TopicArn, "error", err)
+		return
+	}
+	h.logger.Warn("SNS subscription removed; this topic no longer delivers alerts here",
+		"topic_arn", msg.TopicArn, "message_id", msg.MessageID)
+}
+
+// subscribe confirms a verified subscription by fetching its SubscribeURL.
+func (h *Handler) subscribe(msg message) {
 	if err := h.verifier.verify(msg); err != nil {
 		h.logger.Warn("SNS subscription confirmation failed signature check; ignored",
 			"topic_arn", msg.TopicArn, "error", err)
-		return true
+		return
 	}
 	if msg.SubscribeURL == "" {
 		h.logger.Error("SNS subscription confirmation has no SubscribeURL", "topic_arn", msg.TopicArn)
-		return true
+		return
 	}
 
 	if u, err := url.Parse(msg.SubscribeURL); err != nil || !h.allowURL(u) {
 		h.logger.Error("SNS SubscribeURL is not an AWS SNS https URL; not fetched",
 			"topic_arn", msg.TopicArn, "subscribe_url", msg.SubscribeURL)
-		return true
+		return
 	}
 	if !h.confirm(msg.SubscribeURL) {
 		h.logger.Error("CRITICAL: SNS subscription failed auto-confirm; a manual ConfirmSubscription click is needed",
 			"topic_arn", msg.TopicArn, "subscribe_url", msg.SubscribeURL)
 	}
-	return true
 }
 
 func (h *Handler) confirm(subscribeURL string) bool {

@@ -18,7 +18,9 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -107,6 +109,24 @@ func (s *stubIncidentRepo) GetIncidentByID(ctx context.Context, id string) (doma
 func (s *stubIncidentRepo) SearchIncidentActivities(context.Context, domain.SearchIncidentActivitiesRequest) ([]domain.CaseActivity, int, error) {
 	panic("not implemented")
 }
+
+// CreateIncidentNotes hands each non-blank note to createIncidentComment, so tests that watch that hook
+// see the same writes the transactional repository method makes.
+func (s *stubIncidentRepo) CreateIncidentNotes(ctx context.Context, incidentID string, workNotes, additionalComments *string, createdBy string) error {
+	for _, n := range []struct {
+		text *string
+		kind domain.CommentType
+	}{{workNotes, domain.CommentTypeWorkNote}, {additionalComments, domain.CommentTypeComment}} {
+		if n.text == nil || strings.TrimSpace(*n.text) == "" {
+			continue
+		}
+		if _, err := s.CreateIncidentComment(ctx, incidentID, n.kind, *n.text, createdBy); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *stubIncidentRepo) CreateIncidentComment(ctx context.Context, incidentID string, commentType domain.CommentType, content, createdBy string) (domain.CaseComment, error) {
 	if s.createIncidentComment != nil {
 		return s.createIncidentComment(ctx, incidentID, commentType, content, createdBy)
@@ -367,6 +387,14 @@ func TestIncidentService_CreateIncident_PublishesOnlyAfterPostgresSucceeds(t *te
 			resp.Incident.Number = number
 			resp.Incident.CreatedBy = createdBy
 			return resp, nil
+		},
+		// Publishing enriches the event with the escalation fields, which
+		// means reading the incident back -- the same read the ServiceNow
+		// path already makes, now reached from this caller too. An empty view
+		// is enough: every escalation field is optional and this test is
+		// about WHEN the publish happens, not what it carries.
+		getIncidentByID: func(context.Context, string) (domain.IncidentView, error) {
+			return domain.IncidentView{}, nil
 		},
 	}
 	publisher := &mockEventPublisher{}
@@ -828,6 +856,51 @@ func TestIncidentService_UpdateIncident_StartProgressClaimsAndMirrors(t *testing
 	}
 }
 
+// TestIncidentService_UpdateIncident_PlainPostgresClaimAndNote is the alert-born SRE incident on
+// DATA_SOURCE=postgres: the engineer's claim (In Progress + assignee) and a work note in one PATCH
+// are both written, and with no ServiceNow behind this instance nothing is mirrored.
+func TestIncidentService_UpdateIncident_PlainPostgresClaimAndNote(t *testing.T) {
+	engineer := "88888888-8888-8888-8888-888888888888"
+	var got repository.IncidentLifecycleUpdate
+	var notes []string
+	repo := &stubIncidentRepo{
+		updateIncidentLifecycle: func(_ context.Context, _ string, u repository.IncidentLifecycleUpdate, _ string) error {
+			got = u
+			return nil
+		},
+		createIncidentComment: func(_ context.Context, _ string, kind domain.CommentType, content, _ string) (domain.CaseComment, error) {
+			notes = append(notes, string(kind)+":"+content)
+			return domain.CaseComment{}, nil
+		},
+		getIncidentByID: func(_ context.Context, id string) (domain.IncidentView, error) {
+			return newTestIncidentView(id), nil
+		},
+	}
+	svc := NewIncidentServiceWithPublisher(repo, stubUpdateIncidentUserRepo{email: "jane.doe@example.com"}, nil)
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	state := domain.IncidentStateInProgress
+	note := "taking this"
+	resp, err := svc.UpdateIncident(ctx, domain.UpdateIncidentRequest{
+		ID: testDeploymentUUID, State: &state, AssignedEngineerID: &engineer, WorkNotes: &note,
+	})
+	if err != nil {
+		t.Fatalf("UpdateIncident on plain Postgres: %v", err)
+	}
+	if got.State == nil || *got.State != "IN_PROGRESS" || got.AssignedEngineerID == nil || *got.AssignedEngineerID != engineer {
+		t.Errorf("lifecycle got state=%v assignee=%v, want IN_PROGRESS and %s", got.State, got.AssignedEngineerID, engineer)
+	}
+	if got.WorkNotes == nil || *got.WorkNotes != "taking this" || got.AdditionalComments != nil {
+		t.Errorf("lifecycle update carried notes work=%v comment=%v, want the work note in the same transaction", got.WorkNotes, got.AdditionalComments)
+	}
+	if len(notes) != 0 {
+		t.Errorf("notes written outside the lifecycle transaction: %v", notes)
+	}
+	if resp.Message != "Incident updated successfully" {
+		t.Errorf("message = %q", resp.Message)
+	}
+}
+
 // TestIncidentService_UpdateIncident_LifecycleFieldMapping covers the
 // domain -> Postgres label mapping on the way to the repository, and the
 // up-front rejection of values with no Postgres equivalent.
@@ -889,5 +962,104 @@ func TestIncidentService_UpdateIncident_LifecycleFieldMapping(t *testing.T) {
 		if !asValidationError(err, &ve) {
 			t.Errorf("%s: expected *apierror.ValidationError, got %T: %v", name, err, err)
 		}
+	}
+}
+
+// stopSignalFixture builds a dual-write incidentService whose repository answers GetIncidentByID
+// with before on the first read and after on every later one -- the update reads the incident
+// once before writing and once after.
+func stopSignalFixture(t *testing.T, publisher EventPublisherService, before, after domain.IncidentView, beforeErr error) IncidentService {
+	t.Helper()
+	reads := 0
+	repo := &stubIncidentRepo{
+		updateIncidentLifecycle: func(context.Context, string, repository.IncidentLifecycleUpdate, string) error { return nil },
+		getIncidentByID: func(context.Context, string) (domain.IncidentView, error) {
+			reads++
+			if reads == 1 {
+				return before, beforeErr
+			}
+			return after, nil
+		},
+	}
+	mirror := &stubMirrorIncidentService{
+		updateIncident: func(context.Context, domain.UpdateIncidentRequest) (domain.UpdateIncidentResponse, error) {
+			return domain.UpdateIncidentResponse{}, nil
+		},
+	}
+	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
+	return NewIncidentServiceWithSNMirror(repo, stubUpdateIncidentUserRepo{email: "jane.doe@example.com"}, mirror, publisher, dispatcher)
+}
+
+func incidentViewWith(state string, assignee *domain.EntityRef) domain.IncidentView {
+	v := newTestIncidentView(testDeploymentUUID)
+	v.State = &state
+	v.AssignedTo = assignee
+	return v
+}
+
+// TestIncidentService_UpdateIncident_ClaimSendsStopSignals: an engineer claiming a NEW incident
+// (In Progress + assignee) sends incident.acknowledged and incident.assigned, which is what stops
+// the SRE call-escalation ladder for an incident that lives only in Postgres.
+func TestIncidentService_UpdateIncident_ClaimSendsStopSignals(t *testing.T) {
+	engineer := domain.EntityRef{ID: "88888888-8888-8888-8888-888888888888", Name: "Jane Doe"}
+	publisher := &mockEventPublisher{}
+	svc := stopSignalFixture(t, publisher, incidentViewWith("NEW", nil), incidentViewWith("IN_PROGRESS", &engineer), nil)
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	state := domain.IncidentStateInProgress
+	if _, err := svc.UpdateIncident(ctx, domain.UpdateIncidentRequest{ID: testDeploymentUUID, State: &state, AssignedEngineerID: &engineer.ID}); err != nil {
+		t.Fatalf("UpdateIncident: %v", err)
+	}
+
+	ack, ok := findPublishCall(publisher.calls, events.TypeIncidentAcknowledged)
+	if !ok {
+		t.Fatalf("incident.acknowledged not published; got %v", publishedTypes(publisher.calls))
+	}
+	var ackPayload events.IncidentAcknowledgedPayload
+	if err := json.Unmarshal(ack.payload, &ackPayload); err != nil || ackPayload.PreviousState != "NEW" || ackPayload.NewState != "IN_PROGRESS" {
+		t.Errorf("incident.acknowledged payload = %+v (err %v), want NEW -> IN_PROGRESS", ackPayload, err)
+	}
+	asg, ok := findPublishCall(publisher.calls, events.TypeIncidentAssigned)
+	if !ok {
+		t.Fatalf("incident.assigned not published; got %v", publishedTypes(publisher.calls))
+	}
+	var asgPayload events.IncidentAssignedPayload
+	if err := json.Unmarshal(asg.payload, &asgPayload); err != nil || asgPayload.AssigneeID != engineer.ID || asgPayload.AssigneeName != "Jane Doe" {
+		t.Errorf("incident.assigned payload = %+v (err %v), want %s / Jane Doe", asgPayload, err, engineer.ID)
+	}
+	if ack.entityID != testDeploymentUUID || asg.entityID != testDeploymentUUID {
+		t.Errorf("events keyed by %q / %q, want the incident id", ack.entityID, asg.entityID)
+	}
+}
+
+// TestIncidentService_UpdateIncident_NoStopSignalWithoutAChange: re-sending the state and assignee
+// the incident already has, moving between two non-NEW states, or losing the before read sends
+// nothing -- a no-op must not cancel a live ladder, and a guess is worse than silence.
+func TestIncidentService_UpdateIncident_NoStopSignalWithoutAChange(t *testing.T) {
+	engineer := domain.EntityRef{ID: "88888888-8888-8888-8888-888888888888", Name: "Jane Doe"}
+	inProgress := domain.IncidentStateInProgress
+	onHold := domain.IncidentStateOnHold
+	for name, tc := range map[string]struct {
+		before, after domain.IncidentView
+		beforeErr     error
+		state         *domain.IncidentState
+	}{
+		"same state and assignee re-sent": {incidentViewWith("IN_PROGRESS", &engineer), incidentViewWith("IN_PROGRESS", &engineer), nil, &inProgress},
+		"not leaving NEW":                 {incidentViewWith("IN_PROGRESS", &engineer), incidentViewWith("ON_HOLD", &engineer), nil, &onHold},
+		"before read failed":              {domain.IncidentView{}, incidentViewWith("IN_PROGRESS", &engineer), errors.New("db down"), &inProgress},
+	} {
+		t.Run(name, func(t *testing.T) {
+			publisher := &mockEventPublisher{}
+			svc := stopSignalFixture(t, publisher, tc.before, tc.after, tc.beforeErr)
+			ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+			if _, err := svc.UpdateIncident(ctx, domain.UpdateIncidentRequest{ID: testDeploymentUUID, State: tc.state, AssignedEngineerID: &engineer.ID}); err != nil {
+				t.Fatalf("UpdateIncident: %v", err)
+			}
+			for _, typ := range []events.Type{events.TypeIncidentAcknowledged, events.TypeIncidentAssigned} {
+				if _, ok := findPublishCall(publisher.calls, typ); ok {
+					t.Errorf("%s published for a no-op update", typ)
+				}
+			}
+		})
 	}
 }

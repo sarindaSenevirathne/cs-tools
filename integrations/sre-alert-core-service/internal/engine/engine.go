@@ -197,6 +197,7 @@ func (e *Engine) plan(fp string, current *model.Incident, recorded map[string]bo
 			})
 			newIdx = len(p.New) - 1
 			target = &p.New[newIdx].Incident
+			target.TakeRouting(it.Alert) // the group every CSM create attempt for this incident sends
 		}
 	}
 	return p

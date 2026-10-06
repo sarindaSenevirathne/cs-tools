@@ -42,7 +42,8 @@ func NewIncidentRepo(pool *pgxpool.Pool, locker *pglock.Locker) *IncidentRepo {
 
 const incidentColumns = `id, fingerprint, incident_id, incident_number, status, severity, impact, urgency, service,
 	metric_name, category, environment, source, alert_count, first_seen, last_seen, state_checked_at, fallback,
-	csm_confirmed, csm_attempts, csm_permanently_failed, csm_last_attempt_at, fold_version, created_at`
+	csm_confirmed, csm_attempts, csm_permanently_failed, csm_last_attempt_at, fold_version, created_at,
+	assignment_group, source_topic, source_account`
 
 // FoldPlan is what folding a fingerprint's alerts writes: notes and counters on the current incident, and any new incidents.
 type FoldPlan struct {
@@ -80,8 +81,9 @@ const (
 	ON CONFLICT (alert_id) DO NOTHING`
 	insertIncidentQuery = `WITH inc AS (
 	INSERT INTO incidents_processed (fingerprint, incident_number, status, severity, impact, urgency, service, metric_name,
-		category, environment, source, alert_count, first_seen, last_seen, delivery_due_at)
-	VALUES ($1, $2, 'new', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
+		category, environment, source, alert_count, first_seen, last_seen, delivery_due_at,
+		assignment_group, source_topic, source_account)
+	VALUES ($1, $2, 'new', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), $18, $19, $20)
 	RETURNING id)
 	INSERT INTO incident_notes (incident, alert_id, kind, note, chat_pending)
 	SELECT inc.id, n.* FROM inc, unnest($14::text[], $15::text[], $16::text[], $17::bool[]) AS n
@@ -127,7 +129,9 @@ func (r *IncidentRepo) Fold(ctx context.Context, fp string, alertIDs []string, d
 		inc := n.Incident
 		args := []any{inc.Fingerprint, inc.IncidentNumber, inc.Severity, inc.Impact, inc.Urgency, inc.Service,
 			inc.MetricName, inc.Category, inc.Environment, inc.Source, inc.AlertCount, inc.FirstSeen, inc.LastSeen}
-		writes.Queue(insertIncidentQuery, append(args, noteArrays(n.Notes)...)...)
+		args = append(args, noteArrays(n.Notes)...)
+		args = append(args, inc.AssignmentGroup, inc.SourceTopic, inc.SourceAccount)
+		writes.Queue(insertIncidentQuery, args...)
 	}
 	writes.Queue(`COMMIT`)
 	br = conn.SendBatch(ctx, writes)

@@ -21,9 +21,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
@@ -44,6 +46,7 @@ type entityChangeRequestClient interface {
 	GetChangeRequest(ctx context.Context, id string) ([]byte, error)
 	PatchChangeRequest(ctx context.Context, id string, body []byte) ([]byte, error)
 	GetChangeRequestApprovals(ctx context.Context, id string) ([]byte, error)
+	GetChangeRequestLinkOptions(ctx context.Context, body []byte) ([]byte, error)
 	CreateComment(ctx context.Context, body []byte) ([]byte, error)
 	SearchComments(ctx context.Context, body []byte) ([]byte, error)
 	DecideChangeRequestApproval(ctx context.Context, id string, body []byte) ([]byte, error)
@@ -112,10 +115,19 @@ func (h *ChangeRequestHandler) CreateChangeRequest(w http.ResponseWriter, r *htt
 		return
 	}
 
+	if msg := validateChangeRequestScopeFields(body, false); msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+
 	result, err := h.entity.CreateChangeRequest(r.Context(), body)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "entity CreateChangeRequest failed", "userID", user.UserID, "err", err)
-		mapUpstreamErrorGeneric(w, err, "Failed to create change request.")
+		// mapUpstreamError, not the Generic variant: a 400 here is the entity
+		// service explaining why the project / deployments
+		// combination was refused ("deployment ... does not belong to the
+		// selected project"), which the form has to show.
+		mapUpstreamError(w, err, "Failed to create change request.")
 		return
 	}
 
@@ -181,16 +193,160 @@ func validateChangeRequestCustomerGateFlags(body []byte) string {
 	return ""
 }
 
-// mapApprovalDecisionError is mapUpstreamErrorGeneric, except a 403 that
-// carries the entity service's own reason is shown to the caller. A refusal to
-// decide ("the creator of a change request cannot approve it", "members of an
-// SRE team cannot give peer approval") is only useful if the approver can read
-// why; every other failure keeps the generic mapping.
+// maxChangeRequestScopeIDs caps each of deploymentIds / deploymentProductIds
+// (the entity service enforces the same limit).
+const maxChangeRequestScopeIDs = 100
+
+// changeRequestScopeIDArrays are the create/PATCH fields that carry a list of
+// UUIDs: the project's deployments the change touches, and the (read-only)
+// deployment products that follow from them.
+var changeRequestScopeIDArrays = []string{"deploymentIds", "deploymentProductIds"}
+
+// The two fields the change request API no longer accepts, with the entity
+// service's own messages (it refuses them too; the BFF refuses first so the
+// form shows the same text and no upstream call is made). The Customer Group is
+// derived, read-only, from the Customer Project's registered contacts
+// (`customerContacts` on the detail and on the link-options lookup); a
+// deployment carries its environment.
+const (
+	errMsgCustomerGroupIDRemoved = "customerGroupId is no longer accepted: the customer group is derived from the customer project's registered contacts"
+	errMsgEnvironmentIDsRemoved  = "environmentIds is no longer supported: deployments carry the environment"
+)
+
+// validateChangeRequestScopeFields returns a user-facing message when body
+// carries a customer-scope / journal field of the wrong shape, or "" when the
+// body is fine. It checks shape only -- projectId a UUID string; deploymentIds
+// and deploymentProductIds arrays of UUID strings (null is not an array);
+// category, comment and workNote strings; on a PATCH comment / workNote not
+// blank -- so a stray string or null is refused with a message the form can
+// show instead of a generic upstream decode failure. The relationships between
+// them (deployments of the project, products of the deployments, ...) are the
+// entity service's to judge and are surfaced as its 400 message. The exception
+// is customerGroupId / environmentIds, which are no longer accepted at all and
+// are refused here (any value, null included) with the same messages. A body
+// that is not a JSON object is left for the upstream to reject.
+func validateChangeRequestScopeFields(body []byte, patch bool) string {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	isUUIDString := func(raw json.RawMessage) bool {
+		var v string
+		return json.Unmarshal(raw, &v) == nil && uuidRe.MatchString(v)
+	}
+	isNull := func(raw json.RawMessage) bool { return string(bytes.TrimSpace(raw)) == "null" }
+
+	if raw, ok := payload["projectId"]; ok && !isUUIDString(raw) {
+		return "projectId must be a UUID string"
+	}
+	if _, ok := payload["customerGroupId"]; ok {
+		return errMsgCustomerGroupIDRemoved
+	}
+	if _, ok := payload["environmentIds"]; ok {
+		return errMsgEnvironmentIDsRemoved
+	}
+	for _, field := range changeRequestScopeIDArrays {
+		raw, ok := payload[field]
+		if !ok {
+			continue
+		}
+		var items []json.RawMessage
+		if err := json.Unmarshal(raw, &items); err != nil || items == nil {
+			return field + " must be an array of UUID strings"
+		}
+		if len(items) > maxChangeRequestScopeIDs {
+			return fmt.Sprintf("%s must contain at most %d entries", field, maxChangeRequestScopeIDs)
+		}
+		for _, item := range items {
+			if !isUUIDString(item) {
+				return field + " must be an array of UUID strings"
+			}
+		}
+	}
+	if raw, ok := payload["category"]; ok && !(patch && isNull(raw)) {
+		var v string
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return "category must be a string"
+		}
+	}
+	for _, field := range []string{"comment", "workNote"} {
+		raw, ok := payload[field]
+		if !ok {
+			continue
+		}
+		var v string
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return field + " must be a string"
+		}
+		if patch && strings.TrimSpace(v) == "" {
+			return field + " must not be empty"
+		}
+	}
+	return ""
+}
+
+// GetChangeRequestLinkOptions handles POST /change-requests/link-options: the
+// lookup behind the change request form's Customer Project -> Deployments ->
+// Deployment products cascade (and the read-only Customer Group). projectId is required;
+// deploymentIds (the deployments chosen so far) is optional. Whether the
+// deployments belong to the project is the entity service's to judge and
+// comes back as its 400 message.
+func (h *ChangeRequestHandler) GetChangeRequestLinkOptions(w http.ResponseWriter, r *http.Request) {
+	user := middleware.UserInfoFromContext(r.Context())
+	if user == nil {
+		writeError(w, http.StatusUnauthorized, ErrMsgUnauthorized)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, ErrMsgTooLarge)
+			return
+		}
+		writeError(w, http.StatusBadRequest, errMsgReadBody)
+		return
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil || payload == nil {
+		writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
+		return
+	}
+	if _, ok := payload["projectId"]; !ok {
+		writeError(w, http.StatusBadRequest, "projectId is required")
+		return
+	}
+	if msg := validateChangeRequestScopeFields(body, false); msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+
+	result, err := h.entity.GetChangeRequestLinkOptions(r.Context(), body)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "entity GetChangeRequestLinkOptions failed", "userID", user.UserID, "err", err)
+		mapUpstreamError(w, err, "Failed to load change request options.")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+// mapApprovalDecisionError is mapUpstreamErrorGeneric, except a 403 or a 409
+// that carries the entity service's own reason is shown to the caller. A
+// refusal to decide ("the creator of a change request cannot approve it",
+// "only active internal (WSO2) users can approve or reject the Peer Approval
+// stage ...", or -- a 409 -- "this approval is no longer pending: the change
+// request is in Closed, but the Review stage can only be decided while it is in
+// Review") is only useful if the approver can read why; every other failure
+// keeps the generic mapping.
 func mapApprovalDecisionError(w http.ResponseWriter, err error, fallbackMsg string) {
 	var apiErr *apierror.Error
-	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusForbidden {
+	if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusForbidden || apiErr.StatusCode == http.StatusConflict) {
 		if msg := upstreamErrorMessageStrict(apiErr.Body, ""); msg != "" {
-			writeError(w, http.StatusForbidden, msg)
+			writeError(w, apiErr.StatusCode, msg)
 			return
 		}
 	}
@@ -229,6 +385,11 @@ func (h *ChangeRequestHandler) PatchChangeRequest(w http.ResponseWriter, r *http
 	}
 
 	if msg := validateChangeRequestCustomerGateFlags(body); msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+
+	if msg := validateChangeRequestScopeFields(body, true); msg != "" {
 		writeError(w, http.StatusBadRequest, msg)
 		return
 	}

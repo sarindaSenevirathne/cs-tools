@@ -28,6 +28,8 @@ export interface IncidentTaskRow {
   id: string;
   number?: string;
   subject: string;
+  /** Raw state value (an incident_task_state_enum label on Postgres). */
+  state?: string;
   stateLabel?: string;
   assignmentGroupName?: string;
   assignedToName?: string;
@@ -68,6 +70,7 @@ export function useSearchIncidentTasks(
             id: t.id,
             number: t.number ?? undefined,
             subject: t.subject ?? "(no subject)",
+            state: t.state ?? undefined,
             stateLabel: t.stateLabel ?? t.state ?? undefined,
             assignmentGroupName: t.assignmentGroup?.name ?? undefined,
             assignedToName: t.assignedTo?.name ?? undefined,

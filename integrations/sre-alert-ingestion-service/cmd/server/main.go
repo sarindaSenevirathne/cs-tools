@@ -27,20 +27,21 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
+	"github.com/cenkalti/backoff/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"sre-alert-ingestion-service/internal/allocator"
 	"sre-alert-ingestion-service/internal/config"
 	"sre-alert-ingestion-service/internal/outbound/corewake"
 	"sre-alert-ingestion-service/internal/outbound/snsconfirm"
+	"sre-alert-ingestion-service/internal/payloads"
 	"sre-alert-ingestion-service/internal/postgres"
 	"sre-alert-ingestion-service/internal/sources"
 	"sre-alert-ingestion-service/internal/transport/auth"
 	"sre-alert-ingestion-service/internal/transport/server"
 )
 
-// authCacheTTL is how long a verified credential is reused, capped at the row's expires_at.
+// authCacheTTL is how long a verified credential skips PBKDF2.
 const authCacheTTL = 60 * time.Second
 
 // snsConfirmTimeout bounds the SubscribeURL fetch.
@@ -71,6 +72,12 @@ func main() {
 		logger.Error("failed to read postgres config", "error", err)
 		os.Exit(1)
 	}
+	pgCfg, err = postgres.SizePool(pgCfg, cfg.Allocator.WriteConcurrency, cfg.Postgres.MinConns)
+	if err != nil {
+		logger.Error("invalid postgres pool size", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("postgres pool sized", "max_conns", pgCfg.PoolMaxConns, "min_conns", pgCfg.PoolMinConns)
 	// The driver's own timeout must not cut the longer claim_timeout short.
 	pool, err := connectWithRetry(logger, pgCfg, cfg.Postgres,
 		max(cfg.Store.QueryTimeout.Duration(), cfg.Store.ClaimTimeout.Duration()))
@@ -85,14 +92,28 @@ func main() {
 	}
 	// After the pool: AUTH_ENABLED checks webhooks against alerts-core's integration_users.
 	var authn auth.Authenticator = auth.None{}
+	if envCfg.AuthEnabled {
+		users := auth.NewIntegrationUsers(pool, base.With("component", "auth"), auth.UsersConfig{
+			QueryTimeout:    cfg.Postgres.AuthTimeout.Duration(),
+			RefreshInterval: cfg.Postgres.AuthRefreshInterval.Duration(),
+			MaxStale:        cfg.Postgres.AuthMaxStale.Duration(),
+			CacheTTL:        authCacheTTL,
+		})
+		// A failed first load isn't fatal: requests answer 503 until Run's next refresh succeeds.
+		if err := users.Refresh(context.Background()); err != nil {
+			logger.Error("integration_users not loaded; webhooks get 503 until a refresh succeeds", "error", err)
+		}
+		usersCtx, stopUsers := context.WithCancel(context.Background())
+		defer stopUsers()
+		go users.Run(usersCtx)
+		authn = users
+	}
 	switch {
 	case envCfg.AuthEnabled && envCfg.AuthAuditOnly:
-		authn = auth.NewAudit(auth.NewIntegrationUsers(pool, cfg.Store.QueryTimeout.Duration(), authCacheTTL),
-			base.With("component", "auth"))
+		authn = auth.NewAudit(authn, base.With("component", "auth"))
 		logger.Warn("AUTH_AUDIT_ONLY is set: credentials are checked but nothing is rejected")
 	case envCfg.AuthEnabled:
-		authn = auth.NewIntegrationUsers(pool, cfg.Store.QueryTimeout.Duration(), authCacheTTL)
-		logger.Info("auth enabled: source webhooks are checked against integration_users")
+		logger.Info("auth enabled: source webhooks are checked against an in-memory copy of integration_users")
 	default:
 		logger.Warn("AUTH_ENABLED is not true: source routes are unauthenticated")
 		if envCfg.AuthAuditOnly {
@@ -102,7 +123,14 @@ func main() {
 
 	store := postgres.NewStore(pool, cfg.Store.QueryTimeout.Duration(), cfg.Store.ClaimTimeout.Duration())
 
-	waker := corewake.New(base.With("component", "corewake"), envCfg.WakeURL, envCfg.WakeUsername, envCfg.WakeSecret, cfg.Wake.Timeout.Duration())
+	waker := corewake.New(base.With("component", "corewake"), envCfg.WakeURL, envCfg.WakeToken, cfg.Wake.Timeout.Duration())
+
+	rawPayloads := payloads.New(base.With("component", "payloads"), store, payloads.Config{
+		FlushInterval: cfg.Payloads.FlushInterval.Duration(),
+		MaxBytes:      cfg.Payloads.MaxBufferBytes,
+		FlushTimeout:  cfg.Payloads.FlushTimeout.Duration(),
+	})
+	go rawPayloads.Run()
 
 	sns := snsconfirm.New(base.With("component", "snsconfirm"), snsConfirmTimeout)
 
@@ -118,16 +146,18 @@ func main() {
 	})
 
 	srv := server.New(server.Options{
-		Logger:       base.With("component", "server"),
-		Auth:         authn,
-		Pipeline:     server.NewIngestor(registry, alloc, cfg.Server.RequestWait.Duration()).WithSNSConfirmer(sns),
-		Rejects:      nil,
-		Sources:      registry.Names(),
-		MaxBodyBytes: cfg.Server.MaxBodyBytes,
-		PreviewChars: cfg.Reject.BodyPreviewChars,
-		ReadTimeout:  cfg.Server.ReadTimeout.Duration(),
-		WriteTimeout: cfg.Server.WriteTimeout.Duration(),
-		IdleTimeout:  cfg.Server.IdleTimeout.Duration(),
+		Logger:          base.With("component", "server"),
+		Auth:            authn,
+		Pipeline:        server.NewIngestor(registry, alloc, cfg.Server.RequestWait.Duration()).WithSNSConfirmer(sns),
+		Rejects:         nil,
+		Sources:         registry.Names(),
+		MaxBodyBytes:    cfg.Server.MaxBodyBytes,
+		PreviewChars:    cfg.Reject.BodyPreviewChars,
+		PayloadLogBytes: cfg.Log.PayloadMaxBytes,
+		Payloads:        rawPayloads,
+		ReadTimeout:     cfg.Server.ReadTimeout.Duration(),
+		WriteTimeout:    cfg.Server.WriteTimeout.Duration(),
+		IdleTimeout:     cfg.Server.IdleTimeout.Duration(),
 	})
 	httpSrv := srv.HTTPServer(":" + envCfg.Port)
 
@@ -152,32 +182,27 @@ func main() {
 		stop()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownGrace.Duration())
 		defer cancel()
-		shutdown(shutdownCtx, logger, srv, httpSrv, alloc, budget{
+		shutdown(shutdownCtx, logger, srv, httpSrv, alloc, rawPayloads, budget{
 			DrainDelay:     cfg.Server.DrainDelay.Duration(),
 			RequestWait:    cfg.Server.RequestWait.Duration(),
 			AllocatorDrain: cfg.Server.AllocatorDrain.Duration(),
+			PayloadDrain:   cfg.Server.PayloadDrain.Duration(),
 		}, waker.Wait)
 	}
 }
 
 // connectWithRetry backs off exponentially so a transient startup outage doesn't crash-loop the pod.
 func connectWithRetry(logger *slog.Logger, cfg postgres.Config, pcfg config.PostgresConfig, queryTimeout time.Duration) (*pgxpool.Pool, error) {
-	var pool *pgxpool.Pool
 	attempt := 0
-	operation := func() error {
+	operation := func() (*pgxpool.Pool, error) {
 		attempt++
 		p, err := postgres.Connect(cfg, pcfg.ConnectTimeout.Duration(), queryTimeout)
 		if err != nil {
 			logger.Warn("postgres connection failed, retrying", "attempt", attempt, "max_attempts", pcfg.ConnectMaxAttempts, "error", err)
-			return err
 		}
-		pool = p
-		return nil
+		return p, err
 	}
 	eb := backoff.NewExponentialBackOff()
 	eb.InitialInterval = pcfg.ConnectBaseDelay.Duration()
-	if err := backoff.Retry(operation, backoff.WithMaxRetries(eb, uint64(pcfg.ConnectMaxAttempts-1))); err != nil {
-		return nil, err
-	}
-	return pool, nil
+	return backoff.Retry(context.Background(), operation, backoff.WithBackOff(eb), backoff.WithMaxTries(uint(pcfg.ConnectMaxAttempts)))
 }

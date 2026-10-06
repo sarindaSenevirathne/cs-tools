@@ -66,17 +66,27 @@ func TestLoad_PartialFileOverridesFieldByField(t *testing.T) {
 
 func TestLoad_RejectsInvalidValues(t *testing.T) {
 	cases := map[string]string{
-		"zero batch":        "[allocator]\nmax_batch = 0\n",
-		"negative timeout":  "[store]\nquery_timeout = \"-1s\"\n",
-		"bad duration":      "[wake]\ntimeout = \"soon\"\n",
-		"zero idle":         "[server]\nidle_timeout = \"0s\"\n",
-		"zero drain delay":  "[server]\ndrain_delay = \"0s\"\n",
-		"budget over grace": "[server]\nshutdown_grace = \"10s\"\n",
-		"steps over grace":  "[server]\nrequest_wait = \"20s\"\n",
-		"wait near write":   "[server]\nwrite_timeout = \"10500ms\"\n",
-		"deadline at gap":   "[store]\nwrite_deadline = \"10m\"\n",
-		"zero deadline":     "[store]\nwrite_deadline = \"0s\"\n",
-		"queue bytes small": "[allocator]\nqueue_max_bytes = 1048576\n",
+		"zero batch":           "[allocator]\nmax_batch = 0\n",
+		"negative timeout":     "[store]\nquery_timeout = \"-1s\"\n",
+		"bad duration":         "[wake]\ntimeout = \"soon\"\n",
+		"zero idle":            "[server]\nidle_timeout = \"0s\"\n",
+		"zero payload drain":   "[server]\npayload_drain = \"0s\"\n",
+		"payload over grace":   "[server]\npayload_drain = \"6s\"\n",
+		"zero drain delay":     "[server]\ndrain_delay = \"0s\"\n",
+		"budget over grace":    "[server]\nshutdown_grace = \"10s\"\n",
+		"steps over grace":     "[server]\nrequest_wait = \"20s\"\n",
+		"wait near write":      "[server]\nwrite_timeout = \"10500ms\"\n",
+		"deadline at gap":      "[store]\nwrite_deadline = \"10m\"\n",
+		"zero deadline":        "[store]\nwrite_deadline = \"0s\"\n",
+		"queue bytes small":    "[allocator]\nqueue_max_bytes = 1048576\n",
+		"negative min conns":   "[postgres]\nmin_conns = -1\n",
+		"zero auth timeout":    "[postgres]\nauth_timeout = \"0s\"\n",
+		"negative payload log": "[log]\npayload_max_bytes = -1\n",
+		"zero flush interval":  "[payloads]\nflush_interval = \"0s\"\n",
+		"zero flush timeout":   "[payloads]\nflush_timeout = \"0s\"\n",
+		"payload buffer small": "[payloads]\nmax_buffer_bytes = 1048576\n",
+		"zero auth refresh":    "[postgres]\nauth_refresh_interval = \"0s\"\n",
+		"stale under refresh":  "[postgres]\nauth_max_stale = \"30s\"\n",
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {

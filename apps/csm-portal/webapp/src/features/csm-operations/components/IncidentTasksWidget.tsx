@@ -29,6 +29,9 @@ import {
 } from "@wso2/oxygen-ui";
 import { ListChecks } from "@wso2/oxygen-ui-icons-react";
 import type { JSX } from "react";
+import { Link as RouterLink } from "react-router";
+import { useNavTransition } from "@hooks/useNavTransition";
+import { incidentRelatedTabPath } from "@features/csm-operations/utils/incidents";
 import { useSearchIncidentTasks } from "@features/csm-operations/api/useSearchIncidentTasks";
 import RefreshButton from "@components/RefreshButton";
 
@@ -40,13 +43,15 @@ interface IncidentTasksWidgetProps {
 }
 
 /**
- * The incident's tasks, on its Related tab. Incident tasks have no detail
- * page in the portal, so rows are read-only. Same card/table pattern as the
- * case page's `LinkedIncidentsListWidget`.
+ * The incident's tasks, on its Related tab. Each row opens the task's detail
+ * page, with Back returning to this tab. Same card/table pattern as the case
+ * page's `LinkedIncidentsListWidget`.
  */
 export function IncidentTasksWidget({ incidentId }: IncidentTasksWidgetProps): JSX.Element {
   const { data, isLoading, isError, refetch, isFetching, dataUpdatedAt } =
     useSearchIncidentTasks(incidentId);
+  const navigate = useNavTransition();
+  const backPath = incidentRelatedTabPath(incidentId);
 
   const tasks = data?.tasks ?? [];
   const total = data?.total ?? tasks.length;
@@ -106,10 +111,26 @@ export function IncidentTasksWidget({ incidentId }: IncidentTasksWidgetProps): J
               ) : (
                 tasks.map((t) => {
                   const label = `${t.number ?? t.id} — ${t.subject}`;
+                  const taskPath = `/operations/incident-tasks/${encodeURIComponent(t.id)}`;
                   return (
-                    <TableRow key={t.id}>
+                    <TableRow
+                      key={t.id}
+                      hover
+                      onClick={() => navigate(taskPath, { state: { from: backPath } })}
+                      sx={{ cursor: "pointer" }}
+                    >
                       <TableCell sx={{ maxWidth: 0, width: "45%" }}>
-                        <Typography variant="body2" noWrap title={label}>
+                        {/* A real link, not a `role="button"` override on the
+                            row — see `ChildCasesWidget`'s equivalent note. */}
+                        <Typography
+                          component={RouterLink}
+                          to={taskPath}
+                          state={{ from: backPath }}
+                          variant="body2"
+                          noWrap
+                          title={label}
+                          sx={{ color: "inherit", textDecoration: "none", display: "block" }}
+                        >
                           {label}
                         </Typography>
                       </TableCell>

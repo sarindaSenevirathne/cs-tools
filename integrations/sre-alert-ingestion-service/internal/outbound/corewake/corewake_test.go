@@ -18,7 +18,6 @@ package corewake
 
 import (
 	"context"
-	"encoding/base64"
 	"io"
 	"log/slog"
 	"net/http"
@@ -41,7 +40,7 @@ func TestWake_PostsToAlertsCore(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(discard(), srv.URL+"/alertz", "", "", time.Second)
+	c := New(discard(), srv.URL+"/alertz", "", time.Second)
 	c.Wake()
 	c.Wait(context.Background())
 	if calls.Load() != 1 || method != http.MethodPost {
@@ -66,7 +65,7 @@ func TestWake_OneInFlightAndCoalescesTheRest(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(discard(), srv.URL, "", "", 5*time.Second)
+	c := New(discard(), srv.URL, "", 5*time.Second)
 	c.Wake()
 	<-entered // first call is in flight
 	for range 5 {
@@ -84,7 +83,7 @@ func TestWake_OneInFlightAndCoalescesTheRest(t *testing.T) {
 }
 
 func TestWake_EmptyURLIsNoOp(t *testing.T) {
-	c := New(discard(), "", "", "", time.Second)
+	c := New(discard(), "", "", time.Second)
 	c.Wake()
 	c.Wait(context.Background()) // must not hang
 }
@@ -94,17 +93,17 @@ func TestWake_ErrorsAreOnlyLogged(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer srv.Close()
-	c := New(discard(), srv.URL, "", "", time.Second)
+	c := New(discard(), srv.URL, "", time.Second)
 	c.Wake()
 	c.Wait(context.Background())
 
-	unreachable := New(discard(), "http://127.0.0.1:1", "", "", 200*time.Millisecond)
+	unreachable := New(discard(), "http://127.0.0.1:1", "", 200*time.Millisecond)
 	unreachable.Wake()
 	unreachable.Wait(context.Background())
 }
 
 // authHeader records the Authorization header of the one wake call made to srv.
-func authHeader(t *testing.T, tlsServer bool, username, secret string) (string, bool) {
+func authHeader(t *testing.T, tlsServer bool, token string) (string, bool) {
 	t.Helper()
 	var got string
 	var seen bool
@@ -119,30 +118,29 @@ func authHeader(t *testing.T, tlsServer bool, username, secret string) (string, 
 	}
 	defer srv.Close()
 
-	c := New(discard(), srv.URL, username, secret, time.Second)
+	c := New(discard(), srv.URL, token, time.Second)
 	c.http.Transport = srv.Client().Transport // trust the test cert, keep the redirect policy
 	c.Wake()
 	c.Wait(context.Background())
 	return got, seen
 }
 
-func TestWake_SendsCredentialOverHTTPS(t *testing.T) {
-	got, _ := authHeader(t, true, "alert-ingestion", "s3cr3t")
-	want := "Bearer " + base64.StdEncoding.EncodeToString([]byte("alert-ingestion:s3cr3t"))
-	if got != want {
+func TestWake_SendsTokenOverHTTPS(t *testing.T) {
+	got, _ := authHeader(t, true, "wake-token")
+	if want := "Bearer wake-token"; got != want {
 		t.Errorf("Authorization = %q, want %q", got, want)
 	}
 }
 
 // Over plain http the secret would cross the network in cleartext, so it is withheld.
 func TestWake_WithholdsCredentialOverHTTP(t *testing.T) {
-	if _, seen := authHeader(t, false, "alert-ingestion", "s3cr3t"); seen {
+	if _, seen := authHeader(t, false, "wake-token"); seen {
 		t.Error("credential sent over plain http")
 	}
 }
 
 func TestWake_NoCredentialSendsNoHeader(t *testing.T) {
-	if _, seen := authHeader(t, true, "", ""); seen {
+	if _, seen := authHeader(t, true, ""); seen {
 		t.Error("no credential configured, but an Authorization header was sent")
 	}
 }
@@ -163,7 +161,7 @@ func TestWake_DoesNotFollowRedirectsWithCredential(t *testing.T) {
 	}))
 	defer secure.Close()
 
-	c := New(slog.New(slog.NewTextHandler(&logs, nil)), secure.URL+"/alertz", "alert-ingestion", "s3cr3t", time.Second)
+	c := New(slog.New(slog.NewTextHandler(&logs, nil)), secure.URL+"/alertz", "wake-token", time.Second)
 	c.http.Transport = secure.Client().Transport
 	c.Wake()
 	c.Wait(context.Background())

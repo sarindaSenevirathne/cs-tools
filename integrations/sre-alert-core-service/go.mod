@@ -5,11 +5,10 @@ go 1.26.0
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/caarlos0/env/v11 v11.4.1
-	github.com/cenkalti/backoff/v4 v4.3.0
+	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/sony/gobreaker/v2 v2.4.0
 	go.uber.org/goleak v1.3.0
-	golang.org/x/crypto v0.57.0
 	golang.org/x/oauth2 v0.27.0
 	golang.org/x/sync v0.23.0
 )

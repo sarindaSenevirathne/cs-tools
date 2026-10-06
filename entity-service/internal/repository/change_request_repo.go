@@ -79,8 +79,8 @@ import (
 // results by it (the parsed filter array's assignmentGroupId) is also still
 // unwired -- see changeRequestWhereClause's own comment.
 //
-// OnHold/OnHoldReason/OnHoldSince are backed by change_request.is_on_hold/
-// on_hold_reason/on_hold_started_on (migration 0178) -- a concept this
+// OnHold/OnHoldReason are backed by change_request.is_on_hold/
+// on_hold_reason (migration 0178) -- a concept this
 // schema had no representation of at all before, despite a live
 // investigation of the real ServiceNow "Change Request - Normal" workflow
 // finding "on hold" threaded through nearly every stage transition. See
@@ -95,8 +95,10 @@ import (
 // ConfigurationItemID (no CMDB table exists at all in this schema);
 // ApprovedBy/ApprovedOn on domain.ChangeRequest (there is a
 // summary change_request.approval enum but no approver/date columns);
-// Environments/DeploymentProducts/Labels/Deployments (no M2M join table
-// exists for any of the four).
+// Labels (no join table). Deployments / Environments / DeploymentProducts ARE
+// backed (migration 0191's change_request_deployment / _environment /
+// _deployed_product, rules in change_request_links.go), as is Project
+// (work_item.project_id), now written at create time too.
 //
 // LegalNextStates is populated -- see legalChangeRequestNextStates's own
 // doc comment for how, and for the one branch it deliberately does not
@@ -204,19 +206,23 @@ type ChangeRequestRepository interface {
 	// case, where the response DOES return a confirmed, identity-matching
 	// state.
 	//
-	// Only fields with an unambiguous, already-established column/enum
-	// mapping are written. Deliberately NOT applied, for the same
-	// no-backing-column/no-confirmed-mapping reasons this file's own
-	// package doc comment and changeRequestWhereClause's already give:
-	// req.ConfigurationItemID (no CMDB table), req.Category (four
-	// of ChangeRequestCategory's thirteen values -- RegularReleaseCloud/
-	// HotfixReleaseCloud/DevOps/CloudComputing -- have no
-	// change_request_category_enum label, and PatchChangeRequest itself
-	// does not attempt this mapping either), req.EnvironmentIDs/
-	// req.DeploymentProductIDs (no M2M join tables exist for either), and
-	// req.Comment/req.WorkNote (ServiceNow journal entries, no backing
-	// column).
+	// Written beyond the core columns: the Customer Project (work_item.project_id),
+	// deployments / environments / deployment products (the join tables, validated
+	// and derived per change_request_links.go), category (all 13 values have an
+	// enum label since migration 0191) and the Comment / WorkNote journal entries
+	// (comment rows). Everything runs in one transaction. Deliberately NOT
+	// applied: req.ConfigurationItemID (no CMDB table).
 	CreateChangeRequestFromServiceNow(ctx context.Context, req domain.CreateChangeRequestRequest, id, number, createdBy string) (domain.CreateChangeRequestResponse, error)
+	// ValidateChangeRequestLinks validates a customer-scope selection (project,
+	// deployments, environments, deployment products) and returns it with
+	// everything derived, without writing anything -- the pre-flight the
+	// ServiceNow-first create runs before it calls ServiceNow. A
+	// ValidationError names the offending field. See change_request_links.go.
+	ValidateChangeRequestLinks(ctx context.Context, sel domain.ChangeRequestLinkSelection) (domain.ChangeRequestLinkSet, error)
+	// GetChangeRequestLinkOptions backs POST /change-requests/link-options: the
+	// project's active deployments and, for the deployments chosen so far, the
+	// environments and deployment products that follow from them.
+	GetChangeRequestLinkOptions(ctx context.Context, req domain.ChangeRequestLinkOptionsRequest) (domain.ChangeRequestLinkOptionsResponse, error)
 	// GetChangeRequestApprovals returns every approval stage for the change
 	// request identified by id (approval_stage rows with work_item_id = id,
 	// ordered by created_on ascending) together with each stage's approvers
@@ -304,7 +310,7 @@ const changeRequestSelectColumns = `
 	cr.start_on, cr.end_on, cr.impact::TEXT, cr.state::TEXT, cr.change_model::TEXT,
 	wi.created_on, wi.updated_on,
 	ag.id, ag.name,
-	cr.is_on_hold, cr.on_hold_reason, cr.on_hold_started_on`
+	cr.is_on_hold, cr.on_hold_reason`
 
 // changeRequestChangeModelToType/changeRequestTypeToChangeModel map between
 // change_request.change_model's real enum labels (migration 0056) and
@@ -389,6 +395,14 @@ func ChangeRequestTypeSupported(t domain.ChangeRequestType) bool {
 //   - Review offers Closed -- or, when customer_review_required is set,
 //     Customer Review instead (legalChangeRequestNextStates applies that
 //     branch; the map holds the default). Customer Review then offers Closed.
+//   - Customer Approval additionally offers Authorize, which means Re-schedule:
+//     the planned time changed, so the change goes back through internal
+//     approval (patchChangeRequestTx documents the contract). It is the one
+//     state from which a manual {state: "authorize"} is accepted.
+//   - Rollback is the failed-review off-ramp and is offered from exactly two
+//     states, Review (the internal review failed) and Customer Review (the
+//     customer's review failed): changeRequestRollbackFrom. It is not a
+//     forward move, so it is not in this map.
 var changeRequestForwardNextStates = map[domain.ChangeRequestState][]domain.ChangeRequestState{
 	// New's one human action is Request Approval, always sent as
 	// {state: "assess"}; where it actually lands depends on the change's type
@@ -406,9 +420,11 @@ var changeRequestForwardNextStates = map[domain.ChangeRequestState][]domain.Chan
 	// that does not.
 	domain.ChangeRequestStateAuthorize: {},
 	// Customer Approval is the customer-approval step: "scheduled" records the
-	// customer's approval (stamping is_customer_approved) and schedules the
+	// customer's approval (stamping is_customer_approval_required) and schedules the
 	// change; Cancel is the customer declining.
-	domain.ChangeRequestStateCustomerApproval: {domain.ChangeRequestStateScheduled},
+	// "authorize" here is Re-schedule (the process diagram's Time Change loop),
+	// not the approval path: see rescheduleChangeRequest.
+	domain.ChangeRequestStateCustomerApproval: {domain.ChangeRequestStateScheduled, domain.ChangeRequestStateAuthorize},
 	domain.ChangeRequestStateScheduled:        {domain.ChangeRequestStateImplement},
 	domain.ChangeRequestStateImplement:        {domain.ChangeRequestStateReview},
 	// Review's default (customer review not required) is Closed directly.
@@ -427,6 +443,11 @@ var changeRequestForwardNextStates = map[domain.ChangeRequestState][]domain.Chan
 // Customer Review INSTEAD of Closed (and Customer Review then offers Closed);
 // one that does not offers Closed directly.
 //
+// "rollback" is offered, right after the forward move and before "canceled",
+// from exactly two states -- Review and Customer Review (the review failed;
+// changeRequestRollbackFrom). It is the failed-review branch of the process
+// diagram, so it is offered whether or not customer review is required.
+//
 // "canceled" is offered alongside the forward move(s) from every
 // non-terminal state: the Cancel Change action was available on every
 // reachable state checked live, with no exception found. Rollback/Closed/
@@ -444,11 +465,23 @@ func legalChangeRequestNextStates(state *string, customerReviewRequired bool) []
 	if st == domain.ChangeRequestStateReview && customerReviewRequired {
 		nexts = []domain.ChangeRequestState{domain.ChangeRequestStateCustomerReview}
 	}
-	result := make([]string, 0, len(nexts)+1)
+	result := make([]string, 0, len(nexts)+2)
 	for _, next := range nexts {
 		result = append(result, string(next))
 	}
+	if changeRequestRollbackFrom[st] {
+		result = append(result, string(domain.ChangeRequestStateRollback))
+	}
 	return append(result, string(domain.ChangeRequestStateCanceled))
+}
+
+// changeRequestRollbackFrom is the set of states a change can be rolled back
+// from by hand: the two review states. A rejected Customer Review also lands
+// in Rollback, through the customer group's approval (customerReviewStageSpec),
+// which is a different path and not governed by this set.
+var changeRequestRollbackFrom = map[domain.ChangeRequestState]bool{
+	domain.ChangeRequestStateReview:         true,
+	domain.ChangeRequestStateCustomerReview: true,
 }
 
 // scanChangeRequestView scans changeRequestSelectColumns into a
@@ -472,7 +505,6 @@ func scanChangeRequestView(row interface{ Scan(...any) error }) (domain.SearchCh
 		createdOn, updatedOn   time.Time
 		isOnHold               *bool
 		onHoldReason           *string
-		onHoldStartedOn        *time.Time
 	)
 	err := row.Scan(
 		&v.ID, &v.Number, &v.Subject, &v.Description,
@@ -487,7 +519,7 @@ func scanChangeRequestView(row interface{ Scan(...any) error }) (domain.SearchCh
 		&startOn, &endOn, &impact, &state, &changeModel,
 		&createdOn, &updatedOn,
 		&agID, &agName,
-		&isOnHold, &onHoldReason, &onHoldStartedOn,
+		&isOnHold, &onHoldReason,
 	)
 	if err != nil {
 		return domain.SearchChangeRequestView{}, err
@@ -543,10 +575,6 @@ func scanChangeRequestView(row interface{ Scan(...any) error }) (domain.SearchCh
 	}
 	v.OnHold = isOnHold
 	v.OnHoldReason = onHoldReason
-	if onHoldStartedOn != nil {
-		s := onHoldStartedOn.UTC().Format(time.RFC3339)
-		v.OnHoldSince = &s
-	}
 	v.CreatedOn = createdOn.UTC().Format(time.RFC3339)
 	v.UpdatedOn = updatedOn.UTC().Format(time.RFC3339)
 	return v, nil
@@ -770,11 +798,10 @@ func (r *changeRequestRepo) AggregateChangeRequests(ctx context.Context, req dom
 const changeRequestDetailColumns = `
 	wi.created_by, cr.justification, cr.impact_description, cr.service_outage_downtime,
 	cr.communication_plan, cr.rollback_process, cr.test_plan,
-	cr.is_customer_approved, cr.is_customer_reviewed,
+	cr.is_customer_approval_required, cr.is_customer_review_required,
 	cr.implementation_plan, cr.priority::TEXT, cr.category::TEXT,
 	rb.id, COALESCE(rb.name, NULLIF(TRIM(CONCAT_WS(' ', rb.first_name, rb.last_name)), '')),
 	cr.affected_services, cr.affected_component, cr.rollback_duration,
-	cg.id, cg.name,
 	cr.change_request_type::TEXT, cr.likelihood::TEXT, cr.is_planning_visible_to_customers,
 	cr.customer_updated_date_confirmation::TEXT, cr.customer_updated_on,
 	cr.work_start_on, cr.work_end_on, cr.git_reference,
@@ -782,13 +809,12 @@ const changeRequestDetailColumns = `
 
 // changeRequestDetailJoins adds the two FK joins changeRequestDetailColumns
 // needs beyond changeRequestFromJoins -- kept separate from (not folded
-// into) changeRequestFromJoins since RequestedBy/CustomerGroup are detail
+// into) changeRequestFromJoins since RequestedBy is a detail
 // -only fields (domain.ChangeRequest, not SearchChangeRequestView): folding
 // these into the shared joins would cost every SearchChangeRequests/
 // AggregateChangeRequests row two extra joins neither ever selects from.
 const changeRequestDetailJoins = `
-	LEFT JOIN "user" rb ON rb.id = cr.requested_by_user_id
-	LEFT JOIN "group" cg ON cg.id = cr.customer_group_id`
+	LEFT JOIN "user" rb ON rb.id = cr.requested_by_user_id`
 
 // GetChangeRequestByID implements ChangeRequestRepository.
 func (r *changeRequestRepo) GetChangeRequestByID(ctx context.Context, id string) (domain.ChangeRequest, error) {
@@ -804,9 +830,28 @@ func (r *changeRequestRepo) GetChangeRequestByID(ctx context.Context, id string)
 	if err != nil {
 		return domain.ChangeRequest{}, fmt.Errorf("get change request by id: %w", err)
 	}
-	// ApprovedBy/ApprovedOn/LegalNextStates/Environments/DeploymentProducts/
-	// Labels/Deployments have no real column -- see this file's own package
-	// doc comment.
+	// Deployments / DeploymentProducts come from the join tables (never nil).
+	// ApprovedBy/ApprovedOn/Labels have no real column -- see this file's own
+	// package doc comment.
+	cr.Deployments, cr.DeploymentProducts, err = loadChangeRequestLinks(ctx, r.db, id)
+	if err != nil {
+		return domain.ChangeRequest{}, fmt.Errorf("get change request by id: %w", err)
+	}
+	// The Customer Group is derived live from the project, never stored.
+	if cr.CustomerContacts, err = customerContactRefs(ctx, r.db, cr.Project.ID); err != nil {
+		return domain.ChangeRequest{}, fmt.Errorf("get change request by id: %w", err)
+	}
+
+	// While the customer group's approval request is pending (a live
+	// "Customer Approval" / "Customer Review" stage), the manual way out of
+	// the customer state is not offered: the decision comes from the approval.
+	if cr.State != nil {
+		live, err := liveCustomerStageForState(ctx, r.db, id, strings.ToUpper(*cr.State))
+		if err != nil {
+			return domain.ChangeRequest{}, fmt.Errorf("get change request by id: %w", err)
+		}
+		cr.LegalNextStates = withoutManualCustomerOutcome(cr.State, cr.LegalNextStates, live != nil)
+	}
 	return cr, nil
 }
 
@@ -832,7 +877,6 @@ func scanChangeRequestViewAndDetail(row pgx.Row, cr *domain.ChangeRequest) error
 		createdOn, updatedOn   time.Time
 		isOnHold               *bool
 		onHoldReason           *string
-		onHoldStartedOn        *time.Time
 
 		createdBy                                                          string
 		justification, impactDescription, serviceOutage                    *string
@@ -841,7 +885,6 @@ func scanChangeRequestViewAndDetail(row pgx.Row, cr *domain.ChangeRequest) error
 		implementationPlan, priority, category                             *string
 		rbID, rbName                                                       *string
 		affectedServicesText, affectedComponentsText, rollbackDurationText *string
-		cgID, cgName                                                       *string
 		changeRequestType, likelihood                                      *string
 		isPlanningVisibleToCustomers                                       *bool
 		confirmCustomerUpdatedDate                                         *string
@@ -862,13 +905,12 @@ func scanChangeRequestViewAndDetail(row pgx.Row, cr *domain.ChangeRequest) error
 		&startOn, &endOn, &impact, &state, &changeModel,
 		&createdOn, &updatedOn,
 		&agID, &agName,
-		&isOnHold, &onHoldReason, &onHoldStartedOn,
+		&isOnHold, &onHoldReason,
 		&createdBy, &justification, &impactDescription, &serviceOutage, &communicationPlan, &rollbackPlan, &testPlan,
 		&isCustomerApproved, &isCustomerReviewed,
 		&implementationPlan, &priority, &category,
 		&rbID, &rbName,
 		&affectedServicesText, &affectedComponentsText, &rollbackDurationText,
-		&cgID, &cgName,
 		&changeRequestType, &likelihood, &isPlanningVisibleToCustomers,
 		&confirmCustomerUpdatedDate, &customerUpdatedOn,
 		&workStart, &workEnd, &gitReference,
@@ -928,10 +970,6 @@ func scanChangeRequestViewAndDetail(row pgx.Row, cr *domain.ChangeRequest) error
 	}
 	v.OnHold = isOnHold
 	v.OnHoldReason = onHoldReason
-	if onHoldStartedOn != nil {
-		s := onHoldStartedOn.UTC().Format(time.RFC3339)
-		v.OnHoldSince = &s
-	}
 	v.CreatedOn = createdOn.UTC().Format(time.RFC3339)
 	v.UpdatedOn = updatedOn.UTC().Format(time.RFC3339)
 	cr.SearchChangeRequestView = v
@@ -964,9 +1002,6 @@ func scanChangeRequestViewAndDetail(row pgx.Row, cr *domain.ChangeRequest) error
 	cr.AffectedServicesText = affectedServicesText
 	cr.AffectedComponentsText = affectedComponentsText
 	cr.RollbackDurationText = rollbackDurationText
-	if cgID != nil {
-		cr.CustomerGroup = &domain.EntityRef{ID: *cgID, Name: stringOrEmpty(cgName)}
-	}
 	if changeRequestType != nil {
 		lower := strings.ToLower(*changeRequestType)
 		cr.ChangeRequestType = &lower
@@ -1068,6 +1103,27 @@ func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.
 		}
 	}
 
+	// Journal entries ("Additional comments" / "Work notes") are append-only
+	// and cannot be blank.
+	if req.Comment != nil && strings.TrimSpace(*req.Comment) == "" {
+		return "", &apierror.ValidationError{Msg: "comment must not be empty"}
+	}
+	if req.WorkNote != nil && strings.TrimSpace(*req.WorkNote) == "" {
+		return "", &apierror.ValidationError{Msg: "workNote must not be empty"}
+	}
+
+	// Customer-scope fields (project, deployments, environments, deployment
+	// products): validated and planned here, before anything is written, so a
+	// refused combination leaves the change request untouched. See
+	// change_request_links.go for the rules and the edit window.
+	if err := RejectRemovedPatchFields(req); err != nil {
+		return "", err
+	}
+	linkPlan, err := planChangeRequestLinks(ctx, tx, id, req)
+	if err != nil {
+		return "", err
+	}
+
 	wiSets := []string{"updated_on = NOW()", "updated_by = $1"}
 	wiArgs := []any{actorEmail}
 	wiIdx := 2
@@ -1075,6 +1131,13 @@ func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.
 		wiSets = append(wiSets, fmt.Sprintf(assignment, wiIdx))
 		wiArgs = append(wiArgs, val)
 		wiIdx++
+	}
+	if linkPlan != nil && linkPlan.setSingulars {
+		// The single-valued deployment / deployed product columns follow the
+		// first chosen deployment / product (NULL when none), so the list views
+		// that still read them stay in step.
+		addWI("deployment_id = $%d::uuid", linkPlan.deploymentID)
+		addWI("deployed_product_id = $%d::uuid", linkPlan.deployedProductID)
 	}
 	if req.Title != nil {
 		addWI("subject = $%d", *req.Title)
@@ -1185,7 +1248,7 @@ func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.
 	//     caller skip an approval the flow requires.
 	//   - {state: "scheduled"} is rejected EXCEPT from Customer Approval, where
 	//     it is the human action "record the customer's approval": it stamps
-	//     is_customer_approved (through the same authorization and one-way lock
+	//     is_customer_approval_required (through the same authorization and one-way lock
 	//     as a direct isCustomerApproved write) and schedules the change.
 	//     Everywhere else Scheduled is reached only by the CAB/ECAB cascade (or
 	//     Request Approval on a Standard change).
@@ -1193,7 +1256,14 @@ func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.
 	//     is set, and {state: "closed"} from Review is rejected when it is: the
 	//     customer's review is a required step in between. {state: "closed"}
 	//     from Customer Review records the customer's review
-	//     (is_customer_reviewed).
+	//     (is_customer_review_required).
+	//   - {state: "rollback"} is the failed-review off-ramp: accepted only from
+	//     Review and Customer Review (and from Customer Review only while no
+	//     customer-group review request is pending -- its members' rejection
+	//     is what rolls the change back then). It stamps no customer flag,
+	//     provisions no stage, and cancels the still-requested approvers
+	//     (as does reaching Closed or Canceled -- reconcileStaleApprovers).
+	//     Rollback is final: no state change is accepted out of it.
 	//   - {state: "assess"} is the Request Approval action. It is only legal
 	//     from New, and the state actually written is chosen from the change's
 	//     type: Assess (Normal), Authorize (Emergency), Scheduled (Standard) --
@@ -1205,6 +1275,10 @@ func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.
 	// is refused (validateCustomerGateEdits). The row is read under FOR UPDATE.
 	effectiveState := req.State
 	var requestApprovalFlow *changeRequestFlow
+	// Re-schedule (see the "authorize" case below): the internal stage to run
+	// again, or -- Standard -- whether the customer is simply asked again.
+	var rescheduleCheckpoint *changeRequestApprovalCheckpoint
+	rescheduleAsksCustomerAgain := false
 	effectiveApproved, effectiveReviewed := req.IsCustomerApproved, req.IsCustomerReviewed
 	var gates changeRequestGateSnapshot
 	if req.State != nil || req.CustomerApprovalRequired != nil || req.CustomerReviewRequired != nil {
@@ -1225,10 +1299,40 @@ func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.
 	}
 	if req.State != nil {
 		yes := true
+		// Rollback is terminal: nothing moves a rolled-back change anywhere
+		// (a repeated {state: rollback} gets the "only from review" refusal
+		// below).
+		if gates.state == "ROLLBACK" && !strings.EqualFold(string(*req.State), string(domain.ChangeRequestStateRollback)) {
+			return "", &apierror.ValidationError{Msg: "change request has been rolled back; rollback is final and its state can no longer be changed"}
+		}
 		switch strings.ToLower(string(*req.State)) {
 		case "authorize":
-			return "", &apierror.ValidationError{Msg: fmt.Sprintf(
-				"state %q cannot be set manually: it is reached automatically through the approval flow (Request Approval, then peer approval)", *req.State)}
+			// Re-schedule: the one manual way into Authorize, from Customer
+			// Approval only, and only when the planned window really changes
+			// (the diagram's "Time Change = Yes").
+			if gates.state != "CUSTOMER_APPROVAL" {
+				return "", &apierror.ValidationError{Msg: fmt.Sprintf(
+					"state %q cannot be set manually: it is reached automatically through the approval flow (Request Approval, then peer approval); it can only be set by hand to re-schedule a change from customer_approval", *req.State)}
+			}
+			if err := checkRescheduleWindow(ctx, tx, id, req.PlannedStartOn, req.PlannedEndOn); err != nil {
+				return "", err
+			}
+			flow := changeRequestFlowForModel(gates.model)
+			switch {
+			case flow.checkpoint == nil:
+				// Standard has no internal approval to run again: the new
+				// dates are applied, the change stays in Customer Approval and
+				// the customer is asked again (replaced stage, below).
+				stay := domain.ChangeRequestStateCustomerApproval
+				effectiveState = &stay
+				rescheduleAsksCustomerAgain = true
+			case flow.checkpoint.Pool == poolPeer:
+				// Normal: the peer approval stands; CAB approves again.
+				rescheduleCheckpoint = &changeRequestCABCheckpoint
+			default:
+				// Emergency: ECAB approves again.
+				rescheduleCheckpoint = flow.checkpoint
+			}
 		case "customer_approval":
 			return "", &apierror.ValidationError{Msg: fmt.Sprintf(
 				"state %q cannot be set manually: it is reached automatically through the approval flow when customerApprovalRequired is set", *req.State)}
@@ -1237,11 +1341,37 @@ func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.
 				return "", &apierror.ValidationError{Msg: fmt.Sprintf(
 					"state %q cannot be set manually: it is reached automatically through the approval flow (Request Approval, then peer/CAB approval); it can only be set by hand to record the customer's approval, from customer_approval", *req.State)}
 			}
+			// The customer group's approval request is pending: the answer
+			// comes from its members through the approvals, not from here.
+			if live, err := liveCustomerStageForState(ctx, tx, id, gates.state); err != nil {
+				return "", fmt.Errorf("patch change request: %w", err)
+			} else if live != nil {
+				return "", customerStageManualRefusal("scheduled", &customerApprovalStageSpec, live)
+			}
 			if req.IsCustomerApproved != nil && !*req.IsCustomerApproved {
 				return "", &apierror.ValidationError{Msg: "isCustomerApproved cannot be false when recording the customer's approval (state scheduled from customer_approval)"}
 			}
-			// Recording the customer's approval IS setting is_customer_approved.
+			// Recording the customer's approval IS setting is_customer_approval_required.
 			effectiveApproved = &yes
+		case "rollback":
+			// The failed-review off-ramp: only from the two review states.
+			// Terminal, no stamp of is_customer_review_required, no new stage.
+			if gates.state != "REVIEW" && gates.state != "CUSTOMER_REVIEW" {
+				return "", &apierror.ValidationError{Msg: `state "rollback" can only be set from review or customer_review`}
+			}
+			if gates.state == "CUSTOMER_REVIEW" {
+				// With the customer group's review request pending, a failed
+				// review is the members' decision (rejecting it rolls the
+				// change back), as for closing.
+				if live, err := liveCustomerStageForState(ctx, tx, id, gates.state); err != nil {
+					return "", fmt.Errorf("patch change request: %w", err)
+				} else if live != nil {
+					return "", customerStageManualRefusal("rollback", &customerReviewStageSpec, live)
+				}
+			}
+			if req.IsCustomerReviewed != nil && *req.IsCustomerReviewed {
+				return "", &apierror.ValidationError{Msg: "isCustomerReviewed cannot be true when rolling back: the review failed"}
+			}
 		case "customer_review":
 			if !reviewRequired {
 				return "", &apierror.ValidationError{Msg: "state \"customer_review\" cannot be set: customer review is not required for this change request (customerReviewRequired is false); close it from review instead"}
@@ -1251,6 +1381,13 @@ func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.
 				return "", &apierror.ValidationError{Msg: "state \"closed\" cannot be set from review: customer review is required for this change request (customerReviewRequired is true); move it to customer_review first"}
 			}
 			if gates.state == "CUSTOMER_REVIEW" {
+				// As for scheduled above: with the customer group's review
+				// request pending, closing is the members' decision.
+				if live, err := liveCustomerStageForState(ctx, tx, id, gates.state); err != nil {
+					return "", fmt.Errorf("patch change request: %w", err)
+				} else if live != nil {
+					return "", customerStageManualRefusal("closed", &customerReviewStageSpec, live)
+				}
 				if req.IsCustomerReviewed != nil && !*req.IsCustomerReviewed {
 					return "", &apierror.ValidationError{Msg: "isCustomerReviewed cannot be false when recording the customer's review (state closed from customer_review)"}
 				}
@@ -1366,10 +1503,10 @@ func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.
 			return "", err
 		}
 		if effectiveApproved != nil {
-			addCR("is_customer_approved = $%d", *effectiveApproved)
+			addCR("is_customer_approval_required = $%d", *effectiveApproved)
 		}
 		if effectiveReviewed != nil {
-			addCR("is_customer_reviewed = $%d", *effectiveReviewed)
+			addCR("is_customer_review_required = $%d", *effectiveReviewed)
 		}
 	}
 	// The creation form's checkboxes: the requirement, not the outcome. Any
@@ -1421,13 +1558,6 @@ func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.
 			addCR("requested_by_user_id = $%d::uuid", **req.RequestedByID)
 		}
 	}
-	if req.CustomerGroupID != nil {
-		if *req.CustomerGroupID == nil {
-			crSets = append(crSets, "customer_group_id = NULL")
-		} else {
-			addCR("customer_group_id = $%d::uuid", **req.CustomerGroupID)
-		}
-	}
 	if req.Priority != nil {
 		if *req.Priority == nil {
 			crSets = append(crSets, "priority = NULL")
@@ -1451,15 +1581,13 @@ func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.
 	}
 	// OnHold/OnHoldReason -- see PatchChangeRequestRequest.OnHold's own doc
 	// comment for the full tri-state write behavior this implements:
-	//   - OnHold: true  -> is_on_hold = true, on_hold_started_on = NOW()
-	//     (always refreshed, even when already on hold -- a resent
-	//     {onHold: true} is treated as a fresh hold event), on_hold_reason =
-	//     OnHoldReason if provided in this same request, else NULL (a fresh
-	//     hold event does not inherit a stale reason from a previous one).
-	//   - OnHold: false -> is_on_hold = false, and on_hold_reason/
-	//     on_hold_started_on are BOTH cleared to NULL regardless of whether
-	//     OnHoldReason also accompanies this same request -- taking a record
-	//     off hold always wins over setting a reason text in the same call.
+	//   - OnHold: true  -> is_on_hold = true, on_hold_reason = OnHoldReason if
+	//     provided in this same request, else NULL (a fresh hold event does
+	//     not inherit a stale reason from a previous one).
+	//   - OnHold: false -> is_on_hold = false, and on_hold_reason is cleared
+	//     to NULL regardless of whether OnHoldReason also accompanies this
+	//     same request -- taking a record off hold always wins over setting a
+	//     reason text in the same call.
 	//   - OnHold omitted, OnHoldReason provided -> only on_hold_reason is
 	//     written, letting a caller edit the reason text of an existing hold
 	//     (or set one belatedly) without resending OnHold itself.
@@ -1469,14 +1597,13 @@ func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.
 	if req.OnHold != nil {
 		addCR("is_on_hold = $%d", *req.OnHold)
 		if *req.OnHold {
-			crSets = append(crSets, "on_hold_started_on = NOW()")
 			if req.OnHoldReason != nil {
 				addCR("on_hold_reason = $%d", *req.OnHoldReason)
 			} else {
 				crSets = append(crSets, "on_hold_reason = NULL")
 			}
 		} else {
-			crSets = append(crSets, "on_hold_reason = NULL", "on_hold_started_on = NULL")
+			crSets = append(crSets, "on_hold_reason = NULL")
 		}
 	} else if req.OnHoldReason != nil {
 		addCR("on_hold_reason = $%d", *req.OnHoldReason)
@@ -1508,6 +1635,21 @@ func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.
 		// "success" with nothing actually changed.
 		if ct.RowsAffected() == 0 {
 			return "", &apierror.NotFoundError{Msg: "change request not found"}
+		}
+	}
+
+	// Join rows for the scope fields, then the journal entries.
+	if err := applyChangeRequestLinkPlan(ctx, tx, id, linkPlan); err != nil {
+		return "", fmt.Errorf("patch change request: %w", err)
+	}
+	if req.Comment != nil {
+		if err := insertChangeRequestJournalEntry(ctx, tx, id, "COMMENT", actorEmail, *req.Comment); err != nil {
+			return "", fmt.Errorf("patch change request: %w", err)
+		}
+	}
+	if req.WorkNote != nil {
+		if err := insertChangeRequestJournalEntry(ctx, tx, id, "WORK_NOTE", actorEmail, *req.WorkNote); err != nil {
+			return "", fmt.Errorf("patch change request: %w", err)
 		}
 	}
 
@@ -1592,12 +1734,54 @@ func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.
 		}
 	}
 
+	// Re-schedule: a fresh internal approval stage (Normal: CAB, Emergency:
+	// ECAB) for the new plan, or -- Standard, nothing internal to repeat --
+	// the customer's pending request replaced by a fresh one (the call below
+	// provisions it once the old one is cancelled).
+	if rescheduleCheckpoint != nil {
+		if err := provisionReauthorizationStage(ctx, tx, id, actorEmail, *rescheduleCheckpoint); err != nil {
+			return "", err
+		}
+	}
+	if rescheduleAsksCustomerAgain {
+		if err := cancelLiveCustomerStages(ctx, tx, id, actorEmail); err != nil {
+			return "", err
+		}
+	}
+	// The customer group (the project's registered contacts) answers Customer
+	// Approval / Customer Review through an approval stage of its own
+	// (provisionCustomerStage). Whatever this PATCH changed about the state or
+	// the project, bring that stage in step with the change as it now stands:
+	// provision it on entering the state (Request Approval on a Standard
+	// change, {state: customer_review}), replace it when the project changes,
+	// cancel it when the change leaves the state. Idempotent, and a no-op for
+	// every other state.
+	if req.State != nil || req.ProjectID != nil {
+		if _, err := provisionCustomerStage(ctx, tx, id, actorEmail); err != nil {
+			return "", err
+		}
+	}
+
+	// The change has a new state: an approval that belongs to a state it is no
+	// longer in is not actionable any more. This cancels the still-requested
+	// approvers of every stage the change has left (Review's once it moves on
+	// to Customer Review / Closed / Rollback, the customer's once it is
+	// re-scheduled, ...) and of ALL stages once it is Closed, Canceled or
+	// Rolled back. Last on purpose: the stage the NEW state needs (Peer, CAB /
+	// ECAB, Review, a customer stage) has just been provisioned above and
+	// belongs to that state, so it is kept. See reconcileStaleApprovers.
+	if effectiveState != nil {
+		if err := reconcileStaleApprovers(ctx, tx, id, actorEmail); err != nil {
+			return "", err
+		}
+	}
+
 	return wiID, nil
 }
 
 // authorizeChangeRequestCustomerFlagWrite applies the authorization and
-// one-way-lock rules for change_request.is_customer_approved/
-// is_customer_reviewed (domain.ChangeRequest.HasCustomerApproved/
+// one-way-lock rules for change_request.is_customer_approval_required/
+// is_customer_review_required (domain.ChangeRequest.HasCustomerApproved/
 // HasCustomerReviewed on the read side; PatchChangeRequestRequest.
 // IsCustomerApproved/IsCustomerReviewed, approved/reviewed here, on this
 // one) -- the last two customer-facing fields this PATCH used to write
@@ -1666,7 +1850,7 @@ func authorizeChangeRequestCustomerFlagWrite(ctx context.Context, tx pgx.Tx, id,
 	var currentApproved, currentReviewed *bool
 	var projectID *string
 	err := tx.QueryRow(ctx, `
-		SELECT cr.is_customer_approved, cr.is_customer_reviewed, wi.project_id::text
+		SELECT cr.is_customer_approval_required, cr.is_customer_review_required, wi.project_id::text
 		FROM change_request cr
 		JOIN work_item wi ON wi.id = cr.id
 		WHERE cr.id = $1`, id,
@@ -1726,7 +1910,7 @@ func authorizeChangeRequestCustomerFlagWrite(ctx context.Context, tx pgx.Tx, id,
 }
 
 // callerMayGrantChangeRequestCustomerFlag reports whether actorEmail may
-// flip change_request.is_customer_approved/is_customer_reviewed from false
+// flip change_request.is_customer_approval_required/is_customer_review_required from false
 // to true on the change request whose work_item.project_id is projectID --
 // see authorizeChangeRequestCustomerFlagWrite's own doc comment immediately
 // above for the full rule and its provenance. projectID nil/empty (an
@@ -1799,8 +1983,9 @@ type changeRequestApprovalCheckpoint struct {
 
 var (
 	// changeRequestPeerCheckpoint is a Normal change's first stage: peer
-	// approval by experienced engineers (never SRE team members), entered by
-	// Request Approval (state Assess).
+	// approval by the active internal members of the assigned group (the
+	// "Devops Approval" group when there is none), entered by Request Approval
+	// (state Assess).
 	changeRequestPeerCheckpoint = changeRequestApprovalCheckpoint{Position: 0, Label: approvalStageLabelPeer, Pool: poolPeer}
 	// changeRequestCABCheckpoint is a Normal change's second stage, right
 	// after peer approval: the "CAB Approval" group, its own approver group.
@@ -1843,8 +2028,23 @@ func provisionApprovalStage(ctx context.Context, tx pgx.Tx, workItemID string, a
 	// approval_stage_visibility's SELECT policy (migration 0145) already
 	// allows any member of the change request's own project to see this
 	// count, so this still runs under the caller's own identity.
+	// The Customer Approval / Customer Review stages (provisionCustomerStage)
+	// sit outside the internal checkpoint ordinals: counting them would put
+	// the Review checkpoint of a Normal change that went through Customer
+	// Approval at position 3 instead of 2, and it would silently never be
+	// provisioned.
+	// A re-schedule's repeated CAB / ECAB stage (provisionReauthorizationStage)
+	// is the same checkpoint again, not a further one: only the FIRST stage of
+	// each label counts, or the Review checkpoint would never be provisioned
+	// for a change that was re-scheduled.
 	var existingStages int
-	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM approval_stage WHERE work_item_id = $1`, workItemID).Scan(&existingStages); err != nil {
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*) FROM approval_stage s WHERE s.work_item_id = $1
+		   AND COALESCE(s.checkpoint_label, '') NOT IN ($2, $3)
+		   AND NOT EXISTS (SELECT 1 FROM approval_stage e
+		                    WHERE e.work_item_id = s.work_item_id AND e.checkpoint_label = s.checkpoint_label
+		                      AND (e.created_on, e.id) < (s.created_on, s.id))`,
+		workItemID, approvalStageLabelCustomerApproval, approvalStageLabelCustomerReview).Scan(&existingStages); err != nil {
 		return false, fmt.Errorf("patch change request: check existing approval stages: %w", err)
 	}
 	if existingStages != checkpoint.Position {
@@ -1870,18 +2070,28 @@ func provisionApprovalStage(ctx context.Context, tx pgx.Tx, workItemID string, a
 	if err != nil {
 		return false, err
 	}
+	if err := insertApprovalStage(ctx, tx, workItemID, actorEmail, checkpoint.Label, pool, creatorIDs); err != nil {
+		return false, err
+	}
+	return true, nil
+}
 
-	// checkpoint_label (migration 0179) records which checkpoint this is
-	// explicitly; GetChangeRequestApprovals prefers it over the ordinal
-	// heuristic. assignment_group_id is the pool's own group (for CAB/ECAB the
-	// special group, so the Approvals tab names it).
+// insertApprovalStage writes one approval_stage (checkpoint_label = label,
+// assignment_group_id = the pool's group) and one approval_stage_approver per
+// distinct pool member: `requested`, except the change's creator(s), who are
+// born `cancelled` (nobody approves their own change). The caller has already
+// escalated the transaction's identity.
+//
+// checkpoint_label (migration 0179) records which checkpoint this is
+// explicitly; GetChangeRequestApprovals prefers it over the ordinal heuristic.
+func insertApprovalStage(ctx context.Context, tx pgx.Tx, workItemID, actorEmail, label string, pool approvalPool, creatorIDs map[string]bool) error {
 	var stageID string
 	if err := tx.QueryRow(ctx,
 		`INSERT INTO approval_stage (id, created_on, updated_on, created_by, updated_by, work_item_id, assignment_group_id, checkpoint_label)
-		 VALUES (gen_random_uuid(), NOW(), NOW(), $1, $1, $2, $3::uuid, $4)
+		 VALUES (gen_random_uuid(), NOW(), NOW(), $1, $1, $2, NULLIF($3::text, '')::uuid, $4)
 		 RETURNING id`,
-		actorEmail, workItemID, pool.groupID, checkpoint.Label).Scan(&stageID); err != nil {
-		return false, fmt.Errorf("patch change request: create approval stage: %w", err)
+		actorEmail, workItemID, pool.groupID, label).Scan(&stageID); err != nil {
+		return fmt.Errorf("patch change request: create approval stage: %w", err)
 	}
 
 	seen := map[string]bool{}
@@ -1899,10 +2109,10 @@ func provisionApprovalStage(ctx context.Context, tx pgx.Tx, workItemID string, a
 			`INSERT INTO approval_stage_approver (id, created_on, updated_on, created_by, updated_by, work_item_id, stage_id, approver_user_id, status)
 			 VALUES (gen_random_uuid(), NOW(), NOW(), $1, $1, $2, $3, $4::uuid, $5)`,
 			actorEmail, workItemID, stageID, uid, status); err != nil {
-			return false, fmt.Errorf("patch change request: seed approval stage approver: %w", err)
+			return fmt.Errorf("patch change request: seed approval stage approver: %w", err)
 		}
 	}
-	return true, nil
+	return nil
 }
 
 // createChangeRequestPortalQuery is CreateChangeRequest's (the plain-Postgres,
@@ -1921,11 +2131,13 @@ const createChangeRequestPortalQuery = `
 	WITH inserted_work_item AS (
 		INSERT INTO work_item (
 			id, created_on, updated_on, created_by, updated_by,
-			number, subject, description, type, assigned_to_id, assignment_group_id
+			number, subject, description, type, assigned_to_id, assignment_group_id,
+			project_id, deployment_id, deployed_product_id
 		)
 		VALUES (
 			gen_random_uuid(), NOW(), NOW(), $1, $1,
-			next_portal_work_item_number(), $2, $3, 'CHANGE_REQUEST'::work_item_type_enum, $4::uuid, $24::uuid
+			next_portal_work_item_number(), $2, $3, 'CHANGE_REQUEST'::work_item_type_enum, $4::uuid, $24::uuid,
+			$27::uuid, $28::uuid, $29::uuid
 		)
 		RETURNING id, number, subject, created_on, updated_on, created_by
 	),
@@ -1935,13 +2147,14 @@ const createChangeRequestPortalQuery = `
 			justification, implementation_plan, risk_impact_analysis, backout_plan, test_plan,
 			start_on, end_on, requested_by_user_id, customer_group_id,
 			is_planning_visible_to_customers, affected_services, affected_component, rollback_duration,
-			customer_approval_required, customer_review_required
+			customer_approval_required, customer_review_required, category
 		)
 		SELECT id, 'NEW'::change_request_state_enum, $5::uuid, $6::uuid, $7::change_request_impact_enum, $8::change_request_risk_enum,
 		       $9::change_request_priority_enum, $10::change_request_change_model_enum,
 		       $11, $12, $13, $14, $15,
 		       $16::text::timestamptz, $17::text::timestamptz, $18::uuid, $19::uuid,
-		       $20, $21, $22, $23, COALESCE($25::boolean, false), COALESCE($26::boolean, false)
+		       $20, $21, $22, $23, COALESCE($25::boolean, false), COALESCE($26::boolean, false),
+		       $30::change_request_category_enum
 		FROM inserted_work_item
 		RETURNING id
 	)
@@ -1949,14 +2162,93 @@ const createChangeRequestPortalQuery = `
 	FROM inserted_work_item iwi
 	JOIN inserted_change_request icr ON icr.id = iwi.id`
 
-// CreateChangeRequest implements ChangeRequestRepository.
-func (r *changeRequestRepo) CreateChangeRequest(ctx context.Context, req domain.CreateChangeRequestRequest, createdBy string) (domain.CreateChangeRequestResponse, error) {
-	if err := ValidateCreateChangeRequestType(req.Type); err != nil {
-		return domain.CreateChangeRequestResponse{}, err
-	}
-	changeModel := ptrString(changeRequestTypeToChangeModel[*req.Type])
+// createdChangeRequestRow is what both create queries return.
+type createdChangeRequestRow struct {
+	id, number, subject, createdBy string
+	createdOn, updatedOn           time.Time
+}
 
-	var impact, risk, priority *string
+func (c createdChangeRequestRow) response() domain.CreateChangeRequestResponse {
+	resp := domain.CreateChangeRequestResponse{Message: "Change request created successfully."}
+	resp.ChangeRequest.ID = c.id
+	resp.ChangeRequest.Number = c.number
+	resp.ChangeRequest.CreatedOn = c.createdOn.UTC().Format(time.RFC3339)
+	resp.ChangeRequest.CreatedBy = c.createdBy
+	return resp
+}
+
+// changeRequestCreateCategory maps the request's category to the enum label
+// the insert writes, or a ValidationError when it has none.
+func changeRequestCreateCategory(req domain.CreateChangeRequestRequest) (*string, error) {
+	if req.Category == nil {
+		return nil, nil
+	}
+	label := strings.ToUpper(string(*req.Category))
+	if !changeRequestCategoryPGLabels[label] {
+		return nil, &apierror.ValidationError{Msg: fmt.Sprintf("category %q is not supported on the PostgreSQL data source", *req.Category)}
+	}
+	return &label, nil
+}
+
+// createChangeRequestWithScope is the part of both create paths that is not
+// the insert itself: inside one transaction it validates and derives the
+// customer-scope selection (project, deployments, environments, deployment
+// products -- change_request_links.go), runs insert (which writes the
+// work_item/change_request rows, project, the first deployment/deployed
+// product and the category), writes the three join tables, and appends the
+// "Additional comments" / "Work notes" journal entries as comment rows. All or
+// nothing: a refused combination leaves no change request behind.
+func (r *changeRequestRepo) createChangeRequestWithScope(
+	ctx context.Context,
+	req domain.CreateChangeRequestRequest,
+	createdBy string,
+	insert func(ctx context.Context, tx pgx.Tx, projectID, deploymentID, deployedProductID, category *string) (createdChangeRequestRow, error),
+) (createdChangeRequestRow, error) {
+	if err := RejectRemovedCreateFields(req); err != nil {
+		return createdChangeRequestRow{}, err
+	}
+	category, err := changeRequestCreateCategory(req)
+	if err != nil {
+		return createdChangeRequestRow{}, err
+	}
+	return InTxReturning(ctx, r.db, func(tx pgx.Tx) (createdChangeRequestRow, error) {
+		links, err := resolveChangeRequestLinks(ctx, tx, domain.ChangeRequestLinkSelection{
+			ProjectID:            req.ProjectID,
+			DeploymentIDs:        req.DeploymentIDs,
+			DeploymentProductIDs: req.DeploymentProductIDs,
+		}, resolveLinkOpts{})
+		if err != nil {
+			return createdChangeRequestRow{}, err
+		}
+		var projectID *string
+		if links.projectID != "" {
+			projectID = &links.projectID
+		}
+		row, err := insert(ctx, tx, projectID, firstOrNil(links.deploymentIDs()), firstOrNil(links.productIDs()), category)
+		if err != nil {
+			return createdChangeRequestRow{}, err
+		}
+		if err := writeChangeRequestDeployments(ctx, tx, row.id, links.deploymentIDs()); err != nil {
+			return createdChangeRequestRow{}, err
+		}
+		if err := writeChangeRequestProducts(ctx, tx, row.id, links.productIDs()); err != nil {
+			return createdChangeRequestRow{}, err
+		}
+		if req.Comment != nil && strings.TrimSpace(*req.Comment) != "" {
+			if err := insertChangeRequestJournalEntry(ctx, tx, row.id, "COMMENT", createdBy, *req.Comment); err != nil {
+				return createdChangeRequestRow{}, err
+			}
+		}
+		if req.WorkNote != nil && strings.TrimSpace(*req.WorkNote) != "" {
+			if err := insertChangeRequestJournalEntry(ctx, tx, row.id, "WORK_NOTE", createdBy, *req.WorkNote); err != nil {
+				return createdChangeRequestRow{}, err
+			}
+		}
+		return row, nil
+	})
+}
+
+func changeRequestEnumArgs(req domain.CreateChangeRequestRequest) (impact, risk, priority *string) {
 	if req.Impact != nil {
 		v := strings.ToUpper(string(*req.Impact))
 		impact = &v
@@ -1969,20 +2261,35 @@ func (r *changeRequestRepo) CreateChangeRequest(ctx context.Context, req domain.
 		v := strings.ToUpper(string(*req.Priority))
 		priority = &v
 	}
+	return impact, risk, priority
+}
 
-	var (
-		outID, outNumber, outSubject, outCreatedBy string
-		outCreatedOn, outUpdatedOn                 time.Time
-	)
-	err := r.db.QueryRow(ctx, createChangeRequestPortalQuery,
-		createdBy, req.Subject, req.Description, req.AssignedEngineerID,
-		req.ServiceID, req.ServiceOfferingID, impact, risk, priority, changeModel,
-		req.Justification, req.ImplementationPlan, req.RiskImpactAnalysis, req.BackoutPlan, req.TestPlan,
-		req.PlannedStartDate, req.PlannedEndDate, req.RequestedByID, req.CustomerGroupID,
-		req.IsPlanningVisibleToCustomers, req.AffectedServicesText, req.AffectedComponentsText, req.RollbackDurationText,
-		req.GroupID, req.CustomerApprovalRequired, req.CustomerReviewRequired,
-	).Scan(&outID, &outNumber, &outSubject, &outCreatedOn, &outUpdatedOn, &outCreatedBy)
+// CreateChangeRequest implements ChangeRequestRepository.
+func (r *changeRequestRepo) CreateChangeRequest(ctx context.Context, req domain.CreateChangeRequestRequest, createdBy string) (domain.CreateChangeRequestResponse, error) {
+	if err := ValidateCreateChangeRequestType(req.Type); err != nil {
+		return domain.CreateChangeRequestResponse{}, err
+	}
+	changeModel := ptrString(changeRequestTypeToChangeModel[*req.Type])
+	impact, risk, priority := changeRequestEnumArgs(req)
+
+	row, err := r.createChangeRequestWithScope(ctx, req, createdBy, func(ctx context.Context, tx pgx.Tx, projectID, deploymentID, deployedProductID, category *string) (createdChangeRequestRow, error) {
+		var out createdChangeRequestRow
+		err := tx.QueryRow(ctx, createChangeRequestPortalQuery,
+			createdBy, req.Subject, req.Description, req.AssignedEngineerID,
+			req.ServiceID, req.ServiceOfferingID, impact, risk, priority, changeModel,
+			req.Justification, req.ImplementationPlan, req.RiskImpactAnalysis, req.BackoutPlan, req.TestPlan,
+			req.PlannedStartDate, req.PlannedEndDate, req.RequestedByID, nil, // customer_group_id: no longer written (derived from the project)
+			req.IsPlanningVisibleToCustomers, req.AffectedServicesText, req.AffectedComponentsText, req.RollbackDurationText,
+			req.GroupID, req.CustomerApprovalRequired, req.CustomerReviewRequired,
+			projectID, deploymentID, deployedProductID, category,
+		).Scan(&out.id, &out.number, &out.subject, &out.createdOn, &out.updatedOn, &out.createdBy)
+		return out, err
+	})
 	if err != nil {
+		var ve *apierror.ValidationError
+		if errors.As(err, &ve) {
+			return domain.CreateChangeRequestResponse{}, err
+		}
 		// change_request_write_internal_only (migration 0145) permits only an
 		// internal caller to INSERT -- POST /change-requests is gated
 		// internalOnly at the route (routes.go), so this should not be
@@ -2002,13 +2309,7 @@ func (r *changeRequestRepo) CreateChangeRequest(ctx context.Context, req domain.
 		}
 		return domain.CreateChangeRequestResponse{}, fmt.Errorf("create change request: %w", err)
 	}
-
-	resp := domain.CreateChangeRequestResponse{Message: "Change request created successfully."}
-	resp.ChangeRequest.ID = outID
-	resp.ChangeRequest.Number = outNumber
-	resp.ChangeRequest.CreatedOn = outCreatedOn.UTC().Format(time.RFC3339)
-	resp.ChangeRequest.CreatedBy = outCreatedBy
-	return resp, nil
+	return row.response(), nil
 }
 
 // createChangeRequestFromServiceNowQuery inserts both halves of a change
@@ -2037,11 +2338,13 @@ const createChangeRequestFromServiceNowQuery = `
 	WITH inserted_work_item AS (
 		INSERT INTO work_item (
 			id, created_on, updated_on, created_by, updated_by,
-			number, subject, description, type, assigned_to_id, assignment_group_id
+			number, subject, description, type, assigned_to_id, assignment_group_id,
+			project_id, deployment_id, deployed_product_id
 		)
 		VALUES (
 			$1, NOW(), NOW(), $2, $2,
-			$3, $4, $5, 'CHANGE_REQUEST'::work_item_type_enum, $6::uuid, $26::uuid
+			$3, $4, $5, 'CHANGE_REQUEST'::work_item_type_enum, $6::uuid, $26::uuid,
+			$29::uuid, $30::uuid, $31::uuid
 		)
 		RETURNING id, number, subject, created_on, updated_on, created_by
 	),
@@ -2051,14 +2354,15 @@ const createChangeRequestFromServiceNowQuery = `
 			justification, implementation_plan, risk_impact_analysis, backout_plan, test_plan,
 			start_on, end_on, requested_by_user_id, customer_group_id,
 			is_planning_visible_to_customers, affected_services, affected_component, rollback_duration,
-			customer_approval_required, customer_review_required
+			customer_approval_required, customer_review_required, category
 		)
 		VALUES (
 			$1, 'NEW'::change_request_state_enum, $7::uuid, $8::uuid, $9::change_request_impact_enum, $10::change_request_risk_enum,
 			$11::change_request_priority_enum, $12::change_request_change_model_enum,
 			$13, $14, $15, $16, $17,
 			$18::text::timestamptz, $19::text::timestamptz, $20::uuid, $21::uuid,
-			$22, $23, $24, $25, COALESCE($27::boolean, false), COALESCE($28::boolean, false)
+			$22, $23, $24, $25, COALESCE($27::boolean, false), COALESCE($28::boolean, false),
+			$32::change_request_category_enum
 		)
 		RETURNING id
 	)
@@ -2072,44 +2376,34 @@ func (r *changeRequestRepo) CreateChangeRequestFromServiceNow(ctx context.Contex
 		return domain.CreateChangeRequestResponse{}, err
 	}
 	changeModel := ptrString(changeRequestTypeToChangeModel[*req.Type])
+	impact, risk, priority := changeRequestEnumArgs(req)
 
-	var impact, risk, priority *string
-	if req.Impact != nil {
-		v := strings.ToUpper(string(*req.Impact))
-		impact = &v
-	}
-	if req.Risk != nil {
-		v := strings.ToUpper(string(*req.Risk))
-		risk = &v
-	}
-	if req.Priority != nil {
-		v := strings.ToUpper(string(*req.Priority))
-		priority = &v
-	}
-
-	var (
-		outID, outNumber, outSubject, outCreatedBy string
-		outCreatedOn, outUpdatedOn                 time.Time
-	)
 	// WithSystemIdentity: change_request's INSERT policy (migration 0145)
-	// is internal-only -- this insert never sets a project_id (see this
-	// file's own package doc comment on CreateChangeRequestFromServiceNow),
-	// so there is nothing to check project membership against regardless of
-	// who issued the original HTTP request, and the insert only ever runs
-	// after ServiceNow's own workflow has already accepted the create --
-	// treat it as the trusted, already-authorized system operation it is
-	// rather than inheriting whatever identity happened to be on ctx.
+	// is internal-only, and the insert only ever runs after ServiceNow's own
+	// workflow has already accepted the create -- treat it as the trusted,
+	// already-authorized system operation it is rather than inheriting
+	// whatever identity happened to be on ctx. The project, if any, is the one
+	// the caller selected on the form (validated in the same transaction).
 	ctx = WithSystemIdentity(ctx)
-	err := r.db.QueryRow(ctx, createChangeRequestFromServiceNowQuery,
-		id, createdBy,
-		number, req.Subject, req.Description, req.AssignedEngineerID,
-		req.ServiceID, req.ServiceOfferingID, impact, risk, priority, changeModel,
-		req.Justification, req.ImplementationPlan, req.RiskImpactAnalysis, req.BackoutPlan, req.TestPlan,
-		req.PlannedStartDate, req.PlannedEndDate, req.RequestedByID, req.CustomerGroupID,
-		req.IsPlanningVisibleToCustomers, req.AffectedServicesText, req.AffectedComponentsText, req.RollbackDurationText,
-		req.GroupID, req.CustomerApprovalRequired, req.CustomerReviewRequired,
-	).Scan(&outID, &outNumber, &outSubject, &outCreatedOn, &outUpdatedOn, &outCreatedBy)
+	row, err := r.createChangeRequestWithScope(ctx, req, createdBy, func(ctx context.Context, tx pgx.Tx, projectID, deploymentID, deployedProductID, category *string) (createdChangeRequestRow, error) {
+		var out createdChangeRequestRow
+		err := tx.QueryRow(ctx, createChangeRequestFromServiceNowQuery,
+			id, createdBy,
+			number, req.Subject, req.Description, req.AssignedEngineerID,
+			req.ServiceID, req.ServiceOfferingID, impact, risk, priority, changeModel,
+			req.Justification, req.ImplementationPlan, req.RiskImpactAnalysis, req.BackoutPlan, req.TestPlan,
+			req.PlannedStartDate, req.PlannedEndDate, req.RequestedByID, nil, // customer_group_id: no longer written (derived from the project)
+			req.IsPlanningVisibleToCustomers, req.AffectedServicesText, req.AffectedComponentsText, req.RollbackDurationText,
+			req.GroupID, req.CustomerApprovalRequired, req.CustomerReviewRequired,
+			projectID, deploymentID, deployedProductID, category,
+		).Scan(&out.id, &out.number, &out.subject, &out.createdOn, &out.updatedOn, &out.createdBy)
+		return out, err
+	})
 	if err != nil {
+		var ve *apierror.ValidationError
+		if errors.As(err, &ve) {
+			return domain.CreateChangeRequestResponse{}, err
+		}
 		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) {
 			switch pgErr.Code {
 			case "23505": // unique_violation on id/number -- see this method's own doc comment for why this "shouldn't" happen
@@ -2124,13 +2418,7 @@ func (r *changeRequestRepo) CreateChangeRequestFromServiceNow(ctx context.Contex
 		}
 		return domain.CreateChangeRequestResponse{}, fmt.Errorf("create change request from servicenow: %w", err)
 	}
-
-	resp := domain.CreateChangeRequestResponse{Message: "Change request created successfully."}
-	resp.ChangeRequest.ID = outID
-	resp.ChangeRequest.Number = outNumber
-	resp.ChangeRequest.CreatedOn = outCreatedOn.UTC().Format(time.RFC3339)
-	resp.ChangeRequest.CreatedBy = outCreatedBy
-	return resp, nil
+	return row.response(), nil
 }
 
 // changeRequestApprovalStagesQuery backs GetChangeRequestApprovals' first of
@@ -2140,7 +2428,7 @@ func (r *changeRequestRepo) CreateChangeRequestFromServiceNow(ctx context.Contex
 // buildChangeRequestApprovals' positional stage-label derivation depends
 // entirely on this ordering.
 const changeRequestApprovalStagesQuery = `
-	SELECT ast.id, g.name, ast.checkpoint_label
+	SELECT ast.id, g.name, ast.checkpoint_label, g.id::text
 	FROM approval_stage ast
 	LEFT JOIN "group" g ON g.id = ast.assignment_group_id
 	WHERE ast.work_item_id = $1
@@ -2184,6 +2472,10 @@ type changeRequestApprovalStageRow struct {
 	// equivalent concept); buildChangeRequestApprovals falls back to the
 	// ordinal-position heuristic in that case.
 	checkpointLabel *string
+	// assignmentGroupID is the "group" row's id (nil for a stage recorded
+	// against no group -- the customer stages -- or one whose group row is
+	// gone); it becomes domain.ChangeRequestApproval.AssignmentGroup.
+	assignmentGroupID *string
 }
 
 // changeRequestApprovalApproverRow is one row of
@@ -2216,7 +2508,7 @@ func (r *changeRequestRepo) GetChangeRequestApprovals(ctx context.Context, id st
 	var stages []changeRequestApprovalStageRow
 	for stageRows.Next() {
 		var st changeRequestApprovalStageRow
-		if err := stageRows.Scan(&st.id, &st.assignmentGroupName, &st.checkpointLabel); err != nil {
+		if err := stageRows.Scan(&st.id, &st.assignmentGroupName, &st.checkpointLabel, &st.assignmentGroupID); err != nil {
 			stageRows.Close()
 			return domain.ChangeRequestApprovals{}, fmt.Errorf("get change request approvals: scan stage: %w", err)
 		}
@@ -2252,8 +2544,11 @@ func (r *changeRequestRepo) GetChangeRequestApprovals(ctx context.Context, id st
 
 // markCanDecide sets domain.ChangeRequestApprover.CanDecide on the calling
 // viewer's own REQUESTED approver rows, applying the same who-may-decide rules
-// DecideChangeRequestApproval enforces (creator may never approve; SRE team
-// members may not give peer approval). It is purely advisory for the UI --
+// DecideChangeRequestApproval enforces (creator may never approve; only an
+// active internal user may decide an internal stage) and its stage/state rule:
+// a row of a stage the change request is no longer in the state of
+// (approvalStageOutOfState -- Review's once the change moved on, ...) is not
+// decidable, whatever its status still says. It is purely advisory for the UI --
 // DecideChangeRequestApproval re-checks everything -- so any failure here
 // (no viewer identity, an unreadable creator row) leaves CanDecide false
 // rather than failing the read.
@@ -2272,6 +2567,12 @@ func (r *changeRequestRepo) markCanDecide(ctx context.Context, id string, stages
 	if len(viewerIDs) == 0 {
 		return
 	}
+	var crState *string
+	if err := r.db.QueryRow(ctx, `SELECT state::text FROM change_request WHERE id = $1`, id).Scan(&crState); err != nil {
+		slog.WarnContext(ctx, "get change request approvals: state lookup failed, canDecide left false", "changeRequestId", id, "error", err)
+		return
+	}
+	currentState := strings.ToUpper(stringOrEmpty(crState))
 	creatorIDs, err := changeRequestCreatorUserIDs(ctx, r.db, id)
 	if err != nil {
 		slog.WarnContext(ctx, "get change request approvals: creator lookup failed, canDecide left false", "changeRequestId", id, "error", err)
@@ -2289,10 +2590,11 @@ func (r *changeRequestRepo) markCanDecide(ctx context.Context, id string, stages
 			break
 		}
 		kind := classifyApprovalStage(stages[i].checkpointLabel, i)
+		outOfState := approvalStageOutOfState(kind, currentState)
 		for j := range result.Approvals[i].Approvers {
 			ap := &result.Approvals[i].Approvers[j]
 			uid := strings.ToLower(ap.ID)
-			if ap.Status != "REQUESTED" || !viewerIDs[uid] {
+			if ap.Status != "REQUESTED" || !viewerIDs[uid] || outOfState {
 				continue
 			}
 			ids := creatorIDs
@@ -2477,12 +2779,26 @@ func buildChangeRequestApprovals(stages []changeRequestApprovalStageRow, approve
 			stageStatus = domain.ChangeRequestApprovalStatusApproved
 		}
 
+		// The Customer Group is derived from the project's contacts, so its
+		// stages are recorded against no "group" row.
+		approverName := stringOrEmpty(st.assignmentGroupName)
+		if approverName == "" && st.checkpointLabel != nil && customerStageSpecForLabel(*st.checkpointLabel) != nil {
+			approverName = customerGroupDisplayName
+		}
+		// The group reference lets a client open the group and list its
+		// members (GET /groups/{id}). Customer stages are recorded against no
+		// group, so it stays nil for them.
+		var assignmentGroup *domain.ChangeRequestApprovalGroup
+		if st.assignmentGroupID != nil && *st.assignmentGroupID != "" {
+			assignmentGroup = &domain.ChangeRequestApprovalGroup{ID: *st.assignmentGroupID, Name: stringOrEmpty(st.assignmentGroupName)}
+		}
 		result = append(result, domain.ChangeRequestApproval{
-			Stage:        label,
-			ApproverType: approverType,
-			ApproverName: stringOrEmpty(st.assignmentGroupName),
-			Status:       stageStatus,
-			Approvers:    domainApprovers,
+			Stage:           label,
+			ApproverType:    approverType,
+			ApproverName:    approverName,
+			Status:          stageStatus,
+			AssignmentGroup: assignmentGroup,
+			Approvers:       domainApprovers,
 		})
 	}
 
@@ -2495,10 +2811,17 @@ func buildChangeRequestApprovals(stages []changeRequestApprovalStageRow, approve
 // doc comment. stage_id is also returned (nullable, same as everywhere else
 // in this file) so the caller can re-check that stage's own overall outcome
 // for the Assess->Authorize cascade below.
+//
+// $5 is the stage the caller's decision is for (NULL: any -- the caller has no
+// pending row with a stage, so the UPDATE matches nothing or the one stage-less
+// row). It narrows the UPDATE to that one stage when the caller holds pending
+// rows on several (a stale one left over from before the state reconcile and a
+// live one): deciding must never resolve a row of another stage along with it.
 const decideChangeRequestApprovalQuery = `
 	UPDATE approval_stage_approver
 	SET status = $3, updated_on = NOW(), updated_by = $4
 	WHERE work_item_id = $1 AND approver_user_id = $2 AND status = 'requested'
+	  AND ($5::uuid IS NULL OR stage_id = $5::uuid)
 	RETURNING id, stage_id`
 
 // cancelSiblingApprovalStageApprovers moves every other still-Requested
@@ -2534,20 +2857,41 @@ func cancelSiblingApprovalStageApprovers(ctx context.Context, tx pgx.Tx, stageID
 //     customer_approval_required is set (approvalGateTarget). There is no
 //     manual Schedule action; the customer's approval is recorded by a human
 //     {state: "scheduled"} out of Customer Approval.
+//   - the customer group's stage while the change waits in the matching state
+//     (provisionCustomerStage): "Customer Approval" approved -> Scheduled and
+//     is_customer_approval_required = true, rejected -> Canceled; "Customer Review"
+//     approved -> Closed and is_customer_review_required = true, rejected ->
+//     Rollback. CAB / ECAB approval into Customer Approval provisions the
+//     "Customer Approval" stage in the same transaction.
 //   - any other stage (Review, or a stage that is neither): the decision is
 //     recorded and siblings cancelled, no state change.
 //
+// A stage can only be decided while the change request is in the state it
+// belongs to (approvalStageDecidableState): a decision on a stage whose state
+// the change has left is refused with a 409 and changes nothing
+// (staleApprovalRefusal) -- defence in depth for rows the state reconcile has
+// not cancelled (it runs on every state change, and migration 0193 repaired the
+// ones that already existed). Every decision ends with reconcileStaleApprovers,
+// after the cascades above, so a state the decision moved the change to leaves
+// no approver of a state it left actionable (Customer Review approved -> Closed
+// cancels everything still requested).
+//
 // A resolving approval or rejection cancels every other still-Requested
 // approver on the stage (matching real ServiceNow: confirmed live on a
-// 119-approver group). A rejection never changes change_request.state, in
-// either direction: real ServiceNow rolls back to a state this schema cannot
-// confirm, so inventing one would be guessing -- existing behaviour, kept.
+// 119-approver group). A rejection of an INTERNAL stage never changes
+// change_request.state, in either direction: real ServiceNow rolls back to a
+// state this schema cannot confirm, so inventing one would be guessing --
+// existing behaviour, kept. The customer stages are the exception, above:
+// their rejection has one obvious meaning (the customer declined / the review
+// failed).
 //
 // Who may decide (checked before the row is touched, ForbiddenError otherwise):
 //
 //   - the change request's creator/requester may never approve it, at any
 //     stage (they may still cancel it);
-//   - a member of an SRE team may not decide a peer approval.
+//   - only an active INTERNAL user may decide an internal stage (Peer, CAB,
+//     ECAB, Review); the customer stages are decided by the project's
+//     (external) contacts.
 //
 // Concurrency: the change_request row is locked (SELECT ... FOR UPDATE) before
 // any approver row is touched, so two decisions are serialized and cannot
@@ -2561,13 +2905,17 @@ func (r *changeRequestRepo) DecideChangeRequestApproval(ctx context.Context, id,
 	// own session (the base branch's r.db.Begin is not available on Scoped).
 	return InTxReturning(ctx, r.db, func(tx pgx.Tx) (string, error) {
 		var lockedID string
-		if err := tx.QueryRow(ctx, `SELECT id FROM change_request WHERE id = $1 FOR UPDATE`, id).Scan(&lockedID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		var lockedState *string
+		if err := tx.QueryRow(ctx, `SELECT id, state::text FROM change_request WHERE id = $1 FOR UPDATE`, id).Scan(&lockedID, &lockedState); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return "", fmt.Errorf("decide change request approval: lock change request: %w", err)
 		}
+		// The state the change is in, fixed for this transaction by the lock
+		// ("" when NULL or not visible: nothing is guarded then).
+		crState := strings.ToUpper(stringOrEmpty(lockedState))
 
 		// Who-may-decide rules, before the approver row is touched. The
-		// creator rule needs no row; the SRE rule needs the kind of the stage
-		// the caller's pending row belongs to (none found: fall through to the
+		// creator rule needs no row; the internal-only rule needs the kind of the
+		// stage the caller's pending row belongs to (none found: fall through to the
 		// UPDATE below, whose zero rows produce the usual NotFoundError).
 		creatorIDs, err := changeRequestCreatorUserIDs(ctx, tx, id)
 		if err != nil {
@@ -2586,27 +2934,39 @@ func (r *changeRequestRepo) DecideChangeRequestApproval(ctx context.Context, id,
 				creatorIDs[strings.ToLower(approverUserID)] = true
 			}
 		}
-		var pendingStageID *string
-		if err := tx.QueryRow(ctx,
-			`SELECT stage_id::text FROM approval_stage_approver
-			 WHERE work_item_id = $1 AND approver_user_id = $2 AND status = 'requested'
-			 ORDER BY created_on ASC, id ASC LIMIT 1`, id, approverUserID).Scan(&pendingStageID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return "", fmt.Errorf("decide change request approval: find pending approval: %w", err)
-		}
-		kind := stageKindOther
-		if pendingStageID != nil {
-			if kind, err = approvalStageInfo(ctx, tx, id, *pendingStageID); err != nil {
-				return "", fmt.Errorf("decide change request approval: %w", err)
-			}
+		// The stage the caller is deciding: their oldest pending row on a stage
+		// that is decidable in the state the change is in; failing that (every
+		// pending row is on a stage the change has left) their oldest one, which
+		// is then refused below. None found: fall through to the UPDATE, whose
+		// zero rows produce the usual NotFoundError.
+		pendingStageID, kind, err := callerPendingApprovalStage(ctx, tx, id, approverUserID, crState)
+		if err != nil {
+			return "", fmt.Errorf("decide change request approval: %w", err)
 		}
 		if err := approverDecisionBlock(ctx, tx, approverUserID, creatorIDs, kind); err != nil {
 			return "", err
 		}
+		// An approval whose stage belongs to a state the change is no longer in
+		// is no longer pending. Refused before anything is written.
+		if pendingStageID != nil && approvalStageOutOfState(kind, crState) {
+			return "", staleApprovalRefusal(kind, crState)
+		}
 
 		var approvalID string
 		var stageID *string
-		err = tx.QueryRow(ctx, decideChangeRequestApprovalQuery, id, approverUserID, decision, actorEmail).Scan(&approvalID, &stageID)
-		if errors.Is(err, pgx.ErrNoRows) || IsRLSPolicyViolation(err) {
+		err = tx.QueryRow(ctx, decideChangeRequestApprovalQuery, id, approverUserID, decision, actorEmail, pendingStageID).Scan(&approvalID, &stageID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// A change waiting on the customer group's answer: say who may give
+			// it, rather than a bare "no pending approval" for someone who is
+			// simply not in that group.
+			if refusal, rerr := customerStageDecisionRefusal(ctx, tx, id); rerr != nil {
+				return "", rerr
+			} else if refusal != nil {
+				return "", refusal
+			}
+			return "", &apierror.NotFoundError{Msg: "no pending approval found for this change request and caller"}
+		}
+		if IsRLSPolicyViolation(err) {
 			return "", &apierror.NotFoundError{Msg: "no pending approval found for this change request and caller"}
 		}
 		if err != nil {
@@ -2653,8 +3013,24 @@ func (r *changeRequestRepo) DecideChangeRequestApproval(ctx context.Context, id,
 					// unless the customer's approval is required, in which case
 					// the change waits in Customer Approval for it to be
 					// recorded (a human {state: "scheduled"} from there).
-					if _, err := tx.Exec(ctx, `UPDATE change_request SET state = $2::change_request_state_enum WHERE id = $1`, id, approvalGateTarget(customerApprovalRequired)); err != nil {
+					target := approvalGateTarget(customerApprovalRequired)
+					if _, err := tx.Exec(ctx, `UPDATE change_request SET state = $2::change_request_state_enum WHERE id = $1`, id, target); err != nil {
 						return "", fmt.Errorf("decide change request approval: advance state: %w", err)
+					}
+					// Entering Customer Approval asks the customer group, when
+					// the change has one with someone eligible; otherwise the
+					// manual "record the customer's approval" stays open.
+					if target == customerApprovalStageSpec.state {
+						if _, err := provisionCustomerStage(ctx, tx, id, actorEmail); err != nil {
+							return "", err
+						}
+					}
+				case customerStageSpecForKind(stageKind) != nil && currentState.Valid:
+					// The customer group's answer: Customer Approval ->
+					// Scheduled (customer approval recorded), Customer Review
+					// -> Closed (customer review recorded).
+					if _, err := applyCustomerStageOutcome(ctx, tx, id, customerStageSpecForKind(stageKind), currentState.String, true); err != nil {
+						return "", err
 					}
 				}
 			}
@@ -2676,17 +3052,90 @@ func (r *changeRequestRepo) DecideChangeRequestApproval(ctx context.Context, id,
 				if err := cancelSiblingApprovalStageApprovers(ctx, tx, *stageID, actorEmail); err != nil {
 					return "", err
 				}
+				// A customer group's rejection is an outcome, unlike every
+				// internal stage's: Customer Approval rejected -> Canceled,
+				// Customer Review rejected -> Rollback.
+				stageKind, err := approvalStageInfo(ctx, tx, id, *stageID)
+				if err != nil {
+					return "", fmt.Errorf("decide change request approval: %w", err)
+				}
+				if spec := customerStageSpecForKind(stageKind); spec != nil {
+					var currentState sql.NullString
+					if err := tx.QueryRow(ctx, `SELECT state FROM change_request WHERE id = $1`, id).Scan(&currentState); err != nil {
+						return "", fmt.Errorf("decide change request approval: check current state: %w", err)
+					}
+					if currentState.Valid {
+						if _, err := applyCustomerStageOutcome(ctx, tx, id, spec, currentState.String, false); err != nil {
+							return "", err
+						}
+					}
+				}
 			}
+		}
+
+		// The decision may have moved the change (Peer -> Authorize, CAB ->
+		// Scheduled / Customer Approval, a customer outcome -> Scheduled /
+		// Closed / Canceled / Rollback): cancel what that left actionable.
+		if err := reconcileStaleApprovers(ctx, tx, id, actorEmail); err != nil {
+			return "", err
 		}
 
 		return approvalID, nil
 	})
 }
 
+// callerPendingApprovalStage resolves which stage the caller's decision is for:
+// among the stages they hold a REQUESTED approver row on (oldest first), the
+// first one decidable in crState (the change's upper-case state) and, when none
+// is, the oldest. Returns that stage's id and kind; (nil, stageKindOther) when
+// the caller has no pending row, or only a stage-less one.
+func callerPendingApprovalStage(ctx context.Context, tx pgx.Tx, workItemID, approverUserID, crState string) (*string, approvalStageKind, error) {
+	rows, err := tx.Query(ctx,
+		`SELECT stage_id::text FROM approval_stage_approver
+		 WHERE work_item_id = $1 AND approver_user_id = $2 AND status = 'requested'
+		 ORDER BY created_on ASC, id ASC`, workItemID, approverUserID)
+	if err != nil {
+		return nil, stageKindOther, fmt.Errorf("find pending approval: %w", err)
+	}
+	var stageIDs []*string
+	for rows.Next() {
+		var stageID *string
+		if err := rows.Scan(&stageID); err != nil {
+			rows.Close()
+			return nil, stageKindOther, fmt.Errorf("find pending approval: %w", err)
+		}
+		stageIDs = append(stageIDs, stageID)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, stageKindOther, fmt.Errorf("find pending approval: %w", err)
+	}
+
+	var first *string
+	firstKind := stageKindOther
+	for _, stageID := range stageIDs {
+		if stageID == nil {
+			continue
+		}
+		kind, err := approvalStageInfo(ctx, tx, workItemID, *stageID)
+		if err != nil {
+			return nil, stageKindOther, err
+		}
+		if !approvalStageOutOfState(kind, crState) {
+			return stageID, kind, nil
+		}
+		if first == nil {
+			first, firstKind = stageID, kind
+		}
+	}
+	return first, firstKind, nil
+}
+
 // changeRequestCategoryPGLabels is change_request_category_enum's label set
-// (migration 0043). The domain enum carries four more values (regular/hotfix
-// release cloud, devops, cloud computing) with no label here.
+// (migration 0043, plus the four cloud/devops values added by migration 0191)
+// -- every value of the domain's category enum.
 var changeRequestCategoryPGLabels = map[string]bool{
 	"SOFTWARE": true, "NETWORK": true, "SERVICE": true, "TELECOM": true, "HARDWARE": true,
 	"SYSTEM_SOFTWARE": true, "DOCUMENTATION": true, "APPLICATIONS_SOFTWARE": true, "OTHER": true,
+	"REGULAR_RELEASE_CLOUD": true, "HOTFIX_RELEASE_CLOUD": true, "DEVOPS": true, "CLOUD_COMPUTING": true,
 }

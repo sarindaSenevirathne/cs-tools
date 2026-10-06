@@ -91,4 +91,19 @@ func TestInsertBatch_IdempotentWithDatabaseClock(t *testing.T) {
 	if oldest.Before(before) {
 		t.Errorf("created_at = %v, want the database clock", oldest)
 	}
+
+	received := time.Date(2026, 10, 5, 10, 0, 0, 0, time.UTC)
+	payloads := []string{`{"rule_id":"a8f2","severity":"1"}`, `"not json"`}
+	if err := store.InsertPayloads(ctx, []time.Time{received, received.Add(time.Second)}, payloads); err != nil {
+		t.Fatalf("InsertPayloads: %v", err)
+	}
+	var stored int
+	var ruleID string
+	var at time.Time
+	if err := pool.QueryRow(ctx, `SELECT count(*), max(payload->>'rule_id'), min(received_at) FROM raw_alerts`).Scan(&stored, &ruleID, &at); err != nil {
+		t.Fatal(err)
+	}
+	if stored != 2 || ruleID != "a8f2" || !at.Equal(received) {
+		t.Errorf("raw_alerts: rows=%d rule_id=%q received_at=%v, want 2, a8f2, %v", stored, ruleID, at, received)
+	}
 }

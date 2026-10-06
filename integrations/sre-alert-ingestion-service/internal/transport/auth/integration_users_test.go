@@ -20,6 +20,10 @@ import (
 	"crypto/pbkdf2"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -105,67 +109,129 @@ func TestParseCredentials(t *testing.T) {
 	})
 }
 
-// The cache is what keeps a Cassandra read and 10,000 PBKDF2 rounds off the hot path.
-func TestCache(t *testing.T) {
-	a := NewIntegrationUsers(nil, time.Second, time.Minute)
+func newUsers(cacheTTL time.Duration) *IntegrationUsers {
+	return NewIntegrationUsers(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), UsersConfig{
+		QueryTimeout: time.Second, RefreshInterval: 30 * time.Second, MaxStale: 15 * time.Minute, CacheTTL: cacheTTL,
+	})
+}
 
-	if a.cachedHit("alice", "s3cr3t") {
+// load installs rows as the current copy, loaded at loadedAt, the way Refresh would.
+func load(a *IntegrationUsers, loadedAt time.Time, rows map[string]userRow) {
+	a.snap.Store(&usersSnapshot{users: rows, loadedAt: loadedAt})
+}
+
+func basic(user, secret string) *http.Request {
+	r := httptest.NewRequest("POST", "/elasticsearch", nil)
+	r.SetBasicAuth(user, secret)
+	return r
+}
+
+// TestAuthenticate_FromMemory: every decision comes from the in-memory copy, with no database at all (the pool is nil).
+func TestAuthenticate_FromMemory(t *testing.T) {
+	salt, hash := hashes(t, "s3cr3t", 10_000)
+	a := newUsers(time.Minute)
+	load(a, time.Now(), map[string]userRow{
+		"alice":  {hash: hash, salt: salt, iterations: 10_000, enabled: true},
+		"off":    {hash: hash, salt: salt, iterations: 10_000, enabled: false},
+		"absurd": {hash: hash, salt: salt, iterations: 50_000_000, enabled: true},
+	})
+	cases := map[string]struct {
+		user, secret string
+		want         error
+	}{
+		"valid":            {"alice", "s3cr3t", nil},
+		"wrong secret":     {"alice", "nope", ErrUnauthorized},
+		"unknown user":     {"bob", "s3cr3t", ErrUnauthorized},
+		"disabled user":    {"off", "s3cr3t", ErrUnauthorized},
+		"bad iterations":   {"absurd", "s3cr3t", ErrUnauthorized},
+		"cached and valid": {"alice", "s3cr3t", nil},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := a.Authenticate(basic(tc.user, tc.secret), "elasticsearch"); !errors.Is(err, tc.want) {
+				t.Errorf("Authenticate = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestAuthenticate_UnavailableBeforeLoadAndWhenStale: no copy yet, or one older than MaxStale, is a 503, not a 401.
+func TestAuthenticate_UnavailableBeforeLoadAndWhenStale(t *testing.T) {
+	salt, hash := hashes(t, "s3cr3t", 10_000)
+	a := newUsers(time.Minute)
+	if err := a.Authenticate(basic("alice", "s3cr3t"), "aws"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("before the first load = %v, want ErrUnavailable", err)
+	}
+	rows := map[string]userRow{"alice": {hash: hash, salt: salt, iterations: 10_000, enabled: true}}
+	load(a, time.Now().Add(-14*time.Minute), rows)
+	if err := a.Authenticate(basic("alice", "s3cr3t"), "aws"); err != nil {
+		t.Fatalf("a copy inside MaxStale must still serve, got %v", err)
+	}
+	load(a, time.Now().Add(-16*time.Minute), rows)
+	if err := a.Authenticate(basic("alice", "s3cr3t"), "aws"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("a copy past MaxStale = %v, want ErrUnavailable", err)
+	}
+}
+
+// TestAuthenticate_RotationInvalidatesCache: once the copy carries a new hash, the old secret stops working even though it was cached.
+func TestAuthenticate_RotationInvalidatesCache(t *testing.T) {
+	oldSalt, oldHash := hashes(t, "old-secret", 10_000)
+	a := newUsers(time.Hour)
+	load(a, time.Now(), map[string]userRow{"alice": {hash: oldHash, salt: oldSalt, iterations: 10_000, enabled: true}})
+	if err := a.Authenticate(basic("alice", "old-secret"), "aws"); err != nil {
+		t.Fatal(err)
+	}
+	newKey, err := pbkdf2.Key(sha256.New, "new-secret", []byte("fedcba9876543210"), 10_000, keyLen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	load(a, time.Now(), map[string]userRow{"alice": {
+		hash: base64.StdEncoding.EncodeToString(newKey), salt: base64.StdEncoding.EncodeToString([]byte("fedcba9876543210")),
+		iterations: 10_000, enabled: true,
+	}})
+	if err := a.Authenticate(basic("alice", "old-secret"), "aws"); !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("old secret after rotation = %v, want ErrUnauthorized", err)
+	}
+	if err := a.Authenticate(basic("alice", "new-secret"), "aws"); err != nil {
+		t.Errorf("new secret after rotation = %v, want accepted", err)
+	}
+}
+
+func TestCache(t *testing.T) {
+	a := newUsers(time.Minute)
+	row := userRow{hash: "h1"}
+	if a.cachedHit("alice", "s3cr3t", "h1") {
 		t.Error("nothing cached yet, must miss")
 	}
-	a.remember("alice", "s3cr3t", time.Time{})
-	if !a.cachedHit("alice", "s3cr3t") {
+	a.remember("alice", "s3cr3t", row)
+	if !a.cachedHit("alice", "s3cr3t", "h1") {
 		t.Error("the remembered secret must hit")
 	}
-	if a.cachedHit("alice", "wrong-secret") {
+	if a.cachedHit("alice", "wrong-secret", "h1") {
 		t.Error("a wrong secret must miss even for a cached user")
 	}
-	if a.cachedHit("bob", "s3cr3t") {
+	if a.cachedHit("alice", "s3cr3t", "h2") {
+		t.Error("a changed stored hash must miss")
+	}
+	if a.cachedHit("bob", "s3cr3t", "h1") {
 		t.Error("another username must miss")
 	}
 }
 
 func TestCache_Expires(t *testing.T) {
-	a := NewIntegrationUsers(nil, time.Second, time.Millisecond)
-	a.remember("alice", "s3cr3t", time.Time{})
+	a := newUsers(time.Millisecond)
+	a.remember("alice", "s3cr3t", userRow{hash: "h"})
 	time.Sleep(5 * time.Millisecond)
-	if a.cachedHit("alice", "s3cr3t") {
-		t.Error("an expired entry must miss, so a revoked user stops working")
+	if a.cachedHit("alice", "s3cr3t", "h") {
+		t.Error("an expired entry must miss")
 	}
 }
 
 func TestCache_DisabledByZeroTTL(t *testing.T) {
-	a := NewIntegrationUsers(nil, time.Second, 0)
-	a.remember("alice", "s3cr3t", time.Time{})
-	if a.cachedHit("alice", "s3cr3t") {
+	a := newUsers(0)
+	a.remember("alice", "s3cr3t", userRow{hash: "h"})
+	if a.cachedHit("alice", "s3cr3t", "h") {
 		t.Error("a zero TTL must disable caching entirely")
-	}
-}
-
-// CodeRabbit: a credential cached before its row's expires_at must not outlive
-// that expiry just because cacheTTL is longer — the row's own validity bounds
-// the cache entry, not just the configured TTL.
-func TestCache_CappedAtRowExpiry(t *testing.T) {
-	a := NewIntegrationUsers(nil, time.Second, time.Hour)
-	rowExpiresAt := time.Now().Add(5 * time.Millisecond)
-	a.remember("alice", "s3cr3t", rowExpiresAt)
-
-	if !a.cachedHit("alice", "s3cr3t") {
-		t.Fatal("should hit immediately, well before either expiry")
-	}
-	time.Sleep(10 * time.Millisecond)
-	if a.cachedHit("alice", "s3cr3t") {
-		t.Error("a credential past its row's expires_at must not be served from cache, " +
-			"even though cacheTTL (1h) has not elapsed")
-	}
-}
-
-// Cosmos DB round-trips an unset expires_at as the Unix epoch; that must not be
-// mistaken for an actual expiry in the past.
-func TestCache_CosmosEpochIsNotAnExpiry(t *testing.T) {
-	a := NewIntegrationUsers(nil, time.Second, time.Minute)
-	a.remember("alice", "s3cr3t", time.Unix(0, 0))
-	if !a.cachedHit("alice", "s3cr3t") {
-		t.Error("a Cosmos epoch expires_at must be treated as unset, not as already expired")
 	}
 }
 

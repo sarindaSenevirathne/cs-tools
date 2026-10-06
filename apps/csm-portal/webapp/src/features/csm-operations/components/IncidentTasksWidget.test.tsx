@@ -15,14 +15,19 @@
 // under the License.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, renderHook, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import type { JSX, ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
+import { MemoryRouter } from "react-router";
 
 const postMock = vi.fn();
 vi.mock("@api/backend/client", () => ({
   useBackendApi: () => ({ post: postMock }),
+}));
+const navigateMock = vi.fn();
+vi.mock("@hooks/useNavTransition", () => ({
+  useNavTransition: () => navigateMock,
 }));
 
 import IncidentTasksWidget from "@features/csm-operations/components/IncidentTasksWidget";
@@ -59,7 +64,9 @@ describe("useSearchIncidentTasks", () => {
 function renderWidget(): void {
   render(
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-      <IncidentTasksWidget incidentId={INCIDENT_ID} />
+      <MemoryRouter>
+        <IncidentTasksWidget incidentId={INCIDENT_ID} />
+      </MemoryRouter>
     </QueryClientProvider>,
   );
 }
@@ -100,6 +107,25 @@ describe("IncidentTasksWidget", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("WSO2 SRE Team")).toBeInTheDocument();
     expect(screen.getByText("Jane Doe")).toBeInTheDocument();
+  });
+
+  it("opens a task's detail page, with Back returning to the Related tab", async () => {
+    navigateMock.mockReset();
+    postMock.mockResolvedValue({
+      incidentTasks: [{ id: "t1", number: "CS-PORTAL-000021", subject: "[Incident Report] Write it", stateLabel: "Open" }],
+      total: 1,
+      limit: 50,
+      offset: 0,
+    });
+    renderWidget();
+
+    const link = await screen.findByRole("link", { name: "CS-PORTAL-000021 — [Incident Report] Write it" });
+    expect(link).toHaveAttribute("href", "/operations/incident-tasks/t1");
+
+    fireEvent.click(screen.getByText("Open"));
+    expect(navigateMock).toHaveBeenCalledWith("/operations/incident-tasks/t1", {
+      state: { from: `/operations/incidents/${INCIDENT_ID}?tab=related` },
+    });
   });
 
   it("says so when the incident has no tasks", async () => {

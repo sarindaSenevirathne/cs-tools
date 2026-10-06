@@ -487,6 +487,27 @@ type Config struct {
 	EscalationEL4CCOGroupID            string
 	EscalationEL4CROGroupID            string
 	EscalationEL5CEOGroupID            string
+
+	// RedisURL/RedisAddr/RedisPassword configure the optional user cache in
+	// front of GET /users/{id} and GET /users/me (internal/cache), with the
+	// same convention as integrations/csm-notification-service: RedisURL is a
+	// rediss://:<password>@<host>:<port> connection string for a managed,
+	// TLS-only Redis (Azure Managed Redis) and takes priority; RedisAddr/
+	// RedisPassword are the plain, non-TLS pair for a local Redis. Neither set
+	// means no cache: every read goes to Postgres, as before.
+	//
+	// The client is a plain redis.NewClient, so the target must be a
+	// non-clustered Redis or one under the "Enterprise" clustering policy, not
+	// "OSS Cluster".
+	RedisURL      string
+	RedisAddr     string
+	RedisPassword string
+	// UserCacheTTL bounds how long a cached user survives without an
+	// invalidation (USER_CACHE_TTL, default 10m). Every writer of user, role
+	// and membership data invalidates the affected user after it commits, so
+	// this is the backstop for a missed invalidation, not the main freshness
+	// mechanism.
+	UserCacheTTL time.Duration
 }
 
 // Load reads configuration from environment variables and returns a populated
@@ -585,8 +606,18 @@ func Load() *Config {
 	cfg.CSMMigrationSalesforcePartnerIngestEnabled = os.Getenv("CSM_MIGRATION_SALESFORCE_PARTNER_INGEST_ENABLED") == "true"
 	cfg.CSMMigrationCustomerEngagementIngestEnabled = os.Getenv("CSM_MIGRATION_CUSTOMER_ENGAGEMENT_INGEST_ENABLED") == "true"
 	cfg.CustomerEngagementFirefightingTypeID = strings.TrimSpace(os.Getenv("CUSTOMER_ENGAGEMENT_FIREFIGHTING_TYPE_ID"))
+	cfg.RedisURL = strings.TrimSpace(os.Getenv("REDIS_URL"))
+	cfg.RedisAddr = strings.TrimSpace(os.Getenv("REDIS_ADDR"))
+	cfg.RedisPassword = os.Getenv("REDIS_PASSWORD")
+	cfg.UserCacheTTL = envDuration("USER_CACHE_TTL", 10*time.Minute)
 	cfg.applySREEventHubTopic()
 	return cfg
+}
+
+// HasRedis reports whether a Redis connection is configured, which turns on
+// the user cache. Either REDIS_URL or REDIS_ADDR is enough.
+func (c *Config) HasRedis() bool {
+	return c.RedisURL != "" || c.RedisAddr != ""
 }
 
 // ParseInternalClientIDs parses a comma-separated client id list (M2M_CLIENT_IDS)
@@ -819,6 +850,14 @@ func (c *Config) Validate() error {
 	}
 	if v := c.CustomerEngagementFirefightingTypeID; v != "" && !isSysID(v) {
 		return fmt.Errorf("CUSTOMER_ENGAGEMENT_FIREFIGHTING_TYPE_ID must be a 32-character hex sys_id")
+	}
+	// The URL carries the Redis password, so neither it nor url.Parse's own
+	// error (which quotes its input) may appear in this message.
+	if c.RedisURL != "" {
+		u, err := url.Parse(c.RedisURL)
+		if err != nil || (u.Scheme != "redis" && u.Scheme != "rediss") || u.Host == "" {
+			return fmt.Errorf("REDIS_URL must be a redis:// or rediss:// connection string with a host")
+		}
 	}
 	return nil
 }

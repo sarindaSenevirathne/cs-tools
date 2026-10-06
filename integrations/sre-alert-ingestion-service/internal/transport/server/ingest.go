@@ -35,7 +35,7 @@ type Submitter interface {
 	Submit(ctx context.Context, source, requestID string, alerts []model.Alert) ([]string, error)
 }
 
-// SNSConfirmer handles AWS SNS subscription confirmations; *snsconfirm.Handler implements it.
+// SNSConfirmer handles AWS SNS subscribe and unsubscribe confirmations; *snsconfirm.Handler implements it.
 type SNSConfirmer interface {
 	HandleIfConfirmation(raw []byte) bool
 }

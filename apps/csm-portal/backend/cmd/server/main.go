@@ -531,9 +531,14 @@ func main() {
 	route("PATCH /change-requests/{id}", handler.PermWrite, changeRequestHandler.PatchChangeRequest)
 	route("POST /change-requests/search", handler.PermViewOperations, changeRequestHandler.SearchChangeRequests)
 	route("POST /change-requests/aggregate", handler.PermViewOperations, changeRequestHandler.AggregateChangeRequests)
+	route("POST /change-requests/link-options", handler.PermViewOperations, changeRequestHandler.GetChangeRequestLinkOptions)
 	route("POST /services/search", handler.PermView, itServiceHandler.SearchITServices)
 	route("POST /service-offerings/search", handler.PermView, serviceOfferingHandler.SearchServiceOfferings)
 	route("POST /groups/search", handler.PermView, groupHandler.SearchGroups)
+	// One group and its members -- what opens from a change request approval
+	// stage's assignment group. A "group" id (from the approvals response), not a
+	// team id; internal staff only (entity-service refuses anyone else).
+	route("GET /groups/{id}", handler.PermView, groupHandler.GetGroup)
 
 	// Team Schedule. Reads only for now, so everything sits under view: any
 	// role that can see the portal can see who is on the rota. Editing the
@@ -596,6 +601,7 @@ func main() {
 	route("POST /problems/search", handler.PermViewOperations, problemHandler.SearchProblems)
 	route("POST /problems/aggregate", handler.PermViewOperations, problemHandler.AggregateProblems)
 	route("GET /incident-tasks/{id}", handler.PermViewOperations, incidentTaskHandler.GetIncidentTask)
+	route("PATCH /incident-tasks/{id}", handler.PermWrite, incidentTaskHandler.PatchIncidentTask)
 	route("POST /incident-tasks/search", handler.PermViewOperations, incidentTaskHandler.SearchIncidentTasks)
 	route("POST /incident-tasks/aggregate", handler.PermViewOperations, incidentTaskHandler.AggregateIncidentTasks)
 	route("POST /outages", handler.PermWrite, outageHandler.CreateOutage)

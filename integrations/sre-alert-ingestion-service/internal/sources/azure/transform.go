@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"strings"
 
+	"sre-alert-ingestion-service/internal/model"
 	"sre-alert-ingestion-service/internal/sources/jsonnum"
 	"sre-alert-ingestion-service/utils"
 )
@@ -48,20 +49,11 @@ var severityMap = map[string]string{
 	"Sev4": "OK",
 }
 
-// ErrMissingBody is returned when the webhook is called with no body at all.
-var ErrMissingBody = errors.New("MISSING REQUEST BODY DATA")
+// ErrMissingBody is returned when the webhook is called with no body, or a body that isn't valid JSON at all.
+var ErrMissingBody = errors.New("missing or invalid request body")
 
 // Alert is the canonical alert model handed to the core component.
-type Alert struct {
-	Service          string `json:"service"`
-	MetricName       string `json:"metric_name"`
-	Severity         string `json:"severity"`
-	Category         string `json:"category"`
-	Environment      string `json:"environment"`
-	Source           string `json:"source"`
-	UniqueIdentifier string `json:"unique_identifier"`
-	Description      string `json:"description"`
-}
+type Alert = model.Alert
 
 // Config holds operator overrides, keyed the same way as defaults; any field left empty falls back to the default.
 type Config map[string]string
@@ -115,7 +107,8 @@ func Transform(raw []byte, cfg Config) (Alert, error) {
 		Environment:      configValue(cfg, props, "environment", ""),
 		Source:           utils.FirstNonEmpty(cfg["source"], source),
 		UniqueIdentifier: utils.Str(essentials, "alertId"),
-		Description:      utils.CompactJSON(raw),
+		// The rule's own text, never the payload; the raw body is kept in raw_alerts.
+		Description: utils.Str(essentials, "description"),
 	}
 	return alert, nil
 }

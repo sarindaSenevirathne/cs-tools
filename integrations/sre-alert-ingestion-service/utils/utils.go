@@ -18,7 +18,6 @@
 package utils
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -48,13 +47,4 @@ func FirstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-// CompactJSON returns raw as single-line JSON, or raw unchanged if it isn't valid JSON.
-func CompactJSON(raw []byte) string {
-	var buf bytes.Buffer
-	if err := json.Compact(&buf, raw); err != nil {
-		return string(raw)
-	}
-	return buf.String()
 }

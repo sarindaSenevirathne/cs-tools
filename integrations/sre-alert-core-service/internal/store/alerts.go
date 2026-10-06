@@ -98,6 +98,16 @@ func (r *AlertRepo) Release(ctx context.Context, ids []string) error {
 	return nil
 }
 
+// PurgeRaw deletes up to limit raw_alerts rows received before cutoff, oldest first.
+func (r *AlertRepo) PurgeRaw(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `DELETE FROM raw_alerts WHERE id IN (
+		SELECT id FROM raw_alerts WHERE received_at < $1 ORDER BY received_at LIMIT $2)`, cutoff, limit)
+	if err != nil {
+		return 0, fmt.Errorf("purge raw alerts: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // Purge deletes up to limit alerts processed before cutoff, oldest ids first.
 func (r *AlertRepo) Purge(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
 	tag, err := r.pool.Exec(ctx, `DELETE FROM alerts WHERE id IN (

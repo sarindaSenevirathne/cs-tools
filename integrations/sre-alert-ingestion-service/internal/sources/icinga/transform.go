@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"strings"
 
+	"sre-alert-ingestion-service/internal/model"
 	"sre-alert-ingestion-service/internal/sources/jsonnum"
 	"sre-alert-ingestion-service/utils"
 )
@@ -57,16 +58,7 @@ var hostStateMap = map[string]string{
 var ErrInvalidStructure = errors.New("invalid icinga alert payload structure")
 
 // Alert is the canonical alert model handed to the core component.
-type Alert struct {
-	Service          string `json:"service"`
-	MetricName       string `json:"metric_name"`
-	Severity         string `json:"severity"`
-	Category         string `json:"category"`
-	Environment      string `json:"environment"`
-	Source           string `json:"source"`
-	UniqueIdentifier string `json:"unique_identifier"`
-	Description      string `json:"description"`
-}
+type Alert = model.Alert
 
 // Config holds operator overrides mirroring "edge.api.icinga.alert.config"; any field left empty falls back to the default.
 type Config map[string]string
@@ -129,7 +121,8 @@ func Transform(raw []byte, cfg Config) (Alert, error) {
 		Environment:      configValue(cfg, "ENVIRONMENT", utils.FirstNonEmpty(utils.Str(vars, "environment"), utils.Str(payload, "environment"))),
 		Source:           source,
 		UniqueIdentifier: uniqueIdentifier,
-		Description:      utils.CompactJSON(raw),
+		// The check's plugin output, never the payload; the raw body is kept in raw_alerts.
+		Description: utils.FirstNonEmpty(utils.Str(payload, "service_output"), utils.Str(payload, "host_output")),
 	}
 	return alert, nil
 }

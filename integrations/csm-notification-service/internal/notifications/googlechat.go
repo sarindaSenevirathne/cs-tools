@@ -118,6 +118,26 @@ func (c *GoogleChatClient) HasAudienceSpace(audience string) bool {
 	return ok && url != ""
 }
 
+// withThreadReplyOption adds the reply option a threaded webhook message
+// needs: post into the thread named by threadKey, and start it when it does
+// not exist yet. The alternative option would drop a message whose thread has
+// not been created, which is every ladder's first rung.
+//
+// The URL already carries its own key and token, so this preserves the whole
+// query rather than rebuilding it, and never logs the result.
+func withThreadReplyOption(webhookURL string) (string, error) {
+	u, err := url.Parse(webhookURL)
+	if err != nil {
+		// Deliberately not wrapping err: a parse failure echoes the URL,
+		// which carries the space's credentials.
+		return "", fmt.Errorf("notifications: google chat webhook URL is not parseable")
+	}
+	q := u.Query()
+	q.Set("messageReplyOption", chatThreadReplyOption)
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
 // redactURLError strips the request URL — which carries the webhook's secret
 // key/token query parameters — out of a *url.Error before it's wrapped and
 // potentially logged, keeping only the underlying (safe) failure reason.
@@ -141,11 +161,14 @@ type chatCardMessage struct {
 }
 
 // chatThread carries Google Chat's threadKey, which groups every message
-// sharing the same key into one conversation thread within the space. Only
-// SendCaseCreatedAlert/SendCaseAcknowledgedAlert set this today, so a case's
+// sharing the same key into one conversation thread within the space.
+// SendCaseCreatedAlert/SendCaseAcknowledgedAlert set it so a case's
 // acknowledgment lands as a reply under its own case.created alert instead
 // of as a new top-level message -- explicit product request, since the two
-// are about the same case and read better grouped together.
+// are about the same case and read better grouped together. The escalation
+// ladder sets it too, for a different reason: its rungs are one unfolding
+// story rather than separate events, so every rung of an incident's ladder
+// belongs under the first one.
 type chatThread struct {
 	ThreadKey string `json:"threadKey,omitempty"`
 }
@@ -227,6 +250,13 @@ type chatOpenLink struct {
 // color="...">, <a href="...">), so a dynamic value that happened to
 // contain "<" or "&" must not be allowed to break out of the tag it's
 // placed in.
+//
+// Every arg is converted to a string (fmt.Sprint) before escaping, so
+// format must only ever use %s for a dynamic value — a numeric verb like
+// %.2f against the now-stringified arg fails with a Go fmt verb mismatch
+// (%!f(string=...)) instead of formatting the number. Format a non-string
+// value with fmt.Sprintf yourself first, then pass the resulting string in
+// through %s.
 func caseAlertLine(format string, args ...any) string {
 	escaped := make([]any, len(args))
 	for i, a := range args {
@@ -490,7 +520,12 @@ func (c *GoogleChatClient) SendFrustrationAlert(ctx context.Context, audience, c
 	if productName != "" {
 		lines = append(lines, caseAlertLine(`<b>%s</b>`, productName))
 	}
-	lines = append(lines, caseAlertLine(`Frustration level: <b>%.2f</b>`, frustrationLevel))
+	// caseAlertLine stringifies every arg via fmt.Sprint before escaping it
+	// (see its own doc comment) -- %.2f against the already-stringified arg
+	// would fail with a Go fmt verb mismatch (%!f(string=...)), so the float
+	// is formatted here, before caseAlertLine ever sees it, and handed in
+	// through %s like every other caseAlertLine call in this file.
+	lines = append(lines, caseAlertLine(`Frustration level: <b>%s</b>`, fmt.Sprintf("%.2f", frustrationLevel)))
 	if reason != "" {
 		lines = append(lines, caseAlertLine(`%s`, reason))
 	}
@@ -507,7 +542,17 @@ func (c *GoogleChatClient) SendFrustrationAlert(ctx context.Context, audience, c
 				},
 			},
 		},
-		Thread: &chatThread{ThreadKey: chatThreadKey(caseNumber)},
+		// Deliberately NOT threaded (see chatCardMessage.Thread's own doc
+		// comment) -- unlike case.created/case.acknowledged, which group
+		// together because they're genuinely the same gesture on the same
+		// case, a frustration alert needs to stand out as its own visible
+		// message. Threading it under chatThreadKey(caseNumber) (an earlier
+		// version of this did, matching the other case.* cards' own
+		// ThreadKey by copying their shape without this one's different
+		// reasoning) buried every alert as a reply under that case's
+		// original case.created message -- easy to miss if that thread is
+		// already old/scrolled past, exactly the opposite of what a
+		// frustration alert is for.
 	}
 	return c.sendCardToAudience(ctx, audience, msg)
 }
@@ -572,6 +617,16 @@ func (c *GoogleChatClient) postCard(ctx context.Context, webhookURL string, msg 
 	body, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("notifications: encode google chat message: %w", err)
+	}
+
+	// A threaded message needs the space told what to do when the thread does
+	// not exist yet, which is the case for a ladder's first rung. Without
+	// this, Chat rejects the threadKey rather than starting the thread.
+	if msg.Thread != nil {
+		webhookURL, err = withThreadReplyOption(webhookURL)
+		if err != nil {
+			return err
+		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhookURL, bytes.NewReader(body))

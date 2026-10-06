@@ -135,6 +135,13 @@ func TestAlertRepo_ClaimPullsSiblingsAndNeverDoubleClaims(t *testing.T) {
 	if n, err := repo.Purge(ctx, time.Now().Add(-24*time.Hour), 100); err != nil || n != 1 {
 		t.Fatalf("purge = %d, %v, want 1 old processed row deleted", n, err)
 	}
+
+	if _, err := pool.Exec(ctx, `INSERT INTO raw_alerts (received_at, payload) VALUES (now() - interval '2 days', '{"a":1}'), (now(), '{"b":2}')`); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := repo.PurgeRaw(ctx, time.Now().Add(-24*time.Hour), 100); err != nil || n != 1 {
+		t.Fatalf("purge raw = %d, %v, want only the old raw body deleted", n, err)
+	}
 }
 
 func TestIncidentRepo_FoldAndDelivery(t *testing.T) {

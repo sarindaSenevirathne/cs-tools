@@ -27,7 +27,7 @@ import (
 // purgeChunk bounds each DELETE so retention never holds long row locks or a large transaction.
 const purgeChunk = 5000
 
-// Retention deletes processed alerts and settled incidents older than their TTLs.
+// Retention deletes processed alerts, raw webhook bodies and settled incidents older than their TTLs; raw_alerts shares AlertTTL.
 type Retention struct {
 	Logger      *slog.Logger
 	Alerts      *AlertRepo
@@ -63,9 +63,10 @@ func (r *Retention) purgeOnce(ctx context.Context) {
 	}
 	defer unlock()
 	alerts := r.purge(ctx, "alerts", time.Now().Add(-r.AlertTTL), r.Alerts.Purge)
+	raw := r.purge(ctx, "raw_alerts", time.Now().Add(-r.AlertTTL), r.Alerts.PurgeRaw)
 	incidents := r.purge(ctx, "incidents", time.Now().Add(-r.IncidentTTL), r.Incidents.Purge)
-	if alerts > 0 || incidents > 0 {
-		r.Logger.Info("retention purged old rows", "alerts", alerts, "incidents", incidents)
+	if alerts > 0 || raw > 0 || incidents > 0 {
+		r.Logger.Info("retention purged old rows", "alerts", alerts, "raw_alerts", raw, "incidents", incidents)
 	}
 }
 

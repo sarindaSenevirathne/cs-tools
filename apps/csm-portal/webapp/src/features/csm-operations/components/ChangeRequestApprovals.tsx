@@ -20,6 +20,7 @@ import {
   Button,
   Card,
   Chip,
+  Link,
   Skeleton,
   Table,
   TableBody,
@@ -31,12 +32,16 @@ import {
   Typography,
 } from "@wso2/oxygen-ui";
 import { Check, X } from "@wso2/oxygen-ui-icons-react";
-import type { JSX } from "react";
+import { useState, type JSX } from "react";
 import QueryErrorState from "@components/QueryErrorState";
 import { formatBackendTimestampForDisplay } from "@utils/dateTime";
 import { BackendApiError } from "@api/backend/client";
 import { useCurrentUser } from "@context/current-user/CurrentUserContext";
 import { useErrorBanner } from "@context/error-banner/ErrorBannerContext";
+import ApprovalGroupDialog, {
+  type ApprovalGroupPerson,
+  type ApprovalGroupTarget,
+} from "@features/csm-operations/components/ApprovalGroupDialog";
 import { useGetChangeRequestApprovals } from "@features/csm-operations/api/useGetChangeRequestApprovals";
 import { useDecideChangeRequestApproval } from "@features/csm-operations/api/useDecideChangeRequestApproval";
 import {
@@ -48,6 +53,7 @@ import type {
   BeChangeRequestApproval,
   BeChangeRequestApprovalDecision,
   BeChangeRequestApprover,
+  BeCustomerContact,
 } from "@api/backend/types";
 
 function formatDateTime(value?: string | null): string {
@@ -59,9 +65,18 @@ function formatDateTime(value?: string | null): string {
   );
 }
 
-/** "Devops Approval" (STATIC_GROUP) or a named customer contact (DYNAMIC_CONTACT). */
+/** The stages the backend provisions for the CR's customer group (the project's registered contacts). */
+function isCustomerStage(stageName: string): boolean {
+  return stageName === "Customer Approval" || stageName === "Customer Review";
+}
+
+/** "Devops Approval" (STATIC_GROUP), a named customer contact (DYNAMIC_CONTACT)
+ * or, for a Customer Approval / Customer Review stage, the customer group (the
+ * project's registered contacts) who are the approvers. */
 function approverGroupName(approval: BeChangeRequestApproval): string {
-  return approval.approverName || (approval.approverType === "DYNAMIC_CONTACT" ? "Customer contact" : "Approval group");
+  if (approval.approverName) return approval.approverName;
+  if (approval.approverType === "DYNAMIC_CONTACT") return "Customer contact";
+  return isCustomerStage(approvalStageLabel(approval.stage)) ? "Customer group" : "Approval group";
 }
 
 /** Whether this approver row is the current user's own pending ("REQUESTED") approval. */
@@ -91,18 +106,54 @@ interface ApproverTableRow {
   key: string;
   approver: BeChangeRequestApprover;
   groupName: string;
+  /** What clicking the Assignment group opens: the group page, the customer
+   * group's contacts, or `null` (plain text) when the stage has neither. */
+  groupTarget: ApprovalGroupTarget | null;
   /** "Peer Approval" / "CAB Approval" / "ECAB Approval" / backend's own name. */
   stageName: string;
 }
 
-function flattenApprovals(approvals: BeChangeRequestApproval[]): ApproverTableRow[] {
+/**
+ * What the Assignment group of `approval`'s rows opens. An internal stage that
+ * carries its group (`assignmentGroup.id`) opens that group's page. A Customer
+ * Approval / Customer Review stage has no group row -- its approvers are the
+ * project's registered contacts -- so it opens the contacts already on the page
+ * (the change request's `customerContacts`, else the stage's own approvers).
+ * Any other stage (ServiceNow source, legacy rows) has nothing to open.
+ */
+function groupTargetFor(
+  approval: BeChangeRequestApproval,
+  groupName: string,
+  customerContacts: BeCustomerContact[] | undefined,
+): ApprovalGroupTarget | null {
+  const group = approval.assignmentGroup;
+  if (group?.id) return { kind: "group", id: group.id, name: group.name || groupName };
+  if (isCustomerStage(approvalStageLabel(approval.stage))) {
+    const contacts: ApprovalGroupPerson[] =
+      customerContacts && customerContacts.length > 0
+        ? customerContacts.map((c) => ({ id: c.id, name: c.name, email: c.email }))
+        : approval.approvers
+            .filter((a, i, all) => all.findIndex((b) => b.id === a.id) === i)
+            .map((a) => ({ id: a.id, name: a.name?.trim() ?? "" }));
+    return { kind: "customer", name: "Customer Group", contacts };
+  }
+  return null;
+}
+
+function flattenApprovals(
+  approvals: BeChangeRequestApproval[],
+  customerContacts: BeCustomerContact[] | undefined,
+): ApproverTableRow[] {
   const rows: ApproverTableRow[] = [];
   approvals.forEach((approval, approvalIndex) => {
+    const groupName = approverGroupName(approval);
+    const groupTarget = groupTargetFor(approval, groupName, customerContacts);
     approval.approvers.forEach((approver, approverIndex) => {
       rows.push({
         key: `${approvalIndex}-${approverIndex}-${approver.id}`,
         approver,
-        groupName: approverGroupName(approval),
+        groupName,
+        groupTarget,
         stageName: approvalStageLabel(approval.stage),
       });
     });
@@ -193,17 +244,24 @@ function ApproverActionsCell({
 export default function ChangeRequestApprovals({
   id,
   isCreator = false,
+  customerContacts,
 }: {
   id: string | undefined;
   /** True when the signed-in user created/requested this change request -- the
    * backend refuses their approvals, so Approve/Reject render disabled with
    * the reason. See `isChangeRequestCreator`. */
   isCreator?: boolean;
+  /** The change request's read-only Customer Group (its project's registered
+   * contacts, `BeChangeRequestDetail.customerContacts`): what the Assignment
+   * group of a Customer Approval / Customer Review row lists. */
+  customerContacts?: BeCustomerContact[];
 }): JSX.Element | null {
   const { data, isLoading, isError, error } = useGetChangeRequestApprovals(id);
   const { user } = useCurrentUser();
   const { showError } = useErrorBanner();
   const decideApproval = useDecideChangeRequestApproval();
+  // The group whose page is open (clicked from an Assignment group cell).
+  const [openGroup, setOpenGroup] = useState<ApprovalGroupTarget | null>(null);
 
   const decide: DecideHandlers | undefined = id
     ? {
@@ -249,7 +307,7 @@ export default function ChangeRequestApprovals({
   }
 
   const approvals = data?.approvals ?? [];
-  const rows = flattenApprovals(approvals);
+  const rows = flattenApprovals(approvals, customerContacts);
 
 
   if (rows.length === 0) {
@@ -288,7 +346,7 @@ export default function ChangeRequestApprovals({
               </TableRow>
             </TableHead>
             <TableBody>
-              {rows.map(({ key, approver, groupName, stageName }) => {
+              {rows.map(({ key, approver, groupName, groupTarget, stageName }) => {
                 const name = approver.name?.trim();
                 return (
                   <TableRow key={key}>
@@ -308,7 +366,24 @@ export default function ChangeRequestApprovals({
                         </Typography>
                       )}
                     </TableCell>
-                    <TableCell>{groupName}</TableCell>
+                    <TableCell>
+                      {groupTarget ? (
+                        <Link
+                          component="button"
+                          type="button"
+                          underline="hover"
+                          variant="body2"
+                          aria-haspopup="dialog"
+                          aria-label={`View members of ${groupName}`}
+                          onClick={() => setOpenGroup(groupTarget)}
+                          sx={{ textAlign: "left", verticalAlign: "baseline" }}
+                        >
+                          {groupName}
+                        </Link>
+                      ) : (
+                        groupName
+                      )}
+                    </TableCell>
                     <TableCell>{approver.comments?.trim() || "—"}</TableCell>
                     <TableCell>{formatDateTime(approver.createdOn)}</TableCell>
                     <TableCell>{formatDateTime(approver.respondedOn)}</TableCell>
@@ -328,6 +403,7 @@ export default function ChangeRequestApprovals({
           </Table>
         </TableContainer>
       </Box>
+      {openGroup && <ApprovalGroupDialog target={openGroup} onClose={() => setOpenGroup(null)} />}
     </Card>
   );
 }

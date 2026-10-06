@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"strings"
 
+	"sre-alert-ingestion-service/internal/model"
 	"sre-alert-ingestion-service/internal/sources/jsonnum"
 	"sre-alert-ingestion-service/utils"
 )
@@ -70,16 +71,7 @@ var transitionStateMap = map[string]string{
 var ErrInvalidStructure = errors.New("invalid datadog alert payload structure")
 
 // Alert is the canonical alert model handed to the core component.
-type Alert struct {
-	Service          string `json:"service"`
-	MetricName       string `json:"metric_name"`
-	Severity         string `json:"severity"`
-	Category         string `json:"category"`
-	Environment      string `json:"environment"`
-	Source           string `json:"source"`
-	UniqueIdentifier string `json:"unique_identifier"`
-	Description      string `json:"description"`
-}
+type Alert = model.Alert
 
 // Config holds operator overrides mirroring "edge.api.datadog.alert.config"; any field left empty falls back to the default.
 type Config map[string]string
@@ -127,7 +119,8 @@ func Transform(raw []byte, cfg Config) (Alert, error) {
 		Environment:      configValue(cfg, tags, "ENVIRONMENT", utils.Str(payload, "environment")),
 		Source:           source,
 		UniqueIdentifier: uniqueIdentifier,
-		Description:      utils.CompactJSON(raw),
+		// Datadog's message text ($EVENT_MSG), never the payload; the raw body is kept in raw_alerts.
+		Description: utils.FirstNonEmpty(utils.Str(payload, "body"), utils.Str(payload, "text_only_msg"), utils.Str(payload, "event_msg")),
 	}
 	return alert, nil
 }

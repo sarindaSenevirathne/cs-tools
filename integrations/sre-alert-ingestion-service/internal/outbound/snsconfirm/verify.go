@@ -28,8 +28,10 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 // message holds the SNS fields a subscription confirmation is signed over.
@@ -61,8 +63,9 @@ func (m message) stringToSign() string {
 // verifier checks SNS signatures against AWS's signing certificate.
 type verifier struct {
 	http     *http.Client
-	roots    *x509.CertPool // nil means the system roots
 	allowURL func(*url.URL) bool
+	// now is time.Now, replaceable in tests.
+	now func() time.Time
 
 	mu    sync.Mutex
 	certs map[string]*x509.Certificate
@@ -98,7 +101,12 @@ func (v *verifier) verify(m message) error {
 	return nil
 }
 
-// cert fetches (once) the signing certificate, which must be an SNS-hosted .pem that chains to a trusted root.
+// snsCertName matches the names AWS issues SNS signing certificates to.
+var snsCertName = regexp.MustCompile(`^sns(\.[a-z0-9-]+)?\.amazonaws\.com(\.cn)?$`)
+
+// cert fetches (once) the signing certificate from an SNS-hosted .pem. Trust comes from fetching it
+// over HTTPS from an SNS host, as AWS's own message validators do: the .pem holds only the leaf, not
+// its intermediate, so a chain check fails on Linux, where Go does not fetch missing intermediates.
 func (v *verifier) cert(raw string) (*x509.Certificate, error) {
 	u, err := url.Parse(raw)
 	if err != nil || !v.allowURL(u) || !strings.HasSuffix(u.Path, ".pem") {
@@ -108,7 +116,7 @@ func (v *verifier) cert(raw string) (*x509.Certificate, error) {
 	cached := v.certs[raw]
 	v.mu.Unlock()
 	if cached != nil {
-		return cached, nil
+		return cached, v.usable(cached)
 	}
 
 	resp, err := v.http.Get(raw)
@@ -117,33 +125,48 @@ func (v *verifier) cert(raw string) (*x509.Certificate, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("fetch signing certificate: %d", resp.StatusCode)
+		return nil, fmt.Errorf("fetch signing certificate: unexpected status %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if err != nil {
 		return nil, err
 	}
-	var chain []*x509.Certificate
-	for block, rest := pem.Decode(body); block != nil; block, rest = pem.Decode(rest) {
-		if c, err := x509.ParseCertificate(block.Bytes); err == nil {
-			chain = append(chain, c)
-		}
-	}
-	if len(chain) == 0 {
+	block, _ := pem.Decode(body)
+	if block == nil {
 		return nil, errors.New("no certificate in SigningCertURL")
 	}
-	intermediates := x509.NewCertPool()
-	for _, c := range chain[1:] {
-		intermediates.AddCert(c)
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse signing certificate: %w", err)
 	}
-	if _, err := chain[0].Verify(x509.VerifyOptions{Roots: v.roots, Intermediates: intermediates}); err != nil {
-		return nil, fmt.Errorf("signing certificate not trusted: %w", err)
+	if err := v.usable(leaf); err != nil {
+		return nil, err
 	}
 	v.mu.Lock()
 	if v.certs == nil {
 		v.certs = map[string]*x509.Certificate{}
 	}
-	v.certs[raw] = chain[0]
+	v.certs[raw] = leaf
 	v.mu.Unlock()
-	return chain[0], nil
+	return leaf, nil
+}
+
+// usable reports whether c is issued to SNS and valid now.
+func (v *verifier) usable(c *x509.Certificate) error {
+	named := snsCertName.MatchString(c.Subject.CommonName)
+	for _, n := range c.DNSNames {
+		named = named || snsCertName.MatchString(n)
+	}
+	if !named {
+		return fmt.Errorf("signing certificate is for %q, not SNS", c.Subject.CommonName)
+	}
+	now := time.Now()
+	if v.now != nil {
+		now = v.now()
+	}
+	if now.Before(c.NotBefore) || now.After(c.NotAfter) {
+		return fmt.Errorf("signing certificate not valid at %s (valid %s to %s)",
+			now.UTC().Format(time.RFC3339), c.NotBefore.UTC().Format(time.RFC3339), c.NotAfter.UTC().Format(time.RFC3339))
+	}
+	return nil
 }

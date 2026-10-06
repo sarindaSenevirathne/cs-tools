@@ -47,11 +47,26 @@ notifications independently until they're actually delivered.
   backoff: `csm_retry_base_delay`, `csm_retry_multiplier`, `csm_retry_max_delay`,
   up to `max_csm_attempts`), pushes owed work notes in order, posts the Chat
   fallback, and schedules its next due time.
+- **Assignment group and contact type.** These two fields are what route an incident
+  onto the SRE escalation ladder; an incident with neither gets no ladder. The group is
+  taken from the most specific signal the first alert carries, in this order:
+  1. the group the alert names for itself (an AWS alarm's `AlarmDescription`
+     `"assignment_group"`), as a group id or as a name mapped in
+     `CSM_ASSIGNMENT_GROUP_ROUTES` (`"group:<name>"`);
+  2. the matched CMDB service's support group;
+  3. the topic it was sent from, an AWS SNS `TopicArn` (`"topic:<arn>"`);
+  4. the account it was sent from, an AWS account id (`"account:<id>"`);
+  5. `CSM_DEFAULT_ASSIGNMENT_GROUP_ID`.
+
+  The log line `assignment group chosen` names the step that decided (`by=`). The
+  contact type is set when the alert's source has one in CSM's enum (Azure → `AZURE`,
+  Site24x7 → `SITE_247`, Sentinel → `SENTINEL`); AWS and the rest have none and route
+  by the group alone.
 - **Duplicate-create protection.** Before creating an incident, and again before
   every retry, the service searches CSM by `correlationId` so a lost create response
   never causes a duplicate.
 - **Chat fallback.** If CSM still hasn't confirmed an incident
-  `notify.chat_fallback_delay` (60s) after it was created, it is posted once to
+  `notify.chat_fallback_delay` (25s) after it was created, it is posted once to
   `FALLBACK_CHAT_WEBHOOK_URLS`; CSM keeps retrying meanwhile. Without CSM configured,
   or after CSM permanently rejects the incident, the card is posted at once. With `chat_threading_enabled`, each incident gets its
   own thread, and Duplicate/OK alerts are collapsed into one digest reply per
@@ -98,9 +113,10 @@ confirmation being stored.
 - `internal/hub`: the `/alertz` HTTP handler that wakes the poller early.
 - `internal/postgres`: connection setup (`pgxpool`) and schema migration.
 - `internal/config`: loads and validates `config.toml`.
-- `internal/auth`: PBKDF2 hashing/verification, the `integration_users`
-  repository, and the `RequireAuth` middleware guarding `/alertz` (verified
-  credentials are cached for 60s).
+- `internal/auth`: PBKDF2 hashing/verification and the `integration_users`
+  repository (used by `cmd/user` and by sre-alert-ingestion-service's webhook auth),
+  plus `RequireWakeToken`, which guards `/alertz` with the shared
+  `ALERT_CORE_WAKE_TOKEN`.
 - `cmd/server`: wires everything together and manages startup/shutdown.
 - `cmd/user`: CLI to create/rotate, list, enable, and disable `integration_users` rows.
 

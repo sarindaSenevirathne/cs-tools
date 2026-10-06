@@ -21,13 +21,23 @@ import {
   buildCloneChangeRequestNavState,
   CHANGE_REQUEST_CREATE_TYPE_OPTIONS,
   changeRequestBlockingReason,
+  CHANGE_REQUEST_CATEGORY_OPTIONS,
+  changeRequestCategoryLabel,
+  changeRequestCategoryValue,
+  changeRequestScopeLockedReason,
   changeRequestTransitionLabel,
+  changeRequestTransitionRequiresReason,
   countActiveCRFilters,
+  isDestructiveChangeRequestTransition,
   customerApprovalLockedReason,
   customerReviewLockedReason,
+  DEFAULT_CHANGE_REQUEST_CATEGORY,
   DEFAULT_CR_FILTERS,
+  isChangeRequestCategory,
   isChangeRequestCreator,
   isCreatableChangeRequestType,
+  NO_CUSTOMER_CONTACTS_HELPER,
+  noCustomerContactsHelper,
 } from "@features/csm-operations/utils/changeRequests";
 import type { BeChangeRequestApproval, BeChangeRequestDetail } from "@api/backend/types";
 
@@ -89,18 +99,53 @@ describe("buildCloneChangeRequestNavState", () => {
     expect(keys).not.toContain("serviceOutage");
     expect(keys).not.toContain("communicationPlan");
     expect(keys).not.toContain("rollbackPlan");
-    // category/priority/risk/riskImpactAnalysis are write-only — never
-    // returned by GET — so there is no source value ever. `implementationPlan`
+    // priority/risk/riskImpactAnalysis have no clone source. `implementationPlan`
     // is readable now too, but isn't wired into clone yet (separate feature
     // decision), so it also must not appear here.
-    expect(keys).not.toContain("category");
     expect(keys).not.toContain("priority");
     expect(keys).not.toContain("risk");
     expect(keys).not.toContain("implementationPlan");
     expect(keys).not.toContain("riskImpactAnalysis");
   });
 
-  it("never carries the environment, project, or linked-case references", () => {
+  it("carries the customer project and category, but never the deployments / deployment products / customer group", () => {
+    const state = buildCloneChangeRequestNavState({
+      ...FULL_CR,
+      customerContacts: [{ id: "c-1", name: "Alice Aaron" }],
+      category: { id: "devops", name: "DevOps" },
+      deployments: [{ id: "dep-1", name: "prod" }],
+      deploymentProducts: [{ id: "dp-1", name: "API Manager 4.3.0" }],
+    });
+    expect(state.projectId).toBe("proj-1");
+    expect(state.projectLabel).toBe("Project A");
+    expect(state.category).toBe("devops");
+    // A clone exists to promote the change to a different deployment, so what
+    // names the *target* is left for the user to choose; the Customer Group is
+    // derived from the project and read-only, so it is never carried either.
+    const keys = Object.keys(state);
+    expect(keys).not.toContain("deployments");
+    expect(keys).not.toContain("deploymentIds");
+    expect(keys).not.toContain("customerContacts");
+    expect(keys).not.toContain("customerGroupId");
+    expect(keys).not.toContain("customerGroupLabel");
+    expect(keys).not.toContain("environments");
+    expect(keys).not.toContain("environmentIds");
+    expect(keys).not.toContain("deploymentProducts");
+    expect(keys).not.toContain("deploymentProductIds");
+  });
+
+  it("leaves project / category out when the source has none (or an unknown category)", () => {
+    const state = buildCloneChangeRequestNavState({
+      ...FULL_CR,
+      project: undefined,
+      customerContacts: [],
+      category: { id: "something_new", label: "Something new" },
+    });
+    expect(state.projectId).toBeUndefined();
+    expect(state.category).toBeUndefined();
+  });
+
+  it("never carries the single-deployment, linked-case or team references", () => {
     const state = buildCloneChangeRequestNavState(FULL_CR);
     const keys = Object.keys(state);
     expect(keys).not.toContain("deployment");
@@ -200,6 +245,33 @@ describe("changeRequestBlockingReason", () => {
     ).toBeNull();
   });
 
+  // After a Re-schedule the superseded Customer Approval stage keeps its place in
+  // the list, all its approvers cancelled, and the backend reports it PENDING
+  // (nothing was approved or rejected on it). It is not what the change waits on.
+  it("skips a superseded stage whose approvers were all cancelled, naming the stage that is really waiting", () => {
+    const approver = (status: string) => ({ id: `u-${status}`, name: "Someone", status });
+    expect(
+      changeRequestBlockingReason(
+        [
+          approval({ stage: "Peer Approval", status: "APPROVED", approvers: [approver("APPROVED")] }),
+          approval({ stage: "CAB Approval", status: "APPROVED", approvers: [approver("APPROVED")] }),
+          approval({ stage: "Customer Approval", status: "PENDING", approvers: [approver("CANCELLED"), approver("CANCELED")] }),
+          approval({ stage: "CAB Approval", status: "PENDING", approvers: [approver("REQUESTED"), approver("CANCELLED")] }),
+        ],
+        "authorize",
+      ),
+    ).toBe("Awaiting CAB Approval");
+  });
+
+  it("returns null when the only PENDING stage has nobody left to ask", () => {
+    expect(
+      changeRequestBlockingReason(
+        [approval({ stage: "CAB Approval", status: "PENDING", approvers: [{ id: "u", name: "A", status: "NOT_REQUIRED" }] })],
+        "authorize",
+      ),
+    ).toBeNull();
+  });
+
   it("labels a legacy Authorize stage as CAB Approval", () => {
     expect(
       changeRequestBlockingReason([approval({ stage: "Authorize", status: "REQUESTED" })]),
@@ -243,14 +315,14 @@ describe("changeRequestBlockingReason", () => {
   it("names the approver group for a stage it has no label for", () => {
     expect(
       changeRequestBlockingReason([
-        approval({ stage: "Customer Approval", status: "REQUESTED", approverName: "Acme Contact" }),
+        approval({ stage: "Vendor Sign-off", status: "REQUESTED", approverName: "Acme Contact" }),
       ]),
     ).toBe("Awaiting Acme Contact approval");
   });
 
   it("does not double the word 'approval' when the approver name already carries it", () => {
     const reason = changeRequestBlockingReason([
-      approval({ stage: "Customer Approval", status: "REQUESTED", approverName: "Security Approval Board" }),
+      approval({ stage: "Vendor Sign-off", status: "REQUESTED", approverName: "Security Approval Board" }),
     ]);
     expect(reason).toBe("Awaiting Security Approval Board");
     expect(reason?.match(/approval/gi)).toHaveLength(1);
@@ -283,6 +355,10 @@ describe("approvalStageLabel", () => {
     ["ECAB Approval", "ECAB Approval"],
     ["Review", "Review"],
     ["Customer Approval", "Customer Approval"],
+    ["customer_approval", "Customer Approval"],
+    ["CUSTOMER-APPROVAL", "Customer Approval"],
+    ["Customer Review", "Customer Review"],
+    ["customer review", "Customer Review"],
     ["Something New", "Something New"],
   ])("maps %s to %s", (stage, expected) => {
     expect(approvalStageLabel(stage)).toBe(expected);
@@ -312,28 +388,45 @@ describe("changeRequestTransitionLabel", () => {
     expect(changeRequestTransitionLabel("scheduled")).not.toBe("Record customer approval");
   });
 
+  it("labels authorize 'Re-schedule' only when leaving customer_approval", () => {
+    expect(changeRequestTransitionLabel("authorize", "customer_approval")).toBe("Re-schedule");
+    expect(changeRequestTransitionLabel("authorize", "assess")).not.toBe("Re-schedule");
+    expect(changeRequestTransitionLabel("authorize")).not.toBe("Re-schedule");
+    expect(isDestructiveChangeRequestTransition("authorize")).toBe(false);
+  });
+
   it("labels the customer review and close transitions", () => {
     expect(changeRequestTransitionLabel("customer_review", "review")).toBe("Send for customer review");
     expect(changeRequestTransitionLabel("closed", "review")).toBe("Close");
+  });
+
+  it("labels the failed-review off-ramp 'Roll back': destructive and needing a reason, like Cancel change", () => {
+    for (const from of ["review", "customer_review"]) {
+      expect(changeRequestTransitionLabel("rollback", from)).toBe("Roll back");
+    }
+    expect(isDestructiveChangeRequestTransition("rollback")).toBe(true);
+    expect(changeRequestTransitionRequiresReason("rollback")).toBe(true);
+    expect(changeRequestTransitionRequiresReason("canceled")).toBe(true);
+    expect(changeRequestTransitionRequiresReason("closed")).toBe(false);
   });
 });
 
 describe("changeRequestBlockingReason — customer states", () => {
   it("names the customer approval gate from the state, with or without approvals data", () => {
     expect(changeRequestBlockingReason(undefined, "customer_approval")).toBe(
-      "Awaiting customer approval",
+      "Awaiting Customer Approval",
     );
     expect(
       changeRequestBlockingReason(
         [{ stage: "Authorize", approverType: "STATIC_GROUP", approverName: null, status: "APPROVED", approvers: [] }],
         "customer_approval",
       ),
-    ).toBe("Awaiting customer approval");
+    ).toBe("Awaiting Customer Approval");
   });
 
   it("names the customer review gate from the state", () => {
     expect(changeRequestBlockingReason(undefined, "customer_review")).toBe(
-      "Awaiting customer review",
+      "Awaiting Customer Review",
     );
   });
 
@@ -477,6 +570,112 @@ describe("buildChangeRequestSearchFilters", () => {
   it("omits projectIds entirely when no project is selected", () => {
     expect(buildChangeRequestSearchFilters(DEFAULT_CR_FILTERS, "")).not.toHaveProperty(
       "projectIds",
+    );
+  });
+});
+
+describe("change request category helpers", () => {
+  it("offers the 13 ServiceNow categories, with 'other' as the default", () => {
+    expect(CHANGE_REQUEST_CATEGORY_OPTIONS).toHaveLength(13);
+    expect(DEFAULT_CHANGE_REQUEST_CATEGORY).toBe("other");
+    expect(CHANGE_REQUEST_CATEGORY_OPTIONS.find((o) => o.value === "other")?.label).toBe("Other");
+  });
+
+  it("recognises only backend enum values", () => {
+    expect(isChangeRequestCategory("devops")).toBe(true);
+    expect(isChangeRequestCategory("Other")).toBe(false);
+    expect(isChangeRequestCategory("")).toBe(false);
+    expect(isChangeRequestCategory(undefined)).toBe(false);
+  });
+
+  it("reads the enum value off a detail category, whether it carries a name or a label", () => {
+    expect(changeRequestCategoryValue({ id: "network", name: "Network" })).toBe("network");
+    expect(changeRequestCategoryValue({ id: "network", label: "Network" })).toBe("network");
+    expect(changeRequestCategoryValue("devops")).toBe("devops");
+    expect(changeRequestCategoryValue({ id: "unknown" })).toBe("");
+    expect(changeRequestCategoryValue("unknown")).toBe("");
+    expect(changeRequestCategoryValue(null)).toBe("");
+  });
+
+  it("labels a category from the known list first, then from the backend, with a dash when absent", () => {
+    expect(changeRequestCategoryLabel({ id: "regular_release_cloud", name: "x" })).toBe("Regular Release - Cloud");
+    expect(changeRequestCategoryLabel({ id: "mystery", name: "Mystery" })).toBe("Mystery");
+    expect(changeRequestCategoryLabel({ id: "mystery", label: "Old label" })).toBe("Old label");
+    expect(changeRequestCategoryLabel("hotfix_release_cloud")).toBe("Hotfix Release - Cloud");
+    expect(changeRequestCategoryLabel("Free text")).toBe("Free text");
+    expect(changeRequestCategoryLabel(undefined)).toBe("—");
+  });
+});
+
+describe("changeRequestScopeLockedReason", () => {
+  it("is editable before implementation and locked from implement onwards", () => {
+    for (const state of ["new", "assess", "authorize", "customer_approval", "scheduled"]) {
+      expect(changeRequestScopeLockedReason(state)).toBeNull();
+    }
+    for (const state of ["implement", "review", "customer_review", "closed", "rollback", "canceled"]) {
+      expect(changeRequestScopeLockedReason(state)).toMatch(/can't be changed/);
+    }
+    expect(changeRequestScopeLockedReason(undefined)).toBeNull();
+  });
+});
+
+describe("changeRequestBlockingReason — customer group stages", () => {
+  const customerStage = (stage: string, status = "REQUESTED"): BeChangeRequestApproval => ({
+    stage,
+    approverType: "STATIC_GROUP",
+    approverName: "Acme Reviewers",
+    status,
+    approvers: [],
+  });
+
+  it.each([
+    ["Customer Approval", "Awaiting Customer Approval"],
+    ["Customer Review", "Awaiting Customer Review"],
+    ["customer_review", "Awaiting Customer Review"],
+  ])("names a waiting %s stage '%s', never 'approval approval'", (stage, expected) => {
+    const reason = changeRequestBlockingReason([customerStage(stage)], "implement");
+    expect(reason).toBe(expected);
+    expect(reason).not.toMatch(/approval approval/i);
+  });
+
+  it("uses the same wording from the state whether or not a customer stage exists", () => {
+    expect(changeRequestBlockingReason([customerStage("Customer Approval")], "customer_approval")).toBe(
+      "Awaiting Customer Approval",
+    );
+    expect(changeRequestBlockingReason([], "customer_approval")).toBe("Awaiting Customer Approval");
+    expect(changeRequestBlockingReason([customerStage("Customer Review")], "customer_review")).toBe(
+      "Awaiting Customer Review",
+    );
+    expect(changeRequestBlockingReason([], "customer_review")).toBe("Awaiting Customer Review");
+  });
+});
+
+describe("noCustomerContactsHelper", () => {
+  it.each(["customer_approval", "customer_review"])(
+    "returns the helper at %s when the project has no registered contacts",
+    (state) => {
+      expect(noCustomerContactsHelper(state, [])).toBe(NO_CUSTOMER_CONTACTS_HELPER);
+      expect(noCustomerContactsHelper(state, null)).toBe(NO_CUSTOMER_CONTACTS_HELPER);
+    },
+  );
+
+  it("is silent when the project has registered contacts", () => {
+    expect(noCustomerContactsHelper("customer_approval", [{ id: "c1", name: "Alice" }])).toBeNull();
+  });
+
+  it("is silent when the payload carries no customerContacts field at all (unknown)", () => {
+    expect(noCustomerContactsHelper("customer_approval", undefined)).toBeNull();
+  });
+
+  it("is silent outside the customer gates", () => {
+    for (const state of ["new", "assess", "authorize", "scheduled", "implement", "review", "closed", "canceled", undefined]) {
+      expect(noCustomerContactsHelper(state, [])).toBeNull();
+    }
+  });
+
+  it("says what is going on", () => {
+    expect(NO_CUSTOMER_CONTACTS_HELPER).toMatch(
+      /^No registered customer contacts are assigned to this change request's project, so no customer approvers were assigned\./,
     );
   });
 });

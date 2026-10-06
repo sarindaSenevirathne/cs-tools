@@ -64,7 +64,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: user <create|list|enable|disable> [flags]")
-	fmt.Fprintln(os.Stderr, "  create  -username <name> [-secret <value>] [-created-by <who>] [-ttl <duration>] [-clear-expiry]")
+	fmt.Fprintln(os.Stderr, "  create  -username <name> [-secret <value>] [-created-by <who>]")
 	fmt.Fprintln(os.Stderr, "                                                 create a user, or rotate its secret if it already exists")
 	fmt.Fprintln(os.Stderr, "  list    [-username <name>]                    list all users, or show one user's full detail")
 	fmt.Fprintln(os.Stderr, "  enable  -username <name>                      re-enable a user")
@@ -89,18 +89,10 @@ func runCreate(repo *auth.UserRepo, args []string) {
 	username := fs.String("username", "", "internal user to create, e.g. webhook-integration-user (required)")
 	secret := fs.String("secret", "", "secret to set; if omitted, a random secret is generated and printed once")
 	createdBy := fs.String("created-by", "", "operator provisioning this user; defaults to $USER, falls back to \"unknown\"")
-	ttl := fs.Duration("ttl", 0, "if set, the secret expires this long from now, e.g. 720h")
-	clearExpiry := fs.Bool("clear-expiry", false, "clear any existing expiry, making the secret never expire")
 	fs.Parse(args)
 
 	if *username == "" {
 		log.Fatal("user create: -username is required")
-	}
-	if *ttl < 0 {
-		log.Fatal("user create: -ttl must not be negative")
-	}
-	if *ttl > 0 && *clearExpiry {
-		log.Fatal("user create: -ttl and -clear-expiry are mutually exclusive")
 	}
 
 	ctx := context.Background()
@@ -125,7 +117,10 @@ func runCreate(repo *auth.UserRepo, args []string) {
 	if err != nil {
 		log.Fatalf("user create: generate salt: %v", err)
 	}
-	hash := auth.HashSecret(plainSecret, salt, auth.Iterations)
+	hash, err := auth.HashSecret(plainSecret, salt, auth.Iterations)
+	if err != nil {
+		log.Fatalf("user create: hash secret: %v", err)
+	}
 
 	now := time.Now().UTC()
 	u := auth.User{
@@ -145,17 +140,10 @@ func runCreate(repo *auth.UserRepo, args []string) {
 			u.CreatedBy = existing.CreatedBy
 		}
 		u.Enabled = existing.Enabled
-		u.ExpiresAt = existing.ExpiresAt
 	}
 	// u.ID is left unset for both branches: Upsert's INSERT omits the id column, so a new row
 	// gets one from integration_users.id's gen_random_uuid() default, and an existing row's
 	// ON CONFLICT clause never touches id.
-	switch {
-	case *clearExpiry:
-		u.ExpiresAt = time.Time{}
-	case *ttl > 0:
-		u.ExpiresAt = now.Add(*ttl)
-	}
 
 	if err := repo.Upsert(ctx, u); err != nil {
 		log.Fatalf("user create: upsert user: %v", err)
@@ -205,9 +193,9 @@ func runList(repo *auth.UserRepo, args []string) {
 		fmt.Println("no internal users found")
 		return
 	}
-	fmt.Printf("%-30s %-8s %-20s %s\n", "USERNAME", "ENABLED", "CREATED_BY", "EXPIRES_AT")
+	fmt.Printf("%-30s %-8s %s\n", "USERNAME", "ENABLED", "CREATED_BY")
 	for _, u := range users {
-		fmt.Printf("%-30s %-8t %-20s %s\n", u.Username, u.Enabled, u.CreatedBy, formatTime(u.ExpiresAt))
+		fmt.Printf("%-30s %-8t %s\n", u.Username, u.Enabled, u.CreatedBy)
 	}
 }
 
@@ -222,7 +210,6 @@ func printUserDetail(u auth.User) {
 	fmt.Printf("updated_at:         %s\n", formatTime(u.UpdatedAt))
 	fmt.Printf("secret_rotated_at:  %s\n", formatTime(u.SecretRotatedAt))
 	fmt.Printf("last_used_at:       %s\n", formatTime(u.LastUsedAt))
-	fmt.Printf("expires_at:         %s\n", formatTime(u.ExpiresAt))
 }
 
 // formatTime renders a timestamp as RFC3339, or "-" for an unset (zero) one.

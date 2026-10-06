@@ -40,6 +40,11 @@ type Alert struct {
 	Source           string `json:"source"`
 	UniqueIdentifier string `json:"unique_identifier"`
 	Description      string `json:"description"`
+	// AssignmentGroup, SourceTopic and SourceAccount are the ingestion service's routing signals
+	// (see its model.Alert): a group the alert names itself, and where it was sent from.
+	AssignmentGroup string `json:"assignment_group,omitempty"`
+	SourceTopic     string `json:"source_topic,omitempty"`
+	SourceAccount   string `json:"source_account,omitempty"`
 	// ReceivedAt is when ingestion stored the alert (alerts.created_at); dedup windows are measured on it, not on processing time, so a backlog still splits into correct incidents.
 	ReceivedAt time.Time `json:"-"`
 }
@@ -57,20 +62,24 @@ type Incident struct {
 	ID          int64  `json:"id" db:"id"`
 	Fingerprint string `json:"fingerprint" db:"fingerprint"`
 	// IncidentID is CSM's UUID for PATCH; empty until confirmed. IncidentNumber is the human-readable display id.
-	IncidentID     string    `json:"incident_id" db:"incident_id"`
-	IncidentNumber string    `json:"incident_number" db:"incident_number"`
-	Status         string    `json:"status" db:"status"`
-	Severity       int       `json:"severity" db:"severity"`
-	Impact         string    `json:"impact" db:"impact"`
-	Urgency        string    `json:"urgency" db:"urgency"`
-	Service        string    `json:"service" db:"service"`
-	MetricName     string    `json:"metric_name" db:"metric_name"`
-	Category       string    `json:"category" db:"category"`
-	Environment    string    `json:"environment" db:"environment"`
-	Source         string    `json:"source" db:"source"`
-	AlertCount     int       `json:"alert_count" db:"alert_count"`
-	FirstSeen      time.Time `json:"first_seen" db:"first_seen"`
-	LastSeen       time.Time `json:"last_seen" db:"last_seen"`
+	IncidentID     string `json:"incident_id" db:"incident_id"`
+	IncidentNumber string `json:"incident_number" db:"incident_number"`
+	Status         string `json:"status" db:"status"`
+	Severity       int    `json:"severity" db:"severity"`
+	Impact         string `json:"impact" db:"impact"`
+	Urgency        string `json:"urgency" db:"urgency"`
+	Service        string `json:"service" db:"service"`
+	MetricName     string `json:"metric_name" db:"metric_name"`
+	Category       string `json:"category" db:"category"`
+	Environment    string `json:"environment" db:"environment"`
+	Source         string `json:"source" db:"source"`
+	// The first alert's routing signals, kept so every CSM create attempt (including retries) assigns the same group.
+	AssignmentGroup string    `json:"assignment_group" db:"assignment_group"`
+	SourceTopic     string    `json:"source_topic" db:"source_topic"`
+	SourceAccount   string    `json:"source_account" db:"source_account"`
+	AlertCount      int       `json:"alert_count" db:"alert_count"`
+	FirstSeen       time.Time `json:"first_seen" db:"first_seen"`
+	LastSeen        time.Time `json:"last_seen" db:"last_seen"`
 	// StateCheckedAt throttles CSM status refreshes to one per state_check_interval.
 	StateCheckedAt time.Time `json:"state_checked_at" db:"state_checked_at"`
 	// Fallback and CSMConfirmed are independent delivery obligations tracked separately.
@@ -100,6 +109,13 @@ type Note struct {
 	Text        string `db:"note"`
 	CSMPending  bool   `db:"csm_pending"`
 	ChatPending bool   `db:"chat_pending"`
+}
+
+// TakeRouting copies an alert's routing signals onto a new incident; the incident keeps the first alert's.
+func (i *Incident) TakeRouting(a Alert) {
+	i.AssignmentGroup = a.AssignmentGroup
+	i.SourceTopic = a.SourceTopic
+	i.SourceAccount = a.SourceAccount
 }
 
 // CSMRetryDue reports whether enough time has passed since the last CSM attempt, growing the wait exponentially (base, base*mult, ...) capped at maxDelay.

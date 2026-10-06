@@ -32,12 +32,3 @@ func TestStr(t *testing.T) {
 		t.Errorf("Str(nil) = %q, want empty", got)
 	}
 }
-
-func TestCompactJSON(t *testing.T) {
-	if got := CompactJSON([]byte("{ \"a\": 1 }")); got != `{"a":1}` {
-		t.Errorf("CompactJSON = %q", got)
-	}
-	if got := CompactJSON([]byte("not json")); got != "not json" {
-		t.Errorf("CompactJSON(invalid) = %q, want it unchanged", got)
-	}
-}

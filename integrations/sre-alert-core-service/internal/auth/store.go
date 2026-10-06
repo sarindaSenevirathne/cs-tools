@@ -33,7 +33,7 @@ var ErrUserNotFound = errors.New("internal user not found")
 // existing rows keep theirs untouched since Upsert's ON CONFLICT clause never sets it.
 var userColumns = []string{
 	"username", "secret_hash", "salt", "iterations", "enabled",
-	"created_at", "created_by", "updated_at", "secret_rotated_at", "last_used_at", "expires_at",
+	"created_at", "created_by", "updated_at", "secret_rotated_at", "last_used_at",
 }
 
 var allUserColumns = append([]string{"id"}, userColumns...)
@@ -72,12 +72,11 @@ func (r *UserRepo) Upsert(ctx context.Context, u User) error {
 		ON CONFLICT (username) DO UPDATE SET
 			secret_hash = EXCLUDED.secret_hash, salt = EXCLUDED.salt, iterations = EXCLUDED.iterations,
 			enabled = EXCLUDED.enabled, created_by = EXCLUDED.created_by, updated_at = EXCLUDED.updated_at,
-			secret_rotated_at = EXCLUDED.secret_rotated_at, last_used_at = EXCLUDED.last_used_at,
-			expires_at = EXCLUDED.expires_at`,
+			secret_rotated_at = EXCLUDED.secret_rotated_at, last_used_at = EXCLUDED.last_used_at`,
 		columnList(userColumns), placeholders(len(userColumns)))
 	args := []any{
 		u.Username, u.SecretHash, u.Salt, u.Iterations, u.Enabled,
-		u.CreatedAt, u.CreatedBy, u.UpdatedAt, u.SecretRotatedAt, u.LastUsedAt, u.ExpiresAt,
+		u.CreatedAt, u.CreatedBy, u.UpdatedAt, u.SecretRotatedAt, u.LastUsedAt,
 	}
 	if _, err := r.pool.Exec(ctx, query, args...); err != nil {
 		return fmt.Errorf("upsert internal user %s: %w", u.Username, err)

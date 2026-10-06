@@ -31,3 +31,12 @@ CREATE INDEX IF NOT EXISTS alerts_unclaimed_idx ON alerts (id) WHERE processed_a
 CREATE INDEX IF NOT EXISTS alerts_unclaimed_fp_idx ON alerts (fingerprint) WHERE processed_at IS NULL;
 
 CREATE SEQUENCE IF NOT EXISTS alert_seq AS bigint START 1;
+
+-- Raw webhook bodies exactly as received, before any transform; sre-alert-ingestion-service writes them in batches.
+CREATE TABLE IF NOT EXISTS raw_alerts (
+  id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  received_at  timestamptz NOT NULL,
+  payload      jsonb NOT NULL
+);
+-- Retention deletes by age, oldest first.
+CREATE INDEX IF NOT EXISTS raw_alerts_received_at_idx ON raw_alerts (received_at);

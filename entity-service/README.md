@@ -197,6 +197,27 @@ rather than async.
 | `CUSTOMER_PORTAL_BACKEND_CLIENT_ID` | The customer portal backend's client id. Checked first and always resolved purely from the forwarded `x-user-id-token` -- never unconditionally trusted, structurally preventing this id from ever gaining unrestricted access even if misconfigured elsewhere (optional) |
 | `CUSTOMER_ROLES` | Comma-separated ServiceNow role names whose presence on a case comment's author marks it a customer reply — see "Customer reply state transition" below. No default; unset means that path never fires (optional) |
 
+### User cache (Redis)
+
+`GET /users/{id}` and `GET /users/me` can be served from Redis (`internal/cache`), cache-aside:
+a miss reads Postgres and stores the result for `USER_CACHE_TTL`. Every writer of user, contact
+and membership data (`POST /users`, `PATCH /users/me`, the Salesforce Contact and membership
+ingest, and the portal `/projects/{id}/contacts` writes) deletes the affected user's entries after
+its transaction commits, so the TTL is only a backstop. Errors and not-found results are never
+cached.
+
+The cache is optional and fails open: with no Redis configured, or Redis unreachable, every read
+goes to Postgres as before (a Redis outage is logged, never returned to the caller). It is wired
+only when there is a database.
+
+| Variable | Description |
+|---|---|
+| `REDIS_URL` | `rediss://:<access-key>@<host>:<port>` for a managed, TLS-only Redis (Azure Managed Redis); takes priority over `REDIS_ADDR`. Holds the access key — a secret in Choreo. Must be non-clustered or the "Enterprise" clustering policy, not "OSS Cluster" (optional) |
+| `REDIS_ADDR` / `REDIS_PASSWORD` | Plain, non-TLS `host:port` and password for a local Redis (optional) |
+| `USER_CACHE_TTL` | How long a cached user lives without an invalidation, as a Go duration (default `10m`) |
+
+Keys are namespaced `entity:v1:user:*`; emails appear in keys only as a SHA-256 hash.
+
 ### SLA status
 
 `GET /sla-status` reads SLA state live from the `sla` table (migration `000052`), which

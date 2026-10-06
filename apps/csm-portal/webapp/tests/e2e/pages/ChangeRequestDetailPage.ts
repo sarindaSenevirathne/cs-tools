@@ -130,6 +130,21 @@ export class ChangeRequestDetailPage {
     return this.page.getByRole("alert").filter({ hasText: /you created this change request/i });
   }
 
+  /** The Overview cell labelled `label` (e.g. "Customer Project", "Deployments"). */
+  overviewCell(label: string): Locator {
+    return this.page.getByText(label, { exact: true }).locator("xpath=..");
+  }
+
+  /** The chips an Overview cell shows (Deployments / Deployment products / Customer group). */
+  overviewChips(label: string): Locator {
+    return this.overviewCell(label).locator(".MuiChip-label");
+  }
+
+  /** The Clone button in the page header. */
+  cloneButton(): Locator {
+    return this.page.getByRole("button", { name: /clone/i });
+  }
+
   /** The "Stage" cell of the approvals table row for a named approver
    * ("Peer Approval" | "CAB Approval" | "ECAB Approval"). */
   approverStage(approverName: string): Locator {
@@ -143,6 +158,48 @@ export class ChangeRequestDetailPage {
 
   cancelChangeMenuItem(): Locator {
     return this.page.getByRole("menuitem", { name: "Cancel change" });
+  }
+
+  /** "Roll back" -- the failed-review off-ramp; a destructive overflow-menu entry. */
+  rollbackMenuItem(): Locator {
+    return this.page.getByRole("menuitem", { name: "Roll back" });
+  }
+
+  /** The reason dialog the destructive transitions (Roll back, Cancel change) open. */
+  reasonDialog(): Locator {
+    return this.page.getByRole("dialog");
+  }
+
+  /** "Re-schedule" -- the outlined button beside the primary action in Customer Approval. */
+  rescheduleButton(): Locator {
+    return this.page.getByRole("button", { name: "Re-schedule", exact: true });
+  }
+
+  /** The Re-schedule dialog (its heading is "Re-schedule this change?"). */
+  rescheduleDialog(): Locator {
+    return this.page.getByRole("dialog").filter({ has: this.page.getByRole("heading", { name: "Re-schedule this change?" }) });
+  }
+
+  /** The dialog's submit button (the bar's own "Re-schedule" is behind the modal). */
+  rescheduleSubmit(): Locator {
+    return this.rescheduleDialog().getByRole("button", { name: "Re-schedule", exact: true });
+  }
+
+  /**
+   * Types a wall-clock value (in the signed-in user's time zone, as the picker
+   * shows it) into one of the Re-schedule dialog's MUI date-time pickers
+   * ("Planned start" | "Planned end"): focuses the Month section, then types `MMDDYYYYhhmm` + AM/PM, which the field auto-advances through.
+   */
+  async fillRescheduleWindow(label: "Planned start" | "Planned end", value: { month: number; day: number; year: number; hour12: number; minute: number; pm: boolean }): Promise<void> {
+    const two = (n: number): string => String(n).padStart(2, "0");
+    const group = this.rescheduleDialog().getByRole("group", { name: new RegExp(`^${label}`) });
+    // Focus the first section (Month) explicitly: a click on the group's centre
+    // would land on the Year section and shift every typed digit.
+    await group.getByRole("spinbutton", { name: "Month" }).click();
+    await this.page.keyboard.type(
+      `${two(value.month)}${two(value.day)}${value.year}${two(value.hour12)}${two(value.minute)}${value.pm ? "PM" : "AM"}`,
+      { delay: 30 },
+    );
   }
 
   editButton(): Locator {
@@ -173,6 +230,40 @@ export class ChangeRequestDetailPage {
 
   // "Customer approved"/"Customer reviewed" are deliberately not editable
   // controls in this dialog — see EditChangeRequestDialog.tsx's doc comment.
+
+  /** Scope fields inside the edit dialog (same labels as the create form). */
+  editProjectField(): Locator {
+    return this.editDialog().getByRole("combobox", { name: "Customer Project" });
+  }
+
+  editDeploymentsField(): Locator {
+    return this.editDialog().getByRole("combobox", { name: "Deployments" });
+  }
+
+  /** The read-only Customer Group (the project's registered contacts) inside the edit dialog. */
+  editCustomerGroupField(): Locator {
+    return this.editDialog().getByLabel("Customer Group");
+  }
+
+  editDeploymentProductsField(): Locator {
+    return this.editDialog().getByLabel("Deployment products");
+  }
+
+  editCategoryField(): Locator {
+    return this.editDialog().getByRole("combobox", { name: "Category" });
+  }
+
+  /** The chips inside one of the edit dialog's multi-selects / read-only products field. */
+  editChipsOf(field: Locator): Locator {
+    return field.locator("xpath=ancestor::div[contains(@class,'MuiInputBase-root')][1]").locator(".MuiChip-label");
+  }
+
+  /** Opens an edit-dialog multi-select, toggles the named options, closes it. */
+  async editToggleOptions(field: Locator, names: string[]): Promise<void> {
+    await field.click();
+    for (const name of names) await this.page.getByRole("option", { name, exact: true }).click();
+    await field.press("Escape");
+  }
 
   saveButton(): Locator {
     return this.editDialog().getByRole("button", { name: /^(Save|Saving…)$/ });
@@ -205,6 +296,18 @@ export class ChangeRequestDetailPage {
    * "Rejected" | "Cancelled" | ...). */
   approverStatus(approverName: string, stage?: string): Locator {
     return this.approverRow(approverName, stage).locator(".MuiChip-label");
+  }
+
+  /** The Assignment group of an approver's row: a link-button that opens the
+   * group (its members), or the project's registered contacts for a customer
+   * stage. Pass `stage` to pick one stage's row. */
+  groupLink(approverName: string, groupName: string, stage?: string): Locator {
+    return this.approverRow(approverName, stage).getByRole("button", { name: `View members of ${groupName}`, exact: true });
+  }
+
+  /** The group dialog the Assignment group link opens, titled with the group's name. */
+  groupDialog(title: string): Locator {
+    return this.page.getByRole("dialog", { name: title, exact: true });
   }
 
   /** Approve/Reject buttons only render for the signed-in user's own

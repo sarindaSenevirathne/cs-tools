@@ -312,6 +312,12 @@ type CaseRepository interface {
 	// non-nil value to preserve a known past timestamp instead -- see the
 	// implementation's own doc comment for why (ServiceNow comment mirroring).
 	CreateCaseComment(ctx context.Context, req domain.CreateCaseCommentRequest, createdOn *time.Time) (domain.CaseComment, error)
+	// CreateCaseCommentAsSystem is CreateCaseComment run as the system identity,
+	// for the few internal bookkeeping writes that must succeed even when the
+	// triggering request is an external caller's (a WORK_NOTE is refused for
+	// one, migration 0191). The caller must already have authorised
+	// req.CaseID for the person who triggered the write; this method does not.
+	CreateCaseCommentAsSystem(ctx context.Context, req domain.CreateCaseCommentRequest, createdOn *time.Time) (domain.CaseComment, error)
 	// SearchCaseComments returns a paginated slice of comments for the given case
 	// together with the total count of matching rows before pagination.
 	SearchCaseComments(ctx context.Context, req domain.SearchCaseCommentsRequest) ([]domain.CaseComment, int, error)
@@ -1620,6 +1626,12 @@ var caseCommentEnumType = map[string]domain.CommentType{
 	"COMMENT":          domain.CommentTypeComment,
 	"WORK_NOTE":        domain.CommentTypeWorkNote,
 	"APPROVAL_HISTORY": domain.CommentTypeActivity,
+}
+
+// CreateCaseCommentAsSystem implements CaseRepository. Identity stamping lives
+// here, in the repository layer, like every other system-identity write.
+func (r *caseRepo) CreateCaseCommentAsSystem(ctx context.Context, req domain.CreateCaseCommentRequest, createdOn *time.Time) (domain.CaseComment, error) {
+	return r.CreateCaseComment(WithSystemIdentity(ctx), req, createdOn)
 }
 
 // CreateCaseComment implements CaseRepository. createdOn is nil for an

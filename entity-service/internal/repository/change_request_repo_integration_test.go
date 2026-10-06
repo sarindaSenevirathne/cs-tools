@@ -27,6 +27,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
@@ -107,7 +108,7 @@ const (
 	changeRequestOnHoldTestID = "36666666-0000-0000-0000-000000000013"
 
 	// Customer-approval/customer-review authorization fixtures (change_request.
-	// is_customer_approved/is_customer_reviewed -- see
+	// is_customer_approval_required/is_customer_review_required -- see
 	// authorizeChangeRequestCustomerFlagWrite's own doc comment in
 	// change_request_repo.go for the full rule). A distinct id prefix
 	// ("37777777...") from every fixture above, own account/projects/
@@ -183,6 +184,7 @@ func seedApprovalUserForDecisionTest(t *testing.T, pool *pgxpool.Pool, userIDs .
 			id, email); err != nil {
 			t.Fatalf("seed approver user %s: %v", id, err)
 		}
+		setTestUserType(t, pool, ctx, id, userTypeInternal)
 	}
 }
 
@@ -397,11 +399,14 @@ func TestChangeRequestIntegration_DecideApprovalRejectionDoesNotCascade(t *testi
 }
 
 // TestChangeRequestIntegration_DecideApprovalDoesNotCascadeOutsideAssess
-// confirms the cascade is scoped exactly to Assess->Authorize: approving an
-// approver on a change request that isn't currently in Assess (e.g. one
-// already sitting in Authorize, mid its own separate approval stage) must
-// leave state untouched -- this repository deliberately does not attempt
-// Authorize's own outgoing cascade yet.
+// confirms the cascade is scoped exactly to Assess->Authorize: approving a
+// Peer-stage approver on a change request that isn't currently in Assess (e.g.
+// one already sitting in Authorize) must leave state untouched. A stage can
+// only be decided in the state it belongs to (a Peer stage in Assess), so the
+// decision is now refused outright with a 409 rather than recorded without a
+// cascade: nothing changes, the approver row stays requested (the state
+// reconcile does not run on a refused decision). The seeded stage has no
+// label, so it is classified by position, as Peer.
 func TestChangeRequestIntegration_DecideApprovalDoesNotCascadeOutsideAssess(t *testing.T) {
 	dsn := os.Getenv("CHANGE_REQUEST_TEST_DSN")
 	if dsn == "" {
@@ -420,18 +425,31 @@ func TestChangeRequestIntegration_DecideApprovalDoesNotCascadeOutsideAssess(t *t
 	seedChangeRequestForApprovalTest(t, scoped, "AUTHORIZE")
 	seedApprovalStageForDecisionTest(t, scoped, changeRequestApprovalApproverUserID)
 
-	if _, err := repo.DecideChangeRequestApproval(sys, changeRequestApprovalTestID,
-		changeRequestApprovalApproverUserID, "approved", "cr-approval-test"); err != nil {
-		t.Fatalf("DecideChangeRequestApproval(approved): %v", err)
+	_, err = repo.DecideChangeRequestApproval(sys, changeRequestApprovalTestID,
+		changeRequestApprovalApproverUserID, "approved", "cr-approval-test")
+	var conflict *apierror.ConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("DecideChangeRequestApproval(approved) outside Assess: err = %v (%T), want *apierror.ConflictError", err, err)
+	}
+	if want := "this approval is no longer pending: the change request is in Authorize, but the Peer Approval stage can only be decided while it is in Assess"; conflict.Msg != want {
+		t.Fatalf("refusal message = %q, want %q", conflict.Msg, want)
 	}
 
-	var gotState string
+	var gotState, gotStatus string
 	if scanErr := scoped.QueryRow(sys,
 		`SELECT state::TEXT FROM change_request WHERE id = $1`, changeRequestApprovalTestID).Scan(&gotState); scanErr != nil {
 		t.Fatalf("read back state: %v", scanErr)
 	}
 	if gotState != "AUTHORIZE" {
-		t.Fatalf("state after approval outside Assess = %q, want unchanged \"AUTHORIZE\"", gotState)
+		t.Fatalf("state after a refused approval outside Assess = %q, want unchanged \"AUTHORIZE\"", gotState)
+	}
+	if scanErr := scoped.QueryRow(sys,
+		`SELECT status FROM approval_stage_approver WHERE work_item_id = $1 AND approver_user_id = $2`,
+		changeRequestApprovalTestID, changeRequestApprovalApproverUserID).Scan(&gotStatus); scanErr != nil {
+		t.Fatalf("read back approver status: %v", scanErr)
+	}
+	if gotStatus != "requested" {
+		t.Fatalf("approver status after a refused decision = %q, want unchanged \"requested\"", gotStatus)
 	}
 }
 
@@ -996,6 +1014,7 @@ func seedTeamMembersForAssessGateTest(t *testing.T, pool *pgxpool.Pool, userIDs 
 			id, email); err != nil {
 			t.Fatalf("seed team member user %s: %v", id, err)
 		}
+		setTestUserType(t, pool, ctx, id, userTypeInternal)
 
 		memberCleanup := func() {
 			_, _ = pool.Exec(ctx, `DELETE FROM team_member WHERE user_id = $1`, id)
@@ -1266,6 +1285,10 @@ func TestChangeRequestIntegration_PatchAssessRejectsEmptyGroup(t *testing.T) {
 	repo := repository.NewChangeRequestRepository(scoped)
 	seedChangeRequestForAssessGateTest(t, scoped)
 	seedAssessGateGroup(t, pool)
+	// The local seed populates the Devops Approval peer fallback group, which
+	// would rescue an empty assigned team; this test is about nobody being
+	// left, so the fallback group is emptied for its duration.
+	isolateGroupsNamed(t, scoped, domain.PeerApprovalFallbackGroupName)
 	// Deliberately no seedTeamMembersForAssessGateTest call -- the group
 	// exists (so assignedTeamId itself is valid) but has zero members.
 	t.Cleanup(func() {
@@ -1477,6 +1500,8 @@ func TestChangeRequestIntegration_PatchAssessRejectsWhenOnlyMemberIsRequester(t 
 	seedAssessGateGroup(t, pool)
 	seedTeamMembersForAssessGateTest(t, pool, changeRequestAssessGateMemberUserID)
 	setAssessGateRequestedBy(t, scoped, changeRequestAssessGateMemberUserID)
+	// As above: no seeded Devops Approval fallback for the duration.
+	isolateGroupsNamed(t, scoped, domain.PeerApprovalFallbackGroupName)
 	t.Cleanup(func() {
 		_, _ = scoped.Exec(sys, `DELETE FROM approval_stage WHERE work_item_id = $1`, changeRequestAssessGateTestID)
 	})
@@ -1623,6 +1648,7 @@ func seedTeamMembersForReviewGateTest(t *testing.T, pool *pgxpool.Pool, userIDs 
 			id, email); err != nil {
 			t.Fatalf("seed team member user %s: %v", id, err)
 		}
+		setTestUserType(t, pool, ctx, id, userTypeInternal)
 
 		memberCleanup := func() {
 			_, _ = pool.Exec(ctx, `DELETE FROM team_member WHERE user_id = $1`, id)
@@ -2053,6 +2079,12 @@ func TestChangeRequestIntegration_PatchReviewRejectsWhenOnlyMemberIsRequester(t 
 // untouched by the Review stage's own, separately-provisioned approvers
 // (against a different, explicitly-supplied team), and each stage is
 // attributed to its own, distinct id rather than any one clobbering another.
+//
+// The one thing that is NOT left untouched: the change left Authorize for
+// Review without the CAB stage ever being decided, so its still-requested
+// approvers are no longer actionable and are cancelled by the move
+// (reconcileStaleApprovers) -- a stage's approvers can only act while the change
+// is in the stage's own state.
 func TestChangeRequestIntegration_AssessAuthorizeAndReviewStagesCoexist(t *testing.T) {
 	dsn := os.Getenv("CHANGE_REQUEST_TEST_DSN")
 	if dsn == "" {
@@ -2172,8 +2204,9 @@ func TestChangeRequestIntegration_AssessAuthorizeAndReviewStagesCoexist(t *testi
 		}
 	}
 
-	// The CAB stage's own approvers: both CAB Approval members, freshly
-	// "requested" -- unchanged by the Review patch that followed.
+	// The CAB stage's own approvers: both CAB Approval members, requested
+	// when it was provisioned and cancelled by the Review patch that followed
+	// (the change left Authorize without the stage being decided).
 	authorizeApprovers := map[string]string{}
 	authorizeRows, err := scoped.Query(sys,
 		`SELECT approver_user_id::TEXT, status FROM approval_stage_approver WHERE stage_id = $1`, authorizeStageID)
@@ -2193,8 +2226,8 @@ func TestChangeRequestIntegration_AssessAuthorizeAndReviewStagesCoexist(t *testi
 		t.Fatalf("Authorize approval_stage_approver rows: %v", err)
 	}
 	wantAuthorize := map[string]string{
-		crCABMemberUserID1: "requested",
-		crCABMemberUserID2: "requested",
+		crCABMemberUserID1: "cancelled",
+		crCABMemberUserID2: "cancelled",
 	}
 	if len(authorizeApprovers) != len(wantAuthorize) {
 		t.Fatalf("Authorize approval_stage_approver rows = %+v, want exactly %+v", authorizeApprovers, wantAuthorize)
@@ -2240,13 +2273,13 @@ func TestChangeRequestIntegration_AssessAuthorizeAndReviewStagesCoexist(t *testi
 }
 
 // seedChangeRequestForOnHoldTest inserts a minimal work_item/change_request
-// pair in the given state, with is_on_hold/on_hold_reason/on_hold_started_on
+// pair in the given state, with is_on_hold/on_hold_reason
 // set directly via SQL rather than through PatchChangeRequest -- the tests
 // below are split between exercising the GATE (which needs an "already on
 // hold" precondition to exist before the PATCH under test ever runs) and the
 // WRITE path itself (covered separately), so seeding the precondition
 // directly keeps the two concerns from tangling. onHold=false seeds a
-// never-been-on-hold record (is_on_hold FALSE, reason/since left NULL),
+// never-been-on-hold record (is_on_hold FALSE, reason left NULL),
 // matching every change request created before migration 0178 ever ran.
 func seedChangeRequestForOnHoldTest(t *testing.T, pool *repository.Scoped, state string, onHold bool, reason *string) {
 	t.Helper()
@@ -2271,8 +2304,8 @@ func seedChangeRequestForOnHoldTest(t *testing.T, pool *repository.Scoped, state
 		changeRequestOnHoldTestID)
 
 	if onHold {
-		mustExec(`INSERT INTO change_request (id, state, is_on_hold, on_hold_reason, on_hold_started_on)
-		          VALUES ($1, $2::change_request_state_enum, TRUE, $3, now())`,
+		mustExec(`INSERT INTO change_request (id, state, is_on_hold, on_hold_reason)
+		          VALUES ($1, $2::change_request_state_enum, TRUE, $3)`,
 			changeRequestOnHoldTestID, state, reason)
 	} else {
 		mustExec(`INSERT INTO change_request (id, state, is_on_hold) VALUES ($1, $2::change_request_state_enum, FALSE)`,
@@ -2282,7 +2315,7 @@ func seedChangeRequestForOnHoldTest(t *testing.T, pool *repository.Scoped, state
 
 // TestChangeRequestIntegration_PatchOnHoldPersistsAndReadsBack confirms
 // {onHold: true, onHoldReason: ...} actually persists change_request.is_on_hold/
-// on_hold_reason/on_hold_started_on, both in PatchChangeRequest's own
+// on_hold_reason, both in PatchChangeRequest's own
 // response and independently on a fresh GetChangeRequestByID read.
 func TestChangeRequestIntegration_PatchOnHoldPersistsAndReadsBack(t *testing.T) {
 	dsn := os.Getenv("CHANGE_REQUEST_TEST_DSN")
@@ -2313,9 +2346,6 @@ func TestChangeRequestIntegration_PatchOnHoldPersistsAndReadsBack(t *testing.T) 
 	if cr.OnHoldReason == nil || *cr.OnHoldReason != reason {
 		t.Fatalf("OnHoldReason after patch = %v, want %q", cr.OnHoldReason, reason)
 	}
-	if cr.OnHoldSince == nil || *cr.OnHoldSince == "" {
-		t.Fatalf("OnHoldSince after patch = %v, want a non-empty timestamp", cr.OnHoldSince)
-	}
 
 	// Read back independently via GetChangeRequestByID -- not just trusting
 	// PatchChangeRequest's own response -- to confirm this actually
@@ -2329,9 +2359,6 @@ func TestChangeRequestIntegration_PatchOnHoldPersistsAndReadsBack(t *testing.T) 
 	}
 	if got.OnHoldReason == nil || *got.OnHoldReason != reason {
 		t.Fatalf("GetChangeRequestByID OnHoldReason = %v, want %q", got.OnHoldReason, reason)
-	}
-	if got.OnHoldSince == nil || *got.OnHoldSince != *cr.OnHoldSince {
-		t.Fatalf("GetChangeRequestByID OnHoldSince = %v, want %v", got.OnHoldSince, cr.OnHoldSince)
 	}
 }
 
@@ -2387,7 +2414,7 @@ func TestChangeRequestIntegration_PatchStateRejectedWhileOnHold(t *testing.T) {
 // onHold: false} in the SAME request is allowed through even though the
 // record is currently on hold -- "take it off hold and advance in one
 // call". Also confirms clearing OnHold in this combined request clears
-// on_hold_reason/on_hold_started_on exactly the same way a standalone
+// on_hold_reason exactly the same way a standalone
 // {onHold: false} would.
 func TestChangeRequestIntegration_PatchClearsOnHoldAndAdvancesStateTogether(t *testing.T) {
 	dsn := os.Getenv("CHANGE_REQUEST_TEST_DSN")
@@ -2418,9 +2445,6 @@ func TestChangeRequestIntegration_PatchClearsOnHoldAndAdvancesStateTogether(t *t
 	}
 	if cr.OnHoldReason != nil {
 		t.Fatalf("OnHoldReason after simultaneous clear+advance = %v, want nil", cr.OnHoldReason)
-	}
-	if cr.OnHoldSince != nil {
-		t.Fatalf("OnHoldSince after simultaneous clear+advance = %v, want nil", cr.OnHoldSince)
 	}
 	if cr.State == nil || *cr.State != string(domain.ChangeRequestStateCanceled) {
 		t.Fatalf("state after simultaneous clear+advance = %v, want %q", cr.State, domain.ChangeRequestStateCanceled)
@@ -2462,9 +2486,6 @@ func TestChangeRequestIntegration_PatchOffHoldAlwaysSucceeds(t *testing.T) {
 			}
 			if cr.OnHoldReason != nil {
 				t.Fatalf("OnHoldReason after patch = %v, want nil", cr.OnHoldReason)
-			}
-			if cr.OnHoldSince != nil {
-				t.Fatalf("OnHoldSince after patch = %v, want nil", cr.OnHoldSince)
 			}
 			if cr.State == nil || strings.ToUpper(*cr.State) != seedState {
 				t.Fatalf("state after off-hold patch = %v, want unchanged %q", cr.State, seedState)
@@ -2643,8 +2664,8 @@ func seedProjectContactWithRole(t *testing.T, pool *pgxpool.Pool, projectID, ema
 }
 
 // seedChangeRequestForCustomerFlagTest inserts a minimal work_item/
-// change_request pair linked to projectID, with is_customer_approved/
-// is_customer_reviewed seeded directly via SQL -- bypassing PatchChangeRequest
+// change_request pair linked to projectID, with is_customer_approval_required/
+// is_customer_review_required seeded directly via SQL -- bypassing PatchChangeRequest
 // entirely -- to whatever precondition a given test needs to exist before the
 // PATCH under test ever runs. Same split-precondition-from-write-path
 // discipline as seedChangeRequestForOnHoldTest's own doc comment.
@@ -2669,7 +2690,7 @@ func seedChangeRequestForCustomerFlagTest(t *testing.T, pool *repository.Scoped,
 	mustExec(`INSERT INTO work_item (id, created_on, updated_on, created_by, updated_by, number, subject, type, project_id)
 	          VALUES ($1, now(), now(), 'cr-customer-flag-test', 'cr-customer-flag-test', $2, 'customer flag auth test', 'CHANGE_REQUEST', $3::uuid)`,
 		id, number, projectID)
-	mustExec(`INSERT INTO change_request (id, state, is_customer_approved, is_customer_reviewed)
+	mustExec(`INSERT INTO change_request (id, state, is_customer_approval_required, is_customer_review_required)
 	          VALUES ($1, 'NEW'::change_request_state_enum, $2, $3)`,
 		id, approved, reviewed)
 }
@@ -2685,8 +2706,8 @@ func externalCallerCtx(email string) context.Context {
 }
 
 // TestChangeRequestIntegration_PatchCustomerFlagInternalCallerCanSetBoth
-// confirms an internal caller may flip BOTH is_customer_approved and
-// is_customer_reviewed from false to true, in one PATCH, with no project
+// confirms an internal caller may flip BOTH is_customer_approval_required and
+// is_customer_review_required from false to true, in one PATCH, with no project
 // membership or project_contact row involved at all.
 func TestChangeRequestIntegration_PatchCustomerFlagInternalCallerCanSetBoth(t *testing.T) {
 	dsn := os.Getenv("CHANGE_REQUEST_TEST_DSN")
@@ -2731,7 +2752,7 @@ func TestChangeRequestIntegration_PatchCustomerFlagInternalCallerCanSetBoth(t *t
 
 // TestChangeRequestIntegration_PatchCustomerFlagQualifyingPortalUserContactCanApprove
 // confirms a REGISTERED project_contact holding PORTAL_USER on the change
-// request's OWN project may flip is_customer_approved false -> true.
+// request's OWN project may flip is_customer_approval_required false -> true.
 func TestChangeRequestIntegration_PatchCustomerFlagQualifyingPortalUserContactCanApprove(t *testing.T) {
 	dsn := os.Getenv("CHANGE_REQUEST_TEST_DSN")
 	if dsn == "" {
@@ -2816,11 +2837,11 @@ func TestChangeRequestIntegration_PatchCustomerFlagContactOnDifferentProjectCann
 	}
 
 	var gotApproved *bool
-	if scanErr := scoped.QueryRow(sys, `SELECT is_customer_approved FROM change_request WHERE id = $1`, crCustomerFlagDifferentProjectTestID).Scan(&gotApproved); scanErr != nil {
-		t.Fatalf("read back is_customer_approved: %v", scanErr)
+	if scanErr := scoped.QueryRow(sys, `SELECT is_customer_approval_required FROM change_request WHERE id = $1`, crCustomerFlagDifferentProjectTestID).Scan(&gotApproved); scanErr != nil {
+		t.Fatalf("read back is_customer_approval_required: %v", scanErr)
 	}
 	if gotApproved != nil && *gotApproved {
-		t.Fatal("is_customer_approved after rejected patch = true, want unchanged false")
+		t.Fatal("is_customer_approval_required after rejected patch = true, want unchanged false")
 	}
 }
 
@@ -2870,11 +2891,11 @@ func TestChangeRequestIntegration_PatchCustomerFlagWrongRoleContactForbiddenStat
 	}
 
 	var gotApproved *bool
-	if scanErr := scoped.QueryRow(sys, `SELECT is_customer_approved FROM change_request WHERE id = $1`, crCustomerFlagWrongRoleTestID).Scan(&gotApproved); scanErr != nil {
-		t.Fatalf("read back is_customer_approved: %v", scanErr)
+	if scanErr := scoped.QueryRow(sys, `SELECT is_customer_approval_required FROM change_request WHERE id = $1`, crCustomerFlagWrongRoleTestID).Scan(&gotApproved); scanErr != nil {
+		t.Fatalf("read back is_customer_approval_required: %v", scanErr)
 	}
 	if gotApproved != nil && *gotApproved {
-		t.Fatal("is_customer_approved after rejected patch = true, want unchanged false")
+		t.Fatal("is_customer_approval_required after rejected patch = true, want unchanged false")
 	}
 
 	// The rejection above must have zero bearing on this same change
@@ -2983,12 +3004,12 @@ func TestChangeRequestIntegration_PatchCustomerFlagLockedTrueCannotRevert(t *tes
 	}
 
 	var gotApproved, gotReviewed bool
-	if scanErr := scoped.QueryRow(sys, `SELECT is_customer_approved, is_customer_reviewed FROM change_request WHERE id = $1`,
+	if scanErr := scoped.QueryRow(sys, `SELECT is_customer_approval_required, is_customer_review_required FROM change_request WHERE id = $1`,
 		crCustomerFlagLockedTestID).Scan(&gotApproved, &gotReviewed); scanErr != nil {
 		t.Fatalf("read back: %v", scanErr)
 	}
 	if !gotApproved || !gotReviewed {
-		t.Fatalf("is_customer_approved/is_customer_reviewed after both rejected patches = %v/%v, want unchanged true/true", gotApproved, gotReviewed)
+		t.Fatalf("is_customer_approval_required/is_customer_review_required after both rejected patches = %v/%v, want unchanged true/true", gotApproved, gotReviewed)
 	}
 }
 
@@ -3030,10 +3051,10 @@ func TestChangeRequestIntegration_PatchCustomerFlagFalseToFalseNoOpSucceeds(t *t
 
 // TestChangeRequestIntegration_PatchCustomerFlagsLockIndependentPerField
 // confirms one field's own lock state has no bearing on the other's: a
-// single PATCH with is_customer_approved ALREADY true (so true -> true, a
-// no-op, always allowed) and is_customer_reviewed false -> true (the one
+// single PATCH with is_customer_approval_required ALREADY true (so true -> true, a
+// no-op, always allowed) and is_customer_review_required false -> true (the one
 // real gated transition, allowed here since the caller is internal)
-// succeeds as a whole, changing only is_customer_reviewed.
+// succeeds as a whole, changing only is_customer_review_required.
 func TestChangeRequestIntegration_PatchCustomerFlagsLockIndependentPerField(t *testing.T) {
 	dsn := os.Getenv("CHANGE_REQUEST_TEST_DSN")
 	if dsn == "" {
@@ -3071,7 +3092,7 @@ func TestChangeRequestIntegration_PatchCustomerFlagsLockIndependentPerField(t *t
 // Type-dependent approval flow (change_request_approval_flow.go).
 //
 // Lifecycle tests for Normal (peer then CAB), Emergency (ECAB only) and
-// Standard (no approval), the creator/SRE approver rules, the CAB/ECAB groups
+// Standard (no approval), the creator/INTERNAL-only approver rules, the CAB/ECAB groups
 // the migration creates, the automatic move to Scheduled, and the mandatory
 // type on create -- all against the real Postgres this file's neighbours use:
 //
@@ -3098,13 +3119,33 @@ const (
 	crFlowSREID      = "3aaaaaaa-0000-0000-0000-000000000004"
 	crFlowOutsiderID = "3aaaaaaa-0000-0000-0000-000000000005"
 
+	// Users the INTERNAL-only pool rule must keep out of every internal stage:
+	// two customers (EXTERNAL), an internal user who has been deactivated, and
+	// a user with no role at all (user_type NOT_AVAILABLE). crFlowSREPeerID is a
+	// second, ordinary internal member of the SRE team.
+	crFlowExternalID  = "3aaaaaaa-0000-0000-0000-000000000006"
+	crFlowExternalID2 = "3aaaaaaa-0000-0000-0000-000000000007"
+	crFlowSREPeerID   = "3aaaaaaa-0000-0000-0000-000000000008"
+	crFlowInactiveID  = "3aaaaaaa-0000-0000-0000-000000000009"
+	crFlowNoTypeID    = "3aaaaaaa-0000-0000-0000-00000000000a"
+
+	// External members of the CAB / ECAB groups and the Devops Approval
+	// fallback group, and its internal members.
+	crCABExternalID    = "3aaaaaaa-0000-0000-0000-0000000000c3"
+	crECABExternalID   = "3aaaaaaa-0000-0000-0000-0000000000e2"
+	crDevopsMemberID1  = "3aaaaaaa-0000-0000-0000-0000000000d1"
+	crDevopsMemberID2  = "3aaaaaaa-0000-0000-0000-0000000000d2"
+	crDevopsExternalID = "3aaaaaaa-0000-0000-0000-0000000000d3"
+
 	// crFlowGroupID is the change's assigned group: creator, both peers and
-	// one SRE-team member belong to it.
+	// the outsider belong to it.
 	crFlowGroupID = "3aaaaaaa-0000-0000-0000-0000000000a1"
-	// crFlowSREGroupID is an SRE group (Apollo-like): only the SRE member.
-	crFlowSREGroupID = "3aaaaaaa-0000-0000-0000-0000000000a2"
-	// crFlowSRETeamID is the "team" row of type sre-abt the SRE member belongs to.
+	// crFlowSRETeamID is an SRE team (Apollo-like): the "team" row of type
+	// sre-abt, mirrored by a "group" row with the SAME id (as every synced team
+	// is), which is what a change assigned to that team points at.
 	crFlowSRETeamID = "3aaaaaaa-0000-0000-0000-0000000000a3"
+	// crFlowSREGroupID is that mirror group.
+	crFlowSREGroupID = crFlowSRETeamID
 	// crFlowDevopsGroupID is the peer approval fallback group ("Devops Approval").
 	crFlowDevopsGroupID = "3aaaaaaa-0000-0000-0000-0000000000a4"
 )
@@ -3113,10 +3154,47 @@ func crFlowEmail(userID string) string {
 	return fmt.Sprintf("crflow-%s@example.com", userID[len(userID)-12:])
 }
 
-// seedApprovalGroupMembers makes each userID a (freshly seeded) user and a
-// member of the "group" groupID (team_member.group_id). The group row must
-// exist. Everything is removed again on cleanup.
+// "user".user_type values the tests seed. recompute_user_type() derives them
+// from a user's roles (internal/admin -> INTERNAL, customer/external/partner...
+// -> EXTERNAL, nothing -> NOT_AVAILABLE); the tests set the column directly
+// instead of creating role rows, so they do not depend on (or collide with)
+// the seed's fixed-id role rows. Approver pools are INTERNAL-only, so a test
+// user is INTERNAL unless the test says otherwise.
+const (
+	userTypeInternal = "INTERNAL"
+	userTypeExternal = "EXTERNAL"
+)
+
+// testUserExecer is what both *pgxpool.Pool and *repository.Scoped offer.
+type testUserExecer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// setTestUserType sets a seeded test user's user_type.
+func setTestUserType(t *testing.T, db testUserExecer, ctx context.Context, userID, userType string) {
+	t.Helper()
+	if _, err := db.Exec(ctx, `UPDATE "user" SET user_type = $2::user_type_enum WHERE id = $1`, userID, userType); err != nil {
+		t.Fatalf("set user_type %s on %s: %v", userType, userID, err)
+	}
+}
+
+// seedApprovalGroupMembers makes each userID a (freshly seeded) INTERNAL user
+// and a member of the "group" groupID (team_member.group_id). The group row
+// must exist. Everything is removed again on cleanup.
 func seedApprovalGroupMembers(t *testing.T, pool *repository.Scoped, groupID string, userIDs ...string) {
+	t.Helper()
+	seedGroupMembersOfType(t, pool, groupID, userTypeInternal, userIDs...)
+}
+
+// seedExternalGroupMembers is seedApprovalGroupMembers for EXTERNAL (customer)
+// users: members of the group who must never be provisioned as approvers of an
+// internal stage.
+func seedExternalGroupMembers(t *testing.T, pool *repository.Scoped, groupID string, userIDs ...string) {
+	t.Helper()
+	seedGroupMembersOfType(t, pool, groupID, userTypeExternal, userIDs...)
+}
+
+func seedGroupMembersOfType(t *testing.T, pool *repository.Scoped, groupID, userType string, userIDs ...string) {
 	t.Helper()
 	ctx := repository.WithSystemIdentity(context.Background())
 	isolateApprovalGroup(t, pool, groupID)
@@ -3131,6 +3209,7 @@ func seedApprovalGroupMembers(t *testing.T, pool *repository.Scoped, groupID str
 			id, crFlowEmail(id)); err != nil {
 			t.Fatalf("seed user %s: %v", id, err)
 		}
+		setTestUserType(t, pool, ctx, id, userType)
 		if _, err := pool.Exec(ctx,
 			`INSERT INTO team_member (id, created_on, updated_on, created_by, updated_by, team_id, user_id, group_id)
 			 VALUES (gen_random_uuid(), now(), now(), 'cr-flow-test', 'cr-flow-test', $1::uuid, $2, $3::uuid)`,
@@ -3196,6 +3275,19 @@ type crFlow struct {
 
 func newCRFlow(t *testing.T) *crFlow {
 	t.Helper()
+	f := newCRFlowNoIsolation(t)
+	// Tests that seed no CAB/ECAB members expect those groups empty, and so for
+	// the Devops Approval fallback group (the local seed populates all three).
+	isolateApprovalGroup(t, f.scoped, crCABGroupID)
+	isolateApprovalGroup(t, f.scoped, crECABGroupID)
+	isolateGroupsNamed(t, f.scoped, domain.PeerApprovalFallbackGroupName)
+	return f
+}
+
+// newCRFlowNoIsolation is newCRFlow without emptying the CAB / ECAB / Devops
+// Approval groups: for tests about what a seeded database holds in them.
+func newCRFlowNoIsolation(t *testing.T) *crFlow {
+	t.Helper()
 	dsn := os.Getenv("CHANGE_REQUEST_TEST_DSN")
 	if dsn == "" {
 		t.Skip("CHANGE_REQUEST_TEST_DSN not set")
@@ -3217,15 +3309,67 @@ func newCRFlow(t *testing.T) *crFlow {
 	}
 	clean()
 	t.Cleanup(clean)
-	// Tests that seed no CAB/ECAB members expect those groups empty.
-	isolateApprovalGroup(t, scoped, crCABGroupID)
-	isolateApprovalGroup(t, scoped, crECABGroupID)
 	return f
 }
 
-// seedAssignedGroup creates the assigned group (creator, peers A/B, and the
-// SRE member who is in an sre-abt team) plus the SRE team and SRE group.
+// isolateGroupsNamed is isolateApprovalGroup for every "group" row of the
+// given name (the Devops Approval fallback group may exist more than once, and
+// namedGroup counts the members of all of them): their members are removed for
+// the duration of the calling test and put back on cleanup.
+func isolateGroupsNamed(t *testing.T, pool *repository.Scoped, name string) {
+	t.Helper()
+	ctx := repository.WithSystemIdentity(context.Background())
+	rows, err := pool.Query(ctx,
+		`SELECT id::text, team_id::text, user_id::text, group_id::text, role FROM team_member
+		 WHERE group_id IN (SELECT id FROM "group" WHERE name = $1)`, name)
+	if err != nil {
+		t.Fatalf("snapshot members of groups named %q: %v", name, err)
+	}
+	type member struct{ id, team, user, group, role string }
+	var saved []member
+	for rows.Next() {
+		var m member
+		if err := rows.Scan(&m.id, &m.team, &m.user, &m.group, &m.role); err != nil {
+			rows.Close()
+			t.Fatalf("scan member: %v", err)
+		}
+		saved = append(saved, m)
+	}
+	rows.Close()
+	if len(saved) == 0 {
+		return
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM team_member WHERE group_id IN (SELECT id FROM "group" WHERE name = $1)`, name); err != nil {
+		t.Fatalf("clear members of groups named %q: %v", name, err)
+	}
+	t.Cleanup(func() {
+		for _, m := range saved {
+			_, _ = pool.Exec(ctx,
+				`INSERT INTO team_member (id, created_on, updated_on, created_by, updated_by, team_id, user_id, group_id, role)
+				 VALUES ($1::uuid, now(), now(), 'cr-flow-test', 'cr-flow-test', $2::uuid, $3::uuid, $4::uuid, $5) ON CONFLICT (id) DO NOTHING`,
+				m.id, m.team, m.user, m.group, m.role)
+		}
+	})
+}
+
+// seedAssignedGroup creates the assigned group: the creator, peers A/B and the
+// outsider, all INTERNAL users.
 func (f *crFlow) seedAssignedGroup() {
+	f.t.Helper()
+	if _, err := f.scoped.Exec(f.sys,
+		`INSERT INTO "group" (id, created_on, updated_on, created_by, updated_by, name) VALUES ($1, now(), now(), 'cr-flow-test', 'cr-flow-test', 'CR Flow Assigned Group')`,
+		crFlowGroupID); err != nil {
+		f.t.Fatalf("seed assigned group: %v", err)
+	}
+	seedApprovalGroupMembers(f.t, f.scoped, crFlowGroupID, crFlowCreatorID, crFlowPeerAID, crFlowPeerBID)
+	seedApprovalGroupMembers(f.t, f.scoped, crFlowGroupID, crFlowOutsiderID)
+}
+
+// seedSREGroup creates an SRE team the way a synced one looks (Apollo): a
+// "team" row of type sre-abt and a "group" row with the same id, whose members
+// -- the creator, two ordinary internal engineers and a customer -- have
+// team_id = group_id = that id. A change assigned to it points at the group.
+func (f *crFlow) seedSREGroup() {
 	f.t.Helper()
 	mustExec := func(sql string, args ...any) {
 		f.t.Helper()
@@ -3233,18 +3377,14 @@ func (f *crFlow) seedAssignedGroup() {
 			f.t.Fatalf("seed (%.60s): %v", sql, err)
 		}
 	}
-	for id, name := range map[string]string{crFlowGroupID: "CR Flow Assigned Group", crFlowSREGroupID: "CR Flow SRE Group"} {
-		mustExec(`INSERT INTO "group" (id, created_on, updated_on, created_by, updated_by, name) VALUES ($1, now(), now(), 'cr-flow-test', 'cr-flow-test', $2)`, id, name)
-	}
 	mustExec(`INSERT INTO team (id, created_on, updated_on, created_by, updated_by, name, type, key)
 	          VALUES ($1, now(), now(), 'cr-flow-test', 'cr-flow-test', 'CR Flow SRE Team', 'sre-abt', 'crflow-sre')`, crFlowSRETeamID)
-
-	seedApprovalGroupMembers(f.t, f.scoped, crFlowGroupID, crFlowCreatorID, crFlowPeerAID, crFlowPeerBID)
-	seedApprovalGroupMembers(f.t, f.scoped, crFlowGroupID, crFlowSREID)
-	// The SRE member belongs to an SRE team (Apollo-like) as well as the
-	// assigned group.
-	f.makeSRE(crFlowSREID, crFlowGroupID)
-	seedApprovalGroupMembers(f.t, f.scoped, crFlowGroupID, crFlowOutsiderID)
+	mustExec(`INSERT INTO "group" (id, created_on, updated_on, created_by, updated_by, name) VALUES ($1, now(), now(), 'cr-flow-test', 'cr-flow-test', 'CR Flow SRE Team')`, crFlowSREGroupID)
+	seedApprovalGroupMembers(f.t, f.scoped, crFlowSREGroupID, crFlowCreatorID, crFlowSREID, crFlowSREPeerID)
+	seedExternalGroupMembers(f.t, f.scoped, crFlowSREGroupID, crFlowExternalID)
+	for _, uid := range []string{crFlowCreatorID, crFlowSREID, crFlowSREPeerID, crFlowExternalID} {
+		f.makeSRE(uid, crFlowSREGroupID)
+	}
 }
 
 // makeSRE puts userID into the sre-abt team (team_id = the SRE team) while
@@ -3393,8 +3533,7 @@ func TestChangeRequestFlowIntegration_NormalFullLifecycle(t *testing.T) {
 	assertStates(t, "legalNextStates(New)", f.legal(id), "assess", "canceled")
 
 	// Request Approval -> Assess with the PEER stage: the two peers are
-	// requested, the creator is cancelled (never approves their own change),
-	// the SRE-team member is not provisioned at all.
+	// requested, the creator is cancelled (never approves their own change).
 	f.requestApproval(id)
 	if got := f.state(id); got != "ASSESS" {
 		t.Fatalf("state after Request Approval = %q, want ASSESS", got)
@@ -3650,89 +3789,475 @@ func TestChangeRequestFlowIntegration_CreatorRecognisedByCreatedByEmail(t *testi
 	}
 }
 
-// SRE team members (Apollo/Artemis/any SRE group) are never peer approvers.
-func TestChangeRequestFlowIntegration_SREMemberCannotBePeerApprover(t *testing.T) {
+// helpers shared by the INTERNAL-only pool tests ---------------------------
+
+// seedDevopsGroup creates the Devops Approval peer fallback group with two
+// internal members and one customer.
+func (f *crFlow) seedDevopsGroup() {
+	f.t.Helper()
+	if _, err := f.scoped.Exec(f.sys,
+		`INSERT INTO "group" (id, created_on, updated_on, created_by, updated_by, name) VALUES ($1, now(), now(), 'cr-flow-test', 'cr-flow-test', $2)`,
+		crFlowDevopsGroupID, domain.PeerApprovalFallbackGroupName); err != nil {
+		f.t.Fatalf("seed devops group: %v", err)
+	}
+	seedApprovalGroupMembers(f.t, f.scoped, crFlowDevopsGroupID, crDevopsMemberID1, crDevopsMemberID2)
+	seedExternalGroupMembers(f.t, f.scoped, crFlowDevopsGroupID, crDevopsExternalID)
+}
+
+// forceApprover puts userID on the change's (latest) stage with the given label
+// as a REQUESTED approver -- the drift the decision-time guard exists for: a row
+// that predates the INTERNAL-only rule, or a user whose type or membership
+// changed after provisioning.
+func (f *crFlow) forceApprover(id, label, userID string) {
+	f.t.Helper()
+	if _, err := f.scoped.Exec(f.sys,
+		`INSERT INTO approval_stage_approver (id, created_on, updated_on, created_by, updated_by, stage_id, work_item_id, approver_user_id, status)
+		 SELECT gen_random_uuid(), now(), now(), 'cr-flow-test', 'cr-flow-test', s.id, s.work_item_id, $3::uuid, 'requested'
+		 FROM approval_stage s WHERE s.work_item_id = $1 AND s.checkpoint_label = $2
+		 ORDER BY s.created_on DESC, s.id DESC LIMIT 1`, id, label, userID); err != nil {
+		f.t.Fatalf("force %s onto the %s stage: %v", userID, label, err)
+	}
+}
+
+// stage returns the change's stage with the given label (the first, if the
+// stage was repeated), failing the test when there is none.
+func (f *crFlow) stage(id, label string) crFlowStage {
+	f.t.Helper()
+	for _, st := range f.stages(id) {
+		if st.label == label {
+			return st
+		}
+	}
+	f.t.Fatalf("change %s has no %q stage (stages: %v)", id, label, f.labels(id))
+	return crFlowStage{}
+}
+
+// wantPeerPool asserts the change's Peer Approval stage is on groupID with
+// exactly the given approvers.
+func (f *crFlow) wantPeerPool(id, groupID string, want map[string]string) {
+	f.t.Helper()
+	st := f.stage(id, "Peer Approval")
+	if st.groupID != groupID {
+		f.t.Fatalf("peer stage group = %s, want %s", st.groupID, groupID)
+	}
+	assertApprovers(f.t, "peer stage", st.approvers, want)
+}
+
+// Peer approval is the WHOLE assigned group: when that group is an SRE team
+// (Apollo-like: a sre-abt team and its same-id group), its active internal
+// members are the peer approvers -- belonging to an SRE team neither keeps
+// anyone out of the pool nor stops them deciding. The creator is still listed,
+// cancelled, and a customer who is a member of the team is not provisioned.
+func TestChangeRequestFlowIntegration_SRETeamAssignedGroupMembersArePeerApprovers(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedSREGroup()
+	seedApprovalGroupMembers(t, f.scoped, crCABGroupID, crCABMemberUserID1)
+	// The Devops Approval fallback must not be what supplies the approvers.
+	f.seedDevopsGroup()
+	id := f.create(domain.ChangeRequestTypeNormal, crFlowSREGroupID)
+	f.requestApproval(id)
+
+	f.wantPeerPool(id, crFlowSREGroupID, map[string]string{
+		crFlowCreatorID: "cancelled", crFlowSREID: "requested", crFlowSREPeerID: "requested",
+	})
+
+	// They may decide, and see it: canDecide on their own row.
+	if got := f.canDecideAs(id, crFlowSREID); len(got) != 1 || !got["Peer Approval/"+crFlowSREID] {
+		t.Fatalf("canDecide for an SRE-team peer = %v, want their own Peer Approval row", got)
+	}
+	if err := f.decide(id, crFlowSREID, "approved"); err != nil {
+		t.Fatalf("SRE-team peer approval: %v", err)
+	}
+	f.expect(id, "after the SRE-team peer approved", "AUTHORIZE", "canceled")
+	assertApprovers(t, "peer stage after approval", f.stage(id, "Peer Approval").approvers, map[string]string{
+		crFlowCreatorID: "cancelled", crFlowSREID: "approved", crFlowSREPeerID: "cancelled",
+	})
+	if f.stage(id, "CAB Approval").groupID != crCABGroupID {
+		t.Fatal("the CAB stage was not provisioned on the CAB group")
+	}
+}
+
+// The Devops Approval group is the peer pool's fallback and nothing else: only
+// when the assigned group yields no eligible member -- no active internal
+// member other than the creator -- is it used, under the same rules (internal
+// users only, creator cancelled). While the assigned group has an eligible
+// member, a populated Devops Approval group is ignored.
+func TestChangeRequestFlowIntegration_PeerPoolFallsBackToDevopsApprovalOnlyWhenAssignedGroupYieldsNobody(t *testing.T) {
+	newFlow := func(t *testing.T) *crFlow {
+		f := newCRFlow(t)
+		seedApprovalGroupMembers(t, f.scoped, crCABGroupID, crCABMemberUserID1)
+		if _, err := f.scoped.Exec(f.sys,
+			`INSERT INTO "group" (id, created_on, updated_on, created_by, updated_by, name) VALUES ($1, now(), now(), 'cr-flow-test', 'cr-flow-test', 'CR Flow Assigned Group')`,
+			crFlowGroupID); err != nil {
+			t.Fatalf("seed assigned group: %v", err)
+		}
+		return f
+	}
+	devopsPool := map[string]string{crDevopsMemberID1: "requested", crDevopsMemberID2: "requested"}
+
+	t.Run("assigned group with an eligible member does not use Devops Approval", func(t *testing.T) {
+		f := newFlow(t)
+		f.seedDevopsGroup()
+		seedApprovalGroupMembers(t, f.scoped, crFlowGroupID, crFlowCreatorID, crFlowPeerAID)
+		id := f.create(domain.ChangeRequestTypeNormal, crFlowGroupID)
+		f.requestApproval(id)
+		f.wantPeerPool(id, crFlowGroupID, map[string]string{crFlowCreatorID: "cancelled", crFlowPeerAID: "requested"})
+	})
+
+	t.Run("assigned group of customers only falls back", func(t *testing.T) {
+		f := newFlow(t)
+		f.seedDevopsGroup()
+		seedApprovalGroupMembers(t, f.scoped, crFlowGroupID, crFlowCreatorID)
+		seedExternalGroupMembers(t, f.scoped, crFlowGroupID, crFlowExternalID, crFlowExternalID2)
+		id := f.create(domain.ChangeRequestTypeNormal, crFlowGroupID)
+		f.requestApproval(id)
+		// The customer in the Devops group is skipped there too.
+		f.wantPeerPool(id, crFlowDevopsGroupID, devopsPool)
+	})
+
+	t.Run("assigned group with only the creator falls back", func(t *testing.T) {
+		f := newFlow(t)
+		f.seedDevopsGroup()
+		seedApprovalGroupMembers(t, f.scoped, crFlowGroupID, crFlowCreatorID)
+		id := f.create(domain.ChangeRequestTypeNormal, crFlowGroupID)
+		f.requestApproval(id)
+		f.wantPeerPool(id, crFlowDevopsGroupID, devopsPool)
+	})
+
+	t.Run("assigned group of an inactive internal user and a user with no type falls back", func(t *testing.T) {
+		f := newFlow(t)
+		f.seedDevopsGroup()
+		seedApprovalGroupMembers(t, f.scoped, crFlowGroupID, crFlowCreatorID, crFlowInactiveID)
+		f.execSQL(`UPDATE "user" SET is_active = false WHERE id = $1`, crFlowInactiveID)
+		seedGroupMembersOfType(t, f.scoped, crFlowGroupID, "NOT_AVAILABLE", crFlowNoTypeID)
+		id := f.create(domain.ChangeRequestTypeNormal, crFlowGroupID)
+		f.requestApproval(id)
+		f.wantPeerPool(id, crFlowDevopsGroupID, devopsPool)
+	})
+
+	t.Run("an SRE-team assigned group with nobody eligible falls back like any other", func(t *testing.T) {
+		f := newFlow(t)
+		f.seedDevopsGroup()
+		f.seedSREGroup()
+		// Only the creator and a customer are left in the SRE group.
+		f.execSQL(`DELETE FROM team_member WHERE user_id IN ($1, $2)`, crFlowSREID, crFlowSREPeerID)
+		id := f.create(domain.ChangeRequestTypeNormal, crFlowSREGroupID)
+		f.requestApproval(id)
+		f.wantPeerPool(id, crFlowDevopsGroupID, devopsPool)
+	})
+
+	t.Run("nobody eligible anywhere is refused, and says why", func(t *testing.T) {
+		f := newFlow(t)
+		// No Devops Approval members at all (the group may not even exist).
+		seedApprovalGroupMembers(t, f.scoped, crFlowGroupID, crFlowCreatorID)
+		seedExternalGroupMembers(t, f.scoped, crFlowGroupID, crFlowExternalID)
+		id := f.create(domain.ChangeRequestTypeNormal, crFlowGroupID)
+		_, err := f.patchState(id, domain.ChangeRequestStateAssess)
+		f.wantValidationError("Request Approval with no eligible peer", err, "no eligible peer approvers")
+		f.wantValidationError("Request Approval with no eligible peer", err, "external/customer users cannot approve")
+		f.wantValidationError("Request Approval with no eligible peer", err, domain.PeerApprovalFallbackGroupName)
+		if got := f.state(id); got != "NEW" {
+			t.Fatalf("state after refused Request Approval = %q, want NEW", got)
+		}
+		if n := len(f.stages(id)); n != 0 {
+			t.Fatalf("refused Request Approval left %d stages", n)
+		}
+	})
+}
+
+// An EXTERNAL (customer) member of the assigned team is never provisioned as
+// an approver of an internal stage -- Peer, CAB, ECAB or Review -- and neither
+// is an inactive user or one with no derivable type; the creator stays a
+// cancelled row. Mixed pools keep exactly their active internal users.
+func TestChangeRequestFlowIntegration_MixedPoolsKeepOnlyActiveInternalUsers(t *testing.T) {
 	f := newCRFlow(t)
 	f.seedAssignedGroup()
-	f.makeSRE(crFlowSREID, crFlowGroupID)
+	seedExternalGroupMembers(t, f.scoped, crFlowGroupID, crFlowExternalID, crFlowExternalID2)
+	seedApprovalGroupMembers(t, f.scoped, crFlowGroupID, crFlowInactiveID)
+	f.execSQL(`UPDATE "user" SET is_active = false WHERE id = $1`, crFlowInactiveID)
+	seedGroupMembersOfType(t, f.scoped, crFlowGroupID, "NOT_AVAILABLE", crFlowNoTypeID)
+	seedApprovalGroupMembers(t, f.scoped, crCABGroupID, crCABMemberUserID1)
+	seedExternalGroupMembers(t, f.scoped, crCABGroupID, crCABExternalID)
+	seedApprovalGroupMembers(t, f.scoped, crECABGroupID, crECABMemberUserID)
+	seedExternalGroupMembers(t, f.scoped, crECABGroupID, crECABExternalID)
+
+	// Normal: Peer, then CAB, then (after Implement) Review.
+	id := f.create(domain.ChangeRequestTypeNormal, crFlowGroupID)
+	f.requestApproval(id)
+	f.wantPeerPool(id, crFlowGroupID, map[string]string{
+		crFlowCreatorID: "cancelled", crFlowPeerAID: "requested", crFlowPeerBID: "requested", crFlowOutsiderID: "requested",
+	})
+	if err := f.decide(id, crFlowPeerAID, "approved"); err != nil {
+		t.Fatalf("peer approval: %v", err)
+	}
+	assertApprovers(t, "CAB stage", f.stage(id, "CAB Approval").approvers, map[string]string{crCABMemberUserID1: "requested"})
+	if err := f.decide(id, crCABMemberUserID1, "approved"); err != nil {
+		t.Fatalf("CAB approval: %v", err)
+	}
+	f.step(id, domain.ChangeRequestStateImplement, "IMPLEMENT", "review", "canceled")
+	f.step(id, domain.ChangeRequestStateReview, "REVIEW", "closed", "rollback", "canceled")
+	assertApprovers(t, "Review stage", f.stage(id, "Review").approvers, map[string]string{
+		crFlowCreatorID: "cancelled", crFlowPeerAID: "requested", crFlowPeerBID: "requested", crFlowOutsiderID: "requested",
+	})
+
+	// Emergency: ECAB only.
+	eid := f.create(domain.ChangeRequestTypeEmergency, crFlowGroupID)
+	f.requestApproval(eid)
+	assertApprovers(t, "ECAB stage", f.stage(eid, "ECAB Approval").approvers, map[string]string{crECABMemberUserID: "requested"})
+}
+
+// A group made only of customers has no one to give an internal approval: the
+// request is refused up front, with a message that names the group and says
+// customers cannot approve -- for the CAB, the ECAB, and the Review stage
+// (whose assigned team has lost its internal members by then).
+func TestChangeRequestFlowIntegration_AllExternalGroupsAreRefusedClearly(t *testing.T) {
+	t.Run("CAB", func(t *testing.T) {
+		f := newCRFlow(t)
+		f.seedAssignedGroup()
+		seedExternalGroupMembers(t, f.scoped, crCABGroupID, crCABExternalID)
+		id := f.create(domain.ChangeRequestTypeNormal, crFlowGroupID)
+		_, err := f.patchState(id, domain.ChangeRequestStateAssess)
+		f.wantValidationError("CAB of customers only", err, `the "CAB Approval" group has no active internal (WSO2) members`)
+		f.wantValidationError("CAB of customers only", err, "external/customer users")
+		if got := f.state(id); got != "NEW" {
+			t.Fatalf("state after refused Request Approval = %q, want NEW", got)
+		}
+		if n := len(f.stages(id)); n != 0 {
+			t.Fatalf("refused Request Approval left %d stages", n)
+		}
+	})
+	t.Run("ECAB", func(t *testing.T) {
+		f := newCRFlow(t)
+		f.seedAssignedGroup()
+		seedExternalGroupMembers(t, f.scoped, crECABGroupID, crECABExternalID)
+		id := f.create(domain.ChangeRequestTypeEmergency, crFlowGroupID)
+		_, err := f.patchState(id, domain.ChangeRequestStateAssess)
+		f.wantValidationError("ECAB of customers only", err, `the "ECAB Approval" group has no active internal (WSO2) members`)
+	})
+	t.Run("CAB cascade rolls the peer decision back", func(t *testing.T) {
+		f := newCRFlow(t)
+		f.seedAssignedGroup()
+		seedApprovalGroupMembers(t, f.scoped, crCABGroupID, crCABMemberUserID1)
+		id := f.create(domain.ChangeRequestTypeNormal, crFlowGroupID)
+		f.requestApproval(id)
+		// The CAB's only member becomes a customer after the peer stage exists.
+		f.execSQL(`UPDATE "user" SET user_type = 'EXTERNAL'::user_type_enum WHERE id = $1`, crCABMemberUserID1)
+		err := f.decide(id, crFlowPeerAID, "approved")
+		f.wantValidationError("peer approval into a CAB of customers only", err, `the "CAB Approval" group has no active internal (WSO2) members`)
+		f.expect(id, "after the refused peer approval", "ASSESS", "authorize", "canceled")
+	})
+	t.Run("Review", func(t *testing.T) {
+		f := newCRFlow(t)
+		f.seedAssignedGroup()
+		seedApprovalGroupMembers(t, f.scoped, crCABGroupID, crCABMemberUserID1)
+		id := f.create(domain.ChangeRequestTypeNormal, crFlowGroupID)
+		f.requestApproval(id)
+		f.approvePeerAndCAB(id, "SCHEDULED", "implement", "canceled")
+		f.step(id, domain.ChangeRequestStateImplement, "IMPLEMENT", "review", "canceled")
+		// The assigned team turns out to be customers only.
+		f.execSQL(`UPDATE "user" SET user_type = 'EXTERNAL'::user_type_enum WHERE id IN ($1, $2, $3, $4)`,
+			crFlowCreatorID, crFlowPeerAID, crFlowPeerBID, crFlowOutsiderID)
+		_, err := f.patchState(id, domain.ChangeRequestStateReview)
+		f.wantValidationError("Review of a team of customers", err, "the assigned team has no active internal (WSO2) members")
+		f.expect(id, "after the refused review", "IMPLEMENT", "review", "canceled")
+	})
+}
+
+// Decision time: an external user (or an inactive one, or one whose type
+// changed after the row was written) holding a REQUESTED row on an internal
+// stage is refused with a readable 403 and sees canDecide=false, on every
+// internal stage; the internal approvers beside them are unaffected.
+func TestChangeRequestFlowIntegration_ExternalUserCannotDecideInternalStage(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedAssignedGroup()
+	seedExternalGroupMembers(t, f.scoped, crFlowGroupID, crFlowExternalID)
 	seedApprovalGroupMembers(t, f.scoped, crCABGroupID, crCABMemberUserID1)
 	id := f.create(domain.ChangeRequestTypeNormal, crFlowGroupID)
 	f.requestApproval(id)
 
-	stages := f.stages(id)
-	if _, present := stages[0].approvers[crFlowSREID]; present {
-		t.Fatalf("SRE member was provisioned into the peer approval group: %v", stages[0].approvers)
+	wantRefused := func(stage, userID string) {
+		t.Helper()
+		f.wantForbidden(stage+" decision by "+userID, f.decide(id, userID, "approved"), "only active internal (WSO2) users")
+		f.wantForbidden(stage+" rejection by "+userID, f.decide(id, userID, "rejected"), stage)
+		if got := f.canDecideAs(id, userID); len(got) != 0 {
+			t.Fatalf("canDecide for %s on %s = %v, want none", userID, stage, got)
+		}
 	}
 
-	// Decision time: even a row that exists (drift, or a membership that
-	// changed after provisioning) cannot be decided by an SRE member.
-	if _, err := f.scoped.Exec(f.sys,
-		`INSERT INTO approval_stage_approver (id, created_on, updated_on, created_by, updated_by, stage_id, work_item_id, approver_user_id, status)
-		 SELECT gen_random_uuid(), now(), now(), 'cr-flow-test', 'cr-flow-test', s.id, s.work_item_id, $2::uuid, 'requested'
-		 FROM approval_stage s WHERE s.work_item_id = $1 AND s.checkpoint_label = 'Peer Approval'`, id, crFlowSREID); err != nil {
-		t.Fatalf("force SRE member onto the peer stage: %v", err)
+	// Peer: a stale REQUESTED row for the customer who is a member of the team.
+	f.forceApprover(id, "Peer Approval", crFlowExternalID)
+	wantRefused("Peer Approval", crFlowExternalID)
+	// An internal peer beside them can decide, and sees it.
+	if got := f.canDecideAs(id, crFlowPeerAID); len(got) != 1 || !got["Peer Approval/"+crFlowPeerAID] {
+		t.Fatalf("canDecide for an internal peer = %v, want only their own row", got)
 	}
-	err := f.decide(id, crFlowSREID, "approved")
-	var fe *apierror.ForbiddenError
-	if !errors.As(err, &fe) || !strings.Contains(fe.Msg, "SRE") {
-		t.Fatalf("SRE member peer decision err = %v (%T), want a ForbiddenError naming the SRE rule", err, err)
+	// A peer whose type changed after provisioning is refused too.
+	f.execSQL(`UPDATE "user" SET user_type = 'EXTERNAL'::user_type_enum WHERE id = $1`, crFlowPeerBID)
+	wantRefused("Peer Approval", crFlowPeerBID)
+	f.execSQL(`UPDATE "user" SET user_type = 'INTERNAL'::user_type_enum, is_active = false WHERE id = $1`, crFlowPeerBID)
+	f.wantForbidden("an inactive peer deciding", f.decide(id, crFlowPeerBID, "approved"), "only active internal (WSO2) users")
+	f.wantState(id, "ASSESS")
+	if st := f.stage(id, "Peer Approval"); st.approvers[crFlowExternalID] != "requested" {
+		t.Fatalf("refused decision changed the customer's row: %v", st.approvers)
 	}
-	if got := f.state(id); got != "ASSESS" {
-		t.Fatalf("state after refused SRE approval = %q, want ASSESS", got)
+
+	// The internal peers are unaffected: approval cascades to CAB.
+	if err := f.decide(id, crFlowPeerAID, "approved"); err != nil {
+		t.Fatalf("internal peer approval: %v", err)
+	}
+	// CAB stage.
+	f.forceApprover(id, "CAB Approval", crFlowExternalID)
+	wantRefused("CAB Approval", crFlowExternalID)
+	f.wantState(id, "AUTHORIZE")
+	if err := f.decide(id, crCABMemberUserID1, "approved"); err != nil {
+		t.Fatalf("internal CAB approval: %v", err)
+	}
+	f.wantState(id, "SCHEDULED")
+
+	// Review stage.
+	f.step(id, domain.ChangeRequestStateImplement, "IMPLEMENT", "review", "canceled")
+	f.step(id, domain.ChangeRequestStateReview, "REVIEW", "closed", "rollback", "canceled")
+	f.forceApprover(id, "Review", crFlowExternalID)
+	wantRefused("Review", crFlowExternalID)
+
+	// ECAB stage of an Emergency change.
+	seedApprovalGroupMembers(t, f.scoped, crECABGroupID, crECABMemberUserID)
+	eid := f.create(domain.ChangeRequestTypeEmergency, crFlowGroupID)
+	f.requestApproval(eid)
+	f.forceApprover(eid, "ECAB Approval", crFlowExternalID)
+	f.wantForbidden("ECAB decision by a customer", f.decide(eid, crFlowExternalID, "approved"), "ECAB Approval")
+	if got := f.canDecideAs(eid, crFlowExternalID); len(got) != 0 {
+		t.Fatalf("canDecide for a customer on the ECAB stage = %v, want none", got)
+	}
+	f.wantState(eid, "AUTHORIZE")
+	if err := f.decide(eid, crECABMemberUserID, "approved"); err != nil {
+		t.Fatalf("internal ECAB approval: %v", err)
+	}
+	f.wantState(eid, "SCHEDULED")
+}
+
+// wantState asserts the stored state is want (used after a refused decision,
+// which must not move the change).
+func (f *crFlow) wantState(id, want string) {
+	f.t.Helper()
+	if got := f.state(id); got != want {
+		f.t.Fatalf("state = %q, want %q", got, want)
 	}
 }
 
-// When the assigned group IS an SRE group (Apollo), nobody in it may approve;
-// the peer pool falls back to the "Devops Approval" group of experienced
-// engineers. With no such group the request is refused clearly.
-func TestChangeRequestFlowIntegration_SREAssignedGroupFallsBackToPeerApprovalGroup(t *testing.T) {
-	f := newCRFlow(t)
-	f.seedAssignedGroup()
-	f.makeSRE(crFlowSREID, crFlowSREGroupID)
-	seedApprovalGroupMembers(t, f.scoped, crCABGroupID, crCABMemberUserID1)
+// The customer stages are not subject to the INTERNAL-only rule: the project's
+// registered (external) contacts are asked and decide them -- Customer Approval
+// then Customer Review -- while a customer who is only a member of the assigned
+// team (not a contact of the project) cannot.
+func TestChangeRequestFlowIntegration_CustomerStagesStillWorkForExternalContacts(t *testing.T) {
+	f := newCustomerGroupFlow(t)
+	seedExternalGroupMembers(t, f.scoped, crFlowGroupID, crFlowExternalID)
+	for _, uid := range []string{crScopeUserA1, crScopeUserA2} {
+		var typ string
+		if err := f.scoped.QueryRow(f.sys, `SELECT user_type::text FROM "user" WHERE id = $1`, uid).Scan(&typ); err != nil || typ != userTypeExternal {
+			t.Fatalf("customer contact %s user_type = %q (%v), want EXTERNAL", uid, typ, err)
+		}
+	}
+	id := f.createWithProject(domain.ChangeRequestTypeNormal, sp(crScopeProjectA), true, true)
+	f.driveToCustomerApproval(id)
 
-	var existing int
-	if err := f.scoped.QueryRow(f.sys, `SELECT COUNT(*) FROM "group" WHERE name = $1`, domain.PeerApprovalFallbackGroupName).Scan(&existing); err != nil {
-		t.Fatalf("count devops group: %v", err)
+	assertApprovers(t, "Customer Approval", f.customerStages(id)[0].approvers, map[string]string{crScopeUserA1: "requested", crScopeUserA2: "requested"})
+	if got := f.canDecideAs(id, crScopeUserA1); len(got) != 1 || !got[stageCustApproval+"/"+crScopeUserA1] {
+		t.Fatalf("canDecide for an external contact = %v, want their own Customer Approval row", got)
 	}
-	if existing != 0 {
-		t.Skipf("a %q group already exists in this database", domain.PeerApprovalFallbackGroupName)
+	// A customer on the team but not a contact of the project is told so.
+	f.wantForbidden("a team customer who is no contact", f.decide(id, crFlowExternalID, "approved"), "only members of the customer group")
+	if err := f.decide(id, crScopeUserA1, "approved"); err != nil {
+		t.Fatalf("external contact approving Customer Approval: %v", err)
 	}
+	f.expect(id, "after the contact approved", "SCHEDULED", "implement", "canceled")
 
-	// No fallback group: refused, nothing half-written.
-	id := f.create(domain.ChangeRequestTypeNormal, crFlowSREGroupID)
-	_, err := f.patchState(id, domain.ChangeRequestStateAssess)
-	var ve *apierror.ValidationError
-	if !errors.As(err, &ve) || !strings.Contains(ve.Msg, "no eligible peer approvers") {
-		t.Fatalf("Request Approval on an SRE-assigned change with no peer group err = %v (%T), want the no-eligible-peer-approvers ValidationError", err, err)
+	f.driveToCustomerReview(id)
+	if got := f.canDecideAs(id, crScopeUserA2); len(got) != 1 || !got[stageCustReview+"/"+crScopeUserA2] {
+		t.Fatalf("canDecide for an external contact on Customer Review = %v", got)
 	}
-	if got := f.state(id); got != "NEW" {
-		t.Fatalf("state after refused Request Approval = %q, want NEW", got)
+	if err := f.decide(id, crScopeUserA2, "approved"); err != nil {
+		t.Fatalf("external contact approving Customer Review: %v", err)
 	}
-	if n := len(f.stages(id)); n != 0 {
-		t.Fatalf("refused Request Approval left %d stages", n)
-	}
+	f.expect(id, "after the contact reviewed", "CLOSED")
+}
 
-	// With the Devops Approval group (an SRE member sits in it too -- still
-	// excluded), the experienced engineers become the peer approvers.
-	if _, err := f.scoped.Exec(f.sys,
-		`INSERT INTO "group" (id, created_on, updated_on, created_by, updated_by, name) VALUES ($1, now(), now(), 'cr-flow-test', 'cr-flow-test', $2)`,
-		crFlowDevopsGroupID, domain.PeerApprovalFallbackGroupName); err != nil {
-		t.Fatalf("seed devops group: %v", err)
+// The stage approver rows after every step of a Normal change (both customer
+// boxes ticked) whose assigned team, CAB group and project mix internal and
+// external people: the internal stages hold exactly the active internal users
+// (creator cancelled), the customer stages exactly the project's contacts.
+func TestChangeRequestFlowIntegration_LifecycleStageRowsWithInternalAndExternalMembers(t *testing.T) {
+	f := newCustomerGroupFlow(t)
+	seedExternalGroupMembers(t, f.scoped, crFlowGroupID, crFlowExternalID, crFlowExternalID2)
+	seedExternalGroupMembers(t, f.scoped, crCABGroupID, crCABExternalID)
+	id := f.createWithProject(domain.ChangeRequestTypeNormal, sp(crScopeProjectA), true, true)
+
+	labels := func(want ...string) {
+		t.Helper()
+		if got := strings.Join(f.labels(id), ","); got != strings.Join(want, ",") {
+			t.Fatalf("stages = %s, want %s", got, strings.Join(want, ","))
+		}
 	}
-	seedApprovalGroupMembers(t, f.scoped, crFlowDevopsGroupID, crFlowPeerAID, crFlowPeerBID)
-	if _, err := f.scoped.Exec(f.sys,
-		`INSERT INTO team_member (id, created_on, updated_on, created_by, updated_by, team_id, user_id, group_id)
-		 VALUES (gen_random_uuid(), now(), now(), 'cr-flow-test', 'cr-flow-test', $1::uuid, $2, $3::uuid)`,
-		crFlowSRETeamID, crFlowSREID, crFlowDevopsGroupID); err != nil {
-		t.Fatalf("seed SRE member in devops group: %v", err)
-	}
+	labels()
+
+	// 1. Request Approval -> Peer Approval: the team's internal members.
 	f.requestApproval(id)
-	stages := f.stages(id)
-	if len(stages) != 1 || stages[0].groupID != crFlowDevopsGroupID {
-		t.Fatalf("stages = %+v, want one peer stage on the Devops Approval group", stages)
+	labels("Peer Approval")
+	assertApprovers(t, "peer", f.stage(id, "Peer Approval").approvers, map[string]string{
+		crFlowCreatorID: "cancelled", crFlowPeerAID: "requested", crFlowPeerBID: "requested", crFlowOutsiderID: "requested",
+	})
+
+	// 2. A peer approves -> Authorize, CAB Approval: the CAB's internal members.
+	if err := f.decide(id, crFlowPeerAID, "approved"); err != nil {
+		t.Fatalf("peer approval: %v", err)
 	}
-	assertApprovers(t, "fallback peer stage", stages[0].approvers, map[string]string{crFlowPeerAID: "requested", crFlowPeerBID: "requested"})
+	f.expect(id, "after the peer approved", "AUTHORIZE", "canceled")
+	labels("Peer Approval", "CAB Approval")
+	assertApprovers(t, "peer", f.stage(id, "Peer Approval").approvers, map[string]string{
+		crFlowCreatorID: "cancelled", crFlowPeerAID: "approved", crFlowPeerBID: "cancelled", crFlowOutsiderID: "cancelled",
+	})
+	assertApprovers(t, "CAB", f.stage(id, "CAB Approval").approvers, map[string]string{crCABMemberUserID1: "requested", crCABMemberUserID2: "requested"})
+
+	// 3. CAB approves -> Customer Approval: exactly the project's contacts.
+	if err := f.decide(id, crCABMemberUserID2, "approved"); err != nil {
+		t.Fatalf("CAB approval: %v", err)
+	}
+	f.expect(id, "after CAB approved", "CUSTOMER_APPROVAL", "authorize", "canceled")
+	labels("Peer Approval", "CAB Approval", "Customer Approval")
+	assertApprovers(t, "CAB", f.stage(id, "CAB Approval").approvers, map[string]string{crCABMemberUserID1: "cancelled", crCABMemberUserID2: "approved"})
+	assertApprovers(t, "Customer Approval", f.stage(id, "Customer Approval").approvers, map[string]string{crScopeUserA1: "requested", crScopeUserA2: "requested"})
+
+	// 4. A contact approves -> Scheduled.
+	if err := f.decide(id, crScopeUserA2, "approved"); err != nil {
+		t.Fatalf("customer approval: %v", err)
+	}
+	f.expect(id, "after the customer approved", "SCHEDULED", "implement", "canceled")
+	assertApprovers(t, "Customer Approval", f.stage(id, "Customer Approval").approvers, map[string]string{crScopeUserA1: "cancelled", crScopeUserA2: "approved"})
+
+	// 5. Implement -> Review: the team's internal members again, fresh.
+	f.step(id, domain.ChangeRequestStateImplement, "IMPLEMENT", "review", "canceled")
+	f.step(id, domain.ChangeRequestStateReview, "REVIEW", "customer_review", "rollback", "canceled")
+	labels("Peer Approval", "CAB Approval", "Customer Approval", "Review")
+	assertApprovers(t, "Review", f.stage(id, "Review").approvers, map[string]string{
+		crFlowCreatorID: "cancelled", crFlowPeerAID: "requested", crFlowPeerBID: "requested", crFlowOutsiderID: "requested",
+	})
+	if err := f.decide(id, crFlowPeerBID, "approved"); err != nil {
+		t.Fatalf("review approval: %v", err)
+	}
+	f.expect(id, "after the internal review", "REVIEW", "customer_review", "rollback", "canceled")
+	assertApprovers(t, "Review", f.stage(id, "Review").approvers, map[string]string{
+		crFlowCreatorID: "cancelled", crFlowPeerAID: "cancelled", crFlowPeerBID: "approved", crFlowOutsiderID: "cancelled",
+	})
+
+	// 6. Customer Review: exactly the project's contacts again; a contact closes it.
+	f.step(id, domain.ChangeRequestStateCustomerReview, "CUSTOMER_REVIEW", "canceled")
+	labels("Peer Approval", "CAB Approval", "Customer Approval", "Review", "Customer Review")
+	assertApprovers(t, "Customer Review", f.stage(id, "Customer Review").approvers, map[string]string{crScopeUserA1: "requested", crScopeUserA2: "requested"})
+	if err := f.decide(id, crScopeUserA1, "approved"); err != nil {
+		t.Fatalf("customer review: %v", err)
+	}
+	f.expect(id, "after the customer reviewed", "CLOSED")
+	assertApprovers(t, "Customer Review", f.stage(id, "Customer Review").approvers, map[string]string{crScopeUserA1: "approved", crScopeUserA2: "cancelled"})
 }
 
 // A Normal change cannot be sent for approval into a flow with nobody to give
@@ -3847,12 +4372,14 @@ func TestChangeRequestFlowIntegration_TypeLockedAfterApprovalRequested(t *testin
 func TestChangeRequestFlowIntegration_CanDecide(t *testing.T) {
 	f := newCRFlow(t)
 	f.seedAssignedGroup()
-	f.makeSRE(crFlowSREID, crFlowGroupID)
+	seedExternalGroupMembers(t, f.scoped, crFlowGroupID, crFlowExternalID)
 	seedApprovalGroupMembers(t, f.scoped, crCABGroupID, crCABMemberUserID1)
 	id := f.create(domain.ChangeRequestTypeNormal, crFlowGroupID)
 	f.requestApproval(id)
-	// Drift: rows for the creator and the SRE member exist as requested.
-	for _, uid := range []string{crFlowCreatorID, crFlowSREID} {
+	// Drift: rows for the creator and for a customer exist as requested (the
+	// customer was never provisioned, so this is a row that predates the
+	// INTERNAL-only rule).
+	for _, uid := range []string{crFlowCreatorID, crFlowExternalID} {
 		if _, err := f.scoped.Exec(f.sys,
 			`DELETE FROM approval_stage_approver WHERE work_item_id = $1 AND approver_user_id = $2`, id, uid); err != nil {
 			t.Fatalf("reset row: %v", err)
@@ -3889,8 +4416,8 @@ func TestChangeRequestFlowIntegration_CanDecide(t *testing.T) {
 	if got := canDecide(crFlowCreatorID); len(got) != 0 {
 		t.Fatalf("canDecide for the creator = %v, want none", got)
 	}
-	if got := canDecide(crFlowSREID); len(got) != 0 {
-		t.Fatalf("canDecide for an SRE member = %v, want none", got)
+	if got := canDecide(crFlowExternalID); len(got) != 0 {
+		t.Fatalf("canDecide for an external user holding a peer row = %v, want none", got)
 	}
 	if got := canDecide(crCABMemberUserID1); len(got) != 0 {
 		t.Fatalf("canDecide for a CAB member while still in Assess = %v, want none (no CAB row yet)", got)
@@ -4133,9 +4660,9 @@ func TestChangeRequestFlowIntegration_NormalCustomerGateLifecycles(t *testing.T)
 
 			// Both gates sit AFTER the internal approvals: nothing short-circuits them.
 			f.approvePeerAndCAB(id, map[bool]string{true: "CUSTOMER_APPROVAL", false: "SCHEDULED"}[tc.approval],
-				map[bool][]string{true: {"scheduled", "canceled"}, false: {"implement", "canceled"}}[tc.approval]...)
+				map[bool][]string{true: {"scheduled", "authorize", "canceled"}, false: {"implement", "canceled"}}[tc.approval]...)
 			if approved, _ := f.customerOutcome(id); approved {
-				t.Fatal("is_customer_approved is already true before the customer approved anything")
+				t.Fatal("is_customer_approval_required is already true before the customer approved anything")
 			}
 
 			if tc.approval {
@@ -4143,40 +4670,40 @@ func TestChangeRequestFlowIntegration_NormalCustomerGateLifecycles(t *testing.T)
 				// "scheduled", which is legal only here.
 				f.step(id, domain.ChangeRequestStateScheduled, "SCHEDULED", "implement", "canceled")
 				if approved, _ := f.customerOutcome(id); !approved {
-					t.Fatal("is_customer_approved = false after recording the customer's approval, want true")
+					t.Fatal("is_customer_approval_required = false after recording the customer's approval, want true")
 				}
 			} else if approved, _ := f.customerOutcome(id); approved {
-				t.Fatal("is_customer_approved = true although no customer approval was required or given")
+				t.Fatal("is_customer_approval_required = true although no customer approval was required or given")
 			}
 
 			f.step(id, domain.ChangeRequestStateImplement, "IMPLEMENT", "review", "canceled")
 			if tc.review {
-				f.step(id, domain.ChangeRequestStateReview, "REVIEW", "customer_review", "canceled")
+				f.step(id, domain.ChangeRequestStateReview, "REVIEW", "customer_review", "rollback", "canceled")
 				// Review cannot close directly when the customer's review is required.
 				_, err := f.patchState(id, domain.ChangeRequestStateClosed)
 				f.wantValidationError("closed from review (customer review required)", err, "customer review is required")
-				f.expect(id, "after refused close", "REVIEW", "customer_review", "canceled")
-				f.step(id, domain.ChangeRequestStateCustomerReview, "CUSTOMER_REVIEW", "closed", "canceled")
+				f.expect(id, "after refused close", "REVIEW", "customer_review", "rollback", "canceled")
+				f.step(id, domain.ChangeRequestStateCustomerReview, "CUSTOMER_REVIEW", "closed", "rollback", "canceled")
 				if _, reviewed := f.customerOutcome(id); reviewed {
-					t.Fatal("is_customer_reviewed is already true before the customer review was recorded")
+					t.Fatal("is_customer_review_required is already true before the customer review was recorded")
 				}
 				f.step(id, domain.ChangeRequestStateClosed, "CLOSED")
 				if _, reviewed := f.customerOutcome(id); !reviewed {
-					t.Fatal("is_customer_reviewed = false after closing from customer_review, want true")
+					t.Fatal("is_customer_review_required = false after closing from customer_review, want true")
 				}
 			} else {
-				f.step(id, domain.ChangeRequestStateReview, "REVIEW", "closed", "canceled")
+				f.step(id, domain.ChangeRequestStateReview, "REVIEW", "closed", "rollback", "canceled")
 				// Customer Review is not offered, and not accepted, when not required.
 				_, err := f.patchState(id, domain.ChangeRequestStateCustomerReview)
 				f.wantValidationError("customer_review (not required)", err, "customer review is not required")
-				f.expect(id, "after refused customer_review", "REVIEW", "closed", "canceled")
+				f.expect(id, "after refused customer_review", "REVIEW", "closed", "rollback", "canceled")
 				f.step(id, domain.ChangeRequestStateClosed, "CLOSED")
 				if _, reviewed := f.customerOutcome(id); reviewed {
-					t.Fatal("is_customer_reviewed = true although no customer review was required or given")
+					t.Fatal("is_customer_review_required = true although no customer review was required or given")
 				}
 			}
 			if approved, _ := f.customerOutcome(id); approved != tc.approval {
-				t.Fatalf("is_customer_approved at the end = %v, want %v", approved, tc.approval)
+				t.Fatalf("is_customer_approval_required at the end = %v, want %v", approved, tc.approval)
 			}
 			// The two internal approval stages (peer, CAB) are untouched by the
 			// customer gates: Customer Approval is a state, not an approval stage.
@@ -4208,17 +4735,17 @@ func TestChangeRequestFlowIntegration_EmergencyCustomerApprovalLifecycle(t *test
 	if err := f.decide(id, crECABMemberUserID, "approved"); err != nil {
 		t.Fatalf("ECAB approval: %v", err)
 	}
-	f.expect(id, "after ECAB approval", "CUSTOMER_APPROVAL", "scheduled", "canceled")
+	f.expect(id, "after ECAB approval", "CUSTOMER_APPROVAL", "scheduled", "authorize", "canceled")
 	if approved, _ := f.customerOutcome(id); approved {
-		t.Fatal("is_customer_approved is true before the customer's approval was recorded")
+		t.Fatal("is_customer_approval_required is true before the customer's approval was recorded")
 	}
 
 	f.step(id, domain.ChangeRequestStateScheduled, "SCHEDULED", "implement", "canceled")
 	if approved, _ := f.customerOutcome(id); !approved {
-		t.Fatal("is_customer_approved = false after recording the customer's approval")
+		t.Fatal("is_customer_approval_required = false after recording the customer's approval")
 	}
 	f.step(id, domain.ChangeRequestStateImplement, "IMPLEMENT", "review", "canceled")
-	f.step(id, domain.ChangeRequestStateReview, "REVIEW", "closed", "canceled") // review not ticked: straight to Closed
+	f.step(id, domain.ChangeRequestStateReview, "REVIEW", "closed", "rollback", "canceled") // review not ticked: straight to Closed
 	f.step(id, domain.ChangeRequestStateClosed, "CLOSED")
 }
 
@@ -4232,7 +4759,7 @@ func TestChangeRequestFlowIntegration_StandardCustomerApprovalLifecycle(t *testi
 
 	f.expect(id, "after create", "NEW", "assess", "canceled")
 	f.requestApproval(id)
-	f.expect(id, "after Request Approval", "CUSTOMER_APPROVAL", "scheduled", "canceled")
+	f.expect(id, "after Request Approval", "CUSTOMER_APPROVAL", "scheduled", "authorize", "canceled")
 	if n := len(f.stages(id)); n != 0 {
 		t.Fatalf("standard change has %d approval stages, want none", n)
 	}
@@ -4240,18 +4767,18 @@ func TestChangeRequestFlowIntegration_StandardCustomerApprovalLifecycle(t *testi
 	if _, err := f.patchState(id, domain.ChangeRequestStateAssess); err != nil {
 		t.Fatalf("resent Request Approval: %v", err)
 	}
-	f.expect(id, "after resent Request Approval", "CUSTOMER_APPROVAL", "scheduled", "canceled")
+	f.expect(id, "after resent Request Approval", "CUSTOMER_APPROVAL", "scheduled", "authorize", "canceled")
 
 	f.step(id, domain.ChangeRequestStateScheduled, "SCHEDULED", "implement", "canceled")
 	if approved, _ := f.customerOutcome(id); !approved {
-		t.Fatal("is_customer_approved = false after recording the customer's approval")
+		t.Fatal("is_customer_approval_required = false after recording the customer's approval")
 	}
 	f.step(id, domain.ChangeRequestStateImplement, "IMPLEMENT", "review", "canceled")
-	f.step(id, domain.ChangeRequestStateReview, "REVIEW", "customer_review", "canceled")
-	f.step(id, domain.ChangeRequestStateCustomerReview, "CUSTOMER_REVIEW", "closed", "canceled")
+	f.step(id, domain.ChangeRequestStateReview, "REVIEW", "customer_review", "rollback", "canceled")
+	f.step(id, domain.ChangeRequestStateCustomerReview, "CUSTOMER_REVIEW", "closed", "rollback", "canceled")
 	f.step(id, domain.ChangeRequestStateClosed, "CLOSED")
 	if _, reviewed := f.customerOutcome(id); !reviewed {
-		t.Fatal("is_customer_reviewed = false after closing from customer_review")
+		t.Fatal("is_customer_review_required = false after closing from customer_review")
 	}
 }
 
@@ -4267,7 +4794,7 @@ func TestChangeRequestFlowIntegration_StandardCustomerApprovalTickedWithRequestA
 	if _, err := f.patch(together, domain.PatchChangeRequestRequest{State: &st, CustomerApprovalRequired: boolp(true)}); err != nil {
 		t.Fatalf("PATCH {state: assess, customerApprovalRequired: true}: %v", err)
 	}
-	f.expect(together, "after the combined PATCH", "CUSTOMER_APPROVAL", "scheduled", "canceled")
+	f.expect(together, "after the combined PATCH", "CUSTOMER_APPROVAL", "scheduled", "authorize", "canceled")
 
 	separate := f.create(domain.ChangeRequestTypeStandard, crFlowGroupID)
 	if _, err := f.patch(separate, domain.PatchChangeRequestRequest{CustomerApprovalRequired: boolp(true)}); err != nil {
@@ -4275,7 +4802,7 @@ func TestChangeRequestFlowIntegration_StandardCustomerApprovalTickedWithRequestA
 	}
 	f.expect(separate, "after ticking the box", "NEW", "assess", "canceled")
 	f.requestApproval(separate)
-	f.expect(separate, "after Request Approval", "CUSTOMER_APPROVAL", "scheduled", "canceled")
+	f.expect(separate, "after Request Approval", "CUSTOMER_APPROVAL", "scheduled", "authorize", "canceled")
 }
 
 // The checkboxes are accepted on create (both create paths) and PATCH, and
@@ -4374,7 +4901,7 @@ func TestChangeRequestFlowIntegration_CustomerApprovalRequiredEditableUntilGateP
 	if err := f.decide(id, crCABMemberUserID1, "approved"); err != nil {
 		t.Fatalf("CAB approval: %v", err)
 	}
-	f.expect(id, "after CAB approval", "CUSTOMER_APPROVAL", "scheduled", "canceled")
+	f.expect(id, "after CAB approval", "CUSTOMER_APPROVAL", "scheduled", "authorize", "canceled")
 
 	// The gate has been passed: refused, state and flag unchanged.
 	f.wantValidationError("untick in Customer Approval", set(false), "customerApprovalRequired can no longer be changed")
@@ -4441,21 +4968,21 @@ func TestChangeRequestFlowIntegration_CustomerReviewRequiredEditableUntilReviewL
 		}
 	}
 
-	f.step(id, domain.ChangeRequestStateReview, "REVIEW", "closed", "canceled")
+	f.step(id, domain.ChangeRequestStateReview, "REVIEW", "closed", "rollback", "canceled")
 	// Still editable in Review, and it flips what Review offers.
 	if err := set(true); err != nil {
 		t.Fatalf("tick in Review: %v", err)
 	}
-	f.expect(id, "after ticking in Review", "REVIEW", "customer_review", "canceled")
+	f.expect(id, "after ticking in Review", "REVIEW", "customer_review", "rollback", "canceled")
 	if err := set(false); err != nil {
 		t.Fatalf("untick in Review: %v", err)
 	}
-	f.expect(id, "after unticking in Review", "REVIEW", "closed", "canceled")
+	f.expect(id, "after unticking in Review", "REVIEW", "closed", "rollback", "canceled")
 	if err := set(true); err != nil {
 		t.Fatalf("tick in Review (again): %v", err)
 	}
 
-	f.step(id, domain.ChangeRequestStateCustomerReview, "CUSTOMER_REVIEW", "closed", "canceled")
+	f.step(id, domain.ChangeRequestStateCustomerReview, "CUSTOMER_REVIEW", "closed", "rollback", "canceled")
 	f.wantValidationError("untick in Customer Review", set(false), "customerReviewRequired can no longer be changed")
 	if err := set(true); err != nil {
 		t.Fatalf("resending the stored value: %v", err)
@@ -4479,19 +5006,19 @@ func TestChangeRequestFlowIntegration_CloseFromReviewHonoursTheFlagInTheSamePatc
 	id := f.createGated(domain.ChangeRequestTypeStandard, crFlowGroupID, nil, boolp(true))
 	f.requestApproval(id)
 	f.step(id, domain.ChangeRequestStateImplement, "IMPLEMENT", "review", "canceled")
-	f.step(id, domain.ChangeRequestStateReview, "REVIEW", "customer_review", "canceled")
+	f.step(id, domain.ChangeRequestStateReview, "REVIEW", "customer_review", "rollback", "canceled")
 
 	closed := domain.ChangeRequestStateClosed
 	_, err := f.patch(id, domain.PatchChangeRequestRequest{State: &closed})
 	f.wantValidationError("close a review that requires the customer", err, "customer review is required")
-	f.expect(id, "after the refused close", "REVIEW", "customer_review", "canceled")
+	f.expect(id, "after the refused close", "REVIEW", "customer_review", "rollback", "canceled")
 
 	if _, err := f.patch(id, domain.PatchChangeRequestRequest{State: &closed, CustomerReviewRequired: boolp(false)}); err != nil {
 		t.Fatalf("PATCH {state: closed, customerReviewRequired: false}: %v", err)
 	}
 	f.expect(id, "after closing with the box unticked", "CLOSED")
 	if _, reviewed := f.customerOutcome(id); reviewed {
-		t.Fatal("is_customer_reviewed = true although the change closed straight from Review")
+		t.Fatal("is_customer_review_required = true although the change closed straight from Review")
 	}
 }
 
@@ -4512,7 +5039,7 @@ func TestChangeRequestFlowIntegration_ManualScheduledOnlyFromCustomerApproval(t 
 			t.Fatalf("state after refused scheduled from %s = %q", from, got)
 		}
 		if approved, _ := f.customerOutcome(id); approved {
-			t.Fatalf("a refused scheduled from %s still stamped is_customer_approved", from)
+			t.Fatalf("a refused scheduled from %s still stamped is_customer_approval_required", from)
 		}
 	}
 	refused(normal, "NEW")
@@ -4530,7 +5057,7 @@ func TestChangeRequestFlowIntegration_ManualScheduledOnlyFromCustomerApproval(t 
 	refused(normal, "SCHEDULED")
 	f.step(normal, domain.ChangeRequestStateImplement, "IMPLEMENT", "review", "canceled")
 	refused(normal, "IMPLEMENT")
-	f.step(normal, domain.ChangeRequestStateReview, "REVIEW", "closed", "canceled")
+	f.step(normal, domain.ChangeRequestStateReview, "REVIEW", "closed", "rollback", "canceled")
 	refused(normal, "REVIEW")
 
 	// authorize / customer_approval stay unreachable by hand even when required.
@@ -4544,7 +5071,7 @@ func TestChangeRequestFlowIntegration_ManualScheduledOnlyFromCustomerApproval(t 
 	}
 }
 
-// Recording the customer's approval: stamps is_customer_approved through the
+// Recording the customer's approval: stamps is_customer_approval_required through the
 // same one-way lock as a direct isCustomerApproved write, refuses a
 // contradictory isCustomerApproved:false, and is blocked while on hold.
 func TestChangeRequestFlowIntegration_CustomerApprovalRecordsTheApproval(t *testing.T) {
@@ -4552,13 +5079,13 @@ func TestChangeRequestFlowIntegration_CustomerApprovalRecordsTheApproval(t *test
 	f.seedAssignedGroup()
 	id := f.createGated(domain.ChangeRequestTypeStandard, crFlowGroupID, boolp(true), nil)
 	f.requestApproval(id)
-	f.expect(id, "at Customer Approval", "CUSTOMER_APPROVAL", "scheduled", "canceled")
+	f.expect(id, "at Customer Approval", "CUSTOMER_APPROVAL", "scheduled", "authorize", "canceled")
 
 	// Contradictory flag in the same PATCH.
 	sched := domain.ChangeRequestStateScheduled
 	_, err := f.patch(id, domain.PatchChangeRequestRequest{State: &sched, IsCustomerApproved: boolp(false)})
 	f.wantValidationError("scheduled + isCustomerApproved false", err, "isCustomerApproved cannot be false")
-	f.expect(id, "after the contradictory PATCH", "CUSTOMER_APPROVAL", "scheduled", "canceled")
+	f.expect(id, "after the contradictory PATCH", "CUSTOMER_APPROVAL", "scheduled", "authorize", "canceled")
 
 	// On hold blocks the state change like any other.
 	if _, err := f.patch(id, domain.PatchChangeRequestRequest{OnHold: boolp(true)}); err != nil {
@@ -4566,9 +5093,9 @@ func TestChangeRequestFlowIntegration_CustomerApprovalRecordsTheApproval(t *test
 	}
 	_, err = f.patchState(id, domain.ChangeRequestStateScheduled)
 	f.wantValidationError("scheduled while on hold", err, "on hold")
-	f.expect(id, "while on hold", "CUSTOMER_APPROVAL", "scheduled", "canceled")
+	f.expect(id, "while on hold", "CUSTOMER_APPROVAL", "scheduled", "authorize", "canceled")
 	if approved, _ := f.customerOutcome(id); approved {
-		t.Fatal("is_customer_approved stamped by a PATCH that was refused")
+		t.Fatal("is_customer_approval_required stamped by a PATCH that was refused")
 	}
 	// Off hold and approve in one call.
 	if _, err := f.patch(id, domain.PatchChangeRequestRequest{State: &sched, OnHold: boolp(false)}); err != nil {
@@ -4576,7 +5103,7 @@ func TestChangeRequestFlowIntegration_CustomerApprovalRecordsTheApproval(t *test
 	}
 	f.expect(id, "after recording the approval", "SCHEDULED", "implement", "canceled")
 	if approved, _ := f.customerOutcome(id); !approved {
-		t.Fatal("is_customer_approved = false after recording the customer's approval")
+		t.Fatal("is_customer_approval_required = false after recording the customer's approval")
 	}
 
 	// With the explicit flag alongside (true), also fine; a second record is refused as manual scheduled.
@@ -4596,29 +5123,30 @@ func TestChangeRequestFlowIntegration_CustomerApprovalCanBeCancelled(t *testing.
 	f.requestApproval(id)
 	f.step(id, domain.ChangeRequestStateCanceled, "CANCELED")
 	if approved, _ := f.customerOutcome(id); approved {
-		t.Fatal("is_customer_approved = true on a change the customer declined")
+		t.Fatal("is_customer_approval_required = true on a change the customer declined")
 	}
 }
 
-// Creator / SRE approval rules from the CAB flow still hold when the customer
-// gates are ticked.
+// Creator / INTERNAL-only approval rules from the CAB flow still hold when the
+// customer gates are ticked.
 func TestChangeRequestFlowIntegration_ApproverRulesHoldWithCustomerGates(t *testing.T) {
 	f := newCRFlow(t)
 	f.seedAssignedGroup()
+	seedExternalGroupMembers(t, f.scoped, crFlowGroupID, crFlowExternalID)
 	seedApprovalGroupMembers(t, f.scoped, crCABGroupID, crCABMemberUserID1)
 	id := f.createGated(domain.ChangeRequestTypeNormal, crFlowGroupID, boolp(true), boolp(true))
 	f.requestApproval(id)
 
-	// The creator cannot approve the peer stage; an SRE-team member is not even
-	// a peer approver (not provisioned).
+	// The creator cannot approve the peer stage; a customer who is a member of
+	// the team is not even a peer approver (not provisioned).
 	var fe *apierror.ForbiddenError
 	if err := f.decide(id, crFlowCreatorID, "approved"); !errors.As(err, &fe) {
 		t.Fatalf("creator approving the peer stage err = %v (%T), want ForbiddenError", err, err)
 	}
 	if stages := f.stages(id); len(stages) != 1 {
 		t.Fatalf("stages = %d, want 1", len(stages))
-	} else if _, ok := stages[0].approvers[crFlowSREID]; ok {
-		t.Fatal("the SRE-team member was provisioned as a peer approver")
+	} else if _, ok := stages[0].approvers[crFlowExternalID]; ok {
+		t.Fatal("the customer was provisioned as a peer approver")
 	}
 	if err := f.decide(id, crFlowPeerAID, "approved"); err != nil {
 		t.Fatalf("peer approval: %v", err)
@@ -4663,9 +5191,9 @@ func TestChangeRequestFlowIntegration_LegacyRowsDefaultToNoCustomerSteps(t *test
 		state string
 		legal []string
 	}{
-		{"REVIEW", []string{"closed", "canceled"}},
-		{"CUSTOMER_APPROVAL", []string{"scheduled", "canceled"}},
-		{"CUSTOMER_REVIEW", []string{"closed", "canceled"}},
+		{"REVIEW", []string{"closed", "rollback", "canceled"}},
+		{"CUSTOMER_APPROVAL", []string{"scheduled", "authorize", "canceled"}},
+		{"CUSTOMER_REVIEW", []string{"closed", "rollback", "canceled"}},
 		{"SCHEDULED", []string{"implement", "canceled"}},
 	} {
 		if _, err := f.scoped.Exec(f.sys, `UPDATE change_request SET state = $2::change_request_state_enum WHERE id = $1`, id, tc.state); err != nil {
@@ -4711,4 +5239,1792 @@ func TestChangeRequestFlowIntegration_CustomerGateMigrationIsIdempotent(t *testi
 	if !cr.CustomerApprovalRequired || !cr.CustomerReviewRequired {
 		t.Fatalf("flags after re-running the migration = %v/%v, want the stored true/true", cr.CustomerApprovalRequired, cr.CustomerReviewRequired)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Customer-scope fields: Customer Project, Deployments and Deployment
+// products, plus Category, the read-only Customer Group (the project's
+// registered contacts) and the "Additional comments" / "Work notes" journal
+// entries (migration 0191, change_request_links.go). Same harness as the
+// lifecycle tests above.
+// ---------------------------------------------------------------------------
+
+const (
+	crScopeAccountID = "3bbbbbbb-0000-0000-0000-000000000001"
+	// A second customer: project B belongs to it, so project A's groups are
+	// another customer's groups from B's point of view (and vice versa).
+	crScopeAccountB = "3bbbbbbb-0000-0000-0000-000000000002"
+	crScopeProjectA = "3bbbbbbb-0000-0000-0000-000000000011"
+	crScopeProjectB = "3bbbbbbb-0000-0000-0000-000000000012"
+	// Project C belongs to account A and has no customer group at all.
+	crScopeProjectC = "3bbbbbbb-0000-0000-0000-000000000013"
+
+	// The project contacts (the Customer Group). Project A (customer A) has two
+	// registered portal users plus three who do not count: an invited one, a
+	// registered one with only the SECURITY_CONTACT role, and a registered one
+	// whose user is deactivated. Project B (customer B) has one registered
+	// portal user. Project C has none.
+	crScopeUserAlice    = "3bbbbbbb-0000-0000-0000-000000000071" // Alice Aaron, registered, A
+	crScopeUserBob      = "3bbbbbbb-0000-0000-0000-000000000072" // Bob Bell, registered, A
+	crScopeUserInvited  = "3bbbbbbb-0000-0000-0000-000000000073" // invited, A
+	crScopeUserSecurity = "3bbbbbbb-0000-0000-0000-000000000074" // registered, SECURITY_CONTACT only, A
+	crScopeUserInactive = "3bbbbbbb-0000-0000-0000-000000000075" // registered, user deactivated, A
+	crScopeUserCarol    = "3bbbbbbb-0000-0000-0000-000000000076" // Carol Cook, registered, B
+
+	// Project A's deployments. Prod and Stage carry deployed products; Stage2
+	// is a second Staging deployment with none; Dev has none; Old is
+	// deactivated.
+	crScopeDepProd   = "3bbbbbbb-0000-0000-0000-000000000021"
+	crScopeDepStage  = "3bbbbbbb-0000-0000-0000-000000000022"
+	crScopeDepStage2 = "3bbbbbbb-0000-0000-0000-000000000023"
+	crScopeDepDev    = "3bbbbbbb-0000-0000-0000-000000000024"
+	crScopeDepOld    = "3bbbbbbb-0000-0000-0000-000000000025"
+	// Project B's only deployment.
+	crScopeDepOtherB = "3bbbbbbb-0000-0000-0000-000000000026"
+
+	crScopeProductOne = "3bbbbbbb-0000-0000-0000-000000000031"
+	crScopeProductTwo = "3bbbbbbb-0000-0000-0000-000000000032"
+	crScopeVersion1   = "3bbbbbbb-0000-0000-0000-000000000041"
+	crScopeVersion2   = "3bbbbbbb-0000-0000-0000-000000000042"
+	crScopeVersion3   = "3bbbbbbb-0000-0000-0000-000000000043"
+
+	crScopeDPProdOne  = "3bbbbbbb-0000-0000-0000-000000000051" // Prod: product one 1.0
+	crScopeDPProdTwo  = "3bbbbbbb-0000-0000-0000-000000000052" // Prod: product two 3.0
+	crScopeDPStageOne = "3bbbbbbb-0000-0000-0000-000000000053" // Stage: product one 2.0
+	crScopeDPInactive = "3bbbbbbb-0000-0000-0000-000000000054" // Prod, deactivated
+	crScopeDPOtherB   = "3bbbbbbb-0000-0000-0000-000000000055" // B's deployment
+)
+
+// scopeContact describes one project contact for seedScopeContacts.
+type scopeContact struct {
+	userID, name, project, account, state string
+	roles                                 []string // project roles the contact holds
+	inactiveUser                          bool
+}
+
+// seedScopeContacts creates the users, account contacts, project contacts and
+// their PORTAL_USER / SECURITY_CONTACT project roles described by the
+// crScopeUser* constants. A contact's email is crFlowEmail(user id), so the user
+// can also be the caller of an approval decision.
+func (f *crFlow) seedScopeContacts(exec func(sql string, args ...any)) {
+	f.t.Helper()
+	groups := map[string]string{} // role -> project_group id
+	for _, role := range []string{"PORTAL_USER", "SECURITY_CONTACT"} {
+		var roleID string
+		if err := f.scoped.QueryRow(f.sys, `SELECT id::text FROM project_role WHERE role = $1::project_role_enum`, role).Scan(&roleID); err != nil {
+			if err := f.scoped.QueryRow(f.sys,
+				`INSERT INTO project_role (id, created_on, updated_on, created_by, updated_by, role)
+				 VALUES (gen_random_uuid(), now(), now(), 'cr-scope-test', 'cr-scope-test', $1::project_role_enum) RETURNING id::text`, role).Scan(&roleID); err != nil {
+				f.t.Fatalf("seed project_role %s: %v", role, err)
+			}
+		}
+		var gid string
+		if err := f.scoped.QueryRow(f.sys,
+			`INSERT INTO project_group (id, created_on, updated_on, created_by, updated_by, "group")
+			 VALUES (gen_random_uuid(), now(), now(), 'cr-scope-test', 'cr-scope-test', $1) RETURNING id::text`, "CR Scope "+role).Scan(&gid); err != nil {
+			f.t.Fatalf("seed project_group %s: %v", role, err)
+		}
+		exec(`INSERT INTO project_group_role (id, created_on, updated_on, created_by, updated_by, project_group_id, project_role_id)
+		      VALUES (gen_random_uuid(), now(), now(), 'cr-scope-test', 'cr-scope-test', $1, $2)`, gid, roleID)
+		groups[role] = gid
+	}
+	for _, c := range []scopeContact{
+		{crScopeUserAlice, "Alice Aaron", crScopeProjectA, crScopeAccountID, "REGISTERED", []string{"PORTAL_USER"}, false},
+		{crScopeUserBob, "Bob Bell", crScopeProjectA, crScopeAccountID, "REGISTERED", []string{"PORTAL_USER"}, false},
+		{crScopeUserInvited, "Ivy Invited", crScopeProjectA, crScopeAccountID, "INVITED", []string{"PORTAL_USER"}, false},
+		{crScopeUserSecurity, "Sam Security", crScopeProjectA, crScopeAccountID, "REGISTERED", []string{"SECURITY_CONTACT"}, false},
+		{crScopeUserInactive, "Ian Inactive", crScopeProjectA, crScopeAccountID, "REGISTERED", []string{"PORTAL_USER"}, true},
+		{crScopeUserCarol, "Carol Cook", crScopeProjectB, crScopeAccountB, "REGISTERED", []string{"PORTAL_USER"}, false},
+	} {
+		email := crFlowEmail(c.userID)
+		exec(`INSERT INTO "user" (id, created_on, updated_on, created_by, updated_by, user_name, name, first_name, last_name, email, is_active, is_system_user)
+		      VALUES ($1, now(), now(), 'cr-scope-test', 'cr-scope-test', $2, $3, 'First', 'Last', $2, $4, false)`, c.userID, email, c.name, !c.inactiveUser)
+		// The customer's own people: external users, who answer the customer
+		// stages (and only those).
+		exec(`UPDATE "user" SET user_type = 'EXTERNAL'::user_type_enum WHERE id = $1`, c.userID)
+		var acID, pcID string
+		if err := f.scoped.QueryRow(f.sys,
+			`INSERT INTO account_contact (id, created_on, updated_on, created_by, updated_by, user_name, account_id)
+			 VALUES (gen_random_uuid(), now(), now(), 'cr-scope-test', 'cr-scope-test', $1, $2) RETURNING id::text`, email, c.account).Scan(&acID); err != nil {
+			f.t.Fatalf("seed account_contact: %v", err)
+		}
+		if err := f.scoped.QueryRow(f.sys,
+			`INSERT INTO project_contact (id, created_on, updated_on, created_by, updated_by, email, account_contact_id, project_id, state)
+			 VALUES (gen_random_uuid(), now(), now(), 'cr-scope-test', 'cr-scope-test', $1, $2, $3, $4::project_contact_state_enum) RETURNING id::text`,
+			email, acID, c.project, c.state).Scan(&pcID); err != nil {
+			f.t.Fatalf("seed project_contact: %v", err)
+		}
+		for _, role := range c.roles {
+			exec(`INSERT INTO project_contact_group (id, created_on, updated_on, created_by, updated_by, project_contact_id, project_group_id)
+			      VALUES (gen_random_uuid(), now(), now(), 'cr-scope-test', 'cr-scope-test', $1, $2)`, pcID, groups[role])
+		}
+	}
+}
+
+// contactNames returns the names of a change request's customer contacts.
+func contactNames(cs []domain.ChangeRequestCustomerContact) []string {
+	out := make([]string, len(cs))
+	for i, c := range cs {
+		out[i] = c.Name
+	}
+	return out
+}
+
+// seedScope inserts project A (five deployments of four types, three active
+// deployed products and one deactivated; two registered contacts) and project B
+// (one deployment with one deployed product; one registered contact of a
+// different customer) and project C (nothing), and removes them again on
+// cleanup.
+func (f *crFlow) seedScope() {
+	f.t.Helper()
+	exec := func(sql string, args ...any) {
+		f.t.Helper()
+		if _, err := f.scoped.Exec(f.sys, sql, args...); err != nil {
+			f.t.Fatalf("seed scope (%.60s): %v", sql, err)
+		}
+	}
+	clean := func() {
+		for _, q := range []string{
+			`DELETE FROM work_item WHERE subject = 'cr-approval-flow integration test'`,
+			`DELETE FROM deployed_product WHERE id::text LIKE '3bbbbbbb-%'`,
+			`DELETE FROM deployment WHERE id::text LIKE '3bbbbbbb-%'`,
+			`DELETE FROM project WHERE id::text LIKE '3bbbbbbb-%'`,
+			`DELETE FROM product_version WHERE id::text LIKE '3bbbbbbb-%'`,
+			`DELETE FROM product WHERE id::text LIKE '3bbbbbbb-%'`,
+			`DELETE FROM account WHERE id::text LIKE '3bbbbbbb-%'`,
+			`DELETE FROM project_group WHERE "group" LIKE 'CR Scope %'`,
+			`DELETE FROM "user" WHERE id::text LIKE '3bbbbbbb-%'`,
+		} {
+			_, _ = f.scoped.Exec(f.sys, q)
+		}
+	}
+	clean()
+	f.t.Cleanup(clean)
+
+	exec(`INSERT INTO account (id, created_on, updated_on, created_by, updated_by, name, number, sf_id)
+	      VALUES ($1, now(), now(), 'cr-scope-test', 'cr-scope-test', 'CR Scope Test Account', 'CR-SCOPE-ACC', 'CR-SCOPE-SF')`, crScopeAccountID)
+	exec(`INSERT INTO account (id, created_on, updated_on, created_by, updated_by, name, number, sf_id)
+	      VALUES ($1, now(), now(), 'cr-scope-test', 'cr-scope-test', 'CR Scope Test Account B', 'CR-SCOPE-ACC-B', 'CR-SCOPE-SF-B')`, crScopeAccountB)
+	for _, p := range []struct{ id, key, account string }{
+		{crScopeProjectA, "CRSCOPEA", crScopeAccountID}, {crScopeProjectB, "CRSCOPEB", crScopeAccountB}, {crScopeProjectC, "CRSCOPEC", crScopeAccountID},
+	} {
+		exec(`INSERT INTO project (id, created_on, updated_on, created_by, updated_by, key, sf_id, name, account_id)
+		      VALUES ($1, now(), now(), 'cr-scope-test', 'cr-scope-test', $2, $2, $2, $3)`, p.id, p.key, p.account)
+	}
+	f.seedScopeContacts(exec)
+	for _, d := range []struct {
+		id, number, name, typ, project string
+		active                         bool
+	}{
+		{crScopeDepProd, "CRS-DEP-1", "Scope Prod", "PRIMARY_PRODUCTION", crScopeProjectA, true},
+		{crScopeDepStage, "CRS-DEP-2", "Scope Stage", "STAGING", crScopeProjectA, true},
+		{crScopeDepStage2, "CRS-DEP-3", "Scope Stage 2", "STAGING", crScopeProjectA, true},
+		{crScopeDepDev, "CRS-DEP-4", "Scope Dev", "DEVELOPMENT", crScopeProjectA, true},
+		{crScopeDepOld, "CRS-DEP-5", "Scope Old", "QA", crScopeProjectA, false},
+		{crScopeDepOtherB, "CRS-DEP-6", "Scope B Prod", "PRIMARY_PRODUCTION", crScopeProjectB, true},
+	} {
+		exec(`INSERT INTO deployment (id, created_on, updated_on, created_by, updated_by, number, name, type, is_active, project_id)
+		      VALUES ($1, now(), now(), 'cr-scope-test', 'cr-scope-test', $2, $3, $4::deployment_type_enum, $5, $6)`,
+			d.id, d.number, d.name, d.typ, d.active, d.project)
+	}
+	for id, name := range map[string]string{crScopeProductOne: "Scope Product One", crScopeProductTwo: "Scope Product Two"} {
+		exec(`INSERT INTO product (id, created_on, updated_on, created_by, updated_by, manufacturer, category, name)
+		      VALUES ($1, now(), now(), 'cr-scope-test', 'cr-scope-test', 'WSO2', 'SOFTWARE', $2)`, id, name)
+	}
+	for _, v := range []struct{ id, version, product string }{
+		{crScopeVersion1, "1.0", crScopeProductOne}, {crScopeVersion2, "2.0", crScopeProductOne}, {crScopeVersion3, "3.0", crScopeProductTwo},
+	} {
+		exec(`INSERT INTO product_version (id, created_on, updated_on, created_by, updated_by, version, product_id, current_support_status, release_date)
+		      VALUES ($1, now(), now(), 'cr-scope-test', 'cr-scope-test', $2, $3, 'AVAILABLE', '2024-01-01')`, v.id, v.version, v.product)
+	}
+	for _, p := range []struct {
+		id, number, deployment, product, version string
+		active                                   bool
+	}{
+		{crScopeDPProdOne, "CRS-DP-1", crScopeDepProd, crScopeProductOne, crScopeVersion1, true},
+		{crScopeDPProdTwo, "CRS-DP-2", crScopeDepProd, crScopeProductTwo, crScopeVersion3, true},
+		{crScopeDPStageOne, "CRS-DP-3", crScopeDepStage, crScopeProductOne, crScopeVersion2, true},
+		{crScopeDPInactive, "CRS-DP-4", crScopeDepProd, crScopeProductOne, crScopeVersion2, false},
+		{crScopeDPOtherB, "CRS-DP-5", crScopeDepOtherB, crScopeProductOne, crScopeVersion1, true},
+	} {
+		exec(`INSERT INTO deployed_product (id, created_on, updated_on, created_by, updated_by, number, name, active, deployment_id, product_id, version_id, product_category)
+		      VALUES ($1, now(), now(), 'cr-scope-test', 'cr-scope-test', $2, $2, $3, $4, $5, $6, 'PDP')`,
+			p.id, p.number, p.active, p.deployment, p.product, p.version)
+	}
+}
+
+func scopeStrp(s string) *string { return &s }
+
+// createScoped creates a Normal change request with the given scope fields.
+func (f *crFlow) createScoped(mod func(*domain.CreateChangeRequestRequest)) (string, error) {
+	f.t.Helper()
+	typ := domain.ChangeRequestTypeNormal
+	req := domain.CreateChangeRequestRequest{Subject: crFlowSubject, Type: &typ}
+	if mod != nil {
+		mod(&req)
+	}
+	resp, err := f.repo.CreateChangeRequest(f.sys, req, crFlowEmail(crFlowCreatorID))
+	if err != nil {
+		return "", err
+	}
+	return resp.ChangeRequest.ID, nil
+}
+
+func (f *crFlow) mustCreateScoped(mod func(*domain.CreateChangeRequestRequest)) string {
+	f.t.Helper()
+	id, err := f.createScoped(mod)
+	if err != nil {
+		f.t.Fatalf("CreateChangeRequest: %v", err)
+	}
+	return id
+}
+
+func (f *crFlow) mustPatch(id string, req domain.PatchChangeRequestRequest) domain.ChangeRequest {
+	f.t.Helper()
+	cr, err := f.patch(id, req)
+	if err != nil {
+		f.t.Fatalf("PATCH: %v", err)
+	}
+	return cr
+}
+
+func (f *crFlow) setStoredState(id, state string) {
+	f.t.Helper()
+	if _, err := f.scoped.Exec(f.sys, `UPDATE change_request SET state = $1::change_request_state_enum WHERE id = $2`, state, id); err != nil {
+		f.t.Fatalf("force state %s: %v", state, err)
+	}
+}
+
+func scopeIDs(refs []domain.EntityRef) []string {
+	out := make([]string, len(refs))
+	for i, r := range refs {
+		out[i] = r.ID
+	}
+	sort.Strings(out)
+	return out
+}
+
+func scopeNames(refs []domain.EntityRef) []string {
+	out := make([]string, len(refs))
+	for i, r := range refs {
+		out[i] = r.Name
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (f *crFlow) assertScope(what string, cr domain.ChangeRequest, project string, deployments, products []string) {
+	f.t.Helper()
+	if cr.Project.ID != project {
+		f.t.Fatalf("%s: project = %q, want %q", what, cr.Project.ID, project)
+	}
+	for name, c := range map[string]struct {
+		got  []domain.EntityRef
+		want []string
+	}{"deployments": {cr.Deployments, deployments}, "deploymentProducts": {cr.DeploymentProducts, products}} {
+		if c.got == nil {
+			f.t.Fatalf("%s: %s is nil, want a (possibly empty) array", what, name)
+		}
+		want := append([]string{}, c.want...)
+		sort.Strings(want)
+		if got := scopeIDs(c.got); strings.Join(got, ",") != strings.Join(want, ",") {
+			f.t.Fatalf("%s: %s = %v, want %v", what, name, got, want)
+		}
+	}
+}
+
+func (f *crFlow) comments(id string) map[string][]string {
+	f.t.Helper()
+	rows, err := f.scoped.Query(f.sys, `SELECT type::text, content, created_by FROM comment WHERE work_item_id = $1 ORDER BY created_on, id`, id)
+	if err != nil {
+		f.t.Fatalf("read comments: %v", err)
+	}
+	defer rows.Close()
+	out := map[string][]string{}
+	for rows.Next() {
+		var typ, content, by string
+		if err := rows.Scan(&typ, &content, &by); err != nil {
+			f.t.Fatalf("scan comment: %v", err)
+		}
+		out[typ] = append(out[typ], content+"|"+by)
+	}
+	return out
+}
+
+func (f *crFlow) crCount() int {
+	f.t.Helper()
+	var n int
+	if err := f.scoped.QueryRow(f.sys, `SELECT count(*) FROM work_item WHERE subject = $1`, crFlowSubject).Scan(&n); err != nil {
+		f.t.Fatalf("count change requests: %v", err)
+	}
+	return n
+}
+
+// Every scope field persists on create and comes back on GET: project,
+// deployments, deployment products (derived, deactivated ones excluded),
+// category, and the two journal entries as comment rows of the right types; the
+// Customer Group is not stored but derived from the project's registered
+// contacts.
+func TestChangeRequestScopeIntegration_CreatePersistsEveryField(t *testing.T) {
+	for _, path := range []string{"portal", "servicenow-first"} {
+		path := path
+		t.Run(path, func(t *testing.T) {
+			f := newCRFlow(t)
+			f.seedScope()
+			cat := domain.ChangeRequestCategoryDevOps
+			mod := func(r *domain.CreateChangeRequestRequest) {
+				r.ProjectID = scopeStrp(crScopeProjectA)
+				r.DeploymentIDs = []string{crScopeDepProd, crScopeDepStage}
+				r.Category = &cat
+				r.Comment = scopeStrp("customer visible note")
+				r.WorkNote = scopeStrp("internal note")
+			}
+			var id string
+			if path == "portal" {
+				id = f.mustCreateScoped(mod)
+			} else {
+				typ := domain.ChangeRequestTypeNormal
+				req := domain.CreateChangeRequestRequest{Subject: crFlowSubject, Type: &typ}
+				mod(&req)
+				id = "3bbbbbbb-0000-0000-0000-0000000000f1"
+				if _, err := f.repo.CreateChangeRequestFromServiceNow(f.sys, req, id, "CRSCOPESN01", crFlowEmail(crFlowCreatorID)); err != nil {
+					t.Fatalf("CreateChangeRequestFromServiceNow: %v", err)
+				}
+			}
+			cr := f.get(id)
+			f.assertScope("after create", cr, crScopeProjectA,
+				[]string{crScopeDepProd, crScopeDepStage},
+				[]string{crScopeDPProdOne, crScopeDPProdTwo, crScopeDPStageOne})
+			if got := scopeNames(cr.DeploymentProducts); strings.Join(got, ",") != "Scope Product One 1.0,Scope Product One 2.0,Scope Product Two 3.0" {
+				t.Fatalf("deploymentProducts names = %v, want \"<product> <version>\"", got)
+			}
+			if cr.Category == nil || *cr.Category != "devops" {
+				t.Fatalf("category = %v, want devops", cr.Category)
+			}
+			if got := contactNames(cr.CustomerContacts); strings.Join(got, ",") != "Alice Aaron,Bob Bell" {
+				t.Fatalf("customerContacts = %v, want project A's registered portal-user contacts (name order)", got)
+			}
+			if got := f.storedCustomerGroup(id); got != nil {
+				t.Fatalf("customer_group_id = %s, want it left unwritten", *got)
+			}
+			// The single-valued columns the list views read follow the first
+			// deployment (name order) and its first deployed product.
+			if cr.Deployment == nil || cr.Deployment.ID != crScopeDepProd {
+				t.Fatalf("deployment = %+v, want %s", cr.Deployment, crScopeDepProd)
+			}
+			if cr.DeployedProduct == nil || cr.DeployedProduct.ID != crScopeDPProdOne {
+				t.Fatalf("deployedProduct = %+v, want %s", cr.DeployedProduct, crScopeDPProdOne)
+			}
+			got := f.comments(id)
+			by := crFlowEmail(crFlowCreatorID)
+			if len(got["COMMENT"]) != 1 || got["COMMENT"][0] != "customer visible note|"+by || len(got["WORK_NOTE"]) != 1 || got["WORK_NOTE"][0] != "internal note|"+by || len(got) != 2 {
+				t.Fatalf("comment rows = %v, want one COMMENT and one WORK_NOTE by %s", got, by)
+			}
+		})
+	}
+}
+
+// A change request with no scope fields reads back with empty arrays, not null,
+// and a blank journal entry creates no comment row.
+func TestChangeRequestScopeIntegration_CreateWithoutScopeReadsEmptyArrays(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedScope()
+	id := f.mustCreateScoped(func(r *domain.CreateChangeRequestRequest) {
+		r.Comment = scopeStrp("   ")
+		r.WorkNote = scopeStrp("")
+	})
+	cr := f.get(id)
+	f.assertScope("bare create", cr, "", nil, nil)
+	if cr.Category != nil {
+		t.Fatalf("category = %v, want unset", cr.Category)
+	}
+	if cr.CustomerContacts == nil || len(cr.CustomerContacts) != 0 {
+		t.Fatalf("customerContacts = %v, want an empty array without a project", cr.CustomerContacts)
+	}
+	if got := f.comments(id); len(got) != 0 {
+		t.Fatalf("blank journal entries created comment rows: %v", got)
+	}
+}
+
+// A project alone is stored (no deployments needed).
+func TestChangeRequestScopeIntegration_CreateProjectOnly(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedScope()
+	id := f.mustCreateScoped(func(r *domain.CreateChangeRequestRequest) { r.ProjectID = scopeStrp(crScopeProjectA) })
+	f.assertScope("project only", f.get(id), crScopeProjectA, nil, nil)
+}
+
+// Every combination the rules refuse is a ValidationError naming the field and
+// leaves no change request behind (the create is all-or-nothing).
+func TestChangeRequestScopeIntegration_CreateRejectsInconsistentSelections(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedScope()
+	unknown := "3bbbbbbb-9999-0000-0000-000000000000"
+	for _, tc := range []struct {
+		name     string
+		mod      func(*domain.CreateChangeRequestRequest)
+		contains string
+	}{
+		{"deployment of another project", func(r *domain.CreateChangeRequestRequest) {
+			r.ProjectID = scopeStrp(crScopeProjectA)
+			r.DeploymentIDs = []string{crScopeDepProd, crScopeDepOtherB}
+		}, "does not belong to the selected project: " + crScopeDepOtherB},
+		{"deployments without a project", func(r *domain.CreateChangeRequestRequest) {
+			r.DeploymentIDs = []string{crScopeDepProd}
+		}, "projectId is required when deploymentIds are provided"},
+		{"unknown deployment", func(r *domain.CreateChangeRequestRequest) {
+			r.ProjectID = scopeStrp(crScopeProjectA)
+			r.DeploymentIDs = []string{unknown}
+		}, "unknown deployment: " + unknown},
+		{"inactive deployment", func(r *domain.CreateChangeRequestRequest) {
+			r.ProjectID = scopeStrp(crScopeProjectA)
+			r.DeploymentIDs = []string{crScopeDepOld}
+		}, "inactive deployment: " + crScopeDepOld},
+		{"unknown project", func(r *domain.CreateChangeRequestRequest) {
+			r.ProjectID = scopeStrp(unknown)
+		}, "projectId does not refer to an existing project"},
+		{"deployment products without deployments", func(r *domain.CreateChangeRequestRequest) {
+			r.ProjectID = scopeStrp(crScopeProjectA)
+			r.DeploymentProductIDs = []string{crScopeDPProdOne}
+		}, "deploymentProductIds requires deploymentIds"},
+		{"deployment products: a subset of the derived set", func(r *domain.CreateChangeRequestRequest) {
+			r.ProjectID = scopeStrp(crScopeProjectA)
+			r.DeploymentIDs = []string{crScopeDepProd}
+			r.DeploymentProductIDs = []string{crScopeDPProdOne}
+		}, "deploymentProductIds is read-only"},
+		{"deployment products: another deployment's", func(r *domain.CreateChangeRequestRequest) {
+			r.ProjectID = scopeStrp(crScopeProjectA)
+			r.DeploymentIDs = []string{crScopeDepProd}
+			r.DeploymentProductIDs = []string{crScopeDPProdOne, crScopeDPProdTwo, crScopeDPStageOne}
+		}, "deploymentProductIds is read-only"},
+		{"deployment products: includes a deactivated one", func(r *domain.CreateChangeRequestRequest) {
+			r.ProjectID = scopeStrp(crScopeProjectA)
+			r.DeploymentIDs = []string{crScopeDepProd}
+			r.DeploymentProductIDs = []string{crScopeDPProdOne, crScopeDPProdTwo, crScopeDPInactive}
+		}, "deploymentProductIds is read-only"},
+		{"customerGroupId is no longer accepted", func(r *domain.CreateChangeRequestRequest) {
+			r.ProjectID = scopeStrp(crScopeProjectA)
+			r.CustomerGroupID = scopeStrp(seededGroupID)
+		}, crScopeMsgGroupRemoved},
+		{"environmentIds is no longer supported", func(r *domain.CreateChangeRequestRequest) {
+			r.ProjectID = scopeStrp(crScopeProjectA)
+			r.DeploymentIDs = []string{crScopeDepProd}
+			r.EnvironmentIDs = []string{"3bbbbbbb-0000-0000-0000-0000000000e1"}
+		}, crScopeMsgEnvRemoved},
+		{"too many deployments", func(r *domain.CreateChangeRequestRequest) {
+			r.ProjectID = scopeStrp(crScopeProjectA)
+			for i := 0; i < 101; i++ {
+				r.DeploymentIDs = append(r.DeploymentIDs, fmt.Sprintf("3bbbbbbb-0000-0000-0001-%012d", i))
+			}
+		}, "deploymentIds must contain at most 100 entries"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := f.createScoped(tc.mod)
+			f.wantValidationError(tc.name, err, tc.contains)
+			if n := f.crCount(); n != 0 {
+				t.Fatalf("%d change request(s) left behind by a refused create", n)
+			}
+		})
+	}
+}
+
+// Deployment products stated exactly are accepted; duplicates in the lists are
+// collapsed; a deployment with no deployed products derives none.
+func TestChangeRequestScopeIntegration_CreateExplicitProductsAndDuplicates(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedScope()
+	id := f.mustCreateScoped(func(r *domain.CreateChangeRequestRequest) {
+		r.ProjectID = scopeStrp(crScopeProjectA)
+		r.DeploymentIDs = []string{crScopeDepProd, crScopeDepStage}
+		r.DeploymentProductIDs = []string{crScopeDPProdOne, crScopeDPProdTwo, crScopeDPStageOne}
+	})
+	f.assertScope("explicit products", f.get(id), crScopeProjectA,
+		[]string{crScopeDepProd, crScopeDepStage},
+		[]string{crScopeDPProdOne, crScopeDPProdTwo, crScopeDPStageOne})
+
+	id = f.mustCreateScoped(func(r *domain.CreateChangeRequestRequest) {
+		r.ProjectID = scopeStrp(crScopeProjectA)
+		r.DeploymentIDs = []string{crScopeDepStage, crScopeDepStage2, crScopeDepStage}
+	})
+	f.assertScope("two staging deployments", f.get(id), crScopeProjectA,
+		[]string{crScopeDepStage, crScopeDepStage2}, []string{crScopeDPStageOne})
+
+	id = f.mustCreateScoped(func(r *domain.CreateChangeRequestRequest) {
+		r.ProjectID = scopeStrp(crScopeProjectA)
+		r.DeploymentIDs = []string{crScopeDepDev}
+	})
+	f.assertScope("dev only", f.get(id), crScopeProjectA, []string{crScopeDepDev}, nil)
+}
+
+// Category: all 13 values of the API enum persist (four needed new enum labels),
+// on create and on PATCH.
+func TestChangeRequestScopeIntegration_PersistsEveryCategory(t *testing.T) {
+	f := newCRFlow(t)
+	for _, c := range []domain.ChangeRequestCategory{
+		domain.ChangeRequestCategoryHardware, domain.ChangeRequestCategorySoftware, domain.ChangeRequestCategoryService,
+		domain.ChangeRequestCategorySystemSoftware, domain.ChangeRequestCategoryApplicationsSoftware,
+		domain.ChangeRequestCategoryNetwork, domain.ChangeRequestCategoryTelecom, domain.ChangeRequestCategoryDocumentation,
+		domain.ChangeRequestCategoryOther, domain.ChangeRequestCategoryRegularReleaseCloud,
+		domain.ChangeRequestCategoryHotfixReleaseCloud, domain.ChangeRequestCategoryDevOps, domain.ChangeRequestCategoryCloudComputing,
+	} {
+		c := c
+		id := f.mustCreateScoped(func(r *domain.CreateChangeRequestRequest) { r.Category = &c })
+		if got := f.get(id).Category; got == nil || *got != string(c) {
+			t.Fatalf("category after create = %v, want %s", got, c)
+		}
+		// ...and via PATCH, to a different value and back.
+		other := domain.ChangeRequestCategoryOther
+		if c == other {
+			other = domain.ChangeRequestCategorySoftware
+		}
+		oc := &other
+		f.mustPatch(id, domain.PatchChangeRequestRequest{Category: &oc})
+		if got := f.get(id).Category; got == nil || *got != string(other) {
+			t.Fatalf("category after PATCH = %v, want %s", got, other)
+		}
+		cc := &c
+		f.mustPatch(id, domain.PatchChangeRequestRequest{Category: &cc})
+		if got := f.get(id).Category; got == nil || *got != string(c) {
+			t.Fatalf("category after PATCH back = %v, want %s", got, c)
+		}
+	}
+	bogus := domain.ChangeRequestCategory("bogus")
+	_, err := f.createScoped(func(r *domain.CreateChangeRequestRequest) { r.Category = &bogus })
+	f.wantValidationError("bogus category", err, "not supported")
+}
+
+// PATCH arrays replace: deployments, the environments and deployment products
+// that follow, and the single-valued columns, through to an empty array.
+func TestChangeRequestScopeIntegration_PatchArraysReplace(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedScope()
+	id := f.mustCreateScoped(func(r *domain.CreateChangeRequestRequest) {
+		r.ProjectID = scopeStrp(crScopeProjectA)
+		r.DeploymentIDs = []string{crScopeDepProd, crScopeDepStage}
+	})
+
+	cr := f.mustPatch(id, domain.PatchChangeRequestRequest{DeploymentIDs: &[]string{crScopeDepStage}})
+	f.assertScope("replace with [stage]", cr, crScopeProjectA, []string{crScopeDepStage}, []string{crScopeDPStageOne})
+	if cr.Deployment == nil || cr.Deployment.ID != crScopeDepStage || cr.DeployedProduct == nil || cr.DeployedProduct.ID != crScopeDPStageOne {
+		t.Fatalf("single-valued deployment/deployedProduct = %+v/%+v, want stage / its product", cr.Deployment, cr.DeployedProduct)
+	}
+
+	cr = f.mustPatch(id, domain.PatchChangeRequestRequest{DeploymentIDs: &[]string{crScopeDepProd, crScopeDepDev}})
+	f.assertScope("replace with [prod, dev]", cr, crScopeProjectA,
+		[]string{crScopeDepProd, crScopeDepDev}, []string{crScopeDPProdOne, crScopeDPProdTwo})
+
+	cr = f.mustPatch(id, domain.PatchChangeRequestRequest{DeploymentIDs: &[]string{}})
+	f.assertScope("cleared", cr, crScopeProjectA, nil, nil)
+	if cr.Deployment != nil || cr.DeployedProduct != nil {
+		t.Fatalf("single-valued deployment/deployedProduct after clearing = %+v/%+v, want nil", cr.Deployment, cr.DeployedProduct)
+	}
+}
+
+// An unrelated PATCH leaves the deployments and products alone; a client that
+// still sends customerGroupId (a group, or null) or environmentIds is refused
+// with a clear 400 and nothing of the request is applied -- the Customer Group
+// is derived from the project and a deployment carries its environment.
+func TestChangeRequestScopeIntegration_PatchRefusesRemovedFields(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedScope()
+	id := f.mustCreateScoped(func(r *domain.CreateChangeRequestRequest) {
+		r.ProjectID = scopeStrp(crScopeProjectA)
+		r.DeploymentIDs = []string{crScopeDepProd, crScopeDepStage}
+	})
+	both := []string{crScopeDepProd, crScopeDepStage}
+	allProducts := []string{crScopeDPProdOne, crScopeDPProdTwo, crScopeDPStageOne}
+
+	title := "unrelated edit"
+	cr := f.mustPatch(id, domain.PatchChangeRequestRequest{Title: &title})
+	f.assertScope("after unrelated PATCH", cr, crScopeProjectA, both, allProducts)
+
+	group := scopeStrp(seededGroupID)
+	var none *string
+	other := "must not be applied"
+	for name, tc := range map[string]struct {
+		req  domain.PatchChangeRequestRequest
+		want string
+	}{
+		"customerGroupId set":  {domain.PatchChangeRequestRequest{Title: &other, CustomerGroupID: &group}, crScopeMsgGroupRemoved},
+		"customerGroupId null": {domain.PatchChangeRequestRequest{Title: &other, CustomerGroupID: &none}, crScopeMsgGroupRemoved},
+		"environmentIds":       {domain.PatchChangeRequestRequest{Title: &other, EnvironmentIDs: &[]string{"3bbbbbbb-0000-0000-0000-0000000000e1"}}, crScopeMsgEnvRemoved},
+		"environmentIds empty": {domain.PatchChangeRequestRequest{Title: &other, EnvironmentIDs: &[]string{}}, crScopeMsgEnvRemoved},
+	} {
+		_, err := f.patch(id, tc.req)
+		f.wantValidationMessage(name, err, tc.want)
+	}
+	cr = f.get(id)
+	f.assertScope("after refused PATCHes", cr, crScopeProjectA, both, allProducts)
+	if cr.Subject != nil && *cr.Subject == other {
+		t.Fatal("a refused PATCH applied its other fields")
+	}
+	if g := f.storedCustomerGroup(id); g != nil {
+		t.Fatalf("customer_group_id = %s, want it never written", *g)
+	}
+}
+
+// Deployments must belong to the project on PATCH too, and a refused PATCH
+// leaves everything as it was.
+func TestChangeRequestScopeIntegration_PatchRejectsInconsistentSelections(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedScope()
+	id := f.mustCreateScoped(func(r *domain.CreateChangeRequestRequest) {
+		r.ProjectID = scopeStrp(crScopeProjectA)
+		r.DeploymentIDs = []string{crScopeDepProd}
+	})
+	title := "must not be applied"
+	manyIDs := make([]string, 101)
+	for i := range manyIDs {
+		manyIDs[i] = fmt.Sprintf("3bbbbbbb-0000-0000-0002-%012d", i)
+	}
+	for _, tc := range []struct {
+		name     string
+		req      domain.PatchChangeRequestRequest
+		contains string
+	}{
+		{"deployment of another project", domain.PatchChangeRequestRequest{Title: &title, DeploymentIDs: &[]string{crScopeDepOtherB}}, "does not belong to the selected project"},
+		{"inactive deployment", domain.PatchChangeRequestRequest{DeploymentIDs: &[]string{crScopeDepOld}}, "inactive deployment"},
+		{"unknown deployment", domain.PatchChangeRequestRequest{DeploymentIDs: &[]string{"3bbbbbbb-9999-0000-0000-000000000000"}}, "unknown deployment"},
+		{"project changed without deployments", domain.PatchChangeRequestRequest{ProjectID: scopeStrp(crScopeProjectB)}, "projectId cannot be changed without deploymentIds"},
+		{"project changed, old deployments kept", domain.PatchChangeRequestRequest{ProjectID: scopeStrp(crScopeProjectB), DeploymentIDs: &[]string{crScopeDepProd}}, "does not belong to the selected project"},
+		{"unknown project", domain.PatchChangeRequestRequest{ProjectID: scopeStrp("3bbbbbbb-9999-0000-0000-000000000000"), DeploymentIDs: &[]string{}}, "projectId does not refer to an existing project"},
+		{"deployment products: not the derived set", domain.PatchChangeRequestRequest{DeploymentProductIDs: &[]string{crScopeDPProdOne}}, "deploymentProductIds is read-only"},
+		{"deployment products: another project's", domain.PatchChangeRequestRequest{DeploymentProductIDs: &[]string{crScopeDPOtherB}}, "deploymentProductIds is read-only"},
+		{"single deployment fields with deploymentIds", domain.PatchChangeRequestRequest{DeploymentIDs: &[]string{crScopeDepProd}, DeploymentID: scopeStrp(crScopeDepProd)}, "cannot be combined with deploymentIds"},
+		{"too many ids", domain.PatchChangeRequestRequest{DeploymentProductIDs: &manyIDs}, "deploymentProductIds must contain at most 100 entries"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := f.patch(id, tc.req)
+			f.wantValidationError(tc.name, err, tc.contains)
+			cr := f.get(id)
+			f.assertScope("after refused PATCH", cr, crScopeProjectA, []string{crScopeDepProd}, []string{crScopeDPProdOne, crScopeDPProdTwo})
+			if cr.Subject != nil && *cr.Subject == title {
+				t.Fatal("a refused PATCH applied its other fields")
+			}
+		})
+	}
+}
+
+// Moving the change to another project: the deployments must be re-chosen from
+// the new project in the same PATCH (an empty array clears them).
+func TestChangeRequestScopeIntegration_PatchMovesProject(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedScope()
+	id := f.mustCreateScoped(func(r *domain.CreateChangeRequestRequest) {
+		r.ProjectID = scopeStrp(crScopeProjectA)
+		r.DeploymentIDs = []string{crScopeDepProd, crScopeDepStage}
+	})
+	cr := f.mustPatch(id, domain.PatchChangeRequestRequest{ProjectID: scopeStrp(crScopeProjectB), DeploymentIDs: &[]string{crScopeDepOtherB}})
+	f.assertScope("moved to B", cr, crScopeProjectB, []string{crScopeDepOtherB}, []string{crScopeDPOtherB})
+
+	cr = f.mustPatch(id, domain.PatchChangeRequestRequest{ProjectID: scopeStrp(crScopeProjectA), DeploymentIDs: &[]string{}})
+	f.assertScope("back to A with no deployments", cr, crScopeProjectA, nil, nil)
+
+	// With no deployments stored, the project alone can change.
+	cr = f.mustPatch(id, domain.PatchChangeRequestRequest{ProjectID: scopeStrp(crScopeProjectB)})
+	f.assertScope("project alone", cr, crScopeProjectB, nil, nil)
+
+	// A change request created without a project can be given one later.
+	id2 := f.mustCreateScoped(nil)
+	cr = f.mustPatch(id2, domain.PatchChangeRequestRequest{ProjectID: scopeStrp(crScopeProjectA), DeploymentIDs: &[]string{crScopeDepDev}})
+	f.assertScope("project added later", cr, crScopeProjectA, []string{crScopeDepDev}, nil)
+}
+
+// Deployment products are read-only: stated exactly (or as the stored
+// snapshot) they are accepted, and the stored list is always the derived one.
+func TestChangeRequestScopeIntegration_PatchDeploymentProductsReadOnly(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedScope()
+	id := f.mustCreateScoped(func(r *domain.CreateChangeRequestRequest) {
+		r.ProjectID = scopeStrp(crScopeProjectA)
+		r.DeploymentIDs = []string{crScopeDepProd}
+	})
+	derived := []string{crScopeDPProdOne, crScopeDPProdTwo}
+	cr := f.mustPatch(id, domain.PatchChangeRequestRequest{DeploymentProductIDs: &derived})
+	f.assertScope("exact set resent", cr, crScopeProjectA, []string{crScopeDepProd}, derived)
+
+	// The deployment gains a product after the change request was raised: the
+	// stored snapshot stays until the deployments are re-chosen, and resending
+	// the snapshot is still accepted.
+	const extra = "3bbbbbbb-0000-0000-0000-000000000056"
+	if _, err := f.scoped.Exec(f.sys,
+		`INSERT INTO deployed_product (id, created_on, updated_on, created_by, updated_by, number, name, active, deployment_id, product_id, version_id, product_category)
+		 VALUES ($1, now(), now(), 'cr-scope-test', 'cr-scope-test', 'CRS-DP-6', 'CRS-DP-6', true, $2, $3, $4, 'PDP')`,
+		extra, crScopeDepProd, crScopeProductTwo, crScopeVersion3); err != nil {
+		t.Fatalf("add deployed product: %v", err)
+	}
+	f.assertScope("snapshot unchanged", f.get(id), crScopeProjectA, []string{crScopeDepProd}, derived)
+	f.mustPatch(id, domain.PatchChangeRequestRequest{DeploymentProductIDs: &derived})
+	cr = f.mustPatch(id, domain.PatchChangeRequestRequest{DeploymentIDs: &[]string{crScopeDepProd}})
+	f.assertScope("snapshot kept while the deployments are the same", cr, crScopeProjectA, []string{crScopeDepProd}, derived)
+	// Re-choosing the deployments re-derives, picking up the new product.
+	cr = f.mustPatch(id, domain.PatchChangeRequestRequest{DeploymentIDs: &[]string{crScopeDepStage, crScopeDepProd}})
+	f.assertScope("re-derived", cr, crScopeProjectA, []string{crScopeDepProd, crScopeDepStage},
+		[]string{crScopeDPProdOne, crScopeDPProdTwo, crScopeDPStageOne, extra})
+}
+
+// The edit window: project, deployments and deployment products
+// change freely through Scheduled and are refused from Implement on; resending
+// the stored values is always accepted; everything else stays editable.
+func TestChangeRequestScopeIntegration_PatchEditWindow(t *testing.T) {
+	for state, open := range map[string]bool{
+		"NEW": true, "ASSESS": true, "AUTHORIZE": true, "CUSTOMER_APPROVAL": true, "SCHEDULED": true,
+		"IMPLEMENT": false, "REVIEW": false, "CUSTOMER_REVIEW": false, "ROLLBACK": false, "CLOSED": false, "CANCELED": false,
+	} {
+		state, open := state, open
+		t.Run(state, func(t *testing.T) {
+			f := newCRFlow(t)
+			f.seedScope()
+			id := f.mustCreateScoped(func(r *domain.CreateChangeRequestRequest) {
+				r.ProjectID = scopeStrp(crScopeProjectA)
+				r.DeploymentIDs = []string{crScopeDepProd, crScopeDepStage}
+			})
+			f.setStoredState(id, state)
+			stored := f.get(id)
+
+			// Resending what is stored is always fine.
+			storedProducts := scopeIDs(stored.DeploymentProducts)
+			f.mustPatch(id, domain.PatchChangeRequestRequest{
+				ProjectID: scopeStrp(crScopeProjectA), DeploymentIDs: &[]string{crScopeDepStage, crScopeDepProd},
+				DeploymentProductIDs: &storedProducts,
+			})
+
+			attempts := map[string]domain.PatchChangeRequestRequest{
+				"deploymentIds": {DeploymentIDs: &[]string{crScopeDepProd}},
+				"projectId":     {ProjectID: scopeStrp(crScopeProjectB), DeploymentIDs: &[]string{crScopeDepOtherB}},
+			}
+			for field, req := range attempts {
+				_, err := f.patch(id, req)
+				if open {
+					if err != nil {
+						t.Fatalf("%s change in %s: %v", field, state, err)
+					}
+					// Put it back for the next attempt.
+					f.mustPatch(id, domain.PatchChangeRequestRequest{ProjectID: scopeStrp(crScopeProjectA), DeploymentIDs: &[]string{crScopeDepProd, crScopeDepStage}})
+					continue
+				}
+				f.wantValidationError(field+" in "+state, err, "can no longer be changed")
+				if !strings.Contains(err.Error(), strings.ToLower(state)) {
+					t.Fatalf("message %q should name the state %q", err.Error(), strings.ToLower(state))
+				}
+				f.assertScope("after refused "+field, f.get(id), crScopeProjectA, []string{crScopeDepProd, crScopeDepStage}, storedProducts)
+			}
+
+			// Not part of the window, in any state: journal entries and category.
+			cat := domain.ChangeRequestCategoryNetwork
+			cp := &cat
+			f.mustPatch(id, domain.PatchChangeRequestRequest{Comment: scopeStrp("still allowed"), WorkNote: scopeStrp("still allowed"), Category: &cp})
+		})
+	}
+}
+
+// Comment / workNote on PATCH append comment rows of the right types, authored
+// by the caller; blank values are refused; each works alone.
+func TestChangeRequestScopeIntegration_PatchAppendsJournalEntries(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedScope()
+	id := f.mustCreateScoped(nil)
+	by := crFlowEmail(crFlowCreatorID)
+
+	f.mustPatch(id, domain.PatchChangeRequestRequest{Comment: scopeStrp("first comment")})
+	got := f.comments(id)
+	if len(got) != 1 || len(got["COMMENT"]) != 1 || got["COMMENT"][0] != "first comment|"+by {
+		t.Fatalf("after comment alone: %v", got)
+	}
+	f.mustPatch(id, domain.PatchChangeRequestRequest{WorkNote: scopeStrp("a work note")})
+	f.mustPatch(id, domain.PatchChangeRequestRequest{Comment: scopeStrp("second comment"), WorkNote: scopeStrp("second work note")})
+	got = f.comments(id)
+	if len(got["COMMENT"]) != 2 || len(got["WORK_NOTE"]) != 2 || got["COMMENT"][1] != "second comment|"+by || got["WORK_NOTE"][0] != "a work note|"+by {
+		t.Fatalf("after three PATCHes: %v", got)
+	}
+
+	for _, req := range []domain.PatchChangeRequestRequest{
+		{Comment: scopeStrp("")}, {Comment: scopeStrp("  \n")}, {WorkNote: scopeStrp("")}, {WorkNote: scopeStrp("\t")},
+	} {
+		_, err := f.patch(id, req)
+		f.wantValidationError("blank journal entry", err, "must not be empty")
+	}
+	if after := f.comments(id); len(after["COMMENT"]) != 2 || len(after["WORK_NOTE"]) != 2 {
+		t.Fatalf("a refused blank entry changed the journal: %v", after)
+	}
+}
+
+// The Customer Group is derived live from the project's registered portal-user
+// contacts, read-only: it follows a project change, tracks a contact being
+// deregistered or deactivated, is empty without a project or without contacts,
+// and never mixes two customers' contacts.
+func TestChangeRequestScopeIntegration_CustomerContactsAreDerivedFromTheProject(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedScope()
+	names := func(id string) string { return strings.Join(contactNames(f.get(id).CustomerContacts), ",") }
+
+	id := f.mustCreateScoped(nil)
+	if cr := f.get(id); cr.CustomerContacts == nil || len(cr.CustomerContacts) != 0 {
+		t.Fatalf("customerContacts without a project = %v, want []", cr.CustomerContacts)
+	}
+	// Setting the project derives its contacts: registered + PORTAL_USER only
+	// (the invited, security-only and deactivated users of project A do not count).
+	f.mustPatch(id, domain.PatchChangeRequestRequest{ProjectID: scopeStrp(crScopeProjectA)})
+	if got := names(id); got != "Alice Aaron,Bob Bell" {
+		t.Fatalf("project A contacts = %q, want Alice Aaron,Bob Bell", got)
+	}
+	cr := f.get(id)
+	if cr.CustomerContacts[0].ID == "" || cr.CustomerContacts[0].Email != crFlowEmail(crScopeUserAlice) {
+		t.Fatalf("contact = %+v, want an id and the contact's email", cr.CustomerContacts[0])
+	}
+	// Changing the project re-derives: customer B's contact replaces customer A's.
+	f.mustPatch(id, domain.PatchChangeRequestRequest{ProjectID: scopeStrp(crScopeProjectB), DeploymentIDs: &[]string{}})
+	if got := names(id); got != "Carol Cook" {
+		t.Fatalf("project B contacts = %q, want only Carol Cook (customer B's)", got)
+	}
+	f.mustPatch(id, domain.PatchChangeRequestRequest{ProjectID: scopeStrp(crScopeProjectC)})
+	if got := names(id); got != "" {
+		t.Fatalf("project C contacts = %q, want none", got)
+	}
+	// Computed live on every read: a contact who stops being registered, or whose
+	// user is deactivated, drops out; one who registers appears.
+	f.mustPatch(id, domain.PatchChangeRequestRequest{ProjectID: scopeStrp(crScopeProjectA)})
+	f.execSQL(`UPDATE project_contact SET state = 'DEACTIVATED' WHERE email = $1`, crFlowEmail(crScopeUserBob))
+	if got := names(id); got != "Alice Aaron" {
+		t.Fatalf("after deactivating Bob = %q, want Alice Aaron", got)
+	}
+	f.execSQL(`UPDATE project_contact SET state = 'REGISTERED' WHERE email = $1`, crFlowEmail(crScopeUserInvited))
+	if got := names(id); got != "Alice Aaron,Ivy Invited" {
+		t.Fatalf("after Ivy registers = %q, want Alice Aaron,Ivy Invited", got)
+	}
+	f.execSQL(`UPDATE "user" SET is_active = false WHERE id = $1`, crScopeUserAlice)
+	if got := names(id); got != "Ivy Invited" {
+		t.Fatalf("after deactivating Alice's user = %q, want Ivy Invited", got)
+	}
+}
+
+func (f *crFlow) execSQL(sql string, args ...any) {
+	f.t.Helper()
+	if _, err := f.scoped.Exec(f.sys, sql, args...); err != nil {
+		f.t.Fatalf("exec %.60s: %v", sql, err)
+	}
+}
+
+// The scope fields survive the whole lifecycle: create with project,
+// deployments, group and journal entries; Request Approval, peer and CAB
+// approval, Implement, Review, Closed -- unchanged after every step, with the
+// edit window closing at Implement.
+func TestChangeRequestScopeIntegration_SurvivesNormalLifecycle(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedAssignedGroup()
+	f.seedScope()
+	seedApprovalGroupMembers(t, f.scoped, crCABGroupID, crCABMemberUserID1, crCABMemberUserID2)
+	typ := domain.ChangeRequestTypeNormal
+	group := crFlowGroupID
+	resp, err := f.repo.CreateChangeRequest(f.sys, domain.CreateChangeRequestRequest{
+		Subject: crFlowSubject, Type: &typ, GroupID: &group,
+		ProjectID: scopeStrp(crScopeProjectA), DeploymentIDs: []string{crScopeDepProd, crScopeDepStage},
+		Comment: scopeStrp("lifecycle comment"), WorkNote: scopeStrp("lifecycle note"),
+	}, crFlowEmail(crFlowCreatorID))
+	if err != nil {
+		t.Fatalf("CreateChangeRequest: %v", err)
+	}
+	id := resp.ChangeRequest.ID
+	if _, err := f.scoped.Exec(f.sys, `UPDATE change_request SET requested_by_user_id = $1::uuid WHERE id = $2`, crFlowCreatorID, id); err != nil {
+		t.Fatalf("set requested_by: %v", err)
+	}
+	deps := []string{crScopeDepProd, crScopeDepStage}
+	prods := []string{crScopeDPProdOne, crScopeDPProdTwo, crScopeDPStageOne}
+	check := func(when string) {
+		t.Helper()
+		cr := f.get(id)
+		f.assertScope(when, cr, crScopeProjectA, deps, prods)
+		if got := contactNames(cr.CustomerContacts); strings.Join(got, ",") != "Alice Aaron,Bob Bell" {
+			t.Fatalf("%s: customerContacts = %v", when, got)
+		}
+		if c := f.comments(id); len(c["COMMENT"]) < 1 || len(c["WORK_NOTE"]) < 1 || c["COMMENT"][0] != "lifecycle comment|"+crFlowEmail(crFlowCreatorID) {
+			t.Fatalf("%s: journal = %v", when, c)
+		}
+	}
+	check("after create")
+
+	// Editable while New: narrow, then swap back.
+	f.mustPatch(id, domain.PatchChangeRequestRequest{DeploymentIDs: &[]string{crScopeDepProd}})
+	f.assertScope("narrowed while New", f.get(id), crScopeProjectA, []string{crScopeDepProd}, []string{crScopeDPProdOne, crScopeDPProdTwo})
+	f.mustPatch(id, domain.PatchChangeRequestRequest{DeploymentIDs: &deps})
+	check("after narrowing and back")
+
+	f.requestApproval(id)
+	check("after Request Approval")
+	if err := f.decide(id, crFlowPeerAID, "approved"); err != nil {
+		t.Fatalf("peer approval: %v", err)
+	}
+	check("after peer approval")
+	if err := f.decide(id, crCABMemberUserID1, "approved"); err != nil {
+		t.Fatalf("CAB approval: %v", err)
+	}
+	if got := f.state(id); got != "SCHEDULED" {
+		t.Fatalf("state = %s, want SCHEDULED", got)
+	}
+	check("after CAB approval")
+	// Still editable while Scheduled.
+	f.mustPatch(id, domain.PatchChangeRequestRequest{DeploymentIDs: &[]string{crScopeDepProd}})
+	f.mustPatch(id, domain.PatchChangeRequestRequest{DeploymentIDs: &deps})
+	for _, step := range []domain.ChangeRequestState{domain.ChangeRequestStateImplement, domain.ChangeRequestStateReview, domain.ChangeRequestStateClosed} {
+		step := step
+		f.mustPatch(id, domain.PatchChangeRequestRequest{State: &step})
+		check("after " + string(step))
+		if step == domain.ChangeRequestStateImplement {
+			_, err := f.patch(id, domain.PatchChangeRequestRequest{DeploymentIDs: &[]string{crScopeDepProd}})
+			f.wantValidationError("edit after implement", err, "can no longer be changed")
+			check("after refused edit")
+		}
+	}
+}
+
+// The form's lookup: a project's active deployments (with their type);
+// the project's registered contacts (the read-only Customer Group); the
+// read-only deployment products that follow from the
+// chosen deployments; the same validation errors as create.
+func TestChangeRequestScopeIntegration_LinkOptions(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedScope()
+
+	opts, err := f.repo.GetChangeRequestLinkOptions(f.sys, domain.ChangeRequestLinkOptionsRequest{ProjectID: crScopeProjectA})
+	if err != nil {
+		t.Fatalf("GetChangeRequestLinkOptions: %v", err)
+	}
+	var depNames []string
+	for _, d := range opts.Deployments {
+		depNames = append(depNames, d.Name+"/"+d.Type)
+	}
+	if want := "Scope Dev/development,Scope Prod/primary_production,Scope Stage/staging,Scope Stage 2/staging"; strings.Join(depNames, ",") != want {
+		t.Fatalf("deployments = %v, want %s (active only, name order)", depNames, want)
+	}
+	if opts.DeploymentProducts == nil || len(opts.DeploymentProducts) != 0 {
+		t.Fatalf("without chosen deployments: products = %v, want an empty array", opts.DeploymentProducts)
+	}
+	// The read-only Customer Group of the project, name order: the registered
+	// portal-user contacts of project A only.
+	if got := contactNames(opts.CustomerContacts); strings.Join(got, ",") != "Alice Aaron,Bob Bell" {
+		t.Fatalf("customerContacts = %v, want project A's Alice Aaron,Bob Bell", got)
+	}
+	if opts.CustomerContacts[0].ID == "" || opts.CustomerContacts[0].Email == "" {
+		t.Fatalf("contact = %+v, want id and email", opts.CustomerContacts[0])
+	}
+	for project, want := range map[string]string{crScopeProjectB: "Carol Cook", crScopeProjectC: ""} {
+		o, err := f.repo.GetChangeRequestLinkOptions(f.sys, domain.ChangeRequestLinkOptionsRequest{ProjectID: project})
+		if err != nil {
+			t.Fatalf("GetChangeRequestLinkOptions(%s): %v", project, err)
+		}
+		if o.CustomerContacts == nil || strings.Join(contactNames(o.CustomerContacts), ",") != want {
+			t.Fatalf("project %s customerContacts = %v, want %q (never another customer's)", project, o.CustomerContacts, want)
+		}
+	}
+
+	opts, err = f.repo.GetChangeRequestLinkOptions(f.sys, domain.ChangeRequestLinkOptionsRequest{ProjectID: crScopeProjectA, DeploymentIDs: []string{crScopeDepProd, crScopeDepStage, crScopeDepStage2}})
+	if err != nil {
+		t.Fatalf("GetChangeRequestLinkOptions(chosen): %v", err)
+	}
+	var prods []string
+	for _, p := range opts.DeploymentProducts {
+		prods = append(prods, p.ID+"@"+p.Deployment.ID)
+	}
+	sort.Strings(prods)
+	want := []string{crScopeDPProdOne + "@" + crScopeDepProd, crScopeDPProdTwo + "@" + crScopeDepProd, crScopeDPStageOne + "@" + crScopeDepStage}
+	sort.Strings(want)
+	if strings.Join(prods, ",") != strings.Join(want, ",") {
+		t.Fatalf("deploymentProducts = %v, want %v (deactivated product excluded, each with its deployment)", prods, want)
+	}
+	// What the lookup offers is exactly what create accepts.
+	id := f.mustCreateScoped(func(r *domain.CreateChangeRequestRequest) {
+		r.ProjectID = scopeStrp(crScopeProjectA)
+		r.DeploymentIDs = []string{crScopeDepProd, crScopeDepStage, crScopeDepStage2}
+		for _, p := range opts.DeploymentProducts {
+			r.DeploymentProductIDs = append(r.DeploymentProductIDs, p.ID)
+		}
+	})
+	f.assertScope("created from the lookup's options", f.get(id), crScopeProjectA,
+		[]string{crScopeDepProd, crScopeDepStage, crScopeDepStage2},
+		[]string{crScopeDPProdOne, crScopeDPProdTwo, crScopeDPStageOne})
+
+	_, err = f.repo.GetChangeRequestLinkOptions(f.sys, domain.ChangeRequestLinkOptionsRequest{ProjectID: crScopeProjectA, DeploymentIDs: []string{crScopeDepOtherB}})
+	f.wantValidationError("foreign deployment", err, "does not belong to the selected project")
+	_, err = f.repo.GetChangeRequestLinkOptions(f.sys, domain.ChangeRequestLinkOptionsRequest{ProjectID: "3bbbbbbb-9999-0000-0000-000000000000"})
+	f.wantValidationError("unknown project", err, "projectId does not refer to an existing project")
+
+	// Pre-flight validation (the ServiceNow-first create) writes nothing.
+	set, err := f.repo.ValidateChangeRequestLinks(f.sys, domain.ChangeRequestLinkSelection{ProjectID: scopeStrp(crScopeProjectB), DeploymentIDs: []string{crScopeDepOtherB}})
+	if err != nil || set.ProjectID != crScopeProjectB || len(set.Deployments) != 1 || len(set.DeploymentProducts) != 1 {
+		t.Fatalf("ValidateChangeRequestLinks = %+v, %v", set, err)
+	}
+	_, err = f.repo.ValidateChangeRequestLinks(f.sys, domain.ChangeRequestLinkSelection{ProjectID: scopeStrp(crScopeProjectB), DeploymentIDs: []string{crScopeDepProd}})
+	f.wantValidationError("pre-flight foreign deployment", err, "does not belong to the selected project")
+}
+
+// Deleting a deployment, a deployed product or the change request removes the
+// join rows (ON DELETE CASCADE) and nothing else.
+func TestChangeRequestScopeIntegration_JoinRowsCascade(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedScope()
+	id := f.mustCreateScoped(func(r *domain.CreateChangeRequestRequest) {
+		r.ProjectID = scopeStrp(crScopeProjectA)
+		r.DeploymentIDs = []string{crScopeDepProd, crScopeDepStage}
+	})
+	count := func(table string) int {
+		var n int
+		if err := f.scoped.QueryRow(f.sys, fmt.Sprintf(`SELECT count(*) FROM %s WHERE change_request_id = $1`, table), id).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		return n
+	}
+	if count("change_request_deployment") != 2 || count("change_request_deployed_product") != 3 {
+		t.Fatal("join rows not written as expected")
+	}
+	if _, err := f.scoped.Exec(f.sys, `DELETE FROM deployed_product WHERE id = $1`, crScopeDPStageOne); err != nil {
+		t.Fatalf("delete deployed product: %v", err)
+	}
+	if count("change_request_deployed_product") != 2 {
+		t.Fatalf("deployed-product rows after deleting one = %d, want 2", count("change_request_deployed_product"))
+	}
+	if _, err := f.scoped.Exec(f.sys, `DELETE FROM deployment WHERE id = $1`, crScopeDepStage); err != nil {
+		t.Fatalf("delete deployment: %v", err)
+	}
+	f.assertScope("after deleting the stage deployment", f.get(id), crScopeProjectA, []string{crScopeDepProd}, []string{crScopeDPProdOne, crScopeDPProdTwo})
+	if _, err := f.scoped.Exec(f.sys, `DELETE FROM work_item WHERE id = $1`, id); err != nil {
+		t.Fatalf("delete work item: %v", err)
+	}
+	if count("change_request_deployment")+count("change_request_deployed_product") != 0 {
+		t.Fatal("join rows survived the change request")
+	}
+}
+
+// Migrations 0191 and 0192 are idempotent: re-running them (0191 then 0192, as
+// a database that already has both would see on a replay) changes nothing, keeps
+// the data, leaves the category enum with all 13 labels, and leaves no
+// environment catalogue, no change_request_environment table and no
+// project_customer_group table (0192 drops all three; the environment
+// concept is gone because a deployment carries its type).
+func TestChangeRequestScopeIntegration_MigrationIsIdempotent(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedScope()
+	id := f.mustCreateScoped(func(r *domain.CreateChangeRequestRequest) {
+		r.ProjectID = scopeStrp(crScopeProjectA)
+		r.DeploymentIDs = []string{crScopeDepProd}
+	})
+	exists := func(table string) bool {
+		var ok bool
+		if err := f.scoped.QueryRow(f.sys, `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	for _, name := range []string{"0191_change_request_project_links.sql", "0192_change_request_drop_environments.sql"} {
+		sqlBytes, err := os.ReadFile("../../migrations/" + name)
+		if err != nil {
+			t.Fatalf("read migration: %v", err)
+		}
+		for i := 0; i < 2; i++ {
+			if _, err := f.pool.Exec(context.Background(), string(sqlBytes)); err != nil {
+				t.Fatalf("re-running migration %s (pass %d): %v", name, i+1, err)
+			}
+		}
+	}
+	f.assertScope("after re-running the migrations", f.get(id), crScopeProjectA, []string{crScopeDepProd}, []string{crScopeDPProdOne, crScopeDPProdTwo})
+	for _, table := range []string{"environment", "change_request_environment", "project_customer_group"} {
+		if exists(table) {
+			t.Fatalf("table %s still exists after migration 0192", table)
+		}
+	}
+	for _, table := range []string{"change_request_deployment", "change_request_deployed_product"} {
+		if !exists(table) {
+			t.Fatalf("table %s is gone", table)
+		}
+	}
+	var labels int
+	if err := f.scoped.QueryRow(f.sys, `SELECT count(*) FROM pg_enum WHERE enumtypid = 'change_request_category_enum'::regtype`).Scan(&labels); err != nil {
+		t.Fatal(err)
+	}
+	if labels != 13 {
+		t.Fatalf("category labels = %d, want 13", labels)
+	}
+	var fks, idx int
+	if err := f.scoped.QueryRow(f.sys, `SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND conrelid IN ('change_request_deployment'::regclass, 'change_request_deployed_product'::regclass) AND confdeltype = 'c'`).Scan(&fks); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.scoped.QueryRow(f.sys, `SELECT count(*) FROM pg_indexes WHERE tablename IN ('change_request_deployment','change_request_deployed_product')`).Scan(&idx); err != nil {
+		t.Fatal(err)
+	}
+	if fks != 4 || idx != 4 {
+		t.Fatalf("cascading FKs = %d, indexes = %d, want 4 and 4 (a PK + a lookup index per table)", fks, idx)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Rollback: the failed-review off-ramp. Offered from exactly Review and
+// Customer Review; terminal. (A customer-group member rejecting the Customer
+// Review stage also lands here -- change_request_customer_group_integration_test.go.)
+// ---------------------------------------------------------------------------
+
+const rollbackOnlyFromReviewMsg = `state "rollback" can only be set from review or customer_review`
+
+// requestedApprovers counts the REQUESTED approver rows across all of the
+// change's stages.
+func (f *crFlow) requestedApprovers(id string) int {
+	f.t.Helper()
+	var n int
+	if err := f.scoped.QueryRow(f.sys,
+		`SELECT COUNT(*) FROM approval_stage_approver WHERE work_item_id = $1 AND status = 'requested'`, id).Scan(&n); err != nil {
+		f.t.Fatalf("count requested approvers: %v", err)
+	}
+	return n
+}
+
+// driveNormalToImplement takes a Normal change (no customer approval) through
+// Request Approval, peer and CAB approval to Implement.
+func (f *crFlow) driveNormalToImplement(id string) {
+	f.t.Helper()
+	f.requestApproval(id)
+	f.approvePeerAndCAB(id, "SCHEDULED", "implement", "canceled")
+	f.step(id, domain.ChangeRequestStateImplement, "IMPLEMENT", "review", "canceled")
+}
+
+// wantRolledBack asserts the terminal outcome of a manual rollback: state
+// ROLLBACK, nothing left to do, no review stamp, nothing left to approve, and
+// no way out of it.
+func (f *crFlow) wantRolledBack(id string) {
+	f.t.Helper()
+	f.expect(id, "after Roll back", "ROLLBACK")
+	if _, reviewed := f.customerOutcome(id); reviewed {
+		f.t.Fatal("is_customer_review_required = true after a rollback: the review failed")
+	}
+	if n := f.requestedApprovers(id); n != 0 {
+		f.t.Fatalf("%d approver rows still REQUESTED after the rollback, want 0", n)
+	}
+	if cr := f.get(id); cr.LegalNextStates != nil {
+		f.t.Fatalf("legalNextStates(Rollback) = %v, want none (terminal)", cr.LegalNextStates)
+	}
+	for _, to := range []domain.ChangeRequestState{
+		domain.ChangeRequestStateNew, domain.ChangeRequestStateImplement, domain.ChangeRequestStateReview,
+		domain.ChangeRequestStateCustomerReview, domain.ChangeRequestStateClosed, domain.ChangeRequestStateCanceled,
+	} {
+		_, err := f.patchState(id, to)
+		f.wantValidationError("PATCH {state: "+string(to)+"} out of rollback", err, "rollback is final")
+	}
+	_, err := f.patchState(id, domain.ChangeRequestStateRollback)
+	f.wantValidationError("PATCH {state: rollback} again", err, rollbackOnlyFromReviewMsg)
+	f.expect(id, "after the refused moves out of rollback", "ROLLBACK")
+}
+
+// Normal, Customer Review unticked and ticked: ...-> Implement -> Review ->
+// Roll back. State and legalNextStates after every step; the Review stage's
+// requested approvers are cancelled by the rollback.
+func TestChangeRequestFlowIntegration_NormalRollbackFromReview(t *testing.T) {
+	for _, review := range []bool{false, true} {
+		review := review
+		t.Run(fmt.Sprintf("customerReviewRequired=%v", review), func(t *testing.T) {
+			f := newCRFlow(t)
+			f.seedAssignedGroup()
+			seedApprovalGroupMembers(t, f.scoped, crCABGroupID, crCABMemberUserID1, crCABMemberUserID2)
+			id := f.createGated(domain.ChangeRequestTypeNormal, crFlowGroupID, nil, boolp(review))
+			f.expect(id, "after create", "NEW", "assess", "canceled")
+
+			// Rollback is not available before Review.
+			_, err := f.patchState(id, domain.ChangeRequestStateRollback)
+			f.wantValidationError("rollback from New", err, rollbackOnlyFromReviewMsg)
+			f.driveNormalToImplement(id)
+			_, err = f.patchState(id, domain.ChangeRequestStateRollback)
+			f.wantValidationError("rollback from Implement", err, rollbackOnlyFromReviewMsg)
+			f.expect(id, "after the refused rollback from Implement", "IMPLEMENT", "review", "canceled")
+
+			forward := "closed"
+			if review {
+				forward = "customer_review"
+			}
+			f.step(id, domain.ChangeRequestStateReview, "REVIEW", forward, "rollback", "canceled")
+			if n := f.requestedApprovers(id); n == 0 {
+				t.Fatal("the Review stage has no REQUESTED approvers before the rollback, so the cancellation below proves nothing")
+			}
+
+			// A rollback is a failed review: it cannot also record the review.
+			_, err = f.patch(id, domain.PatchChangeRequestRequest{
+				State: stateptr(domain.ChangeRequestStateRollback), IsCustomerReviewed: boolp(true)})
+			f.wantValidationError("rollback with isCustomerReviewed", err, "isCustomerReviewed cannot be true when rolling back")
+			f.expect(id, "after the refused rollback", "REVIEW", forward, "rollback", "canceled")
+
+			f.step(id, domain.ChangeRequestStateRollback, "ROLLBACK")
+			f.wantRolledBack(id)
+			// The stages stay as a record: peer, CAB and Review, all settled.
+			if got := f.labels(id); len(got) != 3 {
+				t.Fatalf("stages after the rollback = %v, want the 3 existing stages and no new one", got)
+			}
+		})
+	}
+}
+
+// Normal with Customer Review ticked and no customer group: ... -> Review ->
+// Customer Review -> Roll back (the manual fallback path).
+func TestChangeRequestFlowIntegration_NormalRollbackFromCustomerReview(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedAssignedGroup()
+	seedApprovalGroupMembers(t, f.scoped, crCABGroupID, crCABMemberUserID1, crCABMemberUserID2)
+	id := f.createGated(domain.ChangeRequestTypeNormal, crFlowGroupID, nil, boolp(true))
+	f.driveNormalToImplement(id)
+	f.step(id, domain.ChangeRequestStateReview, "REVIEW", "customer_review", "rollback", "canceled")
+	f.step(id, domain.ChangeRequestStateCustomerReview, "CUSTOMER_REVIEW", "closed", "rollback", "canceled")
+	if _, reviewed := f.customerOutcome(id); reviewed {
+		t.Fatal("is_customer_review_required is already true before the customer review was recorded")
+	}
+	f.step(id, domain.ChangeRequestStateRollback, "ROLLBACK")
+	f.wantRolledBack(id)
+}
+
+// Rollback is refused, with the exact message and nothing changed, from every
+// state other than Review and Customer Review (a state-less row included).
+func TestChangeRequestFlowIntegration_RollbackRefusedFromEveryOtherState(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedAssignedGroup()
+	id := f.create(domain.ChangeRequestTypeNormal, crFlowGroupID)
+	for _, st := range []string{"NEW", "ASSESS", "AUTHORIZE", "CUSTOMER_APPROVAL", "SCHEDULED", "IMPLEMENT", "CLOSED", "CANCELED", "ROLLBACK", ""} {
+		var seed any = st
+		if st == "" {
+			seed = nil
+		}
+		if _, err := f.scoped.Exec(f.sys, `UPDATE change_request SET state = $2::change_request_state_enum WHERE id = $1`, id, seed); err != nil {
+			t.Fatalf("seed state %q: %v", st, err)
+		}
+		_, err := f.patchState(id, domain.ChangeRequestStateRollback)
+		var ve *apierror.ValidationError
+		if !errors.As(err, &ve) || ve.Msg != rollbackOnlyFromReviewMsg {
+			t.Fatalf("PATCH {state: rollback} from %q: err = %v, want a 400 %q", st, err, rollbackOnlyFromReviewMsg)
+		}
+		if got := f.state(id); got != st {
+			t.Fatalf("state after the refused rollback from %q = %q, want unchanged", st, got)
+		}
+		for _, next := range f.legal(id) {
+			if next == "rollback" {
+				t.Fatalf("legalNextStates(%q) offers rollback: %v", st, f.legal(id))
+			}
+		}
+	}
+}
+
+// The on-hold gate applies: a change on hold cannot be rolled back until it is
+// taken off hold -- which may happen in the same PATCH.
+func TestChangeRequestFlowIntegration_RollbackRespectsOnHold(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedAssignedGroup()
+	seedApprovalGroupMembers(t, f.scoped, crCABGroupID, crCABMemberUserID1, crCABMemberUserID2)
+	id := f.create(domain.ChangeRequestTypeNormal, crFlowGroupID)
+	f.driveNormalToImplement(id)
+	f.step(id, domain.ChangeRequestStateReview, "REVIEW", "closed", "rollback", "canceled")
+
+	reason := "customer change freeze"
+	if _, err := f.patch(id, domain.PatchChangeRequestRequest{OnHold: boolp(true), OnHoldReason: &reason}); err != nil {
+		t.Fatalf("put on hold: %v", err)
+	}
+	_, err := f.patchState(id, domain.ChangeRequestStateRollback)
+	f.wantValidationError("rollback while on hold", err, "change request is on hold")
+	f.expect(id, "after the refused rollback", "REVIEW", "closed", "rollback", "canceled")
+	if n := f.requestedApprovers(id); n == 0 {
+		t.Fatal("the refused rollback cancelled approver rows")
+	}
+
+	if _, err := f.patch(id, domain.PatchChangeRequestRequest{State: stateptr(domain.ChangeRequestStateRollback), OnHold: boolp(false)}); err != nil {
+		t.Fatalf("PATCH {state: rollback, onHold: false}: %v", err)
+	}
+	f.wantRolledBack(id)
+}
+
+func stateptr(s domain.ChangeRequestState) *domain.ChangeRequestState { return &s }
+
+// ---------------------------------------------------------------------------
+// The Customer Group is the Customer Project's registered contacts, read-only:
+// no group is picked or stored, the detail exposes customerContacts, and
+// customerGroupId / environmentIds are refused.
+// ---------------------------------------------------------------------------
+
+const (
+	crScopeMsgGroupRemoved = "customerGroupId is no longer accepted: the customer group is derived from the customer project's registered contacts"
+	crScopeMsgEnvRemoved   = "environmentIds is no longer supported: deployments carry the environment"
+)
+
+func (f *crFlow) storedCustomerGroup(id string) *string {
+	f.t.Helper()
+	var g *string
+	if err := f.scoped.QueryRow(f.sys, `SELECT customer_group_id::text FROM change_request WHERE id = $1`, id).Scan(&g); err != nil {
+		f.t.Fatalf("read stored customer group: %v", err)
+	}
+	return g
+}
+
+// wantValidationMessage is wantValidationError with the message compared exactly.
+func (f *crFlow) wantValidationMessage(what string, err error, want string) {
+	f.t.Helper()
+	var ve *apierror.ValidationError
+	if !errors.As(err, &ve) {
+		f.t.Fatalf("%s: err = %v (%T), want *apierror.ValidationError", what, err, err)
+	}
+	if ve.Msg != want {
+		f.t.Fatalf("%s: message = %q, want %q", what, ve.Msg, want)
+	}
+}
+
+// Create refuses the removed fields on every path (portal insert, ServiceNow-
+// first insert, pre-flight) and leaves nothing behind.
+func TestChangeRequestScopeIntegration_CreateRefusesRemovedFields(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedScope()
+	for name, tc := range map[string]struct {
+		mod  func(*domain.CreateChangeRequestRequest)
+		want string
+	}{
+		"customerGroupId": {func(r *domain.CreateChangeRequestRequest) {
+			r.ProjectID, r.CustomerGroupID = scopeStrp(crScopeProjectA), scopeStrp(seededGroupID)
+		}, crScopeMsgGroupRemoved},
+		"customerGroupId without a project": {func(r *domain.CreateChangeRequestRequest) {
+			r.CustomerGroupID = scopeStrp(seededGroupID)
+		}, crScopeMsgGroupRemoved},
+		"environmentIds": {func(r *domain.CreateChangeRequestRequest) {
+			r.ProjectID, r.EnvironmentIDs = scopeStrp(crScopeProjectA), []string{}
+		}, crScopeMsgEnvRemoved},
+	} {
+		_, err := f.createScoped(tc.mod)
+		f.wantValidationMessage(name+" (portal)", err, tc.want)
+		typ := domain.ChangeRequestTypeNormal
+		req := domain.CreateChangeRequestRequest{Subject: crFlowSubject, Type: &typ}
+		tc.mod(&req)
+		_, err = f.repo.CreateChangeRequestFromServiceNow(f.sys, req, "3bbbbbbb-0000-0000-0000-0000000000f2", "CRSCOPESN02", crFlowEmail(crFlowCreatorID))
+		f.wantValidationMessage(name+" (ServiceNow-first insert)", err, tc.want)
+	}
+	if n := f.crCount(); n != 0 {
+		t.Fatalf("%d change request(s) left behind by refused creates", n)
+	}
+}
+
+// A legacy change request that still has a stored customer_group_id (from
+// before the group was derived) reads fine: customerContacts come from the
+// project, the stored column is ignored, and an unrelated edit works.
+func TestChangeRequestScopeIntegration_LegacyStoredGroupIsIgnored(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedScope()
+	id := f.mustCreateScoped(func(r *domain.CreateChangeRequestRequest) { r.ProjectID = scopeStrp(crScopeProjectB) })
+	f.execSQL(`UPDATE change_request SET customer_group_id = $1 WHERE id = $2`, seededGroupID, id)
+	if got := contactNames(f.get(id).CustomerContacts); strings.Join(got, ",") != "Carol Cook" {
+		t.Fatalf("customerContacts = %v, want project B's Carol Cook regardless of the stored group", got)
+	}
+	title := "edited"
+	f.mustPatch(id, domain.PatchChangeRequestRequest{Title: &title})
+	if g := f.storedCustomerGroup(id); g == nil || *g != seededGroupID {
+		t.Fatalf("the legacy column was rewritten: %v", g)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Re-schedule: the process diagram's Time Change loop. In Customer Approval,
+// PATCH {state: "authorize", plannedStartOn/plannedEndOn} with a changed window
+// sends the change back through internal approval (Normal: a fresh CAB stage,
+// Emergency: a fresh ECAB stage), supersedes the customer's pending request and,
+// once the new approval is given, asks the customer again. Standard has no
+// internal approval to repeat: dates applied, stays in Customer Approval, the
+// customer is asked again.
+// ---------------------------------------------------------------------------
+
+const (
+	rsStart1 = "2030-03-01T09:00:00Z"
+	rsEnd1   = "2030-03-01T11:00:00Z"
+	rsStart2 = "2030-03-08T09:00:00Z"
+	rsEnd2   = "2030-03-08T11:00:00Z"
+	rsStart3 = "2030-03-15T09:00:00Z"
+	// an earlier start inside the first window, for start-only changes
+	rsStartEarly = "2030-03-01T08:00:00Z"
+	rsEnd3       = "2030-03-15T11:00:00Z"
+
+	rescheduleOnlyFromCustomerApprovalMsg = `state "authorize" cannot be set manually: it is reached automatically through the approval flow (Request Approval, then peer approval); it can only be set by hand to re-schedule a change from customer_approval`
+)
+
+// setPlanned stores a planned window directly (the create path under test is
+// not this file's concern).
+func (f *crFlow) setPlanned(id, start, end string) {
+	f.t.Helper()
+	if _, err := f.scoped.Exec(f.sys,
+		`UPDATE change_request SET start_on = $2::text::timestamptz, end_on = $3::text::timestamptz WHERE id = $1`, id, start, end); err != nil {
+		f.t.Fatalf("set planned window: %v", err)
+	}
+}
+
+func (f *crFlow) wantPlanned(id, when, start, end string) {
+	f.t.Helper()
+	cr := f.get(id)
+	if cr.PlannedStartOn == nil || cr.PlannedEndOn == nil || *cr.PlannedStartOn != start || *cr.PlannedEndOn != end {
+		f.t.Fatalf("planned window %s = %v .. %v, want %s .. %s", when, cr.PlannedStartOn, cr.PlannedEndOn, start, end)
+	}
+}
+
+// reschedule is the Re-schedule action: {state: authorize} with the new window.
+func (f *crFlow) reschedule(id string, start, end *string) error {
+	_, err := f.patch(id, domain.PatchChangeRequestRequest{State: stateptr(domain.ChangeRequestStateAuthorize), PlannedStartOn: start, PlannedEndOn: end})
+	return err
+}
+
+// stageLabels lists the labels of the change's stages in creation order.
+func (f *crFlow) stageLabels(id string) string {
+	f.t.Helper()
+	var out []string
+	for _, st := range f.stages(id) {
+		out = append(out, st.label)
+	}
+	return strings.Join(out, ",")
+}
+
+// liveStageRows counts REQUESTED approver rows on stages of the given label.
+func (f *crFlow) liveStageRows(id, label string) int {
+	f.t.Helper()
+	n := 0
+	for _, st := range f.stages(id) {
+		if st.label != label {
+			continue
+		}
+		for _, status := range st.approvers {
+			if status == "requested" {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// Normal, Customer Approval ticked, a customer group with two members: ->
+// Customer Approval (live stage) -> Re-schedule -> Authorize (fresh CAB stage,
+// customer stage cancelled) -> CAB approves -> Customer Approval (fresh customer
+// stage) -> a member approves -> Scheduled -> Implement -> Review. State,
+// legalNextStates and stages after every step.
+func TestChangeRequestFlowIntegration_RescheduleNormalWithCustomerGroup(t *testing.T) {
+	f := newCustomerGroupFlow(t)
+	id := f.createWithProject(domain.ChangeRequestTypeNormal, sp(crScopeProjectA), true, false)
+	f.setPlanned(id, rsStart1, rsEnd1)
+	f.driveToCustomerApproval(id)
+	f.expect(id, "in Customer Approval", "CUSTOMER_APPROVAL", "authorize", "canceled") // live stage: no manual scheduled
+	if got := f.stageLabels(id); got != "Peer Approval,CAB Approval,Customer Approval" {
+		t.Fatalf("stages in Customer Approval = %s", got)
+	}
+
+	// "Time Change = No": no new window, or the stored one, is refused.
+	for what, args := range map[string][2]*string{
+		"no window at all":  {nil, nil},
+		"the stored start":  {sp(rsStart1), nil},
+		"the stored window": {sp(rsStart1), sp(rsEnd1)},
+		"the same instant":  {sp("2030-03-01T10:00:00+01:00"), nil},
+	} {
+		f.wantValidationError("re-schedule with "+what, f.reschedule(id, args[0], args[1]), "re-scheduling requires a changed planned start or end")
+	}
+	f.wantValidationError("re-schedule ending before it starts", f.reschedule(id, sp(rsStart3), sp(rsEnd1)), "planned start must not be after the planned end")
+	f.wantValidationError("re-schedule with a garbage date", f.reschedule(id, sp("next tuesday"), nil), "valid date-times")
+	f.expect(id, "after the refused re-schedules", "CUSTOMER_APPROVAL", "authorize", "canceled")
+	f.wantPlanned(id, "after the refused re-schedules", rsStart1, rsEnd1)
+	if got := f.stageLabels(id); got != "Peer Approval,CAB Approval,Customer Approval" {
+		t.Fatalf("a refused re-schedule changed the stages: %s", got)
+	}
+
+	// Re-schedule: back to Authorize with the new window and a fresh CAB stage.
+	if err := f.reschedule(id, sp(rsStart2), sp(rsEnd2)); err != nil {
+		t.Fatalf("re-schedule: %v", err)
+	}
+	f.expect(id, "after Re-schedule", "AUTHORIZE", "canceled")
+	f.wantPlanned(id, "after Re-schedule", rsStart2, rsEnd2)
+	if got := f.stageLabels(id); got != "Peer Approval,CAB Approval,Customer Approval,CAB Approval" {
+		t.Fatalf("stages after Re-schedule = %s, want a fresh CAB stage after the customer's", got)
+	}
+	stages := f.stages(id)
+	assertApprovers(t, "customer stage after Re-schedule", stages[2].approvers, map[string]string{crScopeUserA1: "cancelled", crScopeUserA2: "cancelled"})
+	assertApprovers(t, "fresh CAB stage", stages[3].approvers, map[string]string{crCABMemberUserID1: "requested", crCABMemberUserID2: "requested"})
+	if stages[3].groupID != crCABGroupID {
+		t.Fatalf("fresh CAB stage group = %s, want the CAB group", stages[3].groupID)
+	}
+	assertApprovers(t, "first CAB stage stays as a record", stages[1].approvers, map[string]string{crCABMemberUserID1: "approved", crCABMemberUserID2: "cancelled"})
+	if n := f.liveStageRows(id, "Peer Approval"); n != 0 {
+		t.Fatalf("%d peer approver rows requested again; the peer approval stands", n)
+	}
+	if approved, _ := f.customerOutcome(id); approved {
+		t.Fatal("is_customer_approval_required stamped by a re-schedule")
+	}
+
+	// Authorize is an approval wait again: no second Re-schedule, no manual way on.
+	f.wantValidationError("re-schedule from Authorize", f.reschedule(id, sp(rsStart3), nil), rescheduleOnlyFromCustomerApprovalMsg)
+	if _, err := f.patchState(id, domain.ChangeRequestStateScheduled); err == nil {
+		t.Fatal("manual {state: scheduled} from Authorize succeeded")
+	}
+	// A customer member cannot answer the superseded request, nor the CAB's.
+	if err := f.decide(id, crScopeUserA1, "approved"); err == nil {
+		t.Fatal("a customer member decided although their request was superseded")
+	}
+	f.expect(id, "after the refused decision", "AUTHORIZE", "canceled")
+
+	// The new CAB approval asks the customer again, with a fresh stage.
+	if err := f.decide(id, crCABMemberUserID2, "approved"); err != nil {
+		t.Fatalf("CAB approval after Re-schedule: %v", err)
+	}
+	f.expect(id, "after the new CAB approval", "CUSTOMER_APPROVAL", "authorize", "canceled")
+	if got := f.stageLabels(id); got != "Peer Approval,CAB Approval,Customer Approval,CAB Approval,Customer Approval" {
+		t.Fatalf("stages after the new CAB approval = %s", got)
+	}
+	stages = f.stages(id)
+	assertApprovers(t, "first customer stage", stages[2].approvers, map[string]string{crScopeUserA1: "cancelled", crScopeUserA2: "cancelled"})
+	assertApprovers(t, "fresh customer stage", stages[4].approvers, map[string]string{crScopeUserA1: "requested", crScopeUserA2: "requested"})
+	assertApprovers(t, "new CAB stage", stages[3].approvers, map[string]string{crCABMemberUserID1: "cancelled", crCABMemberUserID2: "approved"})
+	f.wantPlanned(id, "back in Customer Approval", rsStart2, rsEnd2)
+
+	// A member approves: Scheduled, customer approval recorded; the tail runs and
+	// the Review stage is still provisioned (the repeated CAB stage is not a new checkpoint).
+	if err := f.decide(id, crScopeUserA2, "approved"); err != nil {
+		t.Fatalf("customer approval: %v", err)
+	}
+	f.expect(id, "after the customer's approval", "SCHEDULED", "implement", "canceled")
+	if approved, _ := f.customerOutcome(id); !approved {
+		t.Fatal("is_customer_approval_required not stamped by the member's approval")
+	}
+	f.wantValidationError("re-schedule from Scheduled", f.reschedule(id, sp(rsStart3), nil), rescheduleOnlyFromCustomerApprovalMsg)
+	f.step(id, domain.ChangeRequestStateImplement, "IMPLEMENT", "review", "canceled")
+	f.step(id, domain.ChangeRequestStateReview, "REVIEW", "closed", "rollback", "canceled")
+	if got := f.stageLabels(id); got != "Peer Approval,CAB Approval,Customer Approval,CAB Approval,Customer Approval,Review" {
+		t.Fatalf("stages in Review = %s, want the Review stage after a re-schedule too", got)
+	}
+}
+
+// Normal, Customer Approval ticked, NO customer group (manual fallback), the
+// creator also sits in the CAB group: Re-schedule twice. The creator never gets a
+// decidable row on a new CAB stage; rejecting the new stage behaves as a CAB
+// rejection does (the change stays in Authorize).
+func TestChangeRequestFlowIntegration_RescheduleManualFallbackTwice(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedAssignedGroup()
+	seedApprovalGroupMembers(t, f.scoped, crCABGroupID, crCABMemberUserID1, crCABMemberUserID2)
+	// The creator is a CAB member as well.
+	if _, err := f.scoped.Exec(f.sys,
+		`INSERT INTO team_member (id, created_on, updated_on, created_by, updated_by, team_id, user_id, group_id)
+		 VALUES (gen_random_uuid(), now(), now(), 'cr-flow-test', 'cr-flow-test', $1::uuid, $2, $3::uuid)`,
+		seededGroupID, crFlowCreatorID, crCABGroupID); err != nil {
+		t.Fatalf("put the creator in the CAB group: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = f.scoped.Exec(f.sys, `DELETE FROM team_member WHERE user_id = $1 AND group_id = $2::uuid`, crFlowCreatorID, crCABGroupID)
+	})
+	id := f.createGated(domain.ChangeRequestTypeNormal, crFlowGroupID, boolp(true), nil)
+	f.setPlanned(id, rsStart1, rsEnd1)
+	f.requestApproval(id)
+	f.approvePeerAndCAB(id, "CUSTOMER_APPROVAL", "scheduled", "authorize", "canceled")
+
+	// Re-schedule #1.
+	if err := f.reschedule(id, sp(rsStartEarly), nil); err != nil { // only the start changes
+		t.Fatalf("re-schedule #1: %v", err)
+	}
+	f.expect(id, "after Re-schedule #1", "AUTHORIZE", "canceled")
+	f.wantPlanned(id, "after Re-schedule #1", rsStartEarly, rsEnd1)
+	if got := f.stageLabels(id); got != "Peer Approval,CAB Approval,CAB Approval" {
+		t.Fatalf("stages after Re-schedule #1 = %s (no customer stage without a group)", got)
+	}
+	stages := f.stages(id)
+	assertApprovers(t, "fresh CAB stage", stages[2].approvers, map[string]string{
+		crCABMemberUserID1: "requested", crCABMemberUserID2: "requested", crFlowCreatorID: "cancelled"})
+	var fe *apierror.ForbiddenError
+	if err := f.decide(id, crFlowCreatorID, "approved"); !errors.As(err, &fe) {
+		t.Fatalf("creator deciding the fresh CAB stage: err = %v, want ForbiddenError", err)
+	}
+
+	// A CAB rejection of the new stage changes nothing about the state (as today).
+	if err := f.decide(id, crCABMemberUserID1, "rejected"); err != nil {
+		t.Fatalf("CAB rejection: %v", err)
+	}
+	f.expect(id, "after the new stage was rejected", "AUTHORIZE", "canceled")
+	if n := f.requestedApprovers(id); n != 0 {
+		t.Fatalf("%d rows still requested after the rejection resolved the stage", n)
+	}
+
+	// Start over on a second change to approve the second round and loop again.
+	id = f.createGated(domain.ChangeRequestTypeNormal, crFlowGroupID, boolp(true), nil)
+	f.setPlanned(id, rsStart1, rsEnd1)
+	f.requestApproval(id)
+	f.approvePeerAndCAB(id, "CUSTOMER_APPROVAL", "scheduled", "authorize", "canceled")
+	for round, w := range [][2]string{{rsStart2, rsEnd2}, {rsStart3, rsEnd3}} {
+		if err := f.reschedule(id, sp(w[0]), sp(w[1])); err != nil {
+			t.Fatalf("re-schedule round %d: %v", round+1, err)
+		}
+		f.expect(id, "after re-schedule round", "AUTHORIZE", "canceled")
+		f.wantPlanned(id, "after re-schedule round", w[0], w[1])
+		if err := f.decide(id, crCABMemberUserID1, "approved"); err != nil {
+			t.Fatalf("CAB approval round %d: %v", round+1, err)
+		}
+		f.expect(id, "back in Customer Approval", "CUSTOMER_APPROVAL", "scheduled", "authorize", "canceled")
+	}
+	if got := f.stageLabels(id); got != "Peer Approval,CAB Approval,CAB Approval,CAB Approval" {
+		t.Fatalf("stages after two re-schedules = %s", got)
+	}
+	f.step(id, domain.ChangeRequestStateScheduled, "SCHEDULED", "implement", "canceled")
+	if approved, _ := f.customerOutcome(id); !approved {
+		t.Fatal("manual Record customer approval did not stamp is_customer_approval_required")
+	}
+}
+
+// Emergency with Customer Approval ticked and a customer group: a fresh ECAB stage.
+func TestChangeRequestFlowIntegration_RescheduleEmergency(t *testing.T) {
+	f := newCustomerGroupFlow(t)
+	seedApprovalGroupMembers(t, f.scoped, crECABGroupID, crECABMemberUserID)
+	id := f.createWithProject(domain.ChangeRequestTypeEmergency, sp(crScopeProjectA), true, false)
+	f.setPlanned(id, rsStart1, rsEnd1)
+	f.requestApproval(id)
+	f.expect(id, "after Request Approval", "AUTHORIZE", "canceled")
+	if err := f.decide(id, crECABMemberUserID, "approved"); err != nil {
+		t.Fatalf("ECAB approval: %v", err)
+	}
+	f.expect(id, "after ECAB approval", "CUSTOMER_APPROVAL", "authorize", "canceled")
+
+	if err := f.reschedule(id, nil, sp(rsEnd2)); err != nil { // only the end changes
+		t.Fatalf("re-schedule: %v", err)
+	}
+	f.expect(id, "after Re-schedule", "AUTHORIZE", "canceled")
+	f.wantPlanned(id, "after Re-schedule", rsStart1, rsEnd2)
+	if got := f.stageLabels(id); got != "ECAB Approval,Customer Approval,ECAB Approval" {
+		t.Fatalf("emergency stages after Re-schedule = %s", got)
+	}
+	stages := f.stages(id)
+	assertApprovers(t, "fresh ECAB stage", stages[2].approvers, map[string]string{crECABMemberUserID: "requested"})
+	if stages[2].groupID != crECABGroupID {
+		t.Fatalf("fresh ECAB stage group = %s, want the ECAB group", stages[2].groupID)
+	}
+	assertApprovers(t, "superseded customer stage", stages[1].approvers, map[string]string{crScopeUserA1: "cancelled", crScopeUserA2: "cancelled"})
+
+	if err := f.decide(id, crECABMemberUserID, "approved"); err != nil {
+		t.Fatalf("new ECAB approval: %v", err)
+	}
+	f.expect(id, "after the new ECAB approval", "CUSTOMER_APPROVAL", "authorize", "canceled")
+	if got := f.stageLabels(id); got != "ECAB Approval,Customer Approval,ECAB Approval,Customer Approval" {
+		t.Fatalf("emergency stages after the new ECAB approval = %s", got)
+	}
+	if err := f.decide(id, crScopeUserA1, "approved"); err != nil {
+		t.Fatalf("customer approval: %v", err)
+	}
+	f.expect(id, "after the customer's approval", "SCHEDULED", "implement", "canceled")
+}
+
+// Standard has no internal approval to repeat: Re-schedule applies the dates,
+// stays in Customer Approval and asks the customer again (a fresh stage when the
+// change has a customer group; the manual path stays without one).
+func TestChangeRequestFlowIntegration_RescheduleStandard(t *testing.T) {
+	t.Run("with a customer group", func(t *testing.T) {
+		f := newCustomerGroupFlow(t)
+		id := f.createWithProject(domain.ChangeRequestTypeStandard, sp(crScopeProjectA), true, false)
+		f.setPlanned(id, rsStart1, rsEnd1)
+		f.requestApproval(id)
+		f.expect(id, "after Request Approval", "CUSTOMER_APPROVAL", "authorize", "canceled")
+		f.wantValidationError("re-schedule without a change", f.reschedule(id, sp(rsStart1), sp(rsEnd1)), "re-scheduling requires a changed planned start or end")
+
+		if err := f.reschedule(id, sp(rsStart2), sp(rsEnd2)); err != nil {
+			t.Fatalf("re-schedule: %v", err)
+		}
+		f.expect(id, "after Re-schedule", "CUSTOMER_APPROVAL", "authorize", "canceled")
+		f.wantPlanned(id, "after Re-schedule", rsStart2, rsEnd2)
+		if got := f.stageLabels(id); got != "Customer Approval,Customer Approval" {
+			t.Fatalf("stages after Re-schedule = %s, want the customer asked again with a fresh stage", got)
+		}
+		stages := f.stages(id)
+		assertApprovers(t, "superseded customer stage", stages[0].approvers, map[string]string{crScopeUserA1: "cancelled", crScopeUserA2: "cancelled"})
+		assertApprovers(t, "fresh customer stage", stages[1].approvers, map[string]string{crScopeUserA1: "requested", crScopeUserA2: "requested"})
+
+		if err := f.decide(id, crScopeUserA1, "approved"); err != nil {
+			t.Fatalf("customer approval: %v", err)
+		}
+		f.expect(id, "after the customer's approval", "SCHEDULED", "implement", "canceled")
+	})
+	t.Run("without a customer group", func(t *testing.T) {
+		f := newCRFlow(t)
+		f.seedAssignedGroup()
+		id := f.createGated(domain.ChangeRequestTypeStandard, crFlowGroupID, boolp(true), nil)
+		f.setPlanned(id, rsStart1, rsEnd1)
+		f.requestApproval(id)
+		f.expect(id, "after Request Approval", "CUSTOMER_APPROVAL", "scheduled", "authorize", "canceled")
+		if err := f.reschedule(id, sp(rsStartEarly), nil); err != nil {
+			t.Fatalf("re-schedule: %v", err)
+		}
+		f.expect(id, "after Re-schedule", "CUSTOMER_APPROVAL", "scheduled", "authorize", "canceled")
+		f.wantPlanned(id, "after Re-schedule", rsStartEarly, rsEnd1)
+		if n := len(f.stages(id)); n != 0 {
+			t.Fatalf("standard change has %d stages after Re-schedule, want none", n)
+		}
+		f.step(id, domain.ChangeRequestStateScheduled, "SCHEDULED", "implement", "canceled")
+	})
+}
+
+// Manual authorize is refused, with the exact message, from every state but
+// Customer Approval -- nothing changes.
+func TestChangeRequestFlowIntegration_RescheduleRefusedFromEveryOtherState(t *testing.T) {
+	f := newCRFlow(t)
+	f.seedAssignedGroup()
+	id := f.create(domain.ChangeRequestTypeNormal, crFlowGroupID)
+	f.setPlanned(id, rsStart1, rsEnd1)
+	for _, st := range []string{"NEW", "ASSESS", "AUTHORIZE", "SCHEDULED", "IMPLEMENT", "REVIEW", "CUSTOMER_REVIEW", "CLOSED", "CANCELED", ""} {
+		var seed any = st
+		if st == "" {
+			seed = nil
+		}
+		if _, err := f.scoped.Exec(f.sys, `UPDATE change_request SET state = $2::change_request_state_enum WHERE id = $1`, id, seed); err != nil {
+			t.Fatalf("seed state %q: %v", st, err)
+		}
+		err := f.reschedule(id, sp(rsStart2), sp(rsEnd2))
+		var ve *apierror.ValidationError
+		if !errors.As(err, &ve) || ve.Msg != rescheduleOnlyFromCustomerApprovalMsg {
+			t.Fatalf("manual authorize from %q: err = %v, want a 400 %q", st, err, rescheduleOnlyFromCustomerApprovalMsg)
+		}
+		if got := f.state(id); got != st {
+			t.Fatalf("state after the refused re-schedule from %q = %q", st, got)
+		}
+		f.wantPlanned(id, "after the refused re-schedule from "+st, rsStart1, rsEnd1)
+	}
+	// Rollback is final: the terminal refusal wins.
+	if _, err := f.scoped.Exec(f.sys, `UPDATE change_request SET state = 'ROLLBACK' WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+	f.wantValidationError("re-schedule from rollback", f.reschedule(id, sp(rsStart2), nil), "rollback is final")
+}
+
+// The on-hold gate applies, and an unsatisfiable re-schedule (nobody can give
+// the new CAB approval) is refused as a whole -- window, state and the customer's
+// pending request are untouched.
+func TestChangeRequestFlowIntegration_RescheduleOnHoldAndAtomic(t *testing.T) {
+	f := newCustomerGroupFlow(t)
+	id := f.createWithProject(domain.ChangeRequestTypeNormal, sp(crScopeProjectA), true, false)
+	f.setPlanned(id, rsStart1, rsEnd1)
+	f.driveToCustomerApproval(id)
+
+	reason := "customer freeze"
+	if _, err := f.patch(id, domain.PatchChangeRequestRequest{OnHold: boolp(true), OnHoldReason: &reason}); err != nil {
+		t.Fatalf("put on hold: %v", err)
+	}
+	f.wantValidationError("re-schedule while on hold", f.reschedule(id, sp(rsStart2), sp(rsEnd2)), "change request is on hold")
+	f.expect(id, "after the refused re-schedule", "CUSTOMER_APPROVAL", "authorize", "canceled")
+	f.wantPlanned(id, "while on hold", rsStart1, rsEnd1)
+	if _, err := f.patch(id, domain.PatchChangeRequestRequest{OnHold: boolp(false)}); err != nil {
+		t.Fatalf("take off hold: %v", err)
+	}
+
+	// The CAB group is emptied: the new approval could never be given.
+	if _, err := f.scoped.Exec(f.sys, `DELETE FROM team_member WHERE group_id = $1::uuid`, crCABGroupID); err != nil {
+		t.Fatalf("empty the CAB group: %v", err)
+	}
+	f.wantValidationError("re-schedule into an empty CAB group", f.reschedule(id, sp(rsStart2), sp(rsEnd2)), "no members")
+	f.expect(id, "after the refused re-schedule", "CUSTOMER_APPROVAL", "authorize", "canceled")
+	f.wantPlanned(id, "after the refused re-schedule", rsStart1, rsEnd1)
+	if n := f.liveStageRows(id, "Customer Approval"); n != 2 {
+		t.Fatalf("customer request has %d live rows after the refused re-schedule, want 2 (untouched)", n)
+	}
+	if got := f.stageLabels(id); got != "Peer Approval,CAB Approval,Customer Approval" {
+		t.Fatalf("stages after the refused re-schedule = %s", got)
+	}
+
+	// Taking it off hold in the same PATCH works.
+	seedApprovalGroupMembers(t, f.scoped, crCABGroupID, crCABMemberUserID1)
+	if _, err := f.patch(id, domain.PatchChangeRequestRequest{OnHold: boolp(true)}); err != nil {
+		t.Fatalf("put on hold again: %v", err)
+	}
+	if _, err := f.patch(id, domain.PatchChangeRequestRequest{
+		State: stateptr(domain.ChangeRequestStateAuthorize), PlannedStartOn: sp(rsStartEarly), OnHold: boolp(false)}); err != nil {
+		t.Fatalf("PATCH {state: authorize, plannedStartOn, onHold: false}: %v", err)
+	}
+	f.expect(id, "after re-scheduling and releasing the hold", "AUTHORIZE", "canceled")
 }

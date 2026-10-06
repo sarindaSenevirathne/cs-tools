@@ -41,12 +41,16 @@ import (
 type fakeAWS struct {
 	srv      *httptest.Server
 	key      *rsa.PrivateKey
-	roots    *x509.CertPool
 	confirms atomic.Int32
 	status   int
 }
 
 func newFakeAWS(t *testing.T, status int) *fakeAWS {
+	return newFakeAWSCert(t, status, "sns.amazonaws.com", time.Now().Add(time.Hour))
+}
+
+// newFakeAWSCert serves a leaf-only .pem, as real SNS does, issued to cn and valid until notAfter.
+func newFakeAWSCert(t *testing.T, status int, cn string, notAfter time.Time) *fakeAWS {
 	t.Helper()
 	caKey, _ := rsa.GenerateKey(rand.Reader, 2048)
 	caTmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "test CA"},
@@ -55,13 +59,12 @@ func newFakeAWS(t *testing.T, status int) *fakeAWS {
 	caDER, _ := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
 	ca, _ := x509.ParseCertificate(caDER)
 	leafKey, _ := rsa.GenerateKey(rand.Reader, 2048)
-	leafTmpl := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "sns.amazonaws.com"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature}
+	leafTmpl := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: cn},
+		NotBefore: time.Now().Add(-2 * time.Hour), NotAfter: notAfter, KeyUsage: x509.KeyUsageDigitalSignature}
 	leafDER, _ := x509.CreateCertificate(rand.Reader, leafTmpl, ca, &leafKey.PublicKey, caKey)
 	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
 
-	f := &fakeAWS{key: leafKey, roots: x509.NewCertPool(), status: status}
-	f.roots.AddCert(ca)
+	f := &fakeAWS{key: leafKey, status: status}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, ".pem") {
 			_, _ = w.Write(pemBytes)
@@ -81,7 +84,13 @@ func (f *fakeAWS) subscribeURL() string {
 // signed builds a SubscriptionConfirmation signed by the fake AWS key.
 func (f *fakeAWS) signed(t *testing.T, version, subscribeURL string) []byte {
 	t.Helper()
-	m := message{Type: "SubscriptionConfirmation", MessageID: "m-1", Token: "abc",
+	return f.signedAs(t, "SubscriptionConfirmation", version, subscribeURL)
+}
+
+// signedAs builds an SNS message of type typ signed by the fake AWS key.
+func (f *fakeAWS) signedAs(t *testing.T, typ, version, subscribeURL string) []byte {
+	t.Helper()
+	m := message{Type: typ, MessageID: "m-1", Token: "abc",
 		TopicArn: "arn:aws:sns:us-east-1:000000000000:example", Message: "You have chosen to subscribe",
 		SubscribeURL: subscribeURL, Timestamp: "2026-09-30T06:00:00.000Z",
 		SignatureVersion: version, SigningCertURL: f.srv.URL + "/SimpleNotificationService-test.pem"}
@@ -103,7 +112,6 @@ func handlerFor(f *fakeAWS) (*Handler, *bytes.Buffer) {
 	var mu sync.Mutex
 	h := New(slog.New(slog.NewTextHandler(&lockedWriter{w: &logs, mu: &mu}, nil)), time.Second)
 	h.allowURL = func(u *url.URL) bool { return "http://"+u.Host == f.srv.URL }
-	h.verifier.roots = f.roots
 	return h, &logs
 }
 
@@ -167,14 +175,52 @@ func TestUnsignedOrForged_NotFetched(t *testing.T) {
 	}
 }
 
-func TestUntrustedCertificate_Rejected(t *testing.T) {
-	f := newFakeAWS(t, 200)
-	other := newFakeAWS(t, 200)
-	h, _ := handlerFor(f)
-	h.verifier.roots = other.roots // f's certificate doesn't chain to these
+func TestCertificateNotForSNS_Rejected(t *testing.T) {
+	f := newFakeAWSCert(t, 200, "attacker.example", time.Now().Add(time.Hour))
+	h, logs := handlerFor(f)
 	h.HandleIfConfirmation(f.signed(t, "2", f.subscribeURL()))
 	if f.confirms.Load() != 0 {
-		t.Error("an untrusted signing certificate must not lead to a fetch")
+		t.Error("a certificate not issued to SNS must not lead to a fetch")
+	}
+	if !strings.Contains(logs.String(), "not SNS") {
+		t.Errorf("want the wrong-name warning, got:\n%s", logs.String())
+	}
+}
+
+func TestExpiredCertificate_Rejected(t *testing.T) {
+	f := newFakeAWSCert(t, 200, "sns.amazonaws.com", time.Now().Add(-time.Hour))
+	h, logs := handlerFor(f)
+	h.HandleIfConfirmation(f.signed(t, "2", f.subscribeURL()))
+	if f.confirms.Load() != 0 {
+		t.Error("an expired certificate must not lead to a fetch")
+	}
+	if !strings.Contains(logs.String(), "not valid at") {
+		t.Errorf("want the expiry warning, got:\n%s", logs.String())
+	}
+}
+
+func TestSignedUnsubscribe_HandledNotFetched(t *testing.T) {
+	f := newFakeAWS(t, 200)
+	h, logs := handlerFor(f)
+	if !h.HandleIfConfirmation(f.signedAs(t, "UnsubscribeConfirmation", "2", f.subscribeURL())) {
+		t.Fatal("unsubscribe confirmation not handled; it would be stored as an alert")
+	}
+	if f.confirms.Load() != 0 {
+		t.Errorf("SubscribeURL fetched %d times, want 0: fetching it would subscribe again", f.confirms.Load())
+	}
+	if !strings.Contains(logs.String(), "subscription removed") {
+		t.Errorf("want the removed-subscription warning, got:\n%s", logs.String())
+	}
+}
+
+func TestForgedUnsubscribe_Ignored(t *testing.T) {
+	f := newFakeAWS(t, 200)
+	h, logs := handlerFor(f)
+	if !h.HandleIfConfirmation([]byte(`{"Type":"UnsubscribeConfirmation","SubscribeURL":"` + f.subscribeURL() + `"}`)) {
+		t.Fatal("want handled (answer 200, store nothing)")
+	}
+	if f.confirms.Load() != 0 || !strings.Contains(logs.String(), "failed signature check") {
+		t.Errorf("fetches = %d, logs:\n%s", f.confirms.Load(), logs.String())
 	}
 }
 

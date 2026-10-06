@@ -18,6 +18,7 @@ import { Box, Button, Menu, MenuItem, Tooltip, Typography } from "@wso2/oxygen-u
 import {
   ArrowRight,
   Ban,
+  CalendarClock,
   CheckCircle,
   ChevronDown,
   Play,
@@ -50,6 +51,8 @@ const TARGET_CONFIG: Record<string, TargetConfig> = {
   review: { color: "primary", icon: <CheckCircle size={16} /> },
   customer_review: { color: "primary", icon: <UserCheck size={16} /> },
   closed: { color: "primary", icon: <CheckCircle size={16} /> },
+  // Only ever rendered from `customer_approval` ("Re-schedule").
+  authorize: { color: "primary", icon: <CalendarClock size={16} /> },
   rollback: { color: "error", icon: <Undo2 size={16} /> },
   canceled: { color: "error", icon: <Ban size={16} /> },
 };
@@ -86,18 +89,28 @@ const FORWARD_ORDER: readonly string[] = [
   "closed",
 ];
 
+/**
+ * Actions shown as an outlined (secondary) button beside the primary one
+ * rather than inside the overflow menu: `authorize` is "Re-schedule", the
+ * non-destructive loop back from `customer_approval` (see `isOfferedTarget`).
+ */
+const SECONDARY_ORDER: readonly string[] = ["authorize"];
+
 /** Menu ordering: forward moves first, destructive off-ramps last. */
-const MENU_ORDER: readonly string[] = [...FORWARD_ORDER, "rollback", "canceled"];
+const MENU_ORDER: readonly string[] = [
+  ...FORWARD_ORDER,
+  ...SECONDARY_ORDER,
+  "rollback",
+  "canceled",
+];
 
 /**
  * States this bar never offers, no matter what `legalNextStates` contains.
  *
  * Do not delete this filter because "the list doesn't include them anyway".
- * `rollback`/`customer_approval`: neither state is human-enterable in the
- * backing system — of its 38 UI actions on the change-request table, none
- * sets either one. Both are reached only by automation — rollback is written
- * by the workflow that handles a rejected review, customer approval by the
- * approval process itself. Setting either by hand from here would leave a
+ * `customer_approval`: not human-enterable in the backing system — of its 38
+ * UI actions on the change-request table, none sets it. It is reached only by
+ * the approval process itself. Setting it by hand from here would leave a
  * record sitting in an approval state with no approver record behind it,
  * which is an audit hole rather than a shortcut.
  *
@@ -110,7 +123,10 @@ const MENU_ORDER: readonly string[] = [...FORWARD_ORDER, "rollback", "canceled"]
  * Offering it as a directly-clickable button/menu item from here would let
  * someone skip the actual approval process entirely and land the record in
  * Authorize with no approval behind it — the same audit hole as above, by a
- * different route.
+ * different route. The one exception is the same shape as `scheduled`: from
+ * `customer_approval` it means "Re-schedule" (the planned time changed, so the
+ * change goes back through internal approval -- more approval, not less), and
+ * the page collects the new planned window before sending it.
  *
  * `scheduled` is the same shape as `authorize`: a CR is moved to Scheduled
  * automatically the moment its approval is granted (CAB/ECAB, or Standard's
@@ -122,25 +138,36 @@ const MENU_ORDER: readonly string[] = [...FORWARD_ORDER, "rollback", "canceled"]
  * filtered out unless the CR's current state is `customer_approval` -- see
  * `isOfferedTarget`.
  *
- * The exclusions are deliberately unconditional (the `scheduled` carve-out is
- * keyed on the record's own state, never on what `legalNextStates` claims) so a
- * future backend change that starts returning any of these cannot silently
- * reopen them.
+ * `rollback` is the failed-review off-ramp of the process diagram: a human
+ * action ("Roll back"), but only from the two review states, `review` and
+ * `customer_review` (the backend offers and accepts it from nowhere else).
+ * It is a destructive, menu-only item that requires a stated reason. It used
+ * to be excluded here as "automation-only"; the backend now owns the manual
+ * transition. The carve-out is still keyed on the record's own state.
+ *
+ * The exclusions are deliberately unconditional (the `scheduled` and
+ * `rollback` carve-outs are keyed on the record's own state, never on what
+ * `legalNextStates` claims) so a future backend change that starts returning
+ * any of these cannot silently reopen them.
  */
-const NEVER_OFFERED_TARGETS: readonly string[] = [
-  "rollback",
-  "customer_approval",
-  "authorize",
-];
+const NEVER_OFFERED_TARGETS: readonly string[] = ["customer_approval"];
+
+/** States a change request can be manually rolled back from. */
+const ROLLBACK_FROM_STATES: readonly string[] = ["review", "customer_review"];
 
 /**
- * `scheduled` is a manual action only from `customer_approval`, where it
- * records the customer's approval. Everywhere else it is reached
- * automatically, so it is never offered.
+ * `scheduled` ("Record customer approval") and `authorize` ("Re-schedule") are
+ * manual actions only from `customer_approval`; `rollback` only from the two
+ * review states. Everywhere else they are not offered.
  */
 function isOfferedTarget(target: string, currentState: string | null | undefined): boolean {
   if (!target || target === currentState) return false;
-  if (target === "scheduled") return currentState === "customer_approval";
+  if (target === "scheduled" || target === "authorize") {
+    return currentState === "customer_approval";
+  }
+  if (target === "rollback") {
+    return !!currentState && ROLLBACK_FROM_STATES.includes(currentState);
+  }
   return !NEVER_OFFERED_TARGETS.includes(target);
 }
 
@@ -204,7 +231,8 @@ interface ChangeRequestActionBarProps {
  * caller may not transition).
  *
  * Exactly one target — the first forward move present, by `FORWARD_ORDER` —
- * gets a primary button; everything else sits behind a "Change state"
+ * gets a primary button; "Re-schedule" (only from `customer_approval`) is an
+ * outlined button beside it; everything else sits behind a "Change state"
  * overflow menu. The header this sits in already carries Back, Clone and
  * Edit, so a row of eight buttons would bury the one action the engineer
  * actually wants.
@@ -227,7 +255,8 @@ export default function ChangeRequestActionBar({
   if (targets.length === 0) return null;
 
   const primaryTarget = targets.find((t) => FORWARD_ORDER.includes(t));
-  const menuTargets = targets.filter((t) => t !== primaryTarget);
+  const secondaryTargets = targets.filter((t) => SECONDARY_ORDER.includes(t));
+  const menuTargets = targets.filter((t) => t !== primaryTarget && !SECONDARY_ORDER.includes(t));
 
   const dispatch = (target: string): void => {
     setStateMenuAnchor(null);
@@ -288,6 +317,23 @@ export default function ChangeRequestActionBar({
   return (
     <Box sx={{ display: "flex", gap: 1, flexShrink: 0 }}>
       {primaryTarget && renderPrimary(primaryTarget)}
+      {secondaryTargets.map((target) => {
+        const { color, icon } = configFor(target);
+        return (
+          <Button
+            key={target}
+            size="small"
+            variant="outlined"
+            color={color}
+            startIcon={icon}
+            disabled={isPending}
+            onClick={() => dispatch(target)}
+            sx={{ flexShrink: 0 }}
+          >
+            {changeRequestTransitionLabel(target, cr.state)}
+          </Button>
+        );
+      })}
       {menuTargets.length > 0 && (
         <>
           <Button

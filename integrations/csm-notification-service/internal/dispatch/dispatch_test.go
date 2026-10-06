@@ -177,11 +177,11 @@ type mockCallSender struct {
 	calls []sentCall
 }
 
-func (m *mockCallSender) MakeCall(ctx context.Context, to, message string) error {
+func (m *mockCallSender) MakeCall(ctx context.Context, to, message string) (notifications.Call, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.calls = append(m.calls, sentCall{to, message})
-	return m.err
+	return notifications.Call{}, m.err
 }
 
 // mockLinkResolver defaults to resolving every recipient to the same fixed
@@ -597,6 +597,122 @@ func TestDispatcher_Handle_CommentAdded(t *testing.T) {
 	}
 	if !strings.Contains(mock.calls[0].htmlBody, "fixed it") {
 		t.Error("htmlBody does not contain the comment text")
+	}
+}
+
+// mockSLAEngine is a hand-written fake for slaEngineService.
+type mockSLAEngine struct {
+	mu                    sync.Mutex
+	registerCalls         []struct{ caseID, priority, caseNumber string }
+	applyStateCalls       []struct{ caseID, newStatus string }
+	completeResponseCalls []string
+}
+
+func (m *mockSLAEngine) RegisterClocks(_ context.Context, caseID, priority string, _ time.Time, caseNumber, _, _, _, _, _ string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.registerCalls = append(m.registerCalls, struct{ caseID, priority, caseNumber string }{caseID, priority, caseNumber})
+}
+
+func (m *mockSLAEngine) ApplyStateEffects(_ context.Context, caseID, newStatus string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.applyStateCalls = append(m.applyStateCalls, struct{ caseID, newStatus string }{caseID, newStatus})
+}
+
+func (m *mockSLAEngine) CompleteResponseClock(_ context.Context, caseID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.completeResponseCalls = append(m.completeResponseCalls, caseID)
+}
+
+// TestDispatcher_Handle_CaseCreated_RegistersSLAClocksWhenConfigured verifies
+// handleCaseCreated calls slaEngine.RegisterClocks with the payload's own
+// severity/creation time/display fields when an engine is configured — and
+// TestDispatcher_Handle_CaseCreated above (no engine configured) already
+// confirms this is skipped with no error when it isn't.
+func TestDispatcher_Handle_CaseCreated_RegistersSLAClocksWhenConfigured(t *testing.T) {
+	sla := &mockSLAEngine{}
+	d := newTestDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}).WithSLAEngine(sla)
+
+	record := eventbus.Record{Value: []byte(`{"type":"case.created","entityId":"CASE-1","payload":{"reporterName":"Reporter","projectName":"Proj","projectId":"PROJ-1","caseId":"CASE-1","caseNumber":"CS0001","caseTitle":"Something broke","caseType":"CASE","priority":"CATASTROPHIC","product":"api-manager","createdAt":"2026-01-05T10:00:00Z","description":"desc","recipients":["test-recipient@example.com"]}}`)}
+
+	if err := d.Handle(context.Background(), record); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if len(sla.registerCalls) != 1 {
+		t.Fatalf("expected 1 RegisterClocks call, got %d", len(sla.registerCalls))
+	}
+	got := sla.registerCalls[0]
+	if got.caseID != "CASE-1" || got.priority != "CATASTROPHIC" || got.caseNumber != "CS0001" {
+		t.Errorf("unexpected RegisterClocks args: %+v", got)
+	}
+}
+
+// TestDispatcher_Handle_CaseCreated_MalformedCreatedAt_SkipsRegistration
+// verifies a non-RFC3339 createdAt (an older/malformed publisher) is logged
+// and skipped, rather than guessing a fallback time that would start every
+// clock from the wrong instant.
+func TestDispatcher_Handle_CaseCreated_MalformedCreatedAt_SkipsRegistration(t *testing.T) {
+	sla := &mockSLAEngine{}
+	d := newTestDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}).WithSLAEngine(sla)
+
+	record := eventbus.Record{Value: []byte(`{"type":"case.created","entityId":"CASE-1","payload":{"reporterName":"Reporter","projectName":"Proj","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseType":"CASE","priority":"CATASTROPHIC","createdAt":"2026-01-01","description":"desc","recipients":["test-recipient@example.com"]}}`)}
+
+	if err := d.Handle(context.Background(), record); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if len(sla.registerCalls) != 0 {
+		t.Errorf("expected RegisterClocks to be skipped for a malformed createdAt, got %d calls", len(sla.registerCalls))
+	}
+}
+
+// TestDispatcher_Handle_StatusChanged_AppliesSLAStateEffectsWhenConfigured
+// verifies handleStatusChanged calls slaEngine.ApplyStateEffects.
+func TestDispatcher_Handle_StatusChanged_AppliesSLAStateEffectsWhenConfigured(t *testing.T) {
+	sla := &mockSLAEngine{}
+	d := newTestDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}).WithSLAEngine(sla)
+
+	record := eventbus.Record{Value: []byte(`{"type":"case.status_changed","entityId":"CASE-1","payload":{"projectId":"PROJ-1","caseId":"CASE-1","newStatus":"Awaiting Info","recipients":["test-recipient@example.com"]}}`)}
+
+	if err := d.Handle(context.Background(), record); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if len(sla.applyStateCalls) != 1 || sla.applyStateCalls[0].newStatus != "Awaiting Info" {
+		t.Errorf("unexpected ApplyStateEffects calls: %+v", sla.applyStateCalls)
+	}
+}
+
+// TestDispatcher_Handle_CommentAdded_CompletesResponseClockForSupportEngineer
+// verifies handleCommentAdded calls slaEngine.CompleteResponseClock only
+// when entity-service has already confirmed IsSupportEngineerResponse.
+func TestDispatcher_Handle_CommentAdded_CompletesResponseClockForSupportEngineer(t *testing.T) {
+	sla := &mockSLAEngine{}
+	d := newTestDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}).WithSLAEngine(sla)
+
+	record := eventbus.Record{Value: []byte(`{"type":"case.comment_added","entityId":"CASE-1","payload":{"name":"Commenter","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseComment":"fixed it","commentId":"C-1","isSupportEngineerResponse":true,"recipients":["test-recipient@example.com"]}}`)}
+
+	if err := d.Handle(context.Background(), record); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if len(sla.completeResponseCalls) != 1 || sla.completeResponseCalls[0] != "CASE-1" {
+		t.Errorf("unexpected CompleteResponseClock calls: %v", sla.completeResponseCalls)
+	}
+}
+
+// TestDispatcher_Handle_CommentAdded_NotSupportEngineer_DoesNotCompleteResponseClock
+// is the negative counterpart.
+func TestDispatcher_Handle_CommentAdded_NotSupportEngineer_DoesNotCompleteResponseClock(t *testing.T) {
+	sla := &mockSLAEngine{}
+	d := newTestDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}).WithSLAEngine(sla)
+
+	record := eventbus.Record{Value: []byte(`{"type":"case.comment_added","entityId":"CASE-1","payload":{"name":"Commenter","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseComment":"any update?","commentId":"C-1","recipients":["test-recipient@example.com"]}}`)}
+
+	if err := d.Handle(context.Background(), record); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if len(sla.completeResponseCalls) != 0 {
+		t.Errorf("expected no CompleteResponseClock call, got %v", sla.completeResponseCalls)
 	}
 }
 
@@ -1489,20 +1605,27 @@ func TestDispatcher_Handle_CaseCreated_EmailSendingDisabled(t *testing.T) {
 	}
 }
 
-// TestDispatcher_Handle_IgnoresSLATierReached verifies that a
-// sla.tier_reached record — published by internal/slaengine's own poller,
-// which this dispatcher's consumers still get a full copy of via the shared
-// topic — is a silent no-op here, not an error. Erroring would burn this
-// consumer's retries and dead-letter an event that was never broken.
-func TestDispatcher_Handle_IgnoresSLATierReached(t *testing.T) {
+// TestDispatcher_Handle_IgnoresEventTypesOwnedByOtherConsumers verifies that
+// records belonging to another consumer group on this shared topic -- the
+// slaengine poller's sla.tier_reached, and internal/paging's three
+// incident signals -- are a silent no-op here, not an error. Erroring would
+// burn this consumer's retries and dead-letter an event that was never broken.
+func TestDispatcher_Handle_IgnoresEventTypesOwnedByOtherConsumers(t *testing.T) {
 	mock := &mockEmailSender{}
 	chat := &mockGoogleChatSender{}
 	call := &mockCallSender{}
 	d := newTestDispatcher(mock, chat, call)
 
-	record := `{"type":"sla.tier_reached","entityId":"CASE-1","payload":{"caseId":"CASE-1","clockType":"response","tier":"50"}}`
-	if err := d.Handle(context.Background(), eventbus.Record{Value: []byte(record)}); err != nil {
-		t.Errorf("Handle(%s) error = %v, want nil", record, err)
+	records := []string{
+		`{"type":"sla.tier_reached","entityId":"CASE-1","payload":{"caseId":"CASE-1","clockType":"response","tier":"50"}}`,
+		`{"type":"incident.acknowledged","entityId":"INC-1","payload":{"previousState":"NEW","newState":"IN_PROGRESS"}}`,
+		`{"type":"incident.priority_elevated","entityId":"INC-1","payload":{"oldPriority":"MODERATE","newPriority":"HIGH","title":"t"}}`,
+		`{"type":"incident.comment_added","entityId":"INC-1","payload":{"commentId":"c-1","isPublic":true}}`,
+	}
+	for _, r := range records {
+		if err := d.Handle(context.Background(), eventbus.Record{Value: []byte(r)}); err != nil {
+			t.Errorf("Handle(%s) error = %v, want nil", r, err)
+		}
 	}
 	chatCalls := len(chat.caseCreatedCalls) + len(chat.caseAcknowledgedCalls) + len(chat.severityChangedCalls) + len(chat.securityReportAnalysisCalls)
 	if len(mock.calls) != 0 || chatCalls != 0 || len(call.calls) != 0 {
@@ -1547,7 +1670,7 @@ type concurrencyProbeCallSender struct {
 	sends     int
 }
 
-func (s *concurrencyProbeCallSender) MakeCall(ctx context.Context, to, message string) error {
+func (s *concurrencyProbeCallSender) MakeCall(ctx context.Context, to, message string) (notifications.Call, error) {
 	s.mu.Lock()
 	s.active++
 	s.sends++
@@ -1561,7 +1684,7 @@ func (s *concurrencyProbeCallSender) MakeCall(ctx context.Context, to, message s
 	s.mu.Lock()
 	s.active--
 	s.mu.Unlock()
-	return nil
+	return notifications.Call{}, nil
 }
 
 // TestDispatcher_Handle_ConcurrentClaimNeverOverlaps is a regression test
@@ -2175,5 +2298,20 @@ func TestDispatcher_Handle_CRPlanDateNotice_WordingPerKind(t *testing.T) {
 				t.Errorf("rendered %d documents, want 1", strings.Count(body, "<!DOCTYPE"))
 			}
 		})
+	}
+}
+
+// incident.assigned belongs to the escalation ladder, which stops an SRE
+// ladder on it. The dispatcher's own consumer group gets a copy of the same
+// topic and must acknowledge it as a no-op, not dead-letter it as unknown.
+func TestDispatcher_Handle_IncidentAssignedIsANoOp(t *testing.T) {
+	call := &mockCallSender{}
+	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, call, &mockLinkResolver{}, true, false, nil, true, "+15550000000", nil)
+	body := `{"type":"incident.assigned","entityId":"inc-1","payload":{"assigneeId":"u-1","assigneeName":"Engineer"}}`
+	if err := d.Handle(context.Background(), eventbus.Record{Value: []byte(body)}); err != nil {
+		t.Fatalf("Handle() error = %v; want nil", err)
+	}
+	if len(call.calls) != 0 {
+		t.Fatalf("dispatcher placed %d call(s) for incident.assigned", len(call.calls))
 	}
 }

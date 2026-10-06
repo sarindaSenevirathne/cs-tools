@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -28,7 +29,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
+	"github.com/cenkalti/backoff/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 
@@ -64,6 +65,12 @@ func main() {
 		logger.Error("failed to read postgres config", "error", err)
 		os.Exit(1)
 	}
+	pgCfg, err = postgres.SizePool(pgCfg, depCfg.Poll.Concurrency)
+	if err != nil {
+		logger.Error("invalid postgres pool size", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("postgres pools sized", "main_max_conns", pgCfg.PoolMaxConns, "lock_max_conns", depCfg.Notify.DeliveryConcurrency+lockPoolHeadroom)
 	// Core writes are replayed after a crash, so they skip the WAL flush wait; ingestion keeps synchronous commits since it acknowledges senders.
 	pool, err := connectWithRetry(logger, pgCfg, depCfg.Postgres, true)
 	if err != nil {
@@ -97,15 +104,23 @@ func main() {
 	}
 
 	csmClient := csmClientFromEnv(logger, depCfg.Notify.HTTPTimeout.Duration())
-	notifier := notify.New(base.With("component", "notify"), csmClient, notify.Config{
-		CallerID:             os.Getenv("CSM_CALLER_ID"),
-		UnknownServiceID:     os.Getenv("CSM_UNKNOWN_SERVICE_ID"),
-		ServiceCacheTTL:      depCfg.Notify.ServiceCacheTTL.Duration(),
-		MaxAttempts:          depCfg.Notify.MaxAttempts,
-		RetryBaseDelay:       depCfg.Notify.RetryBaseDelay.Duration(),
-		HTTPTimeout:          depCfg.Notify.HTTPTimeout.Duration(),
-		ChatThreadingEnabled: depCfg.Notify.ChatThreadingEnabled,
-	})
+	notifyCfg := notify.Config{
+		CallerID:         os.Getenv("CSM_CALLER_ID"),
+		UnknownServiceID: os.Getenv("CSM_UNKNOWN_SERVICE_ID"),
+		// Optional: the group an incident is assigned to when nothing more specific routes it.
+		DefaultAssignmentGroupID: os.Getenv("CSM_DEFAULT_ASSIGNMENT_GROUP_ID"),
+		AssignmentGroupRoutes:    assignmentGroupRoutes(logger),
+		ServiceCacheTTL:          depCfg.Notify.ServiceCacheTTL.Duration(),
+		MaxAttempts:              depCfg.Notify.MaxAttempts,
+		RetryBaseDelay:           depCfg.Notify.RetryBaseDelay.Duration(),
+		HTTPTimeout:              depCfg.Notify.HTTPTimeout.Duration(),
+		ChatThreadingEnabled:     depCfg.Notify.ChatThreadingEnabled,
+	}
+	if err := notify.ValidateGroupIDs(notifyCfg); err != nil {
+		logger.Error("invalid assignment group configuration", "error", err)
+		os.Exit(1)
+	}
+	notifier := notify.New(base.With("component", "notify"), csmClient, notifyCfg)
 	eng := engine.New(base.With("component", "engine"), incidents, notifier, engine.Config{
 		Defaults:             defaults,
 		DedupWindow:          depCfg.Engine.DedupWindow.Duration(),
@@ -163,9 +178,16 @@ func main() {
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	// alert-ingestion authenticates against the same integration_users store its own webhooks use.
-	userRepo := auth.NewUserRepo(pool)
-	mux.Handle("/alertz", auth.RequireAuth(userRepo, base.With("component", "auth"))(http.HandlerFunc(h.ServeAlert)))
+	// alert-ingestion wakes the poller with a shared token, so /alertz never needs Postgres or an integration user.
+	wakeToken := strings.TrimSpace(os.Getenv("ALERT_CORE_WAKE_TOKEN"))
+	switch {
+	case wakeToken == "":
+		logger.Warn("ALERT_CORE_WAKE_TOKEN not set; /alertz rejects every wake and alerts are picked up by poll.interval alone")
+	case len(wakeToken) < auth.MinWakeTokenLen:
+		logger.Error("ALERT_CORE_WAKE_TOKEN is too short; generate one with openssl rand -hex 32", "min_length", auth.MinWakeTokenLen)
+		os.Exit(1)
+	}
+	mux.Handle("/alertz", auth.RequireWakeToken(wakeToken, base.With("component", "auth"))(http.HandlerFunc(h.ServeAlert)))
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -203,6 +225,21 @@ func main() {
 			logger.Error("graceful shutdown failed", "error", err)
 		}
 	}
+}
+
+// assignmentGroupRoutes reads CSM_ASSIGNMENT_GROUP_ROUTES, a JSON object of routing key -> CSM group id.
+// Optional; one that does not parse stops startup rather than routing every incident to the default.
+func assignmentGroupRoutes(logger *slog.Logger) map[string]string {
+	raw := strings.TrimSpace(os.Getenv("CSM_ASSIGNMENT_GROUP_ROUTES"))
+	if raw == "" {
+		return nil
+	}
+	var routes map[string]string
+	if err := json.Unmarshal([]byte(raw), &routes); err != nil {
+		logger.Error("CSM_ASSIGNMENT_GROUP_ROUTES is not a JSON object of string to string", "error", err)
+		os.Exit(1)
+	}
+	return routes
 }
 
 // csmEnvVars must all be set to enable CSM delivery; otherwise incidents are tracked locally and surfaced via Chat only.
@@ -254,24 +291,17 @@ func splitComma(raw string) []string {
 
 // connectWithRetry retries with exponential backoff so a transient startup outage doesn't crash the server.
 func connectWithRetry(logger *slog.Logger, cfg postgres.Config, pcfg config.PostgresConfig, asyncCommit bool) (*pgxpool.Pool, error) {
-	var pool *pgxpool.Pool
 	attempt := 0
-	operation := func() error {
+	operation := func() (*pgxpool.Pool, error) {
 		attempt++
 		p, err := postgres.Connect(cfg, pcfg.ConnectTimeout.Duration(), pcfg.QueryTimeout.Duration(), asyncCommit)
 		if err != nil {
 			logger.Warn("postgres connection failed, retrying", "attempt", attempt, "max_attempts", pcfg.ConnectMaxAttempts, "error", err)
-			return err
 		}
-		pool = p
-		return nil
+		return p, err
 	}
 
 	eb := backoff.NewExponentialBackOff()
 	eb.InitialInterval = pcfg.ConnectBaseDelay.Duration()
-	b := backoff.WithMaxRetries(eb, uint64(pcfg.ConnectMaxAttempts-1))
-	if err := backoff.Retry(operation, b); err != nil {
-		return nil, err
-	}
-	return pool, nil
+	return backoff.Retry(context.Background(), operation, backoff.WithBackOff(eb), backoff.WithMaxTries(uint(pcfg.ConnectMaxAttempts)))
 }

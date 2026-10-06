@@ -101,10 +101,8 @@ func TestIngest_201(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
 	}
-	m := decode(t, rec)
-	ids, _ := m["alt_ids"].([]any)
-	if m["status"] != "OK" || m["count"] != float64(1) || len(ids) != 1 || ids[0] != "ALT000000001" {
-		t.Errorf("body = %v", m)
+	if got, want := strings.TrimSpace(rec.Body.String()), `{"status":"OK","alt_id":"ALT000000001"}`; got != want {
+		t.Errorf("body = %s, want %s", got, want)
 	}
 	if len(sub.calls) != 1 || sub.source != "datadog" || sub.calls[0][0].UniqueIdentifier != "148502937" {
 		t.Errorf("submitted %+v for %s", sub.calls, sub.source)
