@@ -17,11 +17,11 @@
 import { describe, expect, it } from "vitest";
 import { getSeverityDisplay } from "@features/support/utils/pendingVerification";
 
-// Regression tests for the CodeRabbit finding: entity-service now sends the
-// lowercase domain severity word (matching Case.severity/CaseView.severity
-// everywhere else in the API) instead of the raw case_severity_enum code
-// ("S1"), and this util must still reconstruct the same "S1 — Critical"
-// style display label the UI already shows.
+// entity-service sends the lowercase domain severity word (matching
+// Case.severity/CaseView.severity everywhere else in the API), and this
+// util must format it to match the case list's own severity chip exactly
+// (mapSeverityToDisplay in support.ts) -- short code only, no spelled-out
+// word, "S4(Query)" for Low.
 describe("getSeverityDisplay", () => {
   it("returns null when severity is absent", () => {
     expect(getSeverityDisplay(undefined)).toBeNull();
@@ -33,16 +33,16 @@ describe("getSeverityDisplay", () => {
   });
 
   it.each([
-    ["catastrophic", "S0 — Catastrophic"],
-    ["critical", "S1 — Critical"],
-    ["high", "S2 — High"],
-    ["medium", "S3 — Medium"],
-    ["low", "S4 — Low"],
-  ])("formats domain severity %s as %s", (severity, expectedLabel) => {
+    ["catastrophic", "S0"],
+    ["critical", "S1"],
+    ["high", "S2"],
+    ["medium", "S3"],
+    ["low", "S4(Query)"],
+  ])("formats domain severity %s as %s, matching the case list", (severity, expectedLabel) => {
     expect(getSeverityDisplay(severity)?.label).toBe(expectedLabel);
   });
 
   it("is case-insensitive", () => {
-    expect(getSeverityDisplay("CRITICAL")?.label).toBe("S1 — Critical");
+    expect(getSeverityDisplay("CRITICAL")?.label).toBe("S1");
   });
 });
