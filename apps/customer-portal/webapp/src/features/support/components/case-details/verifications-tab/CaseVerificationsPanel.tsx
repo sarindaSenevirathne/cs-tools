@@ -86,26 +86,67 @@ function resolveActorDisplay(
   return { name, role, initials };
 }
 
+// A single lifecycle moment of a pending_verification row. A verified round
+// contributes two of these (added + verified) so neither moment is lost from
+// the timeline; an unverified round contributes just the one.
+interface VerificationTimelineEvent {
+  key: string;
+  type: "added" | "verified";
+  timestamp: string;
+  actorEmail: string;
+  note?: string | null;
+  // Only set on a "verified" event -- the round's own addedAt, so the card
+  // can point back to exactly which "Added to Verification" entry it
+  // resolves instead of leaving that link to be inferred from adjacency.
+  addedAt?: string;
+}
+
+// Flattens the search result (one row per verification round, newest-added
+// first) into one timeline event per lifecycle moment, then re-sorts by the
+// moment's own timestamp -- a round's "Verified" event can be newer than
+// another round's "Added to Verification" event, so the rows' own added_on
+// order isn't guaranteed to match the combined event order.
+function buildTimelineEvents(records: PendingVerificationView[]): VerificationTimelineEvent[] {
+  const events: VerificationTimelineEvent[] = [];
+  for (const record of records) {
+    events.push({
+      key: `${record.id}-added`,
+      type: "added",
+      timestamp: record.addedAt,
+      actorEmail: record.addedBy,
+      note: record.note,
+    });
+    if (record.verifiedAt) {
+      events.push({
+        key: `${record.id}-verified`,
+        type: "verified",
+        timestamp: record.verifiedAt,
+        actorEmail: record.verifiedBy ?? record.addedBy,
+        addedAt: record.addedAt,
+      });
+    }
+  }
+  return events.sort(
+    (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+  );
+}
+
 function VerificationTimelineItem({
-  record,
+  event,
   contacts,
   currentUserEmail,
   isLast,
 }: {
-  record: PendingVerificationView;
+  event: VerificationTimelineEvent;
   contacts: ProjectContact[] | undefined;
   currentUserEmail: string;
   isLast: boolean;
 }): JSX.Element {
   const theme = useTheme();
-  const isVerified = !!record.verifiedAt;
+  const isVerified = event.type === "verified";
   const intentColor = isVerified ? theme.palette.success.main : theme.palette.primary.main;
   const intentLight = isVerified ? theme.palette.success.light : theme.palette.primary.light;
-  const actor = resolveActorDisplay(
-    isVerified ? (record.verifiedBy ?? record.addedBy) : record.addedBy,
-    contacts,
-    currentUserEmail,
-  );
+  const actor = resolveActorDisplay(event.actorEmail, contacts, currentUserEmail);
 
   return (
     <Box sx={{ display: "flex", gap: 2 }}>
@@ -143,7 +184,7 @@ function VerificationTimelineItem({
             }}
           />
           <Typography variant="caption" color="text.secondary">
-            {formatRelativeTime(isVerified ? (record.verifiedAt ?? undefined) : record.addedAt)}
+            {formatRelativeTime(event.timestamp)}
           </Typography>
         </Box>
 
@@ -164,17 +205,23 @@ function VerificationTimelineItem({
           </Box>
         </Stack>
 
-        <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, mb: record.note ? 1.5 : 0 }}>
+        <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, mb: event.addedAt || event.note ? 1.5 : 0 }}>
           <Clock size={13} color={theme.palette.text.secondary} />
           <Typography variant="caption" color="text.secondary">
-            {formatDate(isVerified ? record.verifiedAt : record.addedAt)}
+            {formatDate(event.timestamp)}
           </Typography>
         </Box>
 
-        {record.note && (
+        {event.addedAt && (
+          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: event.note ? 1.5 : 0 }}>
+            Resolves the addition from {formatDate(event.addedAt)}
+          </Typography>
+        )}
+
+        {event.note && (
           <Box sx={{ bgcolor: "action.hover", borderRadius: 1, px: 1.5, py: 1 }}>
             <Typography variant="body2" color="text.secondary">
-              {record.note}
+              {event.note}
             </Typography>
           </Box>
         )}
@@ -217,6 +264,7 @@ export default function CaseVerificationsPanel({ projectId, caseId }: Props): JS
   }
 
   const records = data?.pendingVerifications ?? [];
+  const events = buildTimelineEvents(records);
 
   return (
     <Box>
@@ -262,13 +310,13 @@ export default function CaseVerificationsPanel({ projectId, caseId }: Props): JS
         </Box>
       ) : (
         <Box>
-          {records.map((record, index) => (
+          {events.map((event, index) => (
             <VerificationTimelineItem
-              key={record.id}
-              record={record}
+              key={event.key}
+              event={event}
               contacts={contacts}
               currentUserEmail={currentUserEmail}
-              isLast={index === records.length - 1}
+              isLast={index === events.length - 1}
             />
           ))}
         </Box>
