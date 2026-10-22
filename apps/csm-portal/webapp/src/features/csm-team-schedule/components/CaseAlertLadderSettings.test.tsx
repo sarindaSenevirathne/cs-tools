@@ -147,16 +147,10 @@ function openEdit(name: string): { row: HTMLElement; edit: HTMLElement; dialog: 
 }
 
 const OPEN_KEY = "csm-ts.alert-settings.open";
-const GROUPS = ["Who gets alerts", "When a ladder starts", "How it climbs", "Heads", "Chat messages", "other"];
-
 /** Every section open, as for a person who opened them all before: most of
- *  these tests work inside them. */
+ *  these tests work inside them. On/off and channel starts open anyway. */
 function openEverything(): void {
-  const ids = ["CRE", "SRE", "SME"].flatMap((l) => [
-    `${l}.ladder`,
-    `${l}.file`,
-    ...GROUPS.map((g) => `${l}.ladder.${g}`),
-  ]);
+  const ids = ["CRE", "SRE"].flatMap((f) => [`${f}.where`, `${f}.who`, `${f}.advanced`]);
   window.localStorage.setItem(OPEN_KEY, JSON.stringify(ids));
 }
 
@@ -170,20 +164,21 @@ beforeEach(() => {
 describe("CaseAlertLadderSettings", () => {
   it("shows one value per row: what's in use, where it came from, and a saved one not in use yet", () => {
     render(<CaseAlertSettings chain="CRE" />);
-    expect(screen.getByRole("region", { name: "CRE ladder settings" })).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "CRE ladder" })).toBeInTheDocument();
     expect(screen.getByText(/in shadow mode\. In shadow mode it still uses its file/)).toBeInTheDocument();
-    for (const group of ["Who gets alerts", "When a ladder starts", "How it climbs", "Heads"]) {
-      expect(screen.getByRole("region", { name: group })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Who gets alerts" })).toBeInTheDocument();
+    for (const group of ["When a ladder starts", "How it climbs", "Heads"]) {
+      expect(screen.getByRole("heading", { name: group })).toBeInTheDocument();
     }
     // SRE's chat messages are not on the CRE chain.
-    expect(screen.queryByRole("region", { name: "Chat messages" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Chat messages" })).not.toBeInTheDocument();
     expect(screen.queryByRole("columnheader", { name: "Saved here" })).not.toBeInTheDocument();
 
     const abts = row("ABT teams");
     expect(within(abts).getByText("atlas")).toBeInTheDocument();
     expect(within(abts).getByText("from the file")).toBeInTheDocument();
     expect(within(abts).getByText(/^Saved:/)).toHaveTextContent(
-      "Saved: atlas, castor · used after the alert service restarts",
+      "Saved: atlas, castor · not in use yet",
     );
     expect(within(row("Priorities")).getByText("S0, S1")).toBeInTheDocument();
     expect(within(row("Priorities")).queryByText(/^Saved:/)).not.toBeInTheDocument();
@@ -193,7 +188,7 @@ describe("CaseAlertLadderSettings", () => {
     expect(within(row("Needs both to stop")).getByText("saved here")).toBeInTheDocument();
     // Saved, but the alert service hasn't reported a value for it.
     expect(within(row("Head of CRE")).getByText(/^Saved:/)).toHaveTextContent(
-      "Saved: Nimal Perera <nimal@example.test> · used after the alert service restarts",
+      "Saved: Nimal Perera <nimal@example.test> · not in use yet",
     );
     expect(within(row("Head of CS")).getByText(/not named/)).toBeInTheDocument();
 
@@ -208,7 +203,7 @@ describe("CaseAlertLadderSettings", () => {
     render(<CaseAlertSettings chain="CRE" />);
     expect(screen.getByText(/hasn't reported what it uses yet/)).toBeInTheDocument();
     expect(within(row("ABT teams")).getByText("not reported yet")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Save them here" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Copy them here" })).not.toBeInTheDocument();
   });
 
   it("shows nothing to somebody who may not change CRE's settings", () => {
@@ -220,10 +215,12 @@ describe("CaseAlertLadderSettings", () => {
 
   it("offers the setup step: the file's values not saved yet, in one request, after asking", async () => {
     render(<CaseAlertSettings chain="CRE" />);
-    expect(screen.getByText("3 settings still come from the alert service's file.")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Save them here" }));
-    expect(screen.getByText("Save 3 settings here?")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Save 3 settings" }));
+    expect(
+      screen.getByText("3 CRE settings still come from the alert service's file. Copy them here to change them on this page."),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Copy them here" }));
+    expect(screen.getByText("Copy 3 settings here?")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Copy 3 settings" }));
     expect(screen.getByText(/^Added to this tab's changes:/)).toHaveTextContent(
       "Added to this tab's changes: 3 CRE settings from the file. Submit to save them.",
     );
@@ -249,7 +246,7 @@ describe("CaseAlertLadderSettings", () => {
     });
     render(<CaseAlertSettings chain="CRE" />);
     expect(screen.queryByText(/still come/)).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Save them here" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Copy them here" })).not.toBeInTheDocument();
   });
 
   it("edits a list in a dialog, then gives focus back to Edit", async () => {
@@ -370,7 +367,7 @@ describe("CaseAlertLadderSettings", () => {
       // Saved and in use alike: one value, no "Saved:" line.
       expect(within(row("Time between steps")).getByText("5m")).toBeInTheDocument();
       expect(within(row("Time between steps")).queryByText(/^Saved:/)).not.toBeInTheDocument();
-      expect(screen.getByRole("region", { name: "Chat messages" })).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Chat messages" })).toBeInTheDocument();
       expect(screen.queryByText("Head of CRE")).not.toBeInTheDocument();
       unmount();
     }
@@ -380,7 +377,7 @@ describe("CaseAlertLadderSettings", () => {
       canManage: { view: true, roomLadders: ["SME"], routeLadders: [] },
     });
     render(<CaseAlertSettings chain="SME" />);
-    expect(screen.getByText(/SME ladder settings/)).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "SME ladder" })).toBeInTheDocument();
     for (const label of ["Time between steps", "Special Ops teams", "People on leave", "Say when nobody answered"]) {
       expect(row(label)).toBeInTheDocument();
     }
@@ -391,7 +388,7 @@ describe("CaseAlertLadderSettings", () => {
 
   it("shows the CRE settings only the file can set, read-only", () => {
     render(<CaseAlertSettings chain="CRE" />);
-    const group = screen.getByRole("region", { name: /: set in the alert service's file$/ });
+    const group = screen.getByRole("group", { name: /: set in the alert service's file$/ });
     expect(within(group).getByText(/They change only with a reviewed change to the file/)).toBeInTheDocument();
     const value = (label: string) => fileValue(group, label);
     expect(value("Alerts on")).toBe("Yes");
@@ -408,7 +405,7 @@ describe("CaseAlertLadderSettings", () => {
   });
   it("shows the SRE settings only the file can set, without the heads", () => {
     render(<CaseAlertSettings chain="SRE_IAAS" />);
-    const group = screen.getByRole("region", { name: /: set in the alert service's file$/ });
+    const group = screen.getByRole("group", { name: /: set in the alert service's file$/ });
     const value = (label: string) => fileValue(group, label);
     expect(value("Alerts on")).toBe("No");
     expect(value("Channel")).toBe("Log only (no calls or chat)");
@@ -421,6 +418,40 @@ describe("CaseAlertLadderSettings", () => {
     expect(within(group).queryByRole("button")).not.toBeInTheDocument();
   });
 
+  it("edits the switches on the tab once the alert service reports them there, and says who gets which channel", () => {
+    window.localStorage.clear();
+    const base = make();
+    settings.data = make({
+      running: {
+        ...base.running!,
+        ladders: {
+          CRE: {
+            ...base.running!.ladders.CRE,
+            enabled: { value: true, source: "file" },
+            channel: { value: "both", source: "saved" },
+          },
+        },
+        channels: {
+          CRE: { enabled: true, channel: "both", teams: [] },
+        },
+      },
+    });
+    render(<CaseAlertSettings chain="CRE" />);
+    // Advanced starts closed.
+    expect(screen.queryByRole("group", { name: /: set in the alert service's file$/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText(/^Advanced · /));
+    // The file block no longer lists what the tab edits.
+    const file = screen.getByRole("group", { name: /: set in the alert service's file$/ });
+    expect(within(file).queryByText("Alerts on")).not.toBeInTheDocument();
+    expect(within(file).queryByText("Channel")).not.toBeInTheDocument();
+    expect(fileValue(file, "Highest step")).toBe("L3");
+    // Who gets which channel.
+    const channels = screen.getByRole("group", { name: "CRE: who gets which channel" });
+    expect(channels).toHaveTextContent("The CRE ladder is on: Calls and chat.");
+    // The switches section says the same in its summary.
+    expect(screen.getByText(/^On\/off and channel · CRE on, calls and chat/)).toBeInTheDocument();
+  });
+
   it("says the file-only settings are not reported yet", () => {
     const notYet = /Not reported yet: the alert service reports these when it runs in shadow or db mode\./;
     settings.data = make({ running: undefined });
@@ -429,7 +460,7 @@ describe("CaseAlertLadderSettings", () => {
     unmount();
     settings.data = make({ running: { reportedAt: AT, mode: "shadow", ladders: {} } });
     render(<CaseAlertSettings chain="CRE" />);
-    const group = screen.getByRole("region", { name: /: set in the alert service's file$/ });
+    const group = screen.getByRole("group", { name: /: set in the alert service's file$/ });
     expect(within(group).getByText(notYet)).toBeInTheDocument();
     expect(within(group).queryByRole("table")).not.toBeInTheDocument();
   });
@@ -451,39 +482,40 @@ describe("CaseAlertLadderSettings", () => {
     expect(document.body.textContent).not.toContain("token=");
   });
 
-  it("starts with everything but Team chat routing closed, each summary saying what's inside", () => {
+  it("starts with On/off and channel open and the rest closed, each summary saying what's inside", () => {
     window.localStorage.clear();
     render(<CaseAlertSettings chain="CRE" />);
-    // Team chat routing is not a section: it is always shown.
-    expect(screen.getByRole("heading", { name: "Team chat routing" })).toBeInTheDocument();
     const summaries = [...document.querySelectorAll("summary")].map((x) => x.textContent);
     expect(summaries).toEqual([
-      "▸Send a case's alerts to another CRE team · none",
-      "▸CRE ladder settings · 2 saved here",
-      "▸CRE: set in the alert service's file · read-only",
+      "▾On/off and channel · CRE on, calls and chat",
+      "▸Where alerts go",
+      "▸Who gets alerts · 1 saved here",
+      "▸Advanced · timing, escalation, heads, chat messages and the file's own settings · 1 saved here",
     ]);
-    for (const d of document.querySelectorAll("details")) expect(d).not.toHaveAttribute("open");
-    // Closed sections draw nothing inside.
+    // The switches are open: the rows are drawn.
+    expect(row("Alerts on")).toBeInTheDocument();
+    // Closed sections draw nothing inside, the copy-from-the-file step included.
     expect(screen.queryByText("ABT teams")).not.toBeInTheDocument();
-    // The setup step stays at the top, outside them.
-    const setup = screen.getByRole("button", { name: "Save them here" });
-    expect(setup.closest("details")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Copy them here" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Chat space for each team" })).not.toBeInTheDocument();
+    // Nothing says "all from the file": a count shows only once something is saved here.
+    expect(document.body.textContent).not.toContain("all from the file");
   });
 
-  it("says each ladder group's count once the ladder section is opened, and they start closed too", () => {
+  it("puts the rest of the file under Advanced, a ladder's groups one after another", () => {
     window.localStorage.clear();
     render(<CaseAlertSettings chain="CRE" />);
-    fireEvent.click(screen.getByText("CRE ladder settings · 2 saved here"));
-    const groups = within(screen.getByRole("region", { name: "CRE ladder settings" }))
-      .getAllByRole("region")
-      .map((r) => r.querySelector("summary")?.textContent);
-    expect(groups).toEqual([
-      "▸Who gets alerts · 1 saved here",
-      "▸When a ladder starts · all from the file",
-      "▸How it climbs · all from the file",
-      "▸Heads · 1 saved here",
+    fireEvent.click(screen.getByText(/^Advanced · /));
+    const advanced = screen.getByRole("region", { name: "Advanced" });
+    expect(within(advanced).getByRole("heading", { level: 4, name: "CRE ladder" })).toBeInTheDocument();
+    expect(within(advanced).getAllByRole("heading", { level: 5 }).map((h) => h.textContent)).toEqual([
+      "When a ladder starts",
+      "How it climbs",
+      "Heads",
+      "Set in the alert service's file (read-only)",
     ]);
-    expect(screen.queryByText("ABT teams")).not.toBeInTheDocument();
+    // The copy-from-the-file step sits with its ladder, above the groups.
+    expect(within(advanced).getByRole("button", { name: "Copy them here" })).toBeInTheDocument();
   });
 
   it("counts the redirects in their summary", () => {
@@ -495,29 +527,32 @@ describe("CaseAlertLadderSettings", () => {
       ],
     });
     render(<CaseAlertSettings chain="CRE" />);
-    expect(screen.getByText("Send a case's alerts to another CRE team · 2 redirects")).toBeInTheDocument();
+    expect(screen.getByText("Where alerts go · 2 redirects")).toBeInTheDocument();
   });
 
   it("opens a section from its summary and remembers it", () => {
     window.localStorage.clear();
     const { unmount } = render(<CaseAlertSettings chain="CRE" />);
-    const summary = screen.getByText("CRE ladder settings · 2 saved here").closest("summary") as HTMLElement;
+    const summary = screen.getByText("Who gets alerts · 1 saved here").closest("summary") as HTMLElement;
     summary.focus();
     expect(summary).toHaveFocus();
     // Enter or Space on a <summary> is a click.
     fireEvent.click(summary);
     expect(summary.closest("details")).toHaveAttribute("open");
-    expect(summary).toHaveTextContent("▾CRE ladder settings");
-    fireEvent.click(screen.getByText("Who gets alerts · 1 saved here"));
+    expect(summary).toHaveTextContent("▾Who gets alerts");
     expect(screen.getByText("ABT teams")).toBeInTheDocument();
+    // The switches start open; closing them is remembered too.
+    fireEvent.click(screen.getByText(/^On\/off and channel/));
+    expect(screen.queryByText("Alerts on")).not.toBeInTheDocument();
     unmount();
 
     render(<CaseAlertSettings chain="CRE" />);
     expect(screen.getByText("ABT teams")).toBeInTheDocument();
-    // Closing is remembered as well.
-    fireEvent.click(screen.getByText("CRE ladder settings · 2 saved here"));
+    expect(screen.queryByText("Alerts on")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText("Who gets alerts · 1 saved here"));
     expect(screen.queryByText("ABT teams")).not.toBeInTheDocument();
-    expect(JSON.parse(window.localStorage.getItem(OPEN_KEY) ?? "[]")).toEqual(["CRE.ladder.Who gets alerts"]);
+    expect(JSON.parse(window.localStorage.getItem(OPEN_KEY) ?? "[]")).toEqual([]);
+    expect(JSON.parse(window.localStorage.getItem("csm-ts.alert-settings.closed") ?? "[]")).toEqual(["CRE.switches"]);
   });
 
   it("still opens and closes when the browser's storage throws", () => {
@@ -531,7 +566,8 @@ describe("CaseAlertLadderSettings", () => {
     try {
       render(<CaseAlertSettings chain="CRE" />);
       expect(screen.queryByText("ABT teams")).not.toBeInTheDocument();
-      fireEvent.click(screen.getByText("CRE ladder settings · 2 saved here"));
+      // The switches still start open.
+      expect(row("Alerts on")).toBeInTheDocument();
       fireEvent.click(screen.getByText("Who gets alerts · 1 saved here"));
       expect(screen.getByText("ABT teams")).toBeInTheDocument();
     } finally {

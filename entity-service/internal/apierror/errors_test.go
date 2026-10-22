@@ -18,6 +18,7 @@ package apierror
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -78,6 +79,7 @@ func TestCodes_AreStableLowerSnakeCase(t *testing.T) {
 		"CodeChangeRequestNoPlannedWindow":      "change_request_no_planned_window",
 		"CodeChangeRequestProposerNotRecorded":  "change_request_proposer_not_recorded",
 		"CodeIncidentAssignmentGroupNotAllowed": "incident_assignment_group_not_allowed",
+		"CodeChangeRequestApprovedReadOnly":     "change_request_approved_read_only",
 	}
 	got := map[string]string{
 		"CodeChangeRequestOnHold":               CodeChangeRequestOnHold,
@@ -90,6 +92,7 @@ func TestCodes_AreStableLowerSnakeCase(t *testing.T) {
 		"CodeChangeRequestNoPlannedWindow":      CodeChangeRequestNoPlannedWindow,
 		"CodeChangeRequestProposerNotRecorded":  CodeChangeRequestProposerNotRecorded,
 		"CodeIncidentAssignmentGroupNotAllowed": CodeIncidentAssignmentGroupNotAllowed,
+		"CodeChangeRequestApprovedReadOnly":     CodeChangeRequestApprovedReadOnly,
 	}
 	snake := regexp.MustCompile(`^[a-z][a-z0-9]*(_[a-z0-9]+)*$`)
 	seen := map[string]string{}
@@ -104,5 +107,28 @@ func TestCodes_AreStableLowerSnakeCase(t *testing.T) {
 			t.Errorf("%s and %s share the code %q", name, other, code)
 		}
 		seen[code] = name
+	}
+}
+
+func TestPrefixed_KeepsTheRefusalsTypeAndCode(t *testing.T) {
+	var v *ValidationError
+	if err := Prefixed("assignments[1]", &ValidationError{Msg: "bad tier", Code: "c"}); !errors.As(err, &v) || v.Msg != "assignments[1]: bad tier" || v.Code != "c" {
+		t.Errorf("validation = %v", err)
+	}
+	var c *ConflictError
+	if err := Prefixed("absences[0]", &ConflictError{Msg: "held", Code: "k"}); !errors.As(err, &c) || c.Msg != "absences[0]: held" || c.Code != "k" {
+		t.Errorf("conflict = %v", err)
+	}
+	var f *ForbiddenError
+	if err := Prefixed("x", &ForbiddenError{Msg: "no"}); !errors.As(err, &f) || f.Msg != "x: no" {
+		t.Errorf("forbidden = %v", err)
+	}
+	var n *NotFoundError
+	if err := Prefixed("x", &NotFoundError{Msg: "gone"}); !errors.As(err, &n) || n.Msg != "x: gone" {
+		t.Errorf("not found = %v", err)
+	}
+	plain := errors.New("boom")
+	if err := Prefixed("x", plain); !errors.Is(err, plain) || err.Error() != "x: boom" {
+		t.Errorf("plain = %v", err)
 	}
 }

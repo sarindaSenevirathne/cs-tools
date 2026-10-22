@@ -288,6 +288,23 @@ const (
 	// what keeps that scoped to authorship -- granting this one too would
 	// let them act on EVERY comment, erasing that distinction.
 	PermUpdateDeleteAnyComment
+	// PermManageOnboarding is setting a project's onboarding status and
+	// onboarding owner -- the onboardingStatus and onboardingOwner fields of
+	// PATCH /projects/{id}. Held ONLY by the onboarding_lead role and admin --
+	// NOT the CS engineer, same narrowing as PermApproveTimeCard. It is checked
+	// in-handler (ProjectHandler.UpdateProject), since a route permission cannot
+	// see which fields the body targets, and it does not grant any read access:
+	// a holder needs a viewing role separately to see the project at all.
+	PermManageOnboarding
+	// PermUpdateProject is the route-level floor for PATCH /projects/{id} --
+	// CsEngineer ∪ Admin ∪ OnboardingLead, the same "specialised role, or a
+	// role that already dominates it" shape as PermCreateWorkNote, so an
+	// onboarding_lead-only caller can reach the handler at all. It decides who
+	// may REACH the handler, nothing more: ProjectHandler.UpdateProject then
+	// requires PermManageOnboarding for the onboarding fields and PermWrite for
+	// every other field, so an onboarding_lead-only caller can still never edit
+	// anything but the two onboarding fields.
+	PermUpdateProject
 )
 
 // AccessConfig names, per portal role, the role names on the token that grant
@@ -339,6 +356,12 @@ type AccessConfig struct {
 	// hold this permission regardless (same "unconfigured is a normal
 	// state" reasoning as WorknoteCreator's own doc comment).
 	CommentUpdater []string
+	// OnboardingLead grants PermManageOnboarding (see that permission's own
+	// doc comment) -- setting a project's onboarding status and owner -- and
+	// reaching PATCH /projects/{id} at all, but nothing else: no read access
+	// and no other write. Like comment_updater, an unset variable is not a
+	// lockout: admin already holds PermManageOnboarding regardless.
+	OnboardingLead []string
 	// SecurityTeam grants PermView, PermViewOperations,
 	// PermViewSecurityCenter and PermViewSecurityReportCases -- the
 	// dedicated role for security-team staff who need to see the Operations
@@ -433,7 +456,10 @@ type portalRole struct {
 // PermViewSecurityCenter and PermViewSecurityReportCases and nothing else -- not
 // PermWrite, not PermEscalate, not any other state-changing permission -- so both
 // areas it can see render read-only for a holder with no other role. See
-// AccessConfig.SecurityTeam's own doc comment.
+// AccessConfig.SecurityTeam's own doc comment. onboarding_lead implies only
+// PermManageOnboarding and the PermUpdateProject route floor -- no View, no
+// PermWrite -- and admin alone also holds PermManageOnboarding; cs_engineer
+// deliberately does not.
 func NewAccessGuard(cfg AccessConfig) *AccessGuard {
 	build := func(lists ...[]string) map[string]struct{} {
 		set := make(map[string]struct{})
@@ -458,6 +484,7 @@ func NewAccessGuard(cfg AccessConfig) *AccessGuard {
 			{key: "worknote_creator", names: build(cfg.WorknoteCreator)},
 			{key: "announcement_creator", names: build(cfg.AnnouncementCreator)},
 			{key: "comment_updater", names: build(cfg.CommentUpdater)},
+			{key: "onboarding_lead", names: build(cfg.OnboardingLead)},
 			{key: "security_team", names: build(cfg.SecurityTeam)},
 		},
 		allowed: map[Permission]map[string]struct{}{
@@ -519,6 +546,13 @@ func NewAccessGuard(cfg AccessConfig) *AccessGuard {
 			// it to them would erase entity-service's authorship scoping
 			// rather than just widen who can reach the handler.
 			PermUpdateDeleteAnyComment: build(cfg.CommentUpdater, cfg.Admin),
+			// onboarding_lead and admin only -- cs_engineer deliberately does
+			// NOT hold it. See PermManageOnboarding's own doc comment.
+			PermManageOnboarding: build(cfg.OnboardingLead, cfg.Admin),
+			// The route-level floor for PATCH /projects/{id} -- see
+			// PermUpdateProject's own doc comment for the in-handler checks
+			// that narrow what each holder may actually set.
+			PermUpdateProject: build(cfg.CsEngineer, cfg.Admin, cfg.OnboardingLead),
 		},
 	}
 }

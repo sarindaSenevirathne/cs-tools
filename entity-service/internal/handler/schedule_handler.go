@@ -241,6 +241,33 @@ func (h *ScheduleHandler) ApplyScheduleAbsence(w http.ResponseWriter, r *http.Re
 	writeScheduleJSON(w, http.StatusOK, res)
 }
 
+// ImportRota handles POST /team-schedule/rotas/{code}/import?dryRun=true|false.
+func (h *ScheduleHandler) ImportRota(w http.ResponseWriter, r *http.Request) {
+	dryRun := false
+	if raw := r.URL.Query().Get("dryRun"); raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			apierror.WriteJSON(w, http.StatusBadRequest, "dryRun must be true or false")
+			return
+		}
+		dryRun = v
+	}
+	var req domain.ImportRotaRequest
+	if !decodeRequest(w, r, &req) {
+		return
+	}
+	res, err := h.svc.ImportRota(r.Context(), r.PathValue("code"), req, dryRun)
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	status := http.StatusCreated
+	if dryRun {
+		status = http.StatusOK
+	}
+	writeScheduleJSON(w, status, res)
+}
+
 // GetScheduleEditMarkers handles GET /team-schedule/edit-markers.
 func (h *ScheduleHandler) GetScheduleEditMarkers(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()

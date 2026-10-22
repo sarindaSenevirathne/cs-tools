@@ -33,7 +33,7 @@ import {
   isTierlessEscalation,
   shortDayName,
   standingWindowKey,
-  toIsoDate, rotaZoneName } from "../utils/rota";
+  toIsoDate, rotaZoneName, zoneAbbreviation } from "../utils/rota";
 import { accentOf } from "../utils/rotaHues";
 import { useTeamColour, useTeamName } from "../utils/teamColourContext";
 
@@ -160,6 +160,14 @@ function groupsUsefully(rows: ScheduleAssignment[]): boolean {
 /** Minutes past the authoring midnight as HH:MM, wrapping past 24h. */
 function fmtMinute(m: number): string {
   return `${String(Math.floor(m / 60) % 24).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+}
+
+/** A window's hours as authored, naming the clock when it is not the Colombo
+ *  office's -- Americas regular hours are 08:00-18:00 Pacific, not IST. */
+function fmtWindow(shift: ScheduleShift): string {
+  const hours = `${fmtMinute(shift.startMinute)} – ${fmtMinute(shift.endMinute)}`;
+  const zone = shift.authoringTimeZone;
+  return zone && zone !== "Asia/Colombo" && zone !== "Asia/Kolkata" ? `${hours} ${zoneAbbreviation(zone)}` : hours;
 }
 
 /**
@@ -447,7 +455,7 @@ export default function WeekTable({
               >
                 <th className="lab">
                   <span className={`chip sm ${token}`}>
-                    {shift ? `${fmtMinute(shift.startMinute)} – ${fmtMinute(shift.endMinute)}` : code}
+                    {shift ? fmtWindow(shift) : code}
                   </span>
                   {liveIso ? <span className="nowpill">Now</span> : null}
                   <small>{label ?? shift?.label ?? code}</small>

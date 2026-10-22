@@ -1129,23 +1129,21 @@ export const SECURITY_CENTER = {
   },
   /** The Component Analysis tab (ProductVulnerabilitiesTable).
    *
-   * ⚠️ Its search, filters and pagination are all CLIENT-side: the table fetches
-   * the whole dataset once via POST /product-vulnerabilities/search and narrows
-   * it in a `useMemo`. So unlike the case and conversation lists, there is no
-   * per-search request to wait on — assertions have to be made against rendered
-   * rows, and a test that waits for a response after typing will hang.
+   * Its search, filters and pagination are all SERVER-side: every search text,
+   * filter or page change issues its own POST /products/vulnerabilities/search
+   * for one page (at most 50 rows) and the pager's total is the response's
+   * `totalRecords`. Wait for that response after each change; a count read
+   * straight after typing is a count of the previous result.
    *
    * The tab is permission-gated on `hasComponentAnalysis`, and is selected via
    * a `?tab=` query param rather than local state. */
   componentAnalysis: {
     tabId: "components",
     title: "Component Analysis",
-    /** Matches cveId, componentName OR vulnerabilityId, case-insensitively. */
+    /** The server matches cveId, componentName OR vulnerabilityId. */
     searchPlaceholder: "Search CVE or component",
-    /** PRODUCT_VULNERABILITIES_SEARCH_DEBOUNCE_MS. A count read sooner than
-     * this after typing is a count of the PREVIOUS state — which looks exactly
-     * like a search that matched everything. */
-    searchDebounceMs: 350,
+    /** Path of the search request every search, filter and page change issues. */
+    searchPathPattern: /\/products\/vulnerabilities\/search$/,
     emptyMessage: "No vulnerabilities found.",
     filtersButton: "Filters",
     clearFiltersButton: "Clear Filters",

@@ -221,10 +221,6 @@ Receives monitoring webhooks from ten sources (AWS, Azure, Datadog, Elasticsearc
 
 See the [Alert Ingestion Service README](./integrations/sre-alert-ingestion-service/README.md) for full setup and usage documentation.
 
-### CSM Flow Service notes (`integrations/csm-flow-service/`)
-
-This directory holds ServiceNow discovery notes only (`docs/servicenow-discovery/`) for the change-request flow service referenced elsewhere in this platform (e.g. by the CSM Notification Service) — its deployable service code does not live in this repository.
-
 ## Operations (`operations/`)
 
 Shared operational components that run on their own schedule or expose their own public endpoints, rather than belonging to one specific app.

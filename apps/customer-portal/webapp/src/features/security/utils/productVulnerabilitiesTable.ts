@@ -16,7 +16,66 @@
 
 import {
   PRODUCT_VULNERABILITIES_CLEAR_FILTERS_LABEL,
+  PRODUCT_VULNERABILITIES_MAX_PAGE_SIZE,
 } from "@features/security/constants/securityConstants";
+import type {
+  ProductVulnerabilitiesSearchFilters,
+  ProductVulnerabilitiesSearchRequest,
+} from "@features/security/types/security";
+
+/**
+ * Converts the severity select value to the numeric id the search API expects.
+ *
+ * @param value - Select value (a string id from the options, or empty).
+ * @returns {number | undefined} The id, or undefined when empty or not numeric.
+ */
+export function toSeverityFilterId(
+  value: string | number | undefined,
+): number | undefined {
+  if (value === undefined || value === "") return undefined;
+  const id = Number(value);
+  return Number.isFinite(id) ? id : undefined;
+}
+
+/**
+ * Builds the server-side search request for one page of the table. Empty
+ * filters are omitted and the page size never exceeds the endpoint maximum.
+ *
+ * @param searchText - Debounced search text.
+ * @param filters - Raw filter state (severityId, productName, productVersion).
+ * @param page - Zero-based page index.
+ * @param rowsPerPage - Requested page size.
+ * @returns {ProductVulnerabilitiesSearchRequest} The request body.
+ */
+export function buildProductVulnerabilitiesSearchRequest(
+  searchText: string,
+  filters: Record<string, string | number>,
+  page: number,
+  rowsPerPage: number,
+): ProductVulnerabilitiesSearchRequest {
+  const limit = Math.min(
+    Math.max(rowsPerPage, 1),
+    PRODUCT_VULNERABILITIES_MAX_PAGE_SIZE,
+  );
+  const searchQuery = searchText.trim();
+  const severityId = toSeverityFilterId(filters.severityId);
+  const productName = filters.productName ? String(filters.productName) : "";
+  const productVersion = filters.productVersion
+    ? String(filters.productVersion)
+    : "";
+
+  const requestFilters: ProductVulnerabilitiesSearchFilters = {
+    ...(searchQuery ? { searchQuery } : {}),
+    ...(severityId !== undefined ? { severityId } : {}),
+    ...(productName ? { productName } : {}),
+    ...(productVersion ? { productVersion } : {}),
+  };
+
+  return {
+    filters: requestFilters,
+    pagination: { offset: page * limit, limit },
+  };
+}
 
 /**
  * Counts search, severity, product name, and product version filters for the product vulnerabilities table header.

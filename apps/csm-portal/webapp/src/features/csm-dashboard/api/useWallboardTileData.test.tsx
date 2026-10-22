@@ -124,6 +124,43 @@ describe("useWallboardTileData", () => {
     expect(result.current.linkHref).toBeUndefined();
   });
 
+  it("shows the distinct group count for a distinctBy tile, and the error state when groups overflow maxGroups", async () => {
+    postMock.mockResolvedValueOnce({
+      groups: [
+        { key: "a1", label: "Account One", count: 2 },
+        { key: "a2", label: "Account Two", count: 5 },
+      ],
+      othersCount: 0,
+      totalRecords: 7,
+    });
+    const input = {
+      ...baseInput,
+      widgetId: "cre_escalations",
+      resourceType: "case" as const,
+      distinctBy: { field: "account", maxGroups: 1000 },
+    };
+    const ok = renderHook(() => useWallboardTileData(input), { wrapper });
+    await waitFor(() => expect(ok.result.current.state).toBe("value"));
+    expect(ok.result.current.total).toBe(2);
+    expect(postMock).toHaveBeenCalledWith(
+      "/cases/aggregate",
+      { filters: {}, groupBy: "account", maxGroups: 1000 },
+      { signal: expect.any(AbortSignal) },
+    );
+
+    postMock.mockResolvedValueOnce({
+      groups: [{ key: "a1", label: "Account One", count: 2 }],
+      othersCount: 3,
+      totalRecords: 9,
+    });
+    const over = renderHook(
+      () => useWallboardTileData({ ...input, widgetId: "cre_escalations_over" }),
+      { wrapper },
+    );
+    await waitFor(() => expect(over.result.current.state).toBe("error"));
+    expect(over.result.current.linkHref).toBeUndefined();
+  });
+
   it("stays 'loading' with no link while the signed-in user's id is unresolved and filters need it", () => {
     mockCurrentUserId = undefined;
     postMock.mockReturnValue(new Promise(() => {}));

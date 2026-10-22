@@ -1228,6 +1228,27 @@ func (c *CustomerEntityClient) DeleteRotaMarker(ctx context.Context, teamKey, us
 	return c.do(ctx, http.MethodDelete, "/team-schedule/rota-access/markers/"+url.PathEscape(teamKey)+"/"+url.PathEscape(userID), nil)
 }
 
+// GetRotaReminderSettings calls GET /team-schedule/reminder-settings/{family}:
+// 404 when nothing was saved for the family.
+func (c *CustomerEntityClient) GetRotaReminderSettings(ctx context.Context, family string) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, "/team-schedule/reminder-settings/"+url.PathEscape(family), nil)
+}
+
+// PutRotaReminderSettings calls PUT /team-schedule/reminder-settings/{family}.
+func (c *CustomerEntityClient) PutRotaReminderSettings(ctx context.Context, family string, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPut, "/team-schedule/reminder-settings/"+url.PathEscape(family), body)
+}
+
+// ListRotaReminderRequests calls GET /team-schedule/reminder-requests/{family}.
+func (c *CustomerEntityClient) ListRotaReminderRequests(ctx context.Context, family string) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, "/team-schedule/reminder-requests/"+url.PathEscape(family), nil)
+}
+
+// CreateRotaReminderRequest calls POST /team-schedule/reminder-requests/{family}.
+func (c *CustomerEntityClient) CreateRotaReminderRequest(ctx context.Context, family string, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/team-schedule/reminder-requests/"+url.PathEscape(family), body)
+}
+
 // GetCaseAlertSettings calls GET /team-schedule/case-alerts/settings: the
 // chat rooms, group routes and ladder values the paging ladders use, what the
 // alert service last reported running, and what the caller may change.

@@ -723,6 +723,21 @@ func suspend(ctx context.Context, updater projectUpdater, proj project) error {
 		return fmt.Errorf("marshal update request: %w", err)
 	}
 
-	_, err = updater.UpdateProject(ctx, proj.ID, body)
-	return err
+	if _, err := updater.UpdateProject(ctx, proj.ID, body); err != nil {
+		return err
+	}
+	return suspendInSalesforce(ctx, updater, proj)
+}
+
+// suspendInSalesforce sets the project's Salesforce State__c to Suspended,
+// after suspend or suspendInvoice wrote the CSM suspension — ACP writes both
+// itself; nothing syncs CSM to Salesforce. A failure leaves CSM suspended and
+// fails the project, so the run exits non-zero: the next run won't retry it
+// (the project is no longer Open in CSM), so State__c must then be set by
+// hand. ACP never reopens, so it never writes Open.
+func suspendInSalesforce(ctx context.Context, updater projectUpdater, proj project) error {
+	if err := updater.SuspendInSalesforce(ctx, stringValue(proj.SfID)); err != nil {
+		return fmt.Errorf("CSM suspended, but setting Salesforce State__c to Suspended failed: %w", err)
+	}
+	return nil
 }

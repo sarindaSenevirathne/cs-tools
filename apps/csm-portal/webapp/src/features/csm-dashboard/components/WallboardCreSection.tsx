@@ -100,6 +100,7 @@ export default function WallboardCreSection({
             displayName={widget.displayName}
             resourceType={widget.resourceType}
             filters={widget.query ?? {}}
+            distinctBy={widget.distinctBy}
             selectedTeamCreGroupId={selectedTeamCreGroupId}
             selectedTeamSreGroupId={selectedTeamSreGroupId}
             selectedTeamLabel={selectedTeamLabel}

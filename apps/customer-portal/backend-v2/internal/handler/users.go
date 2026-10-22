@@ -59,13 +59,20 @@ type UserHandler struct {
 	// that day: off means GetMe behaves exactly as it always has, because
 	// the block guarded by it is never entered.
 	firstAccessEnabled bool
+	// internalWriteGroups is AUTH_INTERNAL_WRITE_GROUPS -- the JWT "groups"
+	// claim values that let an INTERNAL-type caller see write-path UI. See
+	// GetMe's own isReadOnly computation and
+	// middleware.CachedRoleResolver.IsInternalWriteBlocked, which enforces
+	// the same rule server-side on every write route.
+	internalWriteGroups []string
 }
 
 // NewUserHandler creates a UserHandler backed by the given entity and SCIM
 // clients. firstAccessEnabled turns on the post-sign-in onboarding call; see
-// UserHandler.firstAccessEnabled.
-func NewUserHandler(entity entityUserClient, scim scimUserClient, firstAccessEnabled bool) *UserHandler {
-	return &UserHandler{entity: entity, scim: scim, firstAccessEnabled: firstAccessEnabled}
+// UserHandler.firstAccessEnabled. internalWriteGroups backs the isReadOnly
+// field GetMe reports; see UserHandler.internalWriteGroups.
+func NewUserHandler(entity entityUserClient, scim scimUserClient, firstAccessEnabled bool, internalWriteGroups []string) *UserHandler {
+	return &UserHandler{entity: entity, scim: scim, firstAccessEnabled: firstAccessEnabled, internalWriteGroups: internalWriteGroups}
 }
 
 // firstAccessTimeout bounds the background onboarding call. It runs after the
@@ -119,6 +126,7 @@ func (h *UserHandler) GetMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := dto.MapUserMe(result)
+	resp.IsReadOnly = h.isReadOnly(result.UserType, user.Groups)
 
 	// Phone number is sourced from SCIM, not entity-service. A SCIM lookup
 	// failure or miss is not fatal to the request — the profile is still
@@ -134,6 +142,28 @@ func (h *UserHandler) GetMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSONValue(w, http.StatusOK, resp)
+}
+
+// isReadOnly reports the GetMe response's isReadOnly field: true only when
+// userType is entity-service's INTERNAL classification and tokenGroups (the
+// caller's own JWT "groups" claim) holds none of h.internalWriteGroups.
+// Matches middleware.CachedRoleResolver.IsInternalWriteBlocked exactly --
+// this is the same rule computed a second time here only because GetMe
+// already has the entity-service response in hand and this endpoint isn't
+// itself gated by that middleware (any authenticated caller may read their
+// own profile).
+func (h *UserHandler) isReadOnly(userType string, tokenGroups []string) bool {
+	if len(h.internalWriteGroups) == 0 || userType != entity.UserTypeInternal {
+		return false
+	}
+	for _, want := range h.internalWriteGroups {
+		for _, got := range tokenGroups {
+			if got == want {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // completeFirstAccess runs the onboarding call described in GetMe. It never

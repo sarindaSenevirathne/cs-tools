@@ -17,7 +17,12 @@
 package repository
 
 import (
+	"context"
+	"errors"
 	"testing"
+
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 )
 
 // TestOnboardingOwnerRef covers the NULL-handling of the joined owner columns:
@@ -46,5 +51,22 @@ func TestOnboardingOwnerRef(t *testing.T) {
 	blankName := onboardingOwnerRef(strp(id), nil, strp("jane.doe@example.com"))
 	if blankName == nil || blankName.ID != id || blankName.Name != "" {
 		t.Errorf("blank-name owner = %+v, want owner with empty name", blankName)
+	}
+}
+
+// TestUpdateProject_RejectsInvalidOnboardingStatus pins that a bad status is a
+// ValidationError raised before any database access (the repo has no pool).
+func TestUpdateProject_RejectsInvalidOnboardingStatus(t *testing.T) {
+	bad := "Paused"
+	r := &projectRepo{}
+	_, err := r.UpdateProject(context.Background(), "00000000-0000-0000-0000-000000000001", domain.ProjectUpdateRequest{OnboardingStatus: &bad}, "jane.doe@example.com")
+	var ve *apierror.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want ValidationError", err)
+	}
+	for _, ok := range []string{"In-Progress", "IN_PROGRESS", "in progress", "on-hold", "OnHold"} {
+		if _, err := onboardingStatusEnumLabels("onboardingStatus", []string{ok}); err != nil {
+			t.Errorf("%q rejected: %v", ok, err)
+		}
 	}
 }

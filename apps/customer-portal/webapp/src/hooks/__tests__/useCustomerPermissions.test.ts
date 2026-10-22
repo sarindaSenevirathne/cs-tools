@@ -97,16 +97,34 @@ describe("useCustomerPermissions & Permission Matrix", () => {
       }
     });
 
-    it("Admin has full CRUD on every module", () => {
+    it("Admin has full CRUD on every module except projects:update", () => {
       const roles: CanonicalRole[] = ["admin"];
       for (const mod of ALL_MODULES) {
         for (const act of ALL_ACTIONS) {
-          expect(hasCustomerPermission(roles, mod, act)).toBe(true);
+          const expected = !(mod === "projects" && act === "update");
+          expect(hasCustomerPermission(roles, mod, act)).toBe(expected);
         }
       }
     });
 
-    it("Agent has CRU on Cases/Timecards/CRs, RU on Projects, CRUD on Deployments", () => {
+    it("projects:update is held by customer_admin only", () => {
+      const allRoles: CanonicalRole[] = [
+        "admin",
+        "agent",
+        "internal",
+        "customer_admin",
+        "customer_user",
+        "partner_admin",
+        "partner_user",
+      ];
+      for (const role of allRoles) {
+        expect(hasCustomerPermission([role], "projects", "update")).toBe(
+          role === "customer_admin",
+        );
+      }
+    });
+
+    it("Agent has CRU on Cases/Timecards/CRs, Read-only on Projects, CRUD on Deployments", () => {
       const roles: CanonicalRole[] = ["agent"];
 
       // Cases: CRU, no D
@@ -121,10 +139,10 @@ describe("useCustomerPermissions & Permission Matrix", () => {
       expect(hasCustomerPermission(roles, "time_cards", "update")).toBe(true);
       expect(hasCustomerPermission(roles, "time_cards", "delete")).toBe(false);
 
-      // Projects: RU, no C, no D
+      // Projects: read only (update is customer_admin only)
       expect(hasCustomerPermission(roles, "projects", "create")).toBe(false);
       expect(hasCustomerPermission(roles, "projects", "read")).toBe(true);
-      expect(hasCustomerPermission(roles, "projects", "update")).toBe(true);
+      expect(hasCustomerPermission(roles, "projects", "update")).toBe(false);
       expect(hasCustomerPermission(roles, "projects", "delete")).toBe(false);
 
       // Change Requests: CRU, no D
@@ -173,11 +191,8 @@ describe("useCustomerPermissions & Permission Matrix", () => {
         expect(hasCustomerPermission(roles, "time_cards", "update")).toBe(false);
         expect(hasCustomerPermission(roles, "time_cards", "delete")).toBe(false);
 
-        // Projects: Read Only, EXCEPT customer_admin also gets Update --
-        // PATCH /projects/{id} (the route this permission gates) only ever
-        // touches the project's own AI Assistant settings (hasAgent/
-        // hasKbReferences), not general project data, so a customer's own
-        // Admin is allowed to toggle those for their own project.
+        // Projects: Read Only, EXCEPT customer_admin also gets Update (the
+        // AI-assistant settings are changeable only by a customer's own admin).
         const isCustomerAdminRole = roles.includes("customer_admin");
         expect(hasCustomerPermission(roles, "projects", "read")).toBe(true);
         expect(hasCustomerPermission(roles, "projects", "create")).toBe(false);
@@ -240,5 +255,60 @@ describe("useCustomerPermissions & Permission Matrix", () => {
       expect(result.current.canManageContacts).toBe(false);
     });
 
+
+    // isReadOnly is the backend's flag for an INTERNAL-type user (entity-service's
+    // own user_type) who holds none of the deployment's configured write groups.
+    // It must only ever narrow a write action, and must never narrow anything
+    // for a genuine customer/partner -- see rbac.go's identical gate on the
+    // backend.
+    describe("isReadOnly", () => {
+      it("hides every write action but leaves read untouched", () => {
+        vi.mocked(useGetUserDetails).mockReturnValue({
+          data: {
+            id: "usr-1",
+            email: "am@wso2.com",
+            firstName: "Account",
+            lastName: "Manager",
+            timeZone: "UTC",
+            roles: ["internal"],
+            isReadOnly: true,
+          },
+          isLoading: false,
+          isError: false,
+        } as ReturnType<typeof useGetUserDetails>);
+
+        const { result } = renderHook(() => useCustomerPermissions());
+
+        expect(result.current.isReadOnly).toBe(true);
+        expect(result.current.canCreateCase).toBe(false);
+        expect(result.current.canUpdateCase).toBe(false);
+        expect(result.current.canDeleteCase).toBe(false);
+        expect(result.current.canManageContacts).toBe(false);
+        // Read is unaffected -- "internal" already holds Read on every module.
+        expect(result.current.can("cases", "read")).toBe(true);
+        expect(result.current.canAccessTimeCards).toBe(true);
+        expect(result.current.canAccessChangeRequests).toBe(true);
+      });
+
+      it("defaults to false (full access) when the backend omits the field -- the normal case for a genuine customer/partner, who entity-service never classifies INTERNAL", () => {
+        vi.mocked(useGetUserDetails).mockReturnValue({
+          data: {
+            id: "usr-3",
+            email: "agent@wso2.com",
+            firstName: "Agent",
+            lastName: "Smith",
+            timeZone: "UTC",
+            roles: ["agent"],
+          },
+          isLoading: false,
+          isError: false,
+        } as ReturnType<typeof useGetUserDetails>);
+
+        const { result } = renderHook(() => useCustomerPermissions());
+
+        expect(result.current.isReadOnly).toBe(false);
+        expect(result.current.canCreateCase).toBe(true);
+      });
+    });
   });
 });

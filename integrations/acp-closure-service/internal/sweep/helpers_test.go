@@ -105,6 +105,18 @@ type updateCall struct {
 type mockProjectUpdater struct {
 	updateProjectFn func(ctx context.Context, id string, body []byte) ([]byte, error)
 	calls           []updateCall
+	// sfSuspendFn, when set, answers SuspendInSalesforce; sfSuspendCalls
+	// records the Salesforce ids it was called with.
+	sfSuspendFn    func(ctx context.Context, sfID string) error
+	sfSuspendCalls []string
+}
+
+func (m *mockProjectUpdater) SuspendInSalesforce(ctx context.Context, sfID string) error {
+	m.sfSuspendCalls = append(m.sfSuspendCalls, sfID)
+	if m.sfSuspendFn != nil {
+		return m.sfSuspendFn(ctx, sfID)
+	}
+	return nil
 }
 
 func (m *mockProjectUpdater) UpdateProject(ctx context.Context, id string, body []byte) ([]byte, error) {

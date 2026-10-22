@@ -261,7 +261,9 @@ export function CallRequestsTable({
                 {cr.durationMin ? `${cr.durationMin} min` : "—"}
               </Typography>
 
-              {/* Preferred / scheduled times, plus meeting link when present. */}
+              {/* Preferred / scheduled times. A scheduled call always shows a
+                  meeting-link line: the join link when one exists, otherwise
+                  the same empty placeholder the customer portal card uses. */}
               <Box sx={{ minWidth: 0 }}>
                 <Typography variant="body2" sx={{ whiteSpace: "pre-line" }}>
                   {formatPreferredTimes(cr.preferredTimes)}
@@ -271,7 +273,7 @@ export function CallRequestsTable({
                     Scheduled: {formatPreferredTimes([cr.scheduleTime])}
                   </Typography>
                 )}
-                {cr.meetingLink && (
+                {cr.meetingLink ? (
                   <Typography
                     variant="caption"
                     component="a"
@@ -282,6 +284,16 @@ export function CallRequestsTable({
                   >
                     Join meeting
                   </Typography>
+                ) : (
+                  resolveCallRequestStateKey(cr.state) === "scheduled" && (
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      sx={{ display: "block" }}
+                    >
+                      Meeting link: --
+                    </Typography>
+                  )
                 )}
               </Box>
 

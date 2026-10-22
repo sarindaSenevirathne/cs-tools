@@ -96,6 +96,13 @@ type GoogleChatClient struct {
 	// HasAudienceSpace/sendCardToAudience.
 	mu                 sync.RWMutex
 	teamAudienceSpaces map[string]string
+	// routedIncidentSpaces are incident audiences (IncidentAudience, and
+	// IncidentFallbackAudience) taken from the Alert Settings mapping: an
+	// assignment group -> its SRE team's saved room. Set once the paging
+	// configuration is loaded (SetIncidentRouteSpaces), guarded by mu, and
+	// checked before staticAudienceSpaces, so the mapping wins over an
+	// INCIDENT_CHAT_SPACES entry for the same group.
+	routedIncidentSpaces map[string]string
 }
 
 // NewGoogleChatClient constructs a GoogleChatClient that routes alerts to the
@@ -139,7 +146,8 @@ func (c *GoogleChatClient) SetTeamAudienceSpaces(spaces map[string]string) {
 }
 
 // webhookURLFor resolves audience to its configured Chat webhook URL, if
-// any. staticAudienceSpaces (the standing, config-driven audiences) is
+// any. A routed incident audience (the Alert Settings mapping) wins first;
+// then staticAudienceSpaces (the standing, config-driven audiences) is
 // checked first and wins on a name collision — in practice there should
 // never be one, since a real team's own space now comes from
 // teamAudienceSpaces exclusively, but checking the static map first keeps a
@@ -147,6 +155,14 @@ func (c *GoogleChatClient) SetTeamAudienceSpaces(spaces map[string]string) {
 // listed in both.
 func (c *GoogleChatClient) webhookURLFor(audience string) (string, bool) {
 	audience = strings.TrimSpace(audience)
+	if strings.HasPrefix(audience, IncidentAudiencePrefix) {
+		c.mu.RLock()
+		url := c.routedIncidentSpaces[audience]
+		c.mu.RUnlock()
+		if url != "" {
+			return url, true
+		}
+	}
 	if url, ok := c.staticAudienceSpaces[audience]; ok && url != "" {
 		return url, true
 	}
@@ -168,6 +184,30 @@ func (c *GoogleChatClient) webhookURLFor(audience string) (string, bool) {
 func (c *GoogleChatClient) HasAudienceSpace(audience string) bool {
 	_, ok := c.webhookURLFor(audience)
 	return ok
+}
+
+// SetIncidentRouteSpaces replaces the incident audiences taken from the Alert
+// Settings mapping (incident audience -> webhook URL). Only keys under
+// IncidentAudiencePrefix are kept; nil or empty clears them.
+func (c *GoogleChatClient) SetIncidentRouteSpaces(spaces map[string]string) {
+	routed := make(map[string]string, len(spaces))
+	for audience, url := range spaces {
+		audience = strings.TrimSpace(audience)
+		if strings.HasPrefix(audience, IncidentAudiencePrefix) && strings.TrimSpace(url) != "" {
+			routed[audience] = url
+		}
+	}
+	c.mu.Lock()
+	c.routedIncidentSpaces = routed
+	c.mu.Unlock()
+}
+
+// AudienceWebhookURL is the webhook URL audience resolves to, if any, so the
+// paging configuration can point an incident audience at the room an SRE
+// team's audience-only chat section names. The URL is a credential and is
+// never logged.
+func (c *GoogleChatClient) AudienceWebhookURL(audience string) (string, bool) {
+	return c.webhookURLFor(audience)
 }
 
 // withThreadReplyOption adds the reply option a threaded webhook message

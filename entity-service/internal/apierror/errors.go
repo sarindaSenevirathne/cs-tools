@@ -20,6 +20,7 @@ package apierror
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -143,6 +144,21 @@ type DownstreamError struct {
 
 // Error implements the error interface.
 func (e *DownstreamError) Error() string { return e.Msg }
+
+// Prefixed puts prefix before a caller-facing refusal's message, keeping its type and code; any other error is wrapped.
+func Prefixed(prefix string, err error) error {
+	switch e := err.(type) {
+	case *ValidationError:
+		return &ValidationError{Msg: prefix + ": " + e.Msg, Code: e.Code}
+	case *NotFoundError:
+		return &NotFoundError{Msg: prefix + ": " + e.Msg}
+	case *ForbiddenError:
+		return &ForbiddenError{Msg: prefix + ": " + e.Msg, Code: e.Code}
+	case *ConflictError:
+		return &ConflictError{Msg: prefix + ": " + e.Msg, Code: e.Code}
+	}
+	return fmt.Errorf("%s: %w", prefix, err)
+}
 
 // WriteJSON writes an ErrorResponse JSON body with the given HTTP status code.
 func WriteJSON(w http.ResponseWriter, status int, msg string) {

@@ -161,8 +161,34 @@ func upperEnumFields(body []byte, listKey string, fields ...string) ([]byte, err
 	return doc.bytes(), nil
 }
 
-// upperListFields rewrites the named string fields on each object of the JSON
-// array raw; anything that is not an array, or an item that is not an object,
+// upperPath upper-cases the string at path inside obj, where each step after the
+// first names a nested object (e.g. {"deployment", "type"}). Only a JSON string
+// is rewritten: a null, a missing key or a nested value that is not an object is
+// left as it was (unmarshalling null into a string would succeed and turn the
+// null into "").
+func upperPath(obj orderedObject, path []string) {
+	for i, f := range obj {
+		if f.key != path[0] {
+			continue
+		}
+		if len(path) == 1 {
+			var str string
+			if len(f.val) > 0 && f.val[0] == '"' && json.Unmarshal(f.val, &str) == nil {
+				obj[i].val = marshalPlain(strings.ToUpper(str))
+			}
+			continue
+		}
+		nested, err := decodeOrdered(json.NewDecoder(bytes.NewReader(f.val)))
+		if err != nil {
+			continue
+		}
+		upperPath(nested, path[1:])
+		obj[i].val = nested.bytes()
+	}
+}
+
+// upperListFields rewrites the named string fields (a dotted name reaches into a
+// nested object) on each object of the JSON array raw; anything that is not an array, or an item that is not an object,
 // is returned as it was.
 func upperListFields(raw json.RawMessage, fields []string) json.RawMessage {
 	dec := json.NewDecoder(bytes.NewReader(raw))
@@ -182,15 +208,8 @@ func upperListFields(raw json.RawMessage, fields []string) json.RawMessage {
 			items = append(items, item)
 			continue
 		}
-		for i, f := range obj {
-			for _, name := range fields {
-				var str string
-				// only a JSON string is rewritten: unmarshalling null into a string
-				// would succeed and turn the null into "".
-				if f.key == name && len(f.val) > 0 && f.val[0] == '"' && json.Unmarshal(f.val, &str) == nil {
-					obj[i].val = marshalPlain(strings.ToUpper(str))
-				}
-			}
+		for _, name := range fields {
+			upperPath(obj, strings.Split(name, "."))
 		}
 		items = append(items, obj.bytes())
 	}
@@ -261,7 +280,7 @@ func (h *CatalogHandler) SearchDeployments(w http.ResponseWriter, r *http.Reques
 }
 
 // SearchDeployedProducts handles POST /deployed-products/search; the product
-// category is upper-cased.
+// category and the deployment's type are upper-cased.
 func (h *CatalogHandler) SearchDeployedProducts(w http.ResponseWriter, r *http.Request) {
 	body, ok := readSearchBody(w, r)
 	if !ok {
@@ -273,5 +292,5 @@ func (h *CatalogHandler) SearchDeployedProducts(w http.ResponseWriter, r *http.R
 		mapUpstreamError(w, err, "Failed to search deployed products.")
 		return
 	}
-	writeUpperedJSON(w, r, result, "deployedProducts", "category")
+	writeUpperedJSON(w, r, result, "deployedProducts", "category", "deployment.type")
 }

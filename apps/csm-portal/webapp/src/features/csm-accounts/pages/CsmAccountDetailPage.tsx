@@ -435,6 +435,9 @@ export default function CsmAccountDetailPage(): JSX.Element {
           <MetaCell label="Region">
             <Typography variant="body2">{a.region ?? "—"}</Typography>
           </MetaCell>
+          <MetaCell label="Country">
+            <Typography variant="body2">{a.country || "—"}</Typography>
+          </MetaCell>
           <MetaCell label="Salesforce ID">
             <Mono>{a.sfId || "—"}</Mono>
           </MetaCell>

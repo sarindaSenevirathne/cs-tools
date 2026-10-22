@@ -82,6 +82,8 @@ export interface SaveRoomInput {
 export interface SaveRouteInput {
   ladder: CaseAlertLadder;
   groupName: string;
+  /** An assignment group picked from routeOptions.assignmentGroups. */
+  groupId?: string;
   teamKey?: string;
   rotaCode?: string;
   enabled?: boolean;

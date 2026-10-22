@@ -68,6 +68,10 @@ import ProblemPreviewDrawer from "@features/csm-operations/components/ProblemPre
 import { taskStateColor, taskStateLabel } from "@features/csm-cases/utils/taskState";
 import { TaskDetailDialog } from "@features/csm-cases/components/TaskDetailDialog";
 import CallRequestDetailModal from "@features/csm-cases/components/CallRequestDetailModal";
+import {
+  callRequestStateColor,
+  callRequestStateLabel,
+} from "@features/csm-cases/utils/callRequestState";
 import { resolveAccountTier, type Account } from "@features/csm-accounts/types/csmAccounts";
 import AccountPreviewDrawer from "@features/csm-accounts/components/AccountPreviewDrawer";
 import type { Project } from "@features/csm-projects/types/csmProjects";
@@ -892,8 +896,14 @@ function CallRequestWidgetList({ items, isLoading }: WidgetListRendererProps): J
               <Typography key="reason" variant="body2" noWrap title={cr.reason ?? undefined}>
                 {cr.reason || "—"}
               </Typography>,
-              cr.state?.label ? (
-                <Chip key="state" size="small" variant="outlined" label={cr.state.label} />
+              cr.state ? (
+                <Chip
+                  key="state"
+                  size="small"
+                  variant="outlined"
+                  label={callRequestStateLabel(cr.state)}
+                  color={callRequestStateColor(cr.state)}
+                />
               ) : (
                 <Typography key="state" variant="body2">
                   —

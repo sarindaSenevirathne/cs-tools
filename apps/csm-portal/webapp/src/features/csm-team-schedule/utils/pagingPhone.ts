@@ -16,7 +16,7 @@
  * under the License.
  */
 
-import type { PagingChainMember } from "../types";
+import type { PagingChainMember, PagingTestCall, PagingTestStatus } from "../types";
 
 /** How often the chain is re-read while a test call's result is awaited. */
 export const PAGING_TEST_POLL_MS = 10_000;
@@ -102,14 +102,40 @@ export function phoneChipState(m: PagingChainMember): PhoneChipState {
   return { label: "Number not checked", tone: "unknown" };
 }
 
-/** Whether a test call to this person's paging number is still awaited, as of
- *  the chain read at `readAt` (ms). A call older than the polling window is
- *  given up on, so it can be placed again. */
+/** The last test call of the number a test would ring for this person: the
+ *  one `testCall` names when the reader may test, else the paging number's. */
+export function lastTestOf(m: PagingChainMember): { status?: PagingTestStatus; at?: string } {
+  const t = m.testCall ?? m.pagingPhone;
+  return { status: t?.lastTestStatus, at: t?.lastTestAt };
+}
+
+/** Whether a test call to this person is still awaited, as of the chain read
+ *  at `readAt` (ms). A call older than the polling window is given up on, so
+ *  it can be placed again. */
 export function testCallAwaited(m: PagingChainMember, readAt: number): boolean {
-  const p = m.pagingPhone;
-  if (p?.lastTestStatus !== "pending") return false;
-  const started = p.lastTestAt ? Date.parse(p.lastTestAt) : NaN;
+  const { status, at } = lastTestOf(m);
+  if (status !== "pending") return false;
+  const started = at ? Date.parse(at) : NaN;
   return Number.isNaN(started) || readAt - started < PAGING_TEST_POLL_MAX_MS;
+}
+
+/** The last test of a profile number, in words, for the reader who may test
+ *  it; undefined before the first test and while one is awaited. A paging
+ *  number's test is already in its chip. */
+export function profileTestState(t: PagingTestCall | null | undefined): PhoneChipState | undefined {
+  if (!t || t.source !== "profile") return undefined;
+  switch (t.lastTestStatus) {
+    case "completed": {
+      const on = fmtShortDate(t.lastTestAt);
+      return { label: `Test call answered${on ? ` ${on}` : ""}`, tone: "ok" };
+    }
+    case "no-answer":
+    case "busy":
+    case "failed":
+      return { label: `Test call failed (${t.lastTestStatus})`, tone: "err" };
+    default:
+      return undefined;
+  }
 }
 
 /** A typed number checked as E.164. Spaces, dashes, dots and brackets are

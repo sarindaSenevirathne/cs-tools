@@ -51,26 +51,40 @@ func TestChangeRequestNobodyToAskIntegration_TheRequesterIsJudgedAsItWillStand(t
 	other := crFlowPeerAID // staff, not a contact of the project
 
 	// attempt names the stand-in as the requester: refused with msg, nothing written; naming somebody
-	// who is no contact, clearing the field, and resending the stored one are accepted.
+	// who is no contact, clearing the field, and resending the stored one are accepted. Once the change
+	// has been approved (Customer Approval on) its fields are read-only (change_request_approved_lock.go):
+	// every CHANGE of the requester is refused for that, whoever is named, and only a resend goes through.
 	attempt := func(t *testing.T, f *crFlow, id, when, msg string) {
 		t.Helper()
+		approved := approvedState(f.state(id))
 		before := f.snap(id)
 		stored := f.requestedBy(id)
 		_, err := f.patch(id, domain.PatchChangeRequestRequest{RequestedByID: asRequester(&standIn), Title: sp("must not be written")})
-		f.wantExact("naming the only contact as the requester "+when, err, msg)
+		if approved {
+			f.wantValidationError("naming the only contact as the requester "+when, err, "requestedById can no longer be changed: the change request has been approved")
+		} else {
+			f.wantExact("naming the only contact as the requester "+when, err, msg)
+		}
 		f.wantRefusedSame("naming the only contact as the requester "+when, id, before, err)
 		if got := f.requestedBy(id); got != stored {
 			t.Fatalf("a refused request changed the requester %s: %q -> %q", when, stored, got)
 		}
-		if _, err := f.patch(id, domain.PatchChangeRequestRequest{RequestedByID: asRequester(&other)}); err != nil {
-			t.Fatalf("naming somebody who is no contact %s: %v", when, err)
-		}
-		if _, err := f.patch(id, domain.PatchChangeRequestRequest{RequestedByID: asRequester(nil)}); err != nil {
-			t.Fatalf("clearing the requester %s: %v", when, err)
-		}
-		// A resend of the stored value is never a change, whatever the contacts have become.
-		if _, err := f.patch(id, domain.PatchChangeRequestRequest{RequestedByID: asRequester(sp(crFlowCreatorID))}); err != nil {
-			t.Fatalf("naming the creator as the requester again %s: %v", when, err)
+		if approved {
+			_, err := f.patch(id, domain.PatchChangeRequestRequest{RequestedByID: asRequester(&other)})
+			f.wantValidationError("naming somebody who is no contact "+when, err, "has been approved")
+			_, err = f.patch(id, domain.PatchChangeRequestRequest{RequestedByID: asRequester(nil)})
+			f.wantValidationError("clearing the requester "+when, err, "has been approved")
+		} else {
+			if _, err := f.patch(id, domain.PatchChangeRequestRequest{RequestedByID: asRequester(&other)}); err != nil {
+				t.Fatalf("naming somebody who is no contact %s: %v", when, err)
+			}
+			if _, err := f.patch(id, domain.PatchChangeRequestRequest{RequestedByID: asRequester(nil)}); err != nil {
+				t.Fatalf("clearing the requester %s: %v", when, err)
+			}
+			// A resend of the stored value is never a change, whatever the contacts have become.
+			if _, err := f.patch(id, domain.PatchChangeRequestRequest{RequestedByID: asRequester(sp(crFlowCreatorID))}); err != nil {
+				t.Fatalf("naming the creator as the requester again %s: %v", when, err)
+			}
 		}
 		if _, err := f.patch(id, domain.PatchChangeRequestRequest{RequestedByID: asRequester(sp(crFlowCreatorID))}); err != nil {
 			t.Fatalf("resending the stored requester %s: %v", when, err)
@@ -119,10 +133,11 @@ func TestChangeRequestNobodyToAskIntegration_TheRequesterIsJudgedAsItWillStand(t
 		f.expect(id, "in Customer Approval", "CUSTOMER_APPROVAL", "authorize", "canceled")
 		attempt(t, f, id, "in Customer Approval, where the customer is being asked", nobodyMsgApproval)
 
-		// A Re-schedule carrying a requestedById is judged the same way.
+		// A Re-schedule moves the window of an approved change, nothing else: one carrying a
+		// requestedById is refused for the requester.
 		_, err := f.patch(id, domain.PatchChangeRequestRequest{
 			State: stateptr(domain.ChangeRequestStateAuthorize), PlannedStartOn: sp(rsStart2), PlannedEndOn: sp(rsEnd2), RequestedByID: asRequester(&standIn)})
-		f.wantExact("a Re-schedule naming the only contact as the requester", err, nobodyMsgApproval)
+		f.wantValidationError("a Re-schedule naming the only contact as the requester", err, "requestedById can no longer be changed: the change request has been approved")
 		f.wantPlanned(id, "after the refused Re-schedule", rsStart1, rsEnd1)
 		if err := f.reschedule(id, sp(rsStart2), sp(rsEnd2)); err != nil {
 			t.Fatalf("a Re-schedule that names no requester: %v", err)
@@ -178,7 +193,13 @@ func TestChangeRequestNobodyToAskIntegration_TheRequesterIsJudgedAsItWillStand(t
 		f.execSQL(`UPDATE change_request SET state = 'SCHEDULED' WHERE id = $1`, id)
 		for _, state := range []string{"SCHEDULED", "IMPLEMENT", "REVIEW", "CLOSED", "CANCELED"} {
 			f.setState(id, state)
-			if _, err := f.patch(id, domain.PatchChangeRequestRequest{RequestedByID: asRequester(&standIn)}); err != nil {
+			_, err := f.patch(id, domain.PatchChangeRequestRequest{RequestedByID: asRequester(&standIn)})
+			if approvedState(state) {
+				// Approved: read-only for that reason, not for anybody to ask.
+				f.wantValidationError("naming the only contact as the requester in "+state, err, "requestedById can no longer be changed: the change request has been approved")
+				continue
+			}
+			if err != nil {
 				t.Fatalf("naming the only contact as the requester in %s, past the only gate the change has: %v", state, err)
 			}
 			if got := f.requestedBy(id); got != standIn {
@@ -228,7 +249,7 @@ func TestChangeRequestNobodyToAskIntegration_TheRequesterIsJudgedAsItWillStand(t
 		f.setPlanned(id, rsStart1, rsEnd1)
 		_, err := f.patch(id, domain.PatchChangeRequestRequest{
 			State: stateptr(domain.ChangeRequestStateAuthorize), PlannedStartOn: sp(rsStart2), PlannedEndOn: sp(rsEnd2), RequestedByID: asRequester(&standIn)})
-		f.wantExact("a Re-schedule naming the only contact as the requester", err, nobodyMsgApproval)
+		f.wantValidationError("a Re-schedule naming the only contact as the requester", err, "requestedById can no longer be changed: the change request has been approved")
 		f.wantPlanned(id, "after the refused Re-schedule", rsStart1, rsEnd1)
 		if got := f.requestedBy(id); got != crFlowCreatorID {
 			t.Fatalf("a refused Re-schedule wrote the requester: %q", got)

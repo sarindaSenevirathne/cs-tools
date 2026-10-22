@@ -54,6 +54,28 @@ type PagingChainMember struct {
 	// own profile ("user".phone), which paging calls ahead of PagingPhone.
 	// Absent when the paging numbers are not configured.
 	HasProfilePhone *bool `json:"hasProfilePhone,omitempty"`
+	// CanTestCall is whether the caller may place a test call to this
+	// person: a portal admin, or the rota admin of a family one of the
+	// person's teams is in.
+	CanTestCall bool `json:"canTestCall"`
+	// TestCall is the number a test call would ring -- the one Case Alerts
+	// dials from CSM -- and the last test of it. Only for a caller who may
+	// test it; absent when CSM holds no number to dial.
+	TestCall *PagingTestCall `json:"testCall,omitempty"`
+}
+
+// PagingTestCall is the number a test call rings and its last test.
+type PagingTestCall struct {
+	// Masked keeps the country code and the last three digits.
+	Masked string `json:"masked"`
+	// Source is "profile" (the number on the person's own profile) or
+	// "paging" (their paging-only number), as in GET .../paging-contacts.
+	Source string `json:"source"`
+	// LastTestAt and LastTestStatus are the last test call of this number:
+	// pending, completed, no-answer, busy or failed. Absent until one is
+	// requested, and after the number changes.
+	LastTestAt     *string `json:"lastTestAt,omitempty"`
+	LastTestStatus *string `json:"lastTestStatus,omitempty"`
 }
 
 // PagingPhone is a paging-only phone number: the one paging calls when the

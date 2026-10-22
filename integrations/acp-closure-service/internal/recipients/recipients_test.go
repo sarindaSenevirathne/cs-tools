@@ -47,7 +47,7 @@ func TestAccountManagerEmail_ReturnsEmptyWhenAccountManagerHasNoEmail(t *testing
 func TestResolveCustomerContacts_PrefersBusinessContact(t *testing.T) {
 	projectContacts := []ProjectContact{
 		{Name: "Alice", Email: "alice@customer.example", Roles: []string{"developer"}},
-		{Name: "Bob", Email: "bob@customer.example", Roles: []string{businessContactRole, "developer"}},
+		{Name: "Bob", Email: "bob@customer.example", Roles: []string{BusinessContactRole, "developer"}},
 	}
 	accountContacts := []AccountContact{
 		{Name: "Carol", Email: "carol@customer.example", IsPrimary: true},
@@ -95,7 +95,7 @@ func TestResolveCustomerContacts_FallsBackToPrimaryContact(t *testing.T) {
 // resolve to Recipient: "" instead of falling through to a usable tier.
 func TestResolveCustomerContacts_SkipsBusinessContactWithEmptyEmail(t *testing.T) {
 	projectContacts := []ProjectContact{
-		{Name: "Bob", Email: "", Roles: []string{businessContactRole}},
+		{Name: "Bob", Email: "", Roles: []string{BusinessContactRole}},
 	}
 	accountContacts := []AccountContact{
 		{Name: "Carol", Email: "carol@customer.example", IsPrimary: true},
@@ -120,7 +120,7 @@ func TestResolveCustomerContacts_SkipsBusinessContactWithEmptyEmail(t *testing.T
 // empty Recipient.
 func TestResolveCustomerContacts_NudgesAccountManagerWhenOnlyContactsHaveEmptyEmail(t *testing.T) {
 	projectContacts := []ProjectContact{
-		{Name: "Bob", Email: "", Roles: []string{businessContactRole}},
+		{Name: "Bob", Email: "", Roles: []string{BusinessContactRole}},
 	}
 	accountContacts := []AccountContact{
 		{Name: "Carol", Email: "", IsPrimary: true},
@@ -181,10 +181,10 @@ func TestResolveCustomerContacts_NudgesAccountManagerWhenNoContactsAtAll(t *test
 // email, or without the role, are left out; order is kept.
 func TestResolveCustomerContacts_ReturnsEveryBusinessContact(t *testing.T) {
 	projectContacts := []ProjectContact{
-		{Name: "Bob", Email: "bob@customer.example", Roles: []string{businessContactRole}},
+		{Name: "Bob", Email: "bob@customer.example", Roles: []string{BusinessContactRole}},
 		{Name: "Alice", Email: "alice@customer.example", Roles: []string{"developer"}},
-		{Name: "Eve", Email: "", Roles: []string{businessContactRole}},
-		{Name: "Frank", Email: "frank@customer.example", Roles: []string{"developer", businessContactRole}},
+		{Name: "Eve", Email: "", Roles: []string{BusinessContactRole}},
+		{Name: "Frank", Email: "frank@customer.example", Roles: []string{"developer", BusinessContactRole}},
 	}
 	accountContacts := []AccountContact{
 		{Name: "Carol", Email: "carol@customer.example", IsPrimary: true},
@@ -234,8 +234,8 @@ func TestResolveCustomerContacts_ReturnsEveryPrimaryContact(t *testing.T) {
 // same email.
 func TestResolveCustomerContacts_ListsEachEmailOnce(t *testing.T) {
 	projectContacts := []ProjectContact{
-		{Name: "Bob", Email: "bob@customer.example", Roles: []string{businessContactRole}},
-		{Name: "Bob Again", Email: "Bob@Customer.example", Roles: []string{businessContactRole}},
+		{Name: "Bob", Email: "bob@customer.example", Roles: []string{BusinessContactRole}},
+		{Name: "Bob Again", Email: "Bob@Customer.example", Roles: []string{BusinessContactRole}},
 	}
 
 	got := ResolveCustomerContacts(projectContacts, nil)
@@ -277,8 +277,8 @@ func TestHasBusinessContacts(t *testing.T) {
 		contacts []ProjectContact
 		want     bool
 	}{
-		{"business contact with email", []ProjectContact{{Email: "a@customer.example", Roles: []string{"PORTAL_USER", businessContactRole}}}, true},
-		{"business contact without email", []ProjectContact{{Email: "", Roles: []string{businessContactRole}}}, false},
+		{"business contact with email", []ProjectContact{{Email: "a@customer.example", Roles: []string{"PORTAL_USER", BusinessContactRole}}}, true},
+		{"business contact without email", []ProjectContact{{Email: "", Roles: []string{BusinessContactRole}}}, false},
 		{"only other roles", []ProjectContact{{Email: "a@customer.example", Roles: []string{"PORTAL_USER", "sn_customerservice.customer"}}}, false},
 		{"no contacts", nil, false},
 	}

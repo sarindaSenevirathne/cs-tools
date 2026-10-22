@@ -440,11 +440,22 @@ func (r *callRequestRepo) SearchAllCallRequests(ctx context.Context, f domain.Se
 	return r.runCallRequestSearch(ctx, where, orderBy, args, pagination)
 }
 
+// createCallRequestStateEnum is the customer_call_state_enum label for a
+// create. The service resolves and validates state before this is called. A
+// nil or empty value (a direct repository caller, including older tests)
+// stays the customer-raised default.
+func createCallRequestStateEnum(state *domain.CallRequestStateType) string {
+	if state == nil || *state == "" {
+		return callRequestStateToEnum(domain.CallRequestStatePendingOnWSO2)
+	}
+	return callRequestStateToEnum(*state)
+}
+
 // CreateCallRequest implements CallRequestRepository.
 func (r *callRequestRepo) CreateCallRequest(ctx context.Context, req domain.CreateCallRequestRequest, callerID, callerEmail string) (domain.CreateCallRequestResponse, error) {
-	// A new request is raised by the customer, so it starts pending on WSO2
-	// (who must schedule or counter-propose). preferred times land in
-	// final_times as a JSON array, the shape decodeFinalTimes reads back.
+	// preferred times land in final_times as a JSON array, the shape
+	// decodeFinalTimes reads back. state is pending_on_wso2 unless the caller
+	// (the CSM portal) asked for pending_on_customer.
 	times, err := json.Marshal(req.UTCTimes)
 	if err != nil {
 		return domain.CreateCallRequestResponse{}, fmt.Errorf("encode utcTimes: %w", err)
@@ -464,17 +475,18 @@ func (r *callRequestRepo) CreateCallRequest(ctx context.Context, req domain.Crea
 			duration, reason, final_times
 		)
 		SELECT gen_random_uuid(), NOW(), NOW(), $1, $1,
-		       wi.id, $2::text::uuid, NOW(), TRUE, 'PENDING_ON_WSO2'::customer_call_state_enum,
+		       wi.id, $2::text::uuid, NOW(), TRUE, $7::text::customer_call_state_enum,
 		       make_interval(mins => $3::int), $4::text, $5::text::jsonb
 		FROM work_item wi
 		WHERE wi.id = $6::text::uuid AND wi.type = ANY(` + caseLikeWorkItemTypes + `)
 		  AND ` + announcementVisibilityLeakGuard + `
 		RETURNING id, created_on`
 
+	stateEnum := createCallRequestStateEnum(req.State)
 	var id string
 	var createdOn time.Time
 	err = r.db.QueryRow(ctx, query,
-		callerEmail, callerID, req.DurationMinutes, req.Reason, string(times), req.CaseID,
+		callerEmail, callerID, req.DurationMinutes, req.Reason, string(times), req.CaseID, stateEnum,
 	).Scan(&id, &createdOn)
 	if errors.Is(err, pgx.ErrNoRows) || IsRLSPolicyViolation(err) {
 		return domain.CreateCallRequestResponse{}, &apierror.NotFoundError{Msg: "case not found"}
@@ -488,7 +500,7 @@ func (r *callRequestRepo) CreateCallRequest(ctx context.Context, req domain.Crea
 	resp.CallRequest.ID = id
 	resp.CallRequest.CreatedOn = createdOn.UTC().Format(time.RFC3339)
 	resp.CallRequest.CreatedBy = callerEmail
-	resp.CallRequest.State = CallRequestStateFromEnum(callRequestStateToEnum(domain.CallRequestStatePendingOnWSO2))
+	resp.CallRequest.State = CallRequestStateFromEnum(stateEnum)
 	return resp, nil
 }
 
@@ -513,17 +525,18 @@ func (r *callRequestRepo) CreateCallRequestFromServiceNow(ctx context.Context, r
 			duration, reason, final_times
 		)
 		SELECT $1::text::uuid, $2, $2, $3, $3,
-		       wi.id, $4::text::uuid, $2, TRUE, 'PENDING_ON_WSO2'::customer_call_state_enum,
+		       wi.id, $4::text::uuid, $2, TRUE, $9::text::customer_call_state_enum,
 		       make_interval(mins => $5::int), $6::text, $7::text::jsonb
 		FROM work_item wi
 		WHERE wi.id = $8::text::uuid AND wi.type = ANY(` + caseLikeWorkItemTypes + `)
 		  AND ` + announcementVisibilityLeakGuard + `
 		RETURNING id, created_on`
 
+	stateEnum := createCallRequestStateEnum(req.State)
 	var gotID string
 	var gotCreatedOn time.Time
 	err = r.db.QueryRow(ctx, query,
-		id, createdOn, createdBy, callerID, req.DurationMinutes, req.Reason, string(times), req.CaseID,
+		id, createdOn, createdBy, callerID, req.DurationMinutes, req.Reason, string(times), req.CaseID, stateEnum,
 	).Scan(&gotID, &gotCreatedOn)
 	if errors.Is(err, pgx.ErrNoRows) || IsRLSPolicyViolation(err) {
 		return domain.CreateCallRequestResponse{}, &apierror.NotFoundError{Msg: "case not found"}
@@ -537,7 +550,7 @@ func (r *callRequestRepo) CreateCallRequestFromServiceNow(ctx context.Context, r
 	resp.CallRequest.ID = gotID
 	resp.CallRequest.CreatedOn = gotCreatedOn.UTC().Format(time.RFC3339)
 	resp.CallRequest.CreatedBy = createdBy
-	resp.CallRequest.State = CallRequestStateFromEnum(callRequestStateToEnum(domain.CallRequestStatePendingOnWSO2))
+	resp.CallRequest.State = CallRequestStateFromEnum(stateEnum)
 	return resp, nil
 }
 

@@ -320,8 +320,8 @@ afterEach(() => {
 vi.mock("@features/csm-projects/api/useGetProject", () => ({
   useGetProject: (...args: unknown[]) => useGetProjectMock(...args),
 }));
-vi.mock("@features/csm-cases/api/useGetCsmCaseSlas", () => ({
-  useGetCsmCaseSlas: () => ({ data: undefined }),
+vi.mock("@features/csm-sla/api/useGetWorkItemSlas", () => ({
+  useGetWorkItemSlas: () => ({ data: undefined }),
 }));
 vi.mock("@features/csm-cases/api/useCreateCaseTask", () => ({
   useCreateCaseTask: () => ({ mutate: vi.fn(), isPending: false }),
@@ -717,8 +717,8 @@ vi.mock("@features/csm-cases/components/CallRequestsWidget", () => ({
 vi.mock("@features/csm-cases/components/TasksWidget", () => ({
   TasksWidget: () => null,
 }));
-vi.mock("@features/csm-cases/components/CaseSlaTable", () => ({
-  CaseSlaTable: () => null,
+vi.mock("@features/csm-sla/components/WorkItemSlaTable", () => ({
+  WorkItemSlaTable: () => null,
 }));
 
 // The two components at the center of this regression: CaseTimeCardsPanel is

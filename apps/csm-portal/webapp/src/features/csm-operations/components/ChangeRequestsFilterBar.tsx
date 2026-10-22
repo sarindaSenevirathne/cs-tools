@@ -34,9 +34,10 @@ import {
   Search,
   X,
 } from "@wso2/oxygen-ui-icons-react";
-import { useMemo, type JSX } from "react";
+import { useMemo, useState, type JSX } from "react";
 import { useTeams } from "@features/csm-dashboard/api/useTeams";
 import {
+  CHANGE_REQUEST_FILTER_TYPE_OPTIONS,
   CHANGE_REQUEST_IMPACTS,
   CHANGE_REQUEST_STATES,
   changeRequestImpactLabel,
@@ -50,6 +51,17 @@ import {
 } from "@features/csm-operations/utils/changeRequestsFiltersUrl";
 import SavedViewsMenu from "@features/csm-operations/components/SavedViewsMenu";
 import MultiSelectField from "@components/MultiSelectField";
+import OperationsAdvancedFilters from "@features/csm-operations/components/OperationsAdvancedFilters";
+import {
+  countAdvancedRows,
+  dateAdvancedField,
+  multiAdvancedField,
+  type OperationsAdvancedField,
+} from "@features/csm-operations/utils/operationsAdvancedFields";
+import OperationsAnyOfGroups, { type AnyOfFieldDef } from "@features/csm-operations/components/OperationsAnyOfGroups";
+import { completeAnyOfGroups } from "@features/csm-operations/utils/operationsAnyOf";
+import AsyncTagMultiSelect from "@features/csm-cases/components/AsyncTagMultiSelect";
+import AsyncAssignedUserIdMultiSelect from "@features/csm-cases/components/AsyncAssignedUserIdMultiSelect";
 import AsyncProjectMultiSelect from "@features/csm-cases/components/AsyncProjectMultiSelect";
 
 const { DatePicker, LocalizationProvider } = DatePickers;
@@ -126,10 +138,11 @@ export default function ChangeRequestsFilterBar({
     [],
   );
 
-  // Change requests are SRE-owned, so this control is scoped to the
-  // `sre-abt` team family — see `IncidentsFilterBar`'s equivalent note on
-  // why this isn't `cre-abt` (the cases list's own "SRE Team" control's
-  // family scoping).
+
+  // SRE Team: change requests are SRE-owned, so this control is scoped to the
+  // `sre-abt` team family and listed the way the cases list lists its CRE
+  // teams — see `IncidentsFilterBar`'s equivalent note on why this isn't
+  // `cre-abt`. It matches the record's assignment group (the team's group id).
   const { data: teams } = useTeams(true, "sre-abt");
   const sreTeamOptions = useMemo(
     () =>
@@ -141,6 +154,82 @@ export default function ChangeRequestsFilterBar({
         .map((t) => ({ value: t.sreGroupId, label: t.name })),
     [teams],
   );
+
+  // Value pickers shared by the Advanced rows and the OR-group conditions, so
+  // a field is chosen the same way wherever it appears.
+  const pickers = useMemo(() => {
+    type P = { id: string; values: string[]; onChange: (values: string[]) => void };
+    return {
+      state: ({ id, values, onChange: set }: P) => (
+        <MultiSelectField id={id} label="Value(s)" values={values} options={stateOptions} onChange={set} />
+      ),
+      impact: ({ id, values, onChange: set }: P) => (
+        <MultiSelectField id={id} label="Value(s)" values={values} options={impactOptions} onChange={set} />
+      ),
+      type: ({ id, values, onChange: set }: P) => (
+        <MultiSelectField
+          id={id}
+          label="Value(s)"
+          values={values}
+          options={CHANGE_REQUEST_FILTER_TYPE_OPTIONS}
+          onChange={set}
+        />
+      ),
+      project: ({ id, values, onChange: set }: P) => (
+        <AsyncProjectMultiSelect id={id} label="Value(s)" values={values} onChange={set} />
+      ),
+      tag: ({ id, values, onChange: set }: P) => (
+        <AsyncTagMultiSelect id={id} label="Value(s)" values={values} onChange={set} />
+      ),
+      group: ({ id, values, onChange: set }: P) => (
+        <MultiSelectField id={id} label="Value(s)" values={values} options={sreTeamOptions} onChange={set} />
+      ),
+      assignee: ({ id, values, onChange: set }: P) => (
+        <AsyncAssignedUserIdMultiSelect id={id} values={values} onChange={set} />
+      ),
+    };
+  }, [stateOptions, impactOptions, sreTeamOptions]);
+
+  // Advanced offers every filter as a Field / Operator / Value row, as on the
+  // service request list; each row reads and writes the same state the quick
+  // grid does, so a filter set either way shows in both.
+  const advancedFields = useMemo<OperationsAdvancedField<ChangeRequestFilters>[]>(
+    () => [
+      multiAdvancedField<ChangeRequestFilters>({ key: "state", label: "State", prop: "states", render: pickers.state }),
+      multiAdvancedField<ChangeRequestFilters>({ key: "impact", label: "Impact", prop: "impacts", render: pickers.impact }),
+      multiAdvancedField<ChangeRequestFilters>({ key: "project", label: "Project", prop: "projectIds", render: pickers.project }),
+      multiAdvancedField<ChangeRequestFilters>({ key: "type", label: "Type", prop: "types", render: pickers.type }),
+      multiAdvancedField<ChangeRequestFilters>({ key: "tag", label: "Tags", prop: "tags", render: pickers.tag }),
+      multiAdvancedField<ChangeRequestFilters>({ key: "group", label: "SRE Team", prop: "sreTeamIds", render: pickers.group }),
+      multiAdvancedField<ChangeRequestFilters>({ key: "assignee", label: "Assigned engineer", prop: "assigneeIds", render: pickers.assignee }),
+      dateAdvancedField<ChangeRequestFilters>({ key: "created", label: "Created", from: "createdStartDate", to: "createdEndDate" }),
+      dateAdvancedField<ChangeRequestFilters>({ key: "updated", label: "Updated", from: "updatedStartDate", to: "updatedEndDate" }),
+      dateAdvancedField<ChangeRequestFilters>({ key: "closed", label: "Closed", from: "closedStartDate", to: "closedEndDate" }),
+      dateAdvancedField<ChangeRequestFilters>({
+        key: "plannedStart", label: "Planned start", from: "plannedStartFrom", to: "plannedStartTo", capAtToday: false,
+      }),
+      dateAdvancedField<ChangeRequestFilters>({
+        key: "plannedEnd", label: "Planned end", from: "plannedEndFrom", to: "plannedEndTo", capAtToday: false,
+      }),
+    ],
+    [pickers],
+  );
+  // OR-group conditions: the fields the search accepts inside a group.
+  const anyOfFields = useMemo<AnyOfFieldDef[]>(
+    () => [
+      { field: "state", label: "State", render: pickers.state },
+      { field: "impact", label: "Impact", render: pickers.impact },
+      { field: "projectId", label: "Project", render: pickers.project },
+      { field: "type", label: "Type", render: pickers.type },
+      { field: "tag", label: "Tags", render: pickers.tag },
+      { field: "assignmentGroupId", label: "SRE Team", render: pickers.group },
+      { field: "assignedUserId", label: "Assigned engineer", render: pickers.assignee },
+    ],
+    [pickers],
+  );
+  const advancedCount =
+    countAdvancedRows(advancedFields, filters) + completeAnyOfGroups(filters.anyOf).length;
+  const [mode, setMode] = useState<"quick" | "advanced">("quick");
 
   /**
    * `minDate`/`maxDate` only constrain the calendar popup — MUI's DatePicker
@@ -244,6 +333,45 @@ export default function ChangeRequestsFilterBar({
       {isFiltersOpen && (
         <>
           <Divider />
+          <Box role="group" aria-label="Filter mode" sx={{ display: "flex", alignSelf: "flex-start" }}>
+            <Button
+              size="small"
+              variant={mode === "quick" ? "contained" : "outlined"}
+              color={mode === "quick" ? "primary" : "inherit"}
+              aria-pressed={mode === "quick"}
+              onClick={() => setMode("quick")}
+              sx={{ borderTopRightRadius: 0, borderBottomRightRadius: 0 }}
+            >
+              Quick filters
+            </Button>
+            <Button
+              size="small"
+              variant={mode === "advanced" ? "contained" : "outlined"}
+              color={mode === "advanced" ? "primary" : "inherit"}
+              aria-pressed={mode === "advanced"}
+              onClick={() => setMode("advanced")}
+              sx={{ borderTopLeftRadius: 0, borderBottomLeftRadius: 0, ml: "-1px" }}
+            >
+              {advancedCount > 0 ? `Advanced (${advancedCount})` : "Advanced"}
+            </Button>
+          </Box>
+          {mode === "advanced" ? (
+            <>
+              <OperationsAdvancedFilters
+                idPrefix="cr"
+                fields={advancedFields}
+                filters={filters}
+                onChange={onChange}
+              />
+              <Divider />
+              <OperationsAnyOfGroups
+                idPrefix="cr"
+                fields={anyOfFields}
+                groups={filters.anyOf}
+                onChange={(anyOf) => onChange({ ...filters, anyOf })}
+              />
+            </>
+          ) : (
           <Grid container spacing={2}>
             <Grid size={{ xs: 12, sm: 6, md: 3 }}>
               <MultiSelectField
@@ -280,6 +408,23 @@ export default function ChangeRequestsFilterBar({
               />
             </Grid>
             <Grid size={{ xs: 12, sm: 6, md: 3 }}>
+              <MultiSelectField
+                id="cr-filter-type"
+                label="Type"
+                values={filters.types}
+                options={CHANGE_REQUEST_FILTER_TYPE_OPTIONS}
+                onChange={(next) => onChange({ ...filters, types: next })}
+              />
+            </Grid>
+            <Grid size={{ xs: 12, sm: 6, md: 3 }}>
+              <AsyncTagMultiSelect
+                id="cr-filter-tag"
+                label="Tags"
+                values={filters.tags}
+                onChange={(next) => onChange({ ...filters, tags: next })}
+              />
+            </Grid>
+            <Grid size={{ xs: 12, sm: 6, md: 3 }}>
               <LocalizationProvider dateAdapter={AdapterDateFns}>
                 <DatePicker
                   label="Closed from"
@@ -309,6 +454,7 @@ export default function ChangeRequestsFilterBar({
               </LocalizationProvider>
             </Grid>
           </Grid>
+          )}
           {activeCount > 0 && (
             <Box sx={{ display: "flex", justifyContent: "flex-end" }}>
               <Typography variant="caption" color="text.secondary">

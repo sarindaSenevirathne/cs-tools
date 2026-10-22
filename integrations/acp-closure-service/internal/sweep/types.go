@@ -321,12 +321,15 @@ type ProjectFailure struct {
 	Err       error
 }
 
-// projectUpdater is the minimal write surface processProject needs.
-// Satisfied by *entity.Client for real writes; a dry-run implementation
-// (logs instead of calling UpdateProject) is injected instead when
-// DRY_RUN is set — processProject itself never branches on a dry-run flag.
+// projectUpdater is the minimal write surface processProject needs:
+// UpdateProject writes the CSM project by its CSM id, and SuspendInSalesforce
+// sets the Salesforce project's State__c to Suspended by its Salesforce id.
+// Satisfied by *Writer for real writes; DryRunProjectUpdater (writes
+// nothing) is injected instead when DRY_RUN is set — processProject itself
+// never branches on a dry-run flag.
 type projectUpdater interface {
 	UpdateProject(ctx context.Context, id string, body []byte) ([]byte, error)
+	SuspendInSalesforce(ctx context.Context, sfID string) error
 }
 
 // notifier is the minimal send surface processProject needs. Satisfied by

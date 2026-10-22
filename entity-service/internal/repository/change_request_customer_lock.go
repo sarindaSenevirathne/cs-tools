@@ -319,7 +319,8 @@ func changeRequestPatchNeedsGate(req domain.PatchChangeRequestRequest) bool {
 	return req.State != nil || req.ProjectID != nil || req.Type != nil || req.RequestedByID != nil ||
 		req.CustomerApprovalRequired != nil || req.CustomerReviewRequired != nil ||
 		req.DeploymentIDs != nil || req.DeploymentProductIDs != nil ||
-		req.DeploymentID != nil || req.DeployedProductID != nil
+		req.DeploymentID != nil || req.DeployedProductID != nil ||
+		changeRequestPatchTouchesApprovedContent(req)
 }
 
 // validateCreationPhaseEdits applies rules 1 to 4 in order (the first failing one
@@ -498,7 +499,7 @@ func checkSingularDeploymentFields(ctx context.Context, tx pgx.Tx, id string, re
 			return nil
 		}
 		if snap.state != "" && changeRequestLinksLockedStates[snap.state] {
-			return linkValidationf("%s can no longer be changed: the change request is in state %q (project, deployments and deployment products are editable only before implementation starts)",
+			return linkValidationf("%s can no longer be changed: the change request is in state %q (project, deployments and deployment products are editable only until the change request is approved)",
 				field, strings.ToLower(snap.state))
 		}
 		if !hasProjectID(effectiveProject) {

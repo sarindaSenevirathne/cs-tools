@@ -110,6 +110,8 @@ type ScheduleRepository interface {
 
 	// ApplyAbsence marks one engineer away across a span, or clears it.
 	ApplyAbsence(ctx context.Context, req domain.ApplyScheduleAbsenceRequest, actorEmail string) (domain.ApplyScheduleAbsenceResponse, error)
+	// ImportRota writes a whole rota import in one transaction, through ApplyRange's and ApplyAbsence's own rules.
+	ImportRota(ctx context.Context, w RotaImportWrite, actorEmail string) (RotaImportResult, error)
 }
 
 type scheduleRepository struct{ db *pgxpool.Pool }
@@ -471,6 +473,12 @@ func (r *scheduleRepository) SearchAssignments(ctx context.Context, req domain.S
 		args = append(args, req.UserEmail)
 		where += fmt.Sprintf(" AND LOWER(u.email) = LOWER($%d)", len(args))
 	}
+	if req.ExcludeAbsent {
+		// Asked of the rota day rather than an instant: a whole shift is about
+		// to be announced, and the day it is rostered for is the day leave is
+		// granted against.
+		where += " AND " + absenceOn("NOT EXISTS", "a.rota_date")
+	}
 
 	rows, err := r.db.Query(ctx, `SELECT `+assignmentColumns+assignmentFrom+" "+where+
 		" ORDER BY a.rota_date, a.starts_at, s.sort_order, u.name", args...)
@@ -526,23 +534,32 @@ func (r *scheduleRepository) OnDutyAt(ctx context.Context, at time.Time, include
 func (r *scheduleRepository) onDutyRows(ctx context.Context, at time.Time, exists string) ([]domain.ScheduleAssignment, error) {
 	rows, err := r.db.Query(ctx, `SELECT `+assignmentColumns+assignmentFrom+`
 		WHERE tstzrange(a.starts_at, a.ends_at, '[)') @> $1::timestamptz
-		  AND `+exists+` (
-		        SELECT 1 FROM team_schedule_absence ab
-		        JOIN team_schedule_absence_kind k ON k.id = ab.kind_id
-		        WHERE ab.user_id = a.user_id
-		          AND daterange(ab.starts_on, ab.ends_on, '[]')
-		              @> ($1::timestamptz AT TIME ZONE s.authoring_time_zone)::date
-		          -- Away from every team but the one the span moved them to,
-		          -- and that team's rota: someone on the Brazil rotation is
-		          -- working the Americas rota, and is on duty for its shifts.
-		          AND NOT `+movedWithinRota+`
-		      )
+		  AND `+absenceOn(exists, "($1::timestamptz AT TIME ZONE s.authoring_time_zone)::date")+`
 		ORDER BY a.tier NULLS LAST, s.sort_order, u.name`, at)
 	if err != nil {
 		return nil, fmt.Errorf("query on-duty assignments: %w", err)
 	}
 	defer rows.Close()
 	return scanAssignments(rows)
+}
+
+// absenceOn is the one rule for "this assignment's person is away on day":
+// exists is "EXISTS" (they are away) or "NOT EXISTS" (they are not). The
+// on-duty lookup, its include-on-leave mode, and a search that leaves absent
+// people out all read it, so they can never disagree about who is working.
+// Both arguments are always constants from this file, never caller input: day
+// is a SQL date expression over the assignment (a) and its shift (s).
+func absenceOn(exists, day string) string {
+	return exists + ` (
+		        SELECT 1 FROM team_schedule_absence ab
+		        JOIN team_schedule_absence_kind k ON k.id = ab.kind_id
+		        WHERE ab.user_id = a.user_id
+		          AND daterange(ab.starts_on, ab.ends_on, '[]') @> ` + day + `
+		          -- Away from every team but the one the span moved them to,
+		          -- and that team's rota: someone on the Brazil rotation is
+		          -- working the Americas rota, and is on duty for its shifts.
+		          AND NOT ` + movedWithinRota + `
+		      )`
 }
 
 // SearchAbsences returns every absence overlapping the window. An absence
@@ -1455,6 +1472,27 @@ func (r *scheduleRepository) distinctStrings(ctx context.Context, sql string, ar
 // somebody else already holds on a day is refused as a conflict naming them
 // (tierHolderConflict), and the whole span is left unchanged.
 func (r *scheduleRepository) ApplyRange(ctx context.Context, req domain.ApplyScheduleRangeRequest, actorEmail string) (domain.ApplyScheduleRangeResponse, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return domain.ApplyScheduleRangeResponse{}, fmt.Errorf("begin apply range: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := nameTheActor(ctx, tx, actorEmail); err != nil {
+		return domain.ApplyScheduleRangeResponse{}, err
+	}
+	out, err := applyRangeTx(ctx, tx, req, actorEmail)
+	if err != nil {
+		return out, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return out, fmt.Errorf("commit apply range: %w", err)
+	}
+	return out, nil
+}
+
+// applyRangeTx is ApplyRange inside the caller's transaction.
+func applyRangeTx(ctx context.Context, tx pgx.Tx, req domain.ApplyScheduleRangeRequest, actorEmail string) (domain.ApplyScheduleRangeResponse, error) {
 	out := domain.ApplyScheduleRangeResponse{SkippedDates: []string{}}
 
 	from, err := time.Parse("2006-01-02", req.From)
@@ -1470,16 +1508,6 @@ func (r *scheduleRepository) ApplyRange(ctx context.Context, req domain.ApplySch
 	}
 	if to.Sub(from) > 366*24*time.Hour {
 		return out, &apierror.ValidationError{Msg: "a range longer than a year is almost certainly a mistake"}
-	}
-
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return out, fmt.Errorf("begin apply range: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if err := nameTheActor(ctx, tx, actorEmail); err != nil {
-		return out, err
 	}
 
 	// No shift code means "take them off over this span" -- the picker's own
@@ -1707,9 +1735,6 @@ func (r *scheduleRepository) ApplyRange(ctx context.Context, req domain.ApplySch
 	if err := fileTurnsWhereTheyAre(ctx, tx, &req.UserID, from.Format("2006-01-02"), to.Format("2006-01-02"), actorEmail); err != nil {
 		return out, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return out, fmt.Errorf("commit apply range: %w", err)
-	}
 	return out, nil
 }
 
@@ -1749,6 +1774,27 @@ type overlappingAbsence struct {
 // overlaps one end of the span is shortened, one that straddles both ends is
 // split in two, and only one that falls entirely inside it is removed.
 func (r *scheduleRepository) ApplyAbsence(ctx context.Context, req domain.ApplyScheduleAbsenceRequest, actorEmail string) (domain.ApplyScheduleAbsenceResponse, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return domain.ApplyScheduleAbsenceResponse{}, fmt.Errorf("begin apply absence: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := nameTheActor(ctx, tx, actorEmail); err != nil {
+		return domain.ApplyScheduleAbsenceResponse{}, err
+	}
+	out, err := applyAbsenceTx(ctx, tx, req, actorEmail)
+	if err != nil {
+		return out, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return out, fmt.Errorf("commit apply absence: %w", err)
+	}
+	return out, nil
+}
+
+// applyAbsenceTx is ApplyAbsence inside the caller's transaction.
+func applyAbsenceTx(ctx context.Context, tx pgx.Tx, req domain.ApplyScheduleAbsenceRequest, actorEmail string) (domain.ApplyScheduleAbsenceResponse, error) {
 	out := domain.ApplyScheduleAbsenceResponse{}
 
 	const iso = "2006-01-02"
@@ -1768,16 +1814,6 @@ func (r *scheduleRepository) ApplyAbsence(ctx context.Context, req domain.ApplyS
 	}
 	dayBefore := from.AddDate(0, 0, -1).Format(iso)
 	dayAfter := to.AddDate(0, 0, 1).Format(iso)
-
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return out, fmt.Errorf("begin apply absence: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if err := nameTheActor(ctx, tx, actorEmail); err != nil {
-		return out, err
-	}
 
 	var kindID, bucket string
 	var movesTo *string
@@ -1947,9 +1983,6 @@ func (r *scheduleRepository) ApplyAbsence(ctx context.Context, req domain.ApplyS
 
 	if err := syncMoveShifts(ctx, tx, req.UserID, from.Format(iso), to.Format(iso), actorEmail); err != nil {
 		return out, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return out, fmt.Errorf("commit apply absence: %w", err)
 	}
 	return out, nil
 }

@@ -36,6 +36,8 @@ func TestCaseActivityFieldChangeLabel(t *testing.T) {
 		{"assigned_to_id", "Assigned to"},
 		{"acknowledged_by_user_id", "Acknowledged by"},
 		{"parent_id", "Parent case"},
+		{"workaround_provided_on", "Workaround Provided"},
+		{"fix_issued_on", "Update Released"},
 	}
 	for _, tt := range tests {
 		if got := caseActivityFieldChangeLabel(tt.fieldName); got != tt.want {

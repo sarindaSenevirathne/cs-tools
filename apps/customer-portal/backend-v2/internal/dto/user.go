@@ -25,7 +25,10 @@ import "github.com/wso2-open-operations/cs-tools/apps/customer-portal/backend-v2
 // UserMeResponse is the portal's response for GET /users/me. PhoneNumber and
 // LastPasswordUpdateTime are not part of entity-service's response — the
 // handler sets them separately from the SCIM client's result, since both are
-// sourced from SCIM, not entity-service.
+// sourced from SCIM, not entity-service. IsReadOnly is likewise set by the
+// handler, not this package's Map function — it depends on the caller's JWT
+// "roles" claim (middleware.UserInfo.Roles), which entity-service's response
+// knows nothing about.
 type UserMeResponse struct {
 	ID                     string   `json:"id"`
 	Email                  string   `json:"email"`
@@ -35,6 +38,13 @@ type UserMeResponse struct {
 	Roles                  []string `json:"roles"`
 	PhoneNumber            *string  `json:"phoneNumber,omitempty"`
 	LastPasswordUpdateTime *string  `json:"lastPasswordUpdateTime,omitempty"`
+	// IsReadOnly is true only for an INTERNAL-type user (entity-service's own
+	// user_type) who holds none of the deployment-configured write roles on
+	// their own token. Always false for a genuine customer/partner — their
+	// write access is governed entirely by the webapp's own permission
+	// matrix, unaffected by this flag. The webapp hides write-path UI when
+	// this is true.
+	IsReadOnly bool `json:"isReadOnly"`
 }
 
 // MapUserMe builds the portal response from entity-service's GetUserMeResponse.

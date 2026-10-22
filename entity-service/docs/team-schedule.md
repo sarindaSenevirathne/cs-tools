@@ -460,14 +460,14 @@ and `sme_rota_admin`. No schema change: the family of a team is read from
 | Role (in CRE, SRE or SME) | Reads | Writes, updates, deletes |
 |---|---|---|
 | Engineer | every family | nothing |
-| Rota marker | every family | their own team's rotations, leave and allocations |
+| Rota Manager | every family | their own team's rotations, leave and allocations |
 | Team lead | every family | their own team |
 | Rota admin | every family | their own family's teams |
 | CRE head, CS head | every family | every CRE team, as a CRE rota admin |
 
 - **The CRE head and the CS head** (team position `cre_head` / `cs_head` on
   any team, internal staff) count as CRE rota admins without holding the role:
-  every CRE team's rota, the CRE tags, CRE's rota markers on Rota access, and
+  every CRE team's rota, the CRE tags, CRE's rota managers on Rota access, and
   on Case Paging the responders and Team leads of every CRE team. Who holds a
   position -- the America lead, Americas Team leads, the CRE and CS heads --
   keeps its own rules (a CRE rota admin or the portal admin), so a head cannot
@@ -475,9 +475,9 @@ and `sme_rota_admin`. No schema change: the family of a team is read from
 - **Reads are not limited by family**, for anyone: the catalogue, turns, leave,
   on-duty, edit markers and every Case Paging chain.
 - **Writes** go through `requireRotaWriter`: a lead edits their own team, a rota
-  admin the teams of their family, a rota marker their own team.
-- **A rota marker is not a lead.** The tags, Generate month, Case Paging and
-  paging numbers keep their own rules, which do not include a marker.
+  admin the teams of their family, a rota manager their own team.
+- **A rota manager is not a lead.** The tags, Generate month, Case Paging and
+  paging numbers keep their own rules, which do not include a rota manager.
 - **Absence kinds** (`schedule_tag_family.go`): a kind a rota admin adds is
   stored for their family (`team_schedule_absence_kind.family`), and they may
   delete only their own family's custom kinds. A team lead who is no rota admin
@@ -486,17 +486,20 @@ and `sme_rota_admin`. No schema change: the family of a team is read from
 ## Rota access (0225)
 
 The Team Schedule's **Rota access** tab, next to Case Paging, is where rota
-admins and rota markers are granted and taken back.
+admins and rota managers are granted and taken back.
 
 - **Rota admin** (`cre_rota_admin`, `sre_rota_admin`, `sme_rota_admin`, stored
   in `user_role`): edits every team in one family. Granted and removed by a
   **CSM admin** only.
-- **Rota marker** (`team_schedule_rota_marker`, one row per person and team):
+- **Rota Manager** (`team_schedule_rota_marker`, one row per person and team):
   marks one team's rotations, leave and allocations, and nothing else. Granted
   and removed by a CSM admin for any team, or by a family's rota admin for that
   family's teams. Only a member of the team can be named, and the grant stops
   counting the moment they leave the team or stop being internal staff; the tab
-  then lists it as inactive so it can be removed.
+  then lists it as inactive so it can be removed. The grant was first called
+  "rota marker", and only the name people read changed: the table, the API
+  paths (`/team-schedule/rota-access/markers/...`) and the code still say
+  marker.
 - **A CSM admin is the CSM Portal admin**: a caller whose token's `roles` claim
   holds one of `AUTH_ADMIN_ROLES`, matched exactly. It is the same variable,
   with the same value, that csm-portal-backend reads; entity-service reads it
@@ -581,6 +584,93 @@ such as `staging`), `CASE_ALERTS_RUNTIME_CLIENT_IDS` (narrows who may read the
 URLs), and `CASE_ALERTS_SECRET_KEY` / `_KEY_ID` (only to open a URL sealed
 before 0237).
 
+## Rota import (SRE)
+
+A whole SRE rota for a period, written from one JSON file:
+`POST /team-schedule/rotas/{code}/import` (and the same path on the CSM portal
+backend, `PermWrite`). `?dryRun=true` runs the import and rolls it back, so the
+answer is exactly what it would do. No schema change: every entry goes through
+the picker's own rules (`applyRangeTx` / `applyAbsenceTx`, the transaction-taking
+cores of `ApplyRange` / `ApplyAbsence`), all inside one transaction, so the file
+lands whole or not at all.
+
+In the CSM portal, the roster of an SRE rota offers **Import rota** (next to
+Generate month) to anyone who may edit one of its teams: choose the file, Preview
+(a dry run), then Import. The dialog checks the file is for the rota on screen and
+offers the template below as a download.
+
+The standard structure, schema version 1:
+
+```json
+{
+  "schemaVersion": 1,
+  "family": "SRE",
+  "rotaCode": "SRE_SAAS",
+  "period": { "from": "2026-11-01", "to": "2026-11-30" },
+  "mode": "replace",
+  "assignments": [
+    { "email": "user1@example.com", "teamKey": "apollo",  "shiftCode": "SRE_TZ1_L1", "from": "2026-11-02", "to": "2026-11-06" },
+    { "email": "user2@example.com", "teamKey": "apollo",  "shiftCode": "SRE_TZ1", "tier": "L2", "from": "2026-11-02", "to": "2026-11-06" },
+    { "email": "user3@example.com", "teamKey": "artemis", "shiftCode": "SRE_TZ2_L1", "from": "2026-11-02", "to": "2026-11-06" },
+    { "email": "user4@example.com", "teamKey": "artemis", "shiftCode": "SRE_TZ2", "tier": "L3", "from": "2026-11-02", "to": "2026-11-06" },
+    { "email": "user5@example.com", "teamKey": "apollo",  "shiftCode": "SRE_TZ3", "tier": "L1", "from": "2026-11-02", "to": "2026-11-08" },
+    { "email": "user6@example.com", "teamKey": "apollo",  "shiftCode": "SRE_WE_TZ1", "tier": "L1", "from": "2026-11-07", "to": "2026-11-08" },
+    { "email": "user7@example.com", "teamKey": "artemis", "shiftCode": "SRE_TZ1_REGULAR", "from": "2026-11-02", "to": "2026-11-27" }
+  ],
+  "absences": [
+    { "email": "user2@example.com", "teamKey": "apollo",  "kindCode": "ANNUAL_LEAVE", "from": "2026-11-16", "to": "2026-11-20" },
+    { "email": "user5@example.com", "teamKey": "apollo",  "kindCode": "SRE_NIGHT_COVER", "from": "2026-11-01", "to": "2027-01-31" },
+    { "email": "user8@example.com", "teamKey": "artemis", "kindCode": "ALLO_EXT", "allocatedTo": "Example Customer", "from": "2026-11-09", "to": "2026-11-13" }
+  ]
+}
+```
+
+| Field | Rule |
+|---|---|
+| `schemaVersion` | `1` |
+| `family`, `rotaCode` | `SRE` and a rota of that family (`SRE_SAAS`, `SRE_IAAS`); `rotaCode` must equal the path's `{code}` |
+| `period` | `YYYY-MM-DD`, both ends inclusive, at most a year |
+| `mode` | `replace`: first remove every assignment of the rota's teams dated inside the period, except the shifts a move derives (`source` MOVE, e.g. the SaaS Night cover); absences, and so their moves, are left alone. `merge`: keep them; each entry replaces only what the picker would |
+| `email` | resolved against the team schedule's members (case-insensitive); unknown, or shared by two users, is refused |
+| `teamKey` | a team on that rota (`apollo`, `artemis`, `saas-night-cover`; `iaas`) |
+| `shiftCode` | a window of one of the rota's zones; `SRE_WE_TZ2` is retired and refused |
+| `tier` | on an escalation window that does not fix one (`SRE_TZ1`, `SRE_TZ2`, `SRE_TZ3`, the weekend `SRE_WE_TZ1`, `SRE_IAAS_DAY`, `SRE_IAAS_NIGHT`), required; none on regular hours; `SRE_TZ1_L1` / `SRE_TZ2_L1` take only L1. TZ3 is one crew for the whole SaaS rota |
+| assignment `from`..`to` | inside the period; days the window is not worked are skipped and reported |
+| `kindCode` | a kind offered on the family (leave, `ALLO_INT`, `ALLO_EXT`, `ALLO_BR`, `RND`, `SRE_NIGHT_COVER`, `EXCLUDED`); retired kinds refused |
+| absence `from`..`to` | must overlap the period; may run past it (a Night cover move of three months) |
+
+**Who may.** Internal staff with a user token. Every entry needs a writer of its
+team (`requireRotaWriterOverSpan`, the picker's own rule, Night cover moves
+included), and a `replace` also needs a writer of every team of the rota, since it
+clears them all: an Apollo lead can merge Apollo's rows, only an SRE rota admin (or
+a lead of both teams) can replace the SaaS rota. The rule is asked once per team and
+once per person and team, not once per entry. It is checked before the transaction,
+as the picker checks it before its own: a lead changed in between is not seen.
+
+**Refusals.** The file's own problems are checked first and listed together (up to
+25), each named by its entry: `the rota file has problems: assignments[0]: nobody on
+the team schedule has the email ...; absences[2]: ...`. That includes two entries
+that would replace one another, by the picker's own rule: two turns for one person
+and team on a day both are worked, in the same zone or at overlapping hours, or
+regular hours twice (`assignments[3] overlaps assignments[1]: the same person on
+SRE_TZ1_L1 and SRE_TZ1 on 2026-11-04 ...`), and two absences for one person over the
+same days. Time away inside a move is allowed when the move comes first, which is how
+the roster cuts a move around leave. A rule only the database can check (a tier
+somebody else holds, a turn on another team at the same time) is not in that list:
+it refuses the whole file at the first entry that breaks it (`assignments[4]: ...`),
+status as the picker would give it, so a dry run can still be refused for one entry
+after another.
+
+**Concurrency and size.** The import takes the same advisory lock as "Generate
+month" (`RotaGeneratorOwner(rota)`), so the two never interleave on one rota. The
+lock is held for at most the request's own deadline (`REQUEST_TIMEOUT`, 60s by
+default): a cancelled request rolls the transaction back and releases it. A file is
+at most 1000 entries and 1 MiB (both entity-service and the CSM portal backend cap
+the body). Imported rows are ordinary picker rows (source as `ApplyRange` writes
+them, activity and audit recorded), so a later "Generate month" treats them as set by
+hand. Each assignment a replace clears leaves a `DELETED` activity row, noted
+"Cleared by a rota import (replace)", as a delete on the roster does.
+
 ## 5. Known gaps
 
 - **Why 0152–0156.** 0141–0150 are claimed by the open RLS work in #2094, and
@@ -597,6 +687,7 @@ before 0237).
 
 ## Change log
 
+- **Rota import (no migration).** `POST /team-schedule/rotas/{code}/import` writes a whole SRE rota for a period from one JSON file (schema version 1, people by email), all or nothing, `?dryRun=true` to preview; see "Rota import (SRE)". `ApplyRange` / `ApplyAbsence` were split into a transaction-taking core and a begin/commit wrapper so the import reuses their rules unchanged.
 - **0238 Case Alerts: SME ladder values.** `paging_ladder_value` takes ladder
   `SME`. Additive and re-runnable; no row changes.
 - **0237 Case Alerts: SME team rooms, plain URLs.** `paging_chat_room` takes
@@ -618,6 +709,11 @@ before 0237).
   records only the rota admin roles. Additive: nothing existing is changed or
   removed. entity-service now also reads `AUTH_ADMIN_ROLES` (same value as
   csm-portal-backend's).
+- **Rota reminder bookkeeping (0242).** `team_schedule_reminder_sent` records what csm-scheduled-tasks last sent for one rota period (family, reminder kind, the period's first day): when, how often, and the calendar invites with their attendees. A run reads it to tell "already sent" from "not yet" (the weekend notice re-checks every evening until the rota is complete) and to cancel an invite for somebody taken off the rota since. `GET` / `PUT /team-schedule/reminders/{family}/{kind}/{periodStart}` and `GET /team-schedule/rota-admins/{family}` (the active rota admins to email when a rota is not complete) are for the scheduled tasks' service credential only: a user token is a 403. Additive: one new table, created only if missing, nothing else touched; safe to re-run.
+- **Rota reminder settings (0242).** `team_schedule_reminder_setting` holds one row per family for the rota reminders: weekday and weekend on/off, calendar invites on/off, how many people each weekend shift needs per day (`weekend_required`, JSONB by shift code), a rotation's hours on its own clock (`windows`, e.g. the Americas Weekend and LK On-call at 08:00-18:00 America/Los_Angeles), and addresses copied on every reminder. Saved on the Rota Access tab and read by csm-scheduled-tasks at every run; a family with no row keeps the task's own configuration. `GET /team-schedule/reminder-settings/{family}` (any internal caller, 404 when none saved) and `PUT` (a CSM admin or the family's rota admin, with a user token; recorded in `team_schedule_audit`, which is why the table has an `id`). Additive: one new table, created only if missing; safe to re-run.
+- **One migration for the rota reminders, renamed before release.** All three reminder tables are in `0242_team_schedule_rota_reminders.sql`. They were written as separate files (0240, then 0241 and 0242/0243) and combined when `dev-app-csm-portal` took 0240 (`0240_team_chat_webhook_url`) and 0241 (`0241_runbook`); `first_sent_at` / `last_sent_at` became `first_sent_on` / `last_sent_on` (and `firstSentOn` / `lastSentOn` on the wire) to follow the `_on` convention. None had been released. A local database that applied an earlier name runs the combined file again harmlessly (every statement creates only what is missing); one that applied the `_at` text needs `DROP TABLE team_schedule_reminder_sent` first.
+- **Rota reminder "Send now" (0242).** `team_schedule_reminder_request` queues rota reminders asked for by hand on the Rota Access tab, for csm-scheduled-tasks (which has no address to call): `POST /team-schedule/reminder-requests/{family}` `{kind: weekday|weekend}` (a CSM admin or the family's rota admin; 409 while one of the same kind is waiting, 429 within 10 minutes of the last that did not fail; checked and written under one advisory lock), `GET` the latest 5 for the card, and, for the task's service credential only, `POST .../claim` (the oldest QUEUED, or a SENDING one not reported within 2 hours) and `PUT .../{id}/result` (`SENT` / `FAILED` with a short result). `test: true` ("Send a test to me") is a request sent only to the person asking: its own queue per person, 2 minutes apart, never held up by a real request. Audited through `team_schedule_audit` (hence the `id`). Additive: one new table and index, created only if missing; safe to re-run. 
+- **`excludeAbsent` on the rota search.** `POST /team-schedule/assignments/search` takes `excludeAbsent: true` to leave out anyone away on the assignment's rota day, by the rule `/team-schedule/on-duty` uses (every absence kind counts; a span that moves somebody to another team does not count against that team's shifts). The on-duty lookup (both its modes) and this search read one SQL fragment (`absenceOn` in `schedule_repo.go`), so the reminder emails and the pager cannot disagree about who is working. Off by default: the rota views draw leave over the rota. No schema change. Its caller is csm-scheduled-tasks' rota reminders (`rota_weekday_reminder`, `rota_weekend_notice`); an entity-service without the field refuses it (unknown field, 400), so deploy entity-service first.
 
 - **0199–0200 rotas.** The SME family; `team_schedule_rota`; `zone.rota_id` (TZ1–TZ3 on `SRE_SAAS`); the zone-family check widened from SRE to SRE or SME; IaaS and seven SME rotas, each with a Day and a Night zone and window; the `sme_rota_admin` role. Nothing is removed, renamed or re-typed, but existing objects do change: 0199 adds a value to `team_schedule_shift_family_enum`; 0200 adds the nullable column `team_schedule_zone.rota_id` and sets it on the existing TZ1–TZ3 rows, and replaces the zone-family CHECK with a wider one (every existing row satisfies it). IaaS's two windows are seeded inactive until the new webapp is deployed.
 - **0223 shared windows.** `team_schedule_shift.shared_across_teams` (BOOLEAN, default FALSE), TRUE for `SRE_TZ3` only: its tiers are one crew for the whole SaaS rota. `POST /team-schedule/assignments/apply` refuses (409, naming the holder) an SRE tier somebody else already holds on that zone and day -- per team, or across the rota on a shared window. Additive only; no constraint is added, since data written before it may already hold two people on one tier.

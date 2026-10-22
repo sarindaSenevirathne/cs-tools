@@ -29,6 +29,7 @@ export type ProjectOnboardingStatus =
   | "Not-Started"
   | "In-Progress"
   | "OnHold"
+  | "On-Hold"
   | "Completed"
   | "Expired"
   | "Cancelled"

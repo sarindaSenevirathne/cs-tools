@@ -110,6 +110,11 @@ func (s *pgProjectUpdateService) UpdateProject(ctx context.Context, id string, r
 	if !hasStoredProjectFields(req) {
 		return domain.ProjectUpdateResponse{}, &apierror.ValidationError{Msg: "at least one field must be provided"}
 	}
+	if req.OnboardingOwner != nil {
+		if err := validateUUIDs("onboardingOwner", []string{*req.OnboardingOwner}); err != nil {
+			return domain.ProjectUpdateResponse{}, err
+		}
+	}
 
 	updatedBy, err := s.resolveUpdatedBy(ctx)
 	if err != nil {
@@ -174,13 +179,15 @@ func (s *pgProjectUpdateService) resolveUpdatedBy(ctx context.Context) (string, 
 
 // hasStoredProjectFields reports whether req sets a field Postgres stores.
 func hasStoredProjectFields(req domain.ProjectUpdateRequest) bool {
-	return hasSNMirrorableProjectFields(req) || req.ClosureState != nil || req.VerificationEnabled != nil
+	return hasSNMirrorableProjectFields(req) || req.ClosureState != nil || req.VerificationEnabled != nil ||
+		req.OnboardingStatus != nil || req.OnboardingOwner != nil
 }
 
 // hasSNMirrorableProjectFields reports whether req sets a field the
 // ServiceNow dual-write mirror (snProjectUpdateService) knows how to carry.
-// ClosureState and VerificationEnabled are deliberately excluded: both are
-// direct, Postgres-only fields with no ServiceNow equivalent (see
+// ClosureState, VerificationEnabled, OnboardingStatus and OnboardingOwner are
+// deliberately excluded: they are direct, Postgres-only fields with no
+// ServiceNow equivalent (see
 // domain.ProjectUpdateRequest.ClosureState's own doc comment), so a request
 // that sets only one of them has nothing to mirror -- dispatching one would
 // only ever produce an always-failing writeback attempt against a field

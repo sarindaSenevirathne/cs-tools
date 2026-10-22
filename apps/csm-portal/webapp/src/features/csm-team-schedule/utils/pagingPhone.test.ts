@@ -18,7 +18,7 @@
 
 import { describe, expect, it } from "vitest";
 import { pagingMember } from "../test/fixtures";
-import { phoneChipState, testCallAwaited, validateE164 } from "./pagingPhone";
+import { phoneChipState, profileTestState, testCallAwaited, validateE164 } from "./pagingPhone";
 
 const phone = (over: Record<string, unknown> = {}) => ({
   masked: "+94•••••123",
@@ -80,5 +80,25 @@ describe("testCallAwaited", () => {
     expect(testCallAwaited(m, started + 60_000)).toBe(true);
     expect(testCallAwaited(m, started + 3 * 60_000)).toBe(false);
     expect(testCallAwaited(pagingMember({ membershipId: "b", pagingPhone: phone({ lastTestStatus: "completed" }) }), started)).toBe(false);
+  });
+  it("follows the number a test rings when the reader may test", () => {
+    const profile = pagingMember({
+      membershipId: "c",
+      pagingPhone: phone({ lastTestStatus: "completed" }),
+      testCall: { masked: "+94•••••001", source: "profile", lastTestStatus: "pending", lastTestAt: "2026-10-08T09:00:00Z" },
+    });
+    expect(testCallAwaited(profile, started + 60_000)).toBe(true);
+  });
+});
+
+describe("profileTestState", () => {
+  it("says how a profile number's last test went, and nothing for a paging number or before a result", () => {
+    const t = { masked: "+94•••••001", source: "profile" as const };
+    expect(profileTestState({ ...t, lastTestStatus: "completed" })).toEqual({ label: "Test call answered", tone: "ok" });
+    expect(profileTestState({ ...t, lastTestStatus: "busy" })).toEqual({ label: "Test call failed (busy)", tone: "err" });
+    expect(profileTestState({ ...t, lastTestStatus: "pending" })).toBeUndefined();
+    expect(profileTestState(t)).toBeUndefined();
+    expect(profileTestState({ ...t, source: "paging", lastTestStatus: "failed" })).toBeUndefined();
+    expect(profileTestState(null)).toBeUndefined();
   });
 });

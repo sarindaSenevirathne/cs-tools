@@ -19,9 +19,10 @@ package sweep
 import "context"
 
 // DryRunProjectUpdater satisfies projectUpdater without ever calling
-// entity-service — it silently no-ops instead of writing. This is the
+// entity-service or sales-entity-service — it silently no-ops instead of
+// writing. This is the
 // entire mechanism behind DRY_RUN: main.go injects this instead of the real
-// *entity.Client when dry-run is active, and processProject/Run are
+// *Writer when dry-run is active, and processProject/Run are
 // completely unaware of the distinction — they just call whichever
 // projectUpdater they were given.
 //
@@ -36,4 +37,9 @@ type DryRunProjectUpdater struct{}
 // UpdateProject always succeeds without doing anything.
 func (u *DryRunProjectUpdater) UpdateProject(ctx context.Context, id string, body []byte) ([]byte, error) {
 	return []byte(`{}`), nil
+}
+
+// SuspendInSalesforce always succeeds without doing anything.
+func (u *DryRunProjectUpdater) SuspendInSalesforce(ctx context.Context, sfID string) error {
+	return nil
 }

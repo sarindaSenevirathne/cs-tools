@@ -26,6 +26,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -625,6 +626,11 @@ func (r *projectRepo) UpdateProject(ctx context.Context, id string, req domain.P
 	if err := validateClosureFields(req); err != nil {
 		return domain.ProjectUpdateResult{}, err
 	}
+	if req.OnboardingStatus != nil {
+		if _, err := onboardingStatusEnumLabels("onboardingStatus", []string{*req.OnboardingStatus}); err != nil {
+			return domain.ProjectUpdateResult{}, err
+		}
+	}
 	// WithSystemIdentity: this writes only project and account, neither
 	// RLS-protected, and carries no caller-visible rows. The service already
 	// authorized the caller (resolveUpdatedBy); this only gives Scoped the
@@ -665,6 +671,32 @@ func updateProjectTx(ctx context.Context, tx pgx.Tx, id string, req domain.Proje
 		return domain.ProjectUpdateResult{}, &apierror.ConflictError{Msg: "project has no linked account; hasAgent/hasKbReferences cannot be set"}
 	}
 
+	// The onboarding owner must be an active internal user. A bad id is the
+	// caller's input error (400), not a missing project, so it is not a 404.
+	var onboardingStatus, onboardingOwner *string
+	if req.OnboardingStatus != nil {
+		labels, err := onboardingStatusEnumLabels("onboardingStatus", []string{*req.OnboardingStatus})
+		if err != nil {
+			return domain.ProjectUpdateResult{}, err
+		}
+		onboardingStatus = &labels[0]
+	}
+	if req.OnboardingOwner != nil {
+		var userType *string
+		var active *bool
+		err := tx.QueryRow(ctx, `SELECT user_type::TEXT, is_active FROM "user" WHERE id = $1`, *req.OnboardingOwner).Scan(&userType, &active)
+		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "22P02" {
+			return domain.ProjectUpdateResult{}, &apierror.ValidationError{Msg: "onboardingOwner: " + strconv.Quote(*req.OnboardingOwner) + " is not a valid user id"}
+		}
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && (userType == nil || *userType != "INTERNAL" || (active != nil && !*active))) {
+			return domain.ProjectUpdateResult{}, &apierror.ValidationError{Msg: "onboardingOwner: " + strconv.Quote(*req.OnboardingOwner) + " is not an active internal user"}
+		}
+		if err != nil {
+			return domain.ProjectUpdateResult{}, fmt.Errorf("update project: check onboarding owner: %w", err)
+		}
+		onboardingOwner = req.OnboardingOwner
+	}
+
 	// project.updated_on/updated_by is bumped on every successful call, even one
 	// that only touches the linked account below.
 	var res domain.ProjectUpdateResult
@@ -675,12 +707,15 @@ func updateProjectTx(ctx context.Context, tx pgx.Tx, id string, req domain.Proje
 		    compliance_violation_closure_state = COALESCE($4::compliance_violation_closure_state_enum, compliance_violation_closure_state),
 		    verification_enabled = COALESCE($6::boolean, verification_enabled),
 		    suspension_process_state = COALESCE($7::jsonb, suspension_process_state),
+		    onboarding_status = COALESCE($8::text::onboarding_status_enum, onboarding_status),
+		    onboarding_owner_id = COALESCE($9::uuid, onboarding_owner_id),
 		    updated_on = NOW(),
 		    updated_by = $5
 		WHERE id = $1
 		RETURNING id, updated_on, updated_by, verification_enabled`,
 		id, closureEnumLabel(req.EndDateClosureState), closureEnumLabel(req.InvoiceDueDateClosureState),
 		closureEnumLabel(req.ComplianceViolationClosureState), updatedBy, req.VerificationEnabled, suspensionStateArg(req.SuspensionProcessState),
+		onboardingStatus, onboardingOwner,
 	).Scan(&res.ID, &res.UpdatedOn, &res.UpdatedBy, &res.VerificationEnabled)
 	if err != nil {
 		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "22P02" {
@@ -719,6 +754,17 @@ func updateProjectTx(ctx context.Context, tx pgx.Tx, id string, req domain.Proje
 	if err != nil {
 		return domain.ProjectUpdateResult{}, fmt.Errorf("update project: read closure states: %w", err)
 	}
+
+	var ownerID, ownerName, ownerEmail *string
+	err = tx.QueryRow(ctx, `
+		SELECT INITCAP(REPLACE(p.onboarding_status::TEXT, '_', '-')),
+		       onb.id::TEXT, COALESCE(onb.name, NULLIF(TRIM(CONCAT_WS(' ', onb.first_name, onb.last_name)), '')), onb.email
+		FROM project p LEFT JOIN "user" onb ON onb.id = p.onboarding_owner_id
+		WHERE p.id = $1`, id).Scan(&res.OnboardingStatus, &ownerID, &ownerName, &ownerEmail)
+	if err != nil {
+		return domain.ProjectUpdateResult{}, fmt.Errorf("update project: read onboarding: %w", err)
+	}
+	res.OnboardingOwner = onboardingOwnerRef(ownerID, ownerName, ownerEmail)
 
 	if req.HasAgent != nil || req.HasKbReferences != nil {
 		// RowsAffected is checked, not just the error, because the account

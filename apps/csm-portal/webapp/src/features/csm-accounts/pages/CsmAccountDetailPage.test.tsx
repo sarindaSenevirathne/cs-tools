@@ -14,7 +14,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { JSX, ReactElement } from "react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router";
@@ -185,6 +185,29 @@ describe("CsmAccountDetailPage", () => {
     expect(screen.getByTestId("location-probe")).toHaveTextContent(
       "/admin/teams/team-cre-1",
     );
+  });
+
+  it("shows the account's country beside its region in the Overview", () => {
+    mockAccount({ data: { ...BASE_ACCOUNT, country: "Sri Lanka" } });
+    renderPage(<CsmAccountDetailPage />);
+
+    expect(screen.getByText("Region")).toBeInTheDocument();
+    expect(screen.getByText("US")).toBeInTheDocument();
+    expect(screen.getByText("Country")).toBeInTheDocument();
+    expect(screen.getByText("Sri Lanka")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["has no country on record", { country: null }],
+    ["carries an empty country", { country: "" }],
+    ["omits the country field", {}],
+  ])("shows a dash in the Country cell when the account %s", (_label, overrides) => {
+    mockAccount({ data: { ...BASE_ACCOUNT, region: "US", ...overrides } });
+    renderPage(<CsmAccountDetailPage />);
+
+    const cell = screen.getByText("Country").parentElement;
+    expect(cell).not.toBeNull();
+    expect(within(cell as HTMLElement).getByText("—")).toBeInTheDocument();
   });
 
   it("renders only the SRE chip when only the SRE team is set", () => {

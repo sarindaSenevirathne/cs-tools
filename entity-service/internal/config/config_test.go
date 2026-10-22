@@ -946,7 +946,11 @@ func TestLoad_Redis(t *testing.T) {
 	t.Setenv("REDIS_URL", "")
 	t.Setenv("REDIS_ADDR", "")
 	t.Setenv("USER_CACHE_TTL", "")
+	t.Setenv("PRODUCT_VULNERABILITY_META_CACHE_TTL", "")
 	c := Load()
+	if c.VulnerabilityMetaCacheTTL != 24*time.Hour {
+		t.Errorf("VulnerabilityMetaCacheTTL = %v, want the 24h default", c.VulnerabilityMetaCacheTTL)
+	}
 	if c.HasRedis() {
 		t.Error("HasRedis() = true with neither REDIS_URL nor REDIS_ADDR set")
 	}
@@ -956,7 +960,11 @@ func TestLoad_Redis(t *testing.T) {
 
 	t.Setenv("REDIS_ADDR", " localhost:6379 ")
 	t.Setenv("USER_CACHE_TTL", "90s")
+	t.Setenv("PRODUCT_VULNERABILITY_META_CACHE_TTL", "2h")
 	c = Load()
+	if c.VulnerabilityMetaCacheTTL != 2*time.Hour {
+		t.Errorf("VulnerabilityMetaCacheTTL = %v, want 2h", c.VulnerabilityMetaCacheTTL)
+	}
 	if !c.HasRedis() || c.RedisAddr != "localhost:6379" {
 		t.Errorf("HasRedis() = %v, RedisAddr = %q; want true, %q", c.HasRedis(), c.RedisAddr, "localhost:6379")
 	}

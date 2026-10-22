@@ -18,6 +18,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -45,10 +46,10 @@ func TestGetMe(t *testing.T) {
 		assertContentType(t, w, "application/json")
 	})
 
-	t.Run("returns email from JWT even when SCIM fails", func(t *testing.T) {
-		// SCIM errors are non-fatal; the handler degrades gracefully.
+	t.Run("never consults the identity provider for the phone", func(t *testing.T) {
 		scimClient := &mockSCIMClient{
 			searchUserFn: func(_ context.Context, _ string) (*scim.UserInfo, error) {
+				t.Error("GET /users/me must not read the identity provider")
 				return nil, errors.New("scim unavailable")
 			},
 		}
@@ -64,7 +65,7 @@ func TestGetMe(t *testing.T) {
 			t.Errorf("email = %v, want %q", resp["email"], testUser.Email)
 		}
 		if _, ok := resp["phoneNumber"]; ok {
-			t.Error("phoneNumber should be absent when SCIM fails")
+			t.Error("phoneNumber should be absent when the platform record has none")
 		}
 	})
 
@@ -162,6 +163,140 @@ func TestGetMe(t *testing.T) {
 		}
 		if resp.Team != nil {
 			t.Errorf("team = %v, want null", resp.Team)
+		}
+	})
+
+	t.Run("entity 404 but the token grants cs_engineer provisions a user row from the token", func(t *testing.T) {
+		var createBody []byte
+		var patchedID string
+		var patchBody []byte
+		entityClient := &mockEntityUserClient{
+			getUserMeFn: func(_ context.Context) ([]byte, error) {
+				return nil, &apierror.Error{StatusCode: http.StatusNotFound}
+			},
+			createUserFn: func(_ context.Context, body []byte) ([]byte, error) {
+				createBody = body
+				return []byte(`{"id":"11111111-1111-1111-1111-111111111111","email":"agent@example.com"}`), nil
+			},
+			updateUserFn: func(_ context.Context, id string, body []byte) ([]byte, error) {
+				patchedID = id
+				patchBody = body
+				return []byte(`{}`), nil
+			},
+		}
+		// SCIM must never be consulted for this path -- the caller IS the
+		// person being provisioned, so their own token already has
+		// everything needed (unlike the admin Add User flow, which has no
+		// token for the person it's creating).
+		scimClient := &mockSCIMClient{
+			searchUserFn: func(context.Context, string) (*scim.UserInfo, error) {
+				t.Fatal("SCIM must not be consulted when provisioning from the token")
+				return nil, nil
+			},
+		}
+		cfg := testAccessConfig()
+		h := NewUsersHandler(scimClient, entityClient, testDirectory(t), false, nil).WithAccessGuard(NewAccessGuard(cfg))
+		user := &middleware.UserInfo{
+			Email: "agent@example.com", UserID: "u-1",
+			FirstName: "Jane", LastName: "Doe", PhoneNumber: "+1-555-0100",
+			Roles: []string{"test-cs-engineer"},
+		}
+		r := httptest.NewRequest(http.MethodGet, "/users/me", nil)
+		r = r.WithContext(middleware.WithUserInfo(r.Context(), user))
+		w := httptest.NewRecorder()
+		h.GetMe(w, r)
+
+		assertStatus(t, w, http.StatusOK)
+		type getMeResp struct {
+			ID          *string  `json:"id"`
+			FirstName   *string  `json:"firstName"`
+			LastName    *string  `json:"lastName"`
+			PhoneNumber *string  `json:"phoneNumber"`
+			Roles       []string `json:"roles"`
+		}
+		resp := decodeJSON[getMeResp](t, w)
+		if resp.ID == nil || *resp.ID != "11111111-1111-1111-1111-111111111111" {
+			t.Errorf("id = %v, want the newly created user's id", resp.ID)
+		}
+		if resp.FirstName == nil || *resp.FirstName != "Jane" {
+			t.Errorf("firstName = %v, want Jane (from the token)", resp.FirstName)
+		}
+		if resp.LastName == nil || *resp.LastName != "Doe Ⓦ" {
+			t.Errorf("lastName = %v, want %q", resp.LastName, "Doe Ⓦ")
+		}
+		if resp.PhoneNumber == nil || *resp.PhoneNumber != "+1-555-0100" {
+			t.Errorf("phoneNumber = %v, want %q (from the token)", resp.PhoneNumber, "+1-555-0100")
+		}
+		if joined(&resp.Roles) != "cs_engineer" {
+			t.Errorf("roles = %s, want cs_engineer", joined(&resp.Roles))
+		}
+
+		if createBody == nil {
+			t.Fatal("entity CreateUser was never called")
+		}
+		var created struct {
+			FirstName string   `json:"firstName"`
+			LastName  string   `json:"lastName"`
+			Email     string   `json:"email"`
+			Roles     []string `json:"roles"`
+		}
+		if err := json.Unmarshal(createBody, &created); err != nil {
+			t.Fatalf("decode CreateUser body: %v", err)
+		}
+		if created.FirstName != "Jane" || created.LastName != "Doe Ⓦ" || created.Email != "agent@example.com" {
+			t.Errorf("CreateUser body = %+v, want firstName Jane, lastName \"Doe Ⓦ\", email agent@example.com", created)
+		}
+		if len(created.Roles) != 1 || created.Roles[0] != "internal" {
+			t.Errorf("CreateUser roles = %v, want [internal]", created.Roles)
+		}
+
+		if patchedID != "11111111-1111-1111-1111-111111111111" {
+			t.Errorf("UpdateUser id = %q, want the newly created user's id", patchedID)
+		}
+		var patched struct {
+			Phone string `json:"phone"`
+		}
+		if err := json.Unmarshal(patchBody, &patched); err != nil {
+			t.Fatalf("decode UpdateUser (phone) body: %v", err)
+		}
+		if patched.Phone != "+1-555-0100" {
+			t.Errorf("UpdateUser phone = %q, want %q", patched.Phone, "+1-555-0100")
+		}
+	})
+
+	t.Run("entity 404, cs_engineer, but the entity create fails: falls back to the token-only answer", func(t *testing.T) {
+		entityClient := &mockEntityUserClient{
+			getUserMeFn: func(_ context.Context) ([]byte, error) {
+				return nil, &apierror.Error{StatusCode: http.StatusNotFound}
+			},
+			createUserFn: func(_ context.Context, _ []byte) ([]byte, error) {
+				return nil, errors.New("entity unavailable")
+			},
+		}
+		cfg := testAccessConfig()
+		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil).WithAccessGuard(NewAccessGuard(cfg))
+		user := &middleware.UserInfo{
+			Email: "agent@example.com", UserID: "u-1",
+			FirstName: "Jane", LastName: "Doe",
+			Roles: []string{"test-cs-engineer"},
+		}
+		r := httptest.NewRequest(http.MethodGet, "/users/me", nil)
+		r = r.WithContext(middleware.WithUserInfo(r.Context(), user))
+		w := httptest.NewRecorder()
+		h.GetMe(w, r)
+
+		assertStatus(t, w, http.StatusOK)
+		type getMeResp struct {
+			ID        *string `json:"id"`
+			FirstName *string `json:"firstName"`
+			LastName  *string `json:"lastName"`
+		}
+		resp := decodeJSON[getMeResp](t, w)
+		if resp.ID != nil {
+			t.Errorf("id = %v, want null: no user row was created", resp.ID)
+		}
+		if resp.FirstName == nil || *resp.FirstName != "Jane" || resp.LastName == nil || *resp.LastName != "Doe" {
+			t.Errorf("firstName/lastName = %v/%v, want Jane/Doe (from the token, unmarked)", resp.FirstName, resp.LastName)
 		}
 	})
 
@@ -270,37 +405,42 @@ func TestGetMe(t *testing.T) {
 		}
 	})
 
-	t.Run("searches SCIM by the JWT email and returns phone number", func(t *testing.T) {
-		phone := "+94771234567"
-		var capturedEmail string
-		scimClient := &mockSCIMClient{
-			searchUserFn: func(_ context.Context, email string) (*scim.UserInfo, error) {
-				capturedEmail = email
-				return &scim.UserInfo{
-					PhoneNumber: &phone,
-				}, nil
+	t.Run("phoneNumber is the platform record's phone", func(t *testing.T) {
+		entityClient := &mockEntityUserClient{
+			getUserMeFn: func(_ context.Context) ([]byte, error) {
+				return []byte(`{"id":"u-1","email":"agent@example.com","lastName":"Doe","phone":"+15550001111","roles":[],"groups":[]}`), nil
 			},
 		}
-		h := NewUsersHandler(scimClient, &mockEntityUserClient{}, testDirectory(t), false, nil)
+		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/users/me", nil))
 		w := httptest.NewRecorder()
 		h.GetMe(w, r)
 
 		assertStatus(t, w, http.StatusOK)
-		assertContentType(t, w, "application/json")
-		if capturedEmail != testUser.Email {
-			t.Errorf("SCIM searched email %q, want %q", capturedEmail, testUser.Email)
+		resp := decodeJSON[map[string]any](t, w)
+		if got := resp["phoneNumber"]; got != "+15550001111" {
+			t.Errorf("phoneNumber = %v, want %q", got, "+15550001111")
 		}
-		type getMeResp struct {
-			Email       string  `json:"email"`
-			PhoneNumber *string `json:"phoneNumber"`
+		if _, ok := resp["platformPhone"]; ok {
+			t.Error("platformPhone is no longer part of the response")
 		}
-		resp := decodeJSON[getMeResp](t, w)
-		if resp.Email != testUser.Email {
-			t.Errorf("email = %q, want %q", resp.Email, testUser.Email)
+	})
+
+	t.Run("phoneNumber is absent when the platform record has no phone", func(t *testing.T) {
+		entityClient := &mockEntityUserClient{
+			getUserMeFn: func(_ context.Context) ([]byte, error) {
+				return []byte(`{"id":"u-1","email":"agent@example.com","lastName":"Doe","roles":[],"groups":[]}`), nil
+			},
 		}
-		if resp.PhoneNumber == nil || *resp.PhoneNumber != phone {
-			t.Errorf("phoneNumber = %v, want %q", resp.PhoneNumber, phone)
+		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
+		r := withUser(httptest.NewRequest(http.MethodGet, "/users/me", nil))
+		w := httptest.NewRecorder()
+		h.GetMe(w, r)
+
+		assertStatus(t, w, http.StatusOK)
+		resp := decodeJSON[map[string]any](t, w)
+		if v, ok := resp["phoneNumber"]; ok {
+			t.Errorf("phoneNumber = %v, want the key absent", v)
 		}
 	})
 }
@@ -471,89 +611,35 @@ func TestPatchMe(t *testing.T) {
 		assertErrorMessage(t, w, "At least one field must be provided for update.")
 	})
 
-	t.Run("passes correct userID and phone to SCIM and returns updated phone", func(t *testing.T) {
-		updated := "+94777654321"
-		var capturedUserID, capturedMobile string
+	t.Run("phone is written to the entity service only and echoed back", func(t *testing.T) {
+		var entityBody []byte
 		scimClient := &mockSCIMClient{
-			updateUserPhoneFn: func(_ context.Context, userID, mobile string) (*string, error) {
-				capturedUserID = userID
-				capturedMobile = mobile
-				return &updated, nil
+			updateUserPhoneFn: func(_ context.Context, _, _ string) (*string, error) {
+				t.Error("PATCH /users/me must not write the identity provider")
+				return nil, nil
 			},
 		}
-		h := NewUsersHandler(scimClient, &mockEntityUserClient{}, testDirectory(t), false, nil)
+		entityClient := &mockEntityUserClient{
+			patchUserMeFn: func(_ context.Context, body []byte) ([]byte, error) {
+				entityBody = body
+				return []byte(`{}`), nil
+			},
+		}
+		h := NewUsersHandler(scimClient, entityClient, testDirectory(t), false, nil)
 		r := withUser(httptest.NewRequest(http.MethodPatch, "/users/me", strings.NewReader(`{"phoneNumber":"+94777654321"}`)))
 		w := httptest.NewRecorder()
 		h.PatchMe(w, r)
 
 		assertStatus(t, w, http.StatusOK)
 		assertContentType(t, w, "application/json")
-		if capturedUserID != testUser.UserID {
-			t.Errorf("SCIM called with userID %q, want %q", capturedUserID, testUser.UserID)
-		}
-		if capturedMobile != "+94777654321" {
-			t.Errorf("SCIM called with mobile %q, want %q", capturedMobile, "+94777654321")
-		}
-		type patchResp struct {
-			PhoneNumber *string `json:"phoneNumber"`
-		}
-		resp := decodeJSON[patchResp](t, w)
-		if resp.PhoneNumber == nil || *resp.PhoneNumber != updated {
-			t.Errorf("phoneNumber = %v, want %q", resp.PhoneNumber, updated)
-		}
-	})
-
-	t.Run("phone mirrors to entity after SCIM with the stored value", func(t *testing.T) {
-		var order []string
-		var entityBody []byte
-		stored := "+15555550123"
-		scimClient := &mockSCIMClient{
-			updateUserPhoneFn: func(_ context.Context, _, _ string) (*string, error) {
-				order = append(order, "scim")
-				return &stored, nil
-			},
-		}
-		entityClient := &mockEntityUserClient{
-			patchUserMeFn: func(_ context.Context, body []byte) ([]byte, error) {
-				order = append(order, "entity")
-				entityBody = body
-				return []byte(`{}`), nil
-			},
-		}
-		h := NewUsersHandler(scimClient, entityClient, testDirectory(t), false, nil)
-		r := withUser(httptest.NewRequest(http.MethodPatch, "/users/me", strings.NewReader(`{"phoneNumber":" +1 555 555 0123"}`)))
-		w := httptest.NewRecorder()
-		h.PatchMe(w, r)
-		assertStatus(t, w, http.StatusOK)
-		if strings.Join(order, ",") != "scim,entity" {
-			t.Errorf("call order = %v, want scim then entity", order)
-		}
-		if string(entityBody) != `{"phone":"+15555550123"}` {
+		if string(entityBody) != `{"phone":"+94777654321"}` {
 			t.Errorf("entity body = %s", entityBody)
 		}
 		resp := decodeJSON[struct {
 			PhoneNumber *string `json:"phoneNumber"`
 		}](t, w)
-		if resp.PhoneNumber == nil || *resp.PhoneNumber != stored {
-			t.Errorf("phoneNumber = %v, want %q", resp.PhoneNumber, stored)
-		}
-	})
-
-	t.Run("phone falls back to requested value when SCIM returns none", func(t *testing.T) {
-		var entityBody []byte
-		entityClient := &mockEntityUserClient{
-			patchUserMeFn: func(_ context.Context, body []byte) ([]byte, error) {
-				entityBody = body
-				return []byte(`{}`), nil
-			},
-		}
-		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
-		r := withUser(httptest.NewRequest(http.MethodPatch, "/users/me", strings.NewReader(`{"phoneNumber":"+15555550123"}`)))
-		w := httptest.NewRecorder()
-		h.PatchMe(w, r)
-		assertStatus(t, w, http.StatusOK)
-		if string(entityBody) != `{"phone":"+15555550123"}` {
-			t.Errorf("entity body = %s", entityBody)
+		if resp.PhoneNumber == nil || *resp.PhoneNumber != "+94777654321" {
+			t.Errorf("phoneNumber = %v, want %q", resp.PhoneNumber, "+94777654321")
 		}
 	})
 
@@ -572,6 +658,37 @@ func TestPatchMe(t *testing.T) {
 		assertStatus(t, w, http.StatusOK)
 		if string(entityBody) != `{"phone":""}` {
 			t.Errorf("entity body = %s", entityBody)
+		}
+	})
+
+	t.Run("phone is trimmed before it is stored and echoed back", func(t *testing.T) {
+		for name, tc := range map[string]struct{ in, stored string }{
+			"padded": {" +15555550123 ", "+15555550123"},
+			"blank":  {"   ", ""},
+		} {
+			t.Run(name, func(t *testing.T) {
+				var entityBody []byte
+				entityClient := &mockEntityUserClient{
+					patchUserMeFn: func(_ context.Context, body []byte) ([]byte, error) {
+						entityBody = body
+						return []byte(`{}`), nil
+					},
+				}
+				h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, nil)
+				r := withUser(httptest.NewRequest(http.MethodPatch, "/users/me", strings.NewReader(`{"phoneNumber":"`+tc.in+`"}`)))
+				w := httptest.NewRecorder()
+				h.PatchMe(w, r)
+				assertStatus(t, w, http.StatusOK)
+				if want := `{"phone":"` + tc.stored + `"}`; string(entityBody) != want {
+					t.Errorf("entity body = %s, want %s", entityBody, want)
+				}
+				resp := decodeJSON[struct {
+					PhoneNumber *string `json:"phoneNumber"`
+				}](t, w)
+				if resp.PhoneNumber == nil || *resp.PhoneNumber != tc.stored {
+					t.Errorf("phoneNumber = %v, want %q", resp.PhoneNumber, tc.stored)
+				}
+			})
 		}
 	})
 
@@ -604,7 +721,7 @@ func TestPatchMe(t *testing.T) {
 		}
 	})
 
-	t.Run("timeZone only does not call SCIM", func(t *testing.T) {
+	t.Run("timeZone only does not touch the phone or the identity provider", func(t *testing.T) {
 		scimCalled := false
 		scimClient := &mockSCIMClient{
 			updateUserPhoneFn: func(_ context.Context, _, _ string) (*string, error) {
@@ -665,32 +782,7 @@ func TestPatchMe(t *testing.T) {
 		}
 	})
 
-	t.Run("SCIM failure does not call entity", func(t *testing.T) {
-		entityCalled := false
-		scimClient := &mockSCIMClient{
-			updateUserPhoneFn: func(_ context.Context, _, _ string) (*string, error) {
-				return nil, errors.New("boom")
-			},
-		}
-		entityClient := &mockEntityUserClient{
-			patchUserMeFn: func(_ context.Context, _ []byte) ([]byte, error) {
-				entityCalled = true
-				return []byte(`{}`), nil
-			},
-		}
-		h := NewUsersHandler(scimClient, entityClient, testDirectory(t), false, nil)
-		r := withUser(httptest.NewRequest(http.MethodPatch, "/users/me", strings.NewReader(`{"phoneNumber":"+15555550123","timeZone":"UTC"}`)))
-		w := httptest.NewRecorder()
-		h.PatchMe(w, r)
-		if w.Code < 400 {
-			t.Errorf("status = %d, want error", w.Code)
-		}
-		if entityCalled {
-			t.Error("entity must not be called after SCIM failure")
-		}
-	})
-
-	t.Run("entity errors after SCIM success are mapped", func(t *testing.T) {
+	t.Run("entity errors are mapped", func(t *testing.T) {
 		for _, tc := range upstreamErrors("Failed to update phone number.") {
 			t.Run(tc.name, func(t *testing.T) {
 				t.Parallel()
@@ -705,26 +797,6 @@ func TestPatchMe(t *testing.T) {
 				h.PatchMe(w, r)
 				assertStatus(t, w, tc.wantCode)
 				assertErrorMessage(t, w, tc.wantMsg)
-			})
-		}
-	})
-
-	t.Run("upstream errors from SCIM are mapped correctly", func(t *testing.T) {
-		for _, tc := range upstreamErrors("Failed to update phone number.") {
-			t.Run(tc.name, func(t *testing.T) {
-				t.Parallel()
-				scimClient := &mockSCIMClient{
-					updateUserPhoneFn: func(_ context.Context, _, _ string) (*string, error) {
-						return nil, tc.err
-					},
-				}
-				h := NewUsersHandler(scimClient, &mockEntityUserClient{}, testDirectory(t), false, nil)
-				r := withUser(httptest.NewRequest(http.MethodPatch, "/users/me", strings.NewReader(`{"phoneNumber":"+1"}`)))
-				w := httptest.NewRecorder()
-				h.PatchMe(w, r)
-				assertStatus(t, w, tc.wantCode)
-				assertErrorMessage(t, w, tc.wantMsg)
-				assertContentType(t, w, "application/json")
 			})
 		}
 	})
@@ -1083,6 +1155,118 @@ func TestCreateUser(t *testing.T) {
 				assertErrorMessage(t, w, tc.wantMsg)
 				assertContentType(t, w, "application/json")
 			})
+		}
+	})
+
+	// The Add User form only collects an email; a request with no firstName
+	// AND no lastName at all (not merely empty strings on the wire, since
+	// JSON omission decodes to "" the same way) means the UI expects this
+	// handler to source the rest from SCIM, mirroring provisionCsEngineerUser.
+	t.Run("an email-only request fills firstName/lastName/phone from SCIM", func(t *testing.T) {
+		phone := "+1-555-0100"
+		var capturedCreate []byte
+		var patchedID string
+		var patchedBody []byte
+		entityClient := &mockEntityUserClient{
+			createUserFn: func(_ context.Context, body []byte) ([]byte, error) {
+				capturedCreate = body
+				return []byte(`{"id":"11111111-1111-1111-1111-111111111111","email":"jane.doe@wso2.com"}`), nil
+			},
+			updateUserFn: func(_ context.Context, id string, body []byte) ([]byte, error) {
+				patchedID = id
+				patchedBody = body
+				return []byte(`{}`), nil
+			},
+		}
+		scimClient := &mockSCIMClient{
+			searchUserFn: func(_ context.Context, email string) (*scim.UserInfo, error) {
+				if email != "jane.doe@wso2.com" {
+					t.Errorf("SearchUser email = %q, want jane.doe@wso2.com", email)
+				}
+				return &scim.UserInfo{FirstName: "Jane", LastName: "Doe", PhoneNumber: &phone}, nil
+			},
+		}
+		h := NewUsersHandler(scimClient, entityClient, testDirectory(t), false, nil)
+		r := withUser(httptest.NewRequest(http.MethodPost, "/users",
+			strings.NewReader(`{"email":"jane.doe@wso2.com","roles":["agent"]}`)))
+		w := httptest.NewRecorder()
+		h.CreateUser(w, r)
+
+		assertStatus(t, w, http.StatusCreated)
+		if capturedCreate == nil {
+			t.Fatal("entity CreateUser was never called")
+		}
+		var created struct {
+			FirstName string `json:"firstName"`
+			LastName  string `json:"lastName"`
+			Email     string `json:"email"`
+		}
+		if err := json.Unmarshal(capturedCreate, &created); err != nil {
+			t.Fatalf("decode CreateUser body: %v", err)
+		}
+		if created.FirstName != "Jane" || created.LastName != "Doe" || created.Email != "jane.doe@wso2.com" {
+			t.Errorf("CreateUser body = %+v, want firstName Jane, lastName Doe, email jane.doe@wso2.com", created)
+		}
+
+		if patchedID != "11111111-1111-1111-1111-111111111111" {
+			t.Errorf("UpdateUser id = %q, want the newly created user's id", patchedID)
+		}
+		var patched struct {
+			Phone string `json:"phone"`
+		}
+		if err := json.Unmarshal(patchedBody, &patched); err != nil {
+			t.Fatalf("decode UpdateUser (phone) body: %v", err)
+		}
+		if patched.Phone != phone {
+			t.Errorf("UpdateUser phone = %q, want %q", patched.Phone, phone)
+		}
+	})
+
+	t.Run("an email-only request with no SCIM match is rejected, not forwarded upstream", func(t *testing.T) {
+		called := false
+		entityClient := &mockEntityUserClient{
+			createUserFn: func(context.Context, []byte) ([]byte, error) {
+				called = true
+				return []byte(`{}`), nil
+			},
+		}
+		scimClient := &mockSCIMClient{
+			searchUserFn: func(_ context.Context, _ string) (*scim.UserInfo, error) {
+				return nil, nil
+			},
+		}
+		h := NewUsersHandler(scimClient, entityClient, testDirectory(t), false, nil)
+		r := withUser(httptest.NewRequest(http.MethodPost, "/users",
+			strings.NewReader(`{"email":"unknown@wso2.com"}`)))
+		w := httptest.NewRecorder()
+		h.CreateUser(w, r)
+		assertStatus(t, w, http.StatusBadRequest)
+		if called {
+			t.Fatal("entity service must not be called when SCIM has no matching user")
+		}
+	})
+
+	t.Run("an email-only request is rejected when the SCIM search itself fails", func(t *testing.T) {
+		called := false
+		entityClient := &mockEntityUserClient{
+			createUserFn: func(context.Context, []byte) ([]byte, error) {
+				called = true
+				return []byte(`{}`), nil
+			},
+		}
+		scimClient := &mockSCIMClient{
+			searchUserFn: func(_ context.Context, _ string) (*scim.UserInfo, error) {
+				return nil, errors.New("scim unavailable")
+			},
+		}
+		h := NewUsersHandler(scimClient, entityClient, testDirectory(t), false, nil)
+		r := withUser(httptest.NewRequest(http.MethodPost, "/users",
+			strings.NewReader(`{"email":"jane.doe@wso2.com"}`)))
+		w := httptest.NewRecorder()
+		h.CreateUser(w, r)
+		assertStatus(t, w, http.StatusBadRequest)
+		if called {
+			t.Fatal("entity service must not be called when the SCIM search fails")
 		}
 	})
 }

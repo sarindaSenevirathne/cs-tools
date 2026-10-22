@@ -110,7 +110,7 @@ const expectedInvalidationsFor = (id: string) => [
   ["csm-case-comments", id],
   ["csm-case-activities", id],
   ["csm-case-detail", id],
-  ["csm-case-slas", id],
+  ["work-item-slas", id],
   ["csm-cases"],
   ["csm-case-children"],
 ];
@@ -500,11 +500,11 @@ describe("useMultiplexedCaseStream", () => {
       ["csm-case-comments", ID_A],
       ["csm-case-activities", ID_A],
       ["csm-case-detail", ID_A],
-      ["csm-case-slas", ID_A],
+      ["work-item-slas", ID_A],
       ["csm-case-comments", ID_B],
       ["csm-case-activities", ID_B],
       ["csm-case-detail", ID_B],
-      ["csm-case-slas", ID_B],
+      ["work-item-slas", ID_B],
       ["csm-cases"],
       ["csm-case-children"],
     ]);
@@ -534,7 +534,7 @@ describe("useMultiplexedCaseStream", () => {
       ["csm-case-comments", ID_B],
       ["csm-case-activities", ID_B],
       ["csm-case-detail", ID_B],
-      ["csm-case-slas", ID_B],
+      ["work-item-slas", ID_B],
       ["csm-cases"],
       ["csm-case-children"],
     ]);

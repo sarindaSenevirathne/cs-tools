@@ -110,6 +110,27 @@ export function isProposedTimeAccepted(
   return agreed && !!dto.state && STATES_PAST_CUSTOMER_APPROVAL.includes(dto.state);
 }
 
+/** The states a change request is in only once it has been approved (CAB approval received; a Standard change, which
+ * is pre-approved, once Request Approval has scheduled it). Canceled is not one: a change can be cancelled before
+ * anybody approved it. */
+const APPROVED_STATES: readonly ChangeRequestState[] = [
+  "customer_approval",
+  "scheduled",
+  "implement",
+  "review",
+  "customer_review",
+  "closed",
+  "rollback",
+];
+
+/** Why an approved change request's fields can no longer be edited, or null while they can. The entity service refuses
+ * the edit itself (400 `change_request_approved_read_only`); this only keeps the Edit button from offering it. */
+export function changeRequestApprovedReadOnlyReason(state: ChangeRequestState | null | undefined): string | null {
+  return state && APPROVED_STATES.includes(state)
+    ? "CAB approval has been received, so this change request's fields are read-only. Work notes can still be added."
+    : null;
+}
+
 export function toChangeRequestDetail(dto: ChangeRequestDetailDto): ChangeRequestDetail {
   return {
     ...toChangeRequestSummary(dto),

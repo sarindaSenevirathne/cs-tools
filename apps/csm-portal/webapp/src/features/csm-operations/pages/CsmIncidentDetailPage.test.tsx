@@ -142,6 +142,18 @@ vi.mock("@features/csm-cases/components/CaseDetailWidgets", () => ({
     </div>
   ),
 }));
+vi.mock("@features/csm-sla/components/WorkItemSlaTable", () => ({
+  WorkItemSlaTable: ({
+    workItemId,
+    workItemLabel,
+  }: {
+    workItemId: string;
+    workItemLabel: string;
+  }) => (
+    <div data-testid="work-item-sla-table" data-id={workItemId} data-label={workItemLabel} />
+  ),
+}));
+
 vi.mock("@api/useSearchUsersByName", () => ({
   useSearchUsersByName: () => ({ data: [], isFetching: false, isError: false }),
   useSearchInternalUsersByName: () => ({ data: [], isFetching: false, isError: false }),
@@ -392,6 +404,23 @@ describe("CsmIncidentDetailPage — tabs", () => {
     expect(screen.getByRole("tab", { name: /related/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /watchers/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /attachments/i })).toBeInTheDocument();
+  });
+
+  it("shows the work item's SLA records on an SLA tab, only once that tab is opened", () => {
+    mockQueryResult({ data: BASE_INCIDENT });
+    renderPage();
+
+    expect(screen.queryByTestId("work-item-sla-table")).toBeNull();
+    goToTab(/^sla$/i);
+    const table = screen.getByTestId("work-item-sla-table");
+    expect(table).toHaveAttribute("data-id", "inc-1");
+    expect(table).toHaveAttribute("data-label", "incident");
+  });
+
+  it("opens the SLA tab straight from ?tab=sla", () => {
+    mockQueryResult({ data: BASE_INCIDENT });
+    renderPage("/operations/incidents/inc-1?tab=sla");
+    expect(screen.getByTestId("work-item-sla-table")).toBeInTheDocument();
   });
 
   it("gates AttachmentsWidget's onDownload the same way as the feed's, not unconditionally", () => {

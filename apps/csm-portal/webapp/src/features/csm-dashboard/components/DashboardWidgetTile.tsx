@@ -24,6 +24,7 @@ import { useRelativeTimeTick } from "@components/RelativeTime";
 import { formatRelativeTime } from "@features/csm-dashboard/utils/abtDashboard";
 import { invalidateWidgetQueries } from "@features/csm-dashboard/utils/invalidateWidgetQueries";
 import type {
+  BeDashboardDistinctByConfig,
   BeDashboardGroupByConfig,
   BeDashboardPieSlice,
   BeDashboardWidgetColumn,
@@ -103,6 +104,10 @@ interface DashboardWidgetTileProps {
    * `POST {resourceType}/aggregate` call instead of one search per slice
    * (see `useWidgetGroupByData`). Mutually exclusive with `slices`. */
   groupBy?: BeDashboardGroupByConfig;
+  /** Only meaningful for shape "count": show the number of distinct values
+   * of a field instead of the record total (see `useWidgetData`'s
+   * `distinctBy`). */
+  distinctBy?: BeDashboardDistinctByConfig;
   /** Only meaningful for shape "list". When set (non-empty), this widget
    * renders through the generic `GenericColumnList` (resolving each
    * column's dot-path against every response item) instead of
@@ -250,6 +255,7 @@ function DashboardWidgetTile({
   listLimit,
   slices,
   groupBy,
+  distinctBy,
   columns,
   sortBy,
   days,
@@ -430,6 +436,7 @@ function DashboardWidgetTile({
     resourceType,
     filters,
     shape,
+    distinctBy,
     listLimit,
     enabled: shape !== "pie" && shape !== "bar" && shape !== "line" && isVisible,
     selectedTeamCreGroupId,

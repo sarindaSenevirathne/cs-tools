@@ -53,8 +53,14 @@ describe("useGetVulnerabilitiesMetaData", () => {
     vi.unstubAllGlobals();
   });
 
-  it("fetches metadata and exposes severities", async () => {
-    const payload = { severities: [{ id: "1", label: "Critical" }] };
+  it("fetches metadata and exposes severities and products with their versions", async () => {
+    const payload = {
+      severities: [{ id: "1", label: "Critical" }],
+      products: [
+        { name: "product-a", versions: ["1.0.0"] },
+        { name: "product-b", versions: [] },
+      ],
+    };
     mockAuthFetch.mockResolvedValueOnce({
       ok: true,
       status: 200,

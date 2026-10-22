@@ -19,6 +19,7 @@ import type {
   BeIncidentSearchPayload,
   BeIncidentState,
 } from "@api/backend/types";
+import { anyOfPayload, completeAnyOfGroups, type AnyOfGroup } from "@features/csm-operations/utils/operationsAnyOf";
 
 type ChipColor = "default" | "info" | "warning" | "success" | "error";
 
@@ -91,6 +92,24 @@ export function getLegalNextIncidentStates(current: BeIncidentState): BeIncident
   return [current, ...STATE_TRANSITIONS[current]];
 }
 
+/** Whether an incident in `state` is closed for good (no transition out, no bulk edit). */
+export function isIncidentTerminal(state?: string | null): boolean {
+  return state === "CLOSED" || state === "CANCELLED";
+}
+
+/**
+ * The states every one of `current` can move to (the same table as the Edit
+ * dialog's): what a bulk edit may set on all of them at once, Resolved and
+ * Closed included when legal for each. Empty when they share none, or when one
+ * is in a state the table does not know.
+ */
+export function bulkIncidentTargetStates(current: Array<string | null | undefined>): BeIncidentState[] {
+  if (current.length === 0) return [];
+  return INCIDENT_STATES.filter((target) =>
+    current.every((s) => !!s && (STATE_TRANSITIONS[s as BeIncidentState] ?? []).includes(target)),
+  );
+}
+
 function humanize(value: string): string {
   return value.replace(/_/g, " ");
 }
@@ -153,8 +172,8 @@ export interface CreateIncidentFromIncidentNavState {
  * `number` (see openapi.yaml); `slaViolated`, `createdOn` (date range), and
  * `productName` all route through the generic `filters` array (see
  * {@link buildIncidentSearchFilters}), same as `sreTeamIds`' own
- * `assignmentGroupId`/`"in"` entry — there's no server-side state/category
- * filter to build a control for.
+ * `assignmentGroupId`/`"in"` entry, as do state, category, service, assignee
+ * and the updated-date range.
  */
 export interface IncidentFilters {
   search: string;
@@ -173,7 +192,40 @@ export interface IncidentFilters {
    * `{ field: "assignmentGroupId", op: "in" }` filter entry (see
    * `buildIncidentSearchFilters`), not a named payload field. */
   sreTeamIds: string[];
+  /** `{ field: "state", op: "in" }`. */
+  states: BeIncidentState[];
+  /** `{ field: "category", op: "in" }` (PostgreSQL only). */
+  categories: string[];
+  /** Service ids — `{ field: "businessServiceId", op: "in" }`. */
+  serviceIds: string[];
+  /** Assignee user ids — `{ field: "assignedUserId", op: "in" }`. */
+  assigneeIds: string[];
+  /** `YYYY-MM-DD` UTC dates bounding the last update, or empty. */
+  updatedStartDate: string;
+  updatedEndDate: string;
+  /** Advanced OR groups, sent as `filters.anyOf`. */
+  anyOf: AnyOfGroup[];
 }
+
+/** The search fields an incident OR group condition can use. */
+export const INCIDENT_ANY_OF_FIELDS = [
+  "state",
+  "priority",
+  "category",
+  "businessServiceId",
+  "assignmentGroupId",
+  "assignedUserId",
+] as const;
+
+/** Every incident category the data holds (ServiceNow's choices, synced),
+ * not only the three the create form offers — a filter must reach the
+ * incidents that carry the others. */
+export const INCIDENT_FILTER_CATEGORIES: string[] = [
+  "INQUIRY", "SERVICE_INTERRUPTION", "SECURITY", "NETWORK", "DATABASE", "HARDWARE",
+  "SOFTWARE", "APPLICATION", "CONNECTIVITY", "EC2_INSTANCE", "ELASTIC_LOAD_BALANCER",
+  "ERRORS", "METRICS", "MONITORING", "PERFORMANCE", "RDS_DATABASE",
+  "RESOURCE_EXHAUSTION", "TECHNICAL_FAULTS",
+];
 
 export const DEFAULT_INCIDENT_FILTERS: IncidentFilters = {
   search: "",
@@ -183,6 +235,13 @@ export const DEFAULT_INCIDENT_FILTERS: IncidentFilters = {
   createdEndDate: "",
   products: [],
   sreTeamIds: [],
+  states: [],
+  categories: [],
+  serviceIds: [],
+  assigneeIds: [],
+  updatedStartDate: "",
+  updatedEndDate: "",
+  anyOf: [],
 };
 
 /** Count non-search active filters (used for the badge on the Filters button). */
@@ -193,7 +252,14 @@ export function countActiveIncidentFilters(filters: IncidentFilters): number {
     (filters.createdStartDate ? 1 : 0) +
     (filters.createdEndDate ? 1 : 0) +
     (filters.products.length > 0 ? 1 : 0) +
-    (filters.sreTeamIds.length > 0 ? 1 : 0)
+    (filters.sreTeamIds.length > 0 ? 1 : 0) +
+    (filters.states.length > 0 ? 1 : 0) +
+    (filters.categories.length > 0 ? 1 : 0) +
+    (filters.serviceIds.length > 0 ? 1 : 0) +
+    (filters.assigneeIds.length > 0 ? 1 : 0) +
+    (filters.updatedStartDate ? 1 : 0) +
+    (filters.updatedEndDate ? 1 : 0) +
+    completeAnyOfGroups(filters.anyOf).length
   );
 }
 
@@ -204,12 +270,14 @@ export function incidentDateOnlyToUTCStart(dateOnly: string): string {
 }
 
 /** `YYYY-MM-DD` (interpreted as a UTC calendar date) to the inclusive
- * end-of-day UTC instant the backend expects. Deliberately `T23:59:59Z`, not
- * `T00:00:00Z` of the next day — the backend truncates a date-time bound to
- * date-only without erroring, so an off-by-one here silently drops the last
- * day of the range instead of failing loudly. */
+ * end-of-day UTC instant the backend expects. Deliberately the last
+ * microsecond of the day (the precision Postgres stores), so a record updated at
+ * `23:59:59.500Z` is still inside the range, and not `T00:00:00Z` of the next
+ * day — the backend truncates a date-time bound to date-only without erroring,
+ * so an off-by-one there silently drops the last day of the range instead of
+ * failing loudly. */
 export function incidentDateOnlyToUTCEnd(dateOnly: string): string {
-  return `${dateOnly}T23:59:59Z`;
+  return `${dateOnly}T23:59:59.999999Z`;
 }
 
 /**
@@ -258,12 +326,44 @@ export function buildIncidentSearchFilters(
     ...(filters.sreTeamIds.length > 0
       ? [{ field: "assignmentGroupId" as const, op: "in" as const, values: filters.sreTeamIds }]
       : []),
+    ...(filters.states.length > 0
+      ? [{ field: "state" as const, op: "in" as const, values: filters.states }]
+      : []),
+    ...(filters.categories.length > 0
+      ? [{ field: "category" as const, op: "in" as const, values: filters.categories }]
+      : []),
+    ...(filters.serviceIds.length > 0
+      ? [{ field: "businessServiceId" as const, op: "in" as const, values: filters.serviceIds }]
+      : []),
+    ...(filters.assigneeIds.length > 0
+      ? [{ field: "assignedUserId" as const, op: "in" as const, values: filters.assigneeIds }]
+      : []),
+    ...(filters.updatedStartDate
+      ? [
+          {
+            field: "updatedOn" as const,
+            op: "gte" as const,
+            values: [incidentDateOnlyToUTCStart(filters.updatedStartDate)],
+          },
+        ]
+      : []),
+    ...(filters.updatedEndDate
+      ? [
+          {
+            field: "updatedOn" as const,
+            op: "lte" as const,
+            values: [incidentDateOnlyToUTCEnd(filters.updatedEndDate)],
+          },
+        ]
+      : []),
   ];
 
+  const anyOf = anyOfPayload(filters.anyOf);
   return {
     ...(debouncedSearch.length > 0 && { searchQuery: debouncedSearch }),
     ...(filters.priorities.length > 0 && { priorities: filters.priorities }),
     ...(fieldFilters.length > 0 && { filters: fieldFilters }),
+    ...(anyOf && { anyOf }),
   };
 }
 

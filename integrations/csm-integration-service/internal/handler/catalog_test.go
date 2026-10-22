@@ -186,6 +186,48 @@ func TestCatalog_UpperEnumFieldsKeepsMemberOrder(t *testing.T) {
 	}
 }
 
+func TestCatalog_UpperEnumFieldsNestedDeploymentType(t *testing.T) {
+	in := `{"total":4,"deployedProducts":[` +
+		`{"id":"a","category":"pdp","deployment":{"id":"d1","name":"QA env","type":"qa"},"tps":1.50},` +
+		`{"id":"b","category":null,"deployment":{"id":"d2","name":"n","type":null}},` +
+		`{"id":"c","deployment":null},` +
+		`{"id":"d","deployment":{"id":"d4","type":"primary_production","name":"p"}}` +
+		`],"hasMore":false}`
+	want := `{"total":4,"deployedProducts":[` +
+		`{"id":"a","category":"PDP","deployment":{"id":"d1","name":"QA env","type":"QA"},"tps":1.50},` +
+		`{"id":"b","category":null,"deployment":{"id":"d2","name":"n","type":null}},` +
+		`{"id":"c","deployment":null},` +
+		`{"id":"d","deployment":{"id":"d4","type":"PRIMARY_PRODUCTION","name":"p"}}` +
+		`],"hasMore":false}`
+	out, err := upperEnumFields([]byte(in), "deployedProducts", "category", "deployment.type")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(out) != want {
+		t.Errorf("nested rewrite wrong:\n got %s\nwant %s", out, want)
+	}
+	// a non-object "deployment" and a missing one are left alone
+	for _, body := range []string{`{"deployedProducts":[{"deployment":"x"}]}`, `{"deployedProducts":[{"id":"z"}]}`} {
+		out, err := upperEnumFields([]byte(body), "deployedProducts", "deployment.type")
+		if err != nil || string(out) != body {
+			t.Errorf("body %s: out=%s err=%v, want unchanged", body, out, err)
+		}
+	}
+}
+
+func TestCatalog_DeployedProductsUppercaseDeploymentType(t *testing.T) {
+	m := &mockCatalogClient{deployedProducts: func([]byte) ([]byte, error) {
+		return []byte(`{"deployedProducts":[{"id":"p","category":"pdp","deployment":{"id":"d","name":"Prod","type":"primary_production"}}],"total":1}`), nil
+	}}
+	w := serveCatalog(m, "/deployed-products/search", `{}`)
+	assertStatus(t, w, http.StatusOK)
+	list := decodeJSON[map[string]any](t, w)["deployedProducts"].([]any)
+	dep := list[0].(map[string]any)["deployment"].(map[string]any)
+	if dep["type"] != "PRIMARY_PRODUCTION" || dep["id"] != "d" || dep["name"] != "Prod" || list[0].(map[string]any)["category"] != "PDP" {
+		t.Errorf("unexpected deployed product: %v", list[0])
+	}
+}
+
 func TestCatalog_NonJSONUpstreamBodyIs500(t *testing.T) {
 	m := &mockCatalogClient{products: func([]byte) ([]byte, error) { return []byte(`not json`), nil }}
 	assertStatus(t, serveCatalog(m, "/products/search", `{}`), http.StatusInternalServerError)

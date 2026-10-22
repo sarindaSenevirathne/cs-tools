@@ -55,6 +55,15 @@ type scimUser struct {
 	PhoneNumbers []scimPhone `json:"phoneNumbers,omitempty"`
 	SchemaScope  *scimSchema `json:"urn:scim:wso2:schema,omitempty"`
 	Roles        scimRoles   `json:"roles,omitempty"`
+	Name         *scimName   `json:"name,omitempty"`
+}
+
+// scimName mirrors the SCIM core schema's "name" complex attribute. Like
+// every other attribute here, a search response only returns it when
+// explicitly requested (see SearchUser's own Attributes list).
+type scimName struct {
+	GivenName  string `json:"givenName,omitempty"`
+	FamilyName string `json:"familyName,omitempty"`
 }
 
 // scimRoleEntry is one element of the SCIM "roles" attribute in its full
@@ -317,6 +326,12 @@ type UserInfo struct {
 	ID                     string
 	PhoneNumber            *string
 	LastPasswordUpdateTime *string
+	// FirstName and LastName are only populated when the caller requested the
+	// SCIM "name" attribute (see SearchUser's own Attributes list) -- empty
+	// otherwise, the same "only what was asked for" rule every other field on
+	// this struct already follows.
+	FirstName string
+	LastName  string
 	// Roles is the user's full Asgardeo role assignment, spanning every
 	// application they hold a role in -- not just the CSM portal, and
 	// deliberately left unfiltered: a caller wanting just this portal's roles

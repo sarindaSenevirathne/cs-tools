@@ -29,7 +29,7 @@ import type {
   ScheduleTier,
   RotaFamily,
 } from "../types";
-import { addDays, HALF_DAY_LEAVE_CODES, initialsOf, isRotationShift, mondayOf, toIsoDate, zoneColumnOf, zoneLabelOn, type RosterSpan } from "../utils/rota";
+import { addDays, initialsOf, isRotationShift, kindsOfferedOn, mondayOf, movesOfferedOn, toIsoDate, zoneColumnOf, zoneLabelOn, type RosterSpan } from "../utils/rota";
 import { ordinaryDayCode, REGULAR_HOURS_CODE } from "../utils/standingDay";
 import { useTeamColour, useTeamName } from "../utils/teamColourContext";
 
@@ -758,10 +758,11 @@ export default function MonthRoster({
     };
   }, [leadTeams, onEditCell, editing]);
 
-  /** The legend: one line per code actually on screen, in the order a reader
-   *  meets them -- turns, hours, leave, allocations. The labels only: the
-   *  grid's own marks (a struck-through turn, the dot of an empty day) say
-   *  what they are in their tooltips. */
+  /** The legend: one line per code on screen, in the order a reader meets
+   *  them -- turns, hours, leave, allocations -- plus every leave, allocation
+   *  and move tag a rota marker can add on this rota, on screen or not. The
+   *  labels only: the grid's own marks (a struck-through turn, the dot of an
+   *  empty day) say what they are in their tooltips. */
   const legendItems = useMemo((): LegendItem[] => {
     const out = new Map<string, LegendItem>();
     const put = (it: LegendItem): void => {
@@ -815,18 +816,40 @@ export default function MonthRoster({
         }
       }
     }
-    // The half days are listed whether or not anybody is on one in view:
-    // they are new, and a lead looking for how to mark one finds them here.
-    // Always morning then evening, whichever one the grid met first.
-    for (const code of HALF_DAY_LEAVE_CODES) {
-      const kind = kindByCode.get(code);
-      if (kind && !kind.retired) {
-        out.delete(`k|${kind.code}`);
-        put({ key: `k|${kind.code}`, group: "Leave", code: kind.shortCode, token: kind.colourToken, label: kind.label });
-      }
+    // Every tag a rota marker can add here is listed whether or not anybody
+    // carries it in view: a lead looking for how to mark something finds it
+    // here. The same tags as the picker (leave, allocations, moves to another
+    // team), with the ones on screen, in catalogue order.
+    const tags = new Map<string, ScheduleAbsenceKind>();
+    for (const key of [...out.keys()]) {
+      if (!key.startsWith("k|")) continue;
+      const kind = kindByCode.get(key.slice(2));
+      if (kind) tags.set(kind.code, kind);
+      out.delete(key);
+    }
+    for (const kind of [...kindsOfferedOn(absenceKinds, family), ...movesOfferedOn(absenceKinds, family)]) {
+      tags.set(kind.code, kind);
+    }
+    for (const kind of [...tags.values()].sort((a, b) => a.sortOrder - b.sortOrder)) {
+      put({
+        key: `k|${kind.code}`,
+        group: kind.bucket === "LEAVE" ? "Leave" : "Allocations",
+        code: kind.shortCode,
+        token: kind.colourToken,
+        label: kind.label,
+      });
+    }
+    // A move worked as that team's hours (the Brazil rotation, picked as
+    // "Move to Americas Team") is drawn as those hours, so it reads as them.
+    for (const kind of absenceKinds) {
+      if (!kind.movesToTeamKey || !kind.worksRotaThere || !kind.showsAsShiftCode || kind.retired) continue;
+      if (kind.family && kind.family !== family) continue;
+      // Only this rota's windows: the picker offers no other family's hours.
+      const sh = shifts.get(kind.showsAsShiftCode);
+      if (sh && sh.family === family) put({ key: `s|${sh.shortCode}|${sh.colourToken}|`, group: "Hours", code: sh.shortCode, token: sh.colourToken, label: sh.label });
     }
     return [...out.values()];
-  }, [rows, days, kindByCode, defaultFor]);
+  }, [rows, days, kindByCode, defaultFor, absenceKinds, family, shifts]);
 
   /** Turn a click on any roster cell into the slot the page should open the
    *  picker on. Shared by the plain grid and by SRE's zone-split one, which

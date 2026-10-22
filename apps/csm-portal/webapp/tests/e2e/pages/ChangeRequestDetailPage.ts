@@ -359,15 +359,16 @@ export class ChangeRequestDetailPage {
     return this.page.getByRole("button", { name: "Edit", exact: true });
   }
 
+  /** Opens the edit form. It is shown in the page (a region named "Edit
+   * change request", in place of the tabs), not a modal; the name is kept so
+   * the specs read the same. */
   async openEditDialog(): Promise<void> {
     await this.editButton().click();
-    await expect(
-      this.page.getByRole("dialog").getByRole("heading", { name: "Edit change request" }),
-    ).toBeVisible();
+    await expect(this.editDialog()).toBeVisible();
   }
 
   editDialog(): Locator {
-    return this.page.getByRole("dialog");
+    return this.page.getByRole("region", { name: "Edit change request" });
   }
 
   /**
@@ -420,6 +421,21 @@ export class ChangeRequestDetailPage {
 
   saveButton(): Locator {
     return this.editDialog().getByRole("button", { name: /^(Save|Saving…)$/ });
+  }
+
+  /** The form's one action once the change request has been approved: every field is read-only, a work note is all it adds. */
+  addWorkNoteButton(): Locator {
+    return this.editDialog().getByRole("button", { name: /^(Add work note|Saving…)$/ });
+  }
+
+  /** The notice over the form once the change request has been approved (CAB approval received). */
+  editApprovedNotice(): Locator {
+    return this.editDialog().getByText(/CAB approval has been received, so this change request's fields are read-only/);
+  }
+
+  /** The form's internal work note. */
+  editWorkNoteField(): Locator {
+    return this.editDialog().getByRole("textbox", { name: /work note/i });
   }
 
   async saveEdit(): Promise<void> {

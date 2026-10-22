@@ -18,7 +18,12 @@ import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { ApiQueryKeys } from "@constants/apiConstants";
 import { useBackendApi } from "@api/backend/client";
 import { postCountingOnly } from "@api/backend/postCountingOnly";
-import type { BeWidgetResourceType, BeWidgetShape } from "@api/backend/types";
+import type {
+  BeDashboardDistinctByConfig,
+  BeGroupByResponse,
+  BeWidgetResourceType,
+  BeWidgetShape,
+} from "@api/backend/types";
 import { WIDGET_RESOURCE_CONFIG } from "@features/csm-dashboard/config/widgetResourceConfig";
 import {
   hasTeamPlaceholder,
@@ -126,6 +131,16 @@ export interface UseWidgetDataOptions {
    * wallboard implementation's 60s refresh; `DashboardWidgetTile` and every
    * other caller leaves it unset. */
   refetchIntervalMs?: number;
+  /** Only meaningful for shape "count". When set, the widget shows the number
+   * of distinct `distinctBy.field` values instead of the record total: one
+   * `POST` to the resourceType's group-by endpoint (see
+   * `WidgetResourceConfig.groupByEndpoint`) with `{filters, groupBy:
+   * distinctBy.field, maxGroups: distinctBy.maxGroups}`, and `total` is the
+   * returned group count. A response with `othersCount > 0` would under-count,
+   * so that fails the query (the widget's error state) rather than yield a
+   * number. Absent is a no-op — the record-total search below runs exactly as
+   * before. */
+  distinctBy?: BeDashboardDistinctByConfig;
 }
 
 /**
@@ -150,6 +165,7 @@ export function useWidgetData({
   sortBy,
   currentUserId,
   refetchIntervalMs,
+  distinctBy,
 }: UseWidgetDataOptions): UseQueryResult<WidgetData, Error> {
   const api = useBackendApi();
   const config = WIDGET_RESOURCE_CONFIG[resourceType];
@@ -162,6 +178,7 @@ export function useWidgetData({
     currentUserId,
   );
   const effectiveSortBy = shape === "list" ? sortBy : undefined;
+  const effectiveDistinctBy = shape === "count" ? distinctBy : undefined;
   // A `__current_user__` placeholder that survived resolution means the
   // signed-in user's profile hasn't landed yet. Sending these filters would
   // either 400 on the non-UUID value or — before this resolver started
@@ -201,6 +218,10 @@ export function useWidgetData({
       limit,
       effectiveOffset,
       effectiveSortBy,
+      // Appended last (after every existing slot) so the positional
+      // widget-id/resource-type reads in `invalidateWidgetQueries` stay valid.
+      // Only a count widget uses it; `undefined` for everything else.
+      effectiveDistinctBy,
     ],
     enabled: enabled && !awaitingCurrentUser,
     // Self-throttling: a wallboard tile whose interval fires while the
@@ -225,6 +246,31 @@ export function useWidgetData({
       // actually abort this specific in-flight request, not just start a
       // timer nothing observes.
       return withWidgetFetchSlot(async (signal) => {
+        if (effectiveDistinctBy) {
+          if (!config.groupByEndpoint) {
+            throw new Error(`Unsupported distinctBy widget resourceType: ${resourceType}`);
+          }
+          const res = await api.post<
+            { filters: Record<string, unknown>; groupBy: string; maxGroups: number },
+            BeGroupByResponse
+          >(
+            config.groupByEndpoint,
+            {
+              filters: resolvedFilters,
+              groupBy: effectiveDistinctBy.field,
+              maxGroups: effectiveDistinctBy.maxGroups,
+            },
+            { signal },
+          );
+          // Anything beyond `maxGroups` is folded into `othersCount`, so the
+          // group count alone would silently under-count — fail loudly.
+          if (res.othersCount > 0) {
+            throw new Error(
+              `distinctBy "${effectiveDistinctBy.field}" for widget "${widgetId}" exceeds maxGroups (${effectiveDistinctBy.maxGroups}); the distinct count would be understated`,
+            );
+          }
+          return { total: res.groups.length, items: [] };
+        }
         // Most resourceTypes' own search contract takes
         // `{filters, pagination:{offset,limit}, sortBy?}` and returns
         // `{total, [itemsKey]: [...]}` — `config.buildSearchRequestBody`/

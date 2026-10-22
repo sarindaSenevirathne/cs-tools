@@ -51,6 +51,16 @@ const userInfoKey contextKey = "user-info"
 type UserInfo struct {
 	Email  string
 	UserID string
+	// Groups is the token's "groups" claim -- distinct from the business
+	// roles RoleResolver.GetRoles resolves from entity-service's GetMe.
+	// Consumed by CachedRoleResolver.IsInternalWriteBlocked: an INTERNAL-type
+	// user may only reach a write path if they belong to one of the
+	// configured write-access groups, since an INTERNAL classification alone
+	// grants much broader access on entity-service than before (see that
+	// service's own CLAUDE.md, AccessService.ResolveScope). This is the
+	// claim the customer portal's own OAuth app is provisioned to emit (the
+	// deprecated v1 Ballerina backend only ever read groups/email/userid too
+	// -- there has never been a roles claim on this app's tokens).
 	Groups []string
 }
 

@@ -204,6 +204,14 @@ func TestCallRequestService_CreateValidation(t *testing.T) {
 		{"no utcTimes", func(r *domain.CreateCallRequestRequest) { r.UTCTimes = nil }, &apierror.ValidationError{}},
 		{"non-positive duration", func(r *domain.CreateCallRequestRequest) { r.DurationMinutes = 0 }, &apierror.ValidationError{}},
 		{"no caller token", func(r *domain.CreateCallRequestRequest) {}, &apierror.UnauthorizedError{}},
+		{"explicit empty state", func(r *domain.CreateCallRequestRequest) {
+			empty := domain.CallRequestStateType("")
+			r.State = &empty
+		}, &apierror.ValidationError{}},
+		{"state other than pending_on_customer", func(r *domain.CreateCallRequestRequest) {
+			scheduled := domain.CallRequestStateScheduled
+			r.State = &scheduled
+		}, &apierror.ValidationError{}},
 	}
 	for _, tt := range tests {
 		req := ok

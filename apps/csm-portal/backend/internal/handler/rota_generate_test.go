@@ -27,10 +27,11 @@ import (
 )
 
 type fakeRotaGenerateClient struct {
-	gotCode string
-	gotBody string
-	resp    []byte
-	err     error
+	gotCode   string
+	gotBody   string
+	gotDryRun bool
+	resp      []byte
+	err       error
 }
 
 func (f *fakeRotaGenerateClient) GenerateRotaMonth(_ context.Context, code string, body []byte) ([]byte, error) {
@@ -40,6 +41,11 @@ func (f *fakeRotaGenerateClient) GenerateRotaMonth(_ context.Context, code strin
 
 func (f *fakeRotaGenerateClient) GetRotaNightCrew(_ context.Context, code, from, to string) ([]byte, error) {
 	f.gotCode, f.gotBody = code, from+".."+to
+	return f.resp, f.err
+}
+
+func (f *fakeRotaGenerateClient) ImportRota(_ context.Context, code string, dryRun bool, body []byte) ([]byte, error) {
+	f.gotCode, f.gotDryRun, f.gotBody = code, dryRun, string(body)
 	return f.resp, f.err
 }
 
@@ -144,5 +150,82 @@ func TestGetRotaNightCrew_KeepsTheRefusalReason(t *testing.T) {
 	NewRotaGenerateHandler(fake).GetRotaNightCrew(w, withUser(nightCrewRequest("from=2026-10&to=2026-12")))
 	if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), "has no night crew") {
 		t.Fatalf("status %d body %s", w.Code, w.Body.String())
+	}
+}
+
+const importFileBody = `{"schemaVersion":1,"family":"SRE","rotaCode":"SRE_SAAS","period":{"from":"2026-11-01","to":"2026-11-30"},"mode":"replace","assignments":[{"email":"user1@example.com","teamKey":"apollo","shiftCode":"SRE_TZ1_L1","from":"2026-11-02","to":"2026-11-06"}],"absences":[]}`
+
+func importRequest(query, body string) *http.Request {
+	r := httptest.NewRequest(http.MethodPost, "/team-schedule/rotas/SRE_SAAS/import"+query, strings.NewReader(body))
+	r.SetPathValue("code", "SRE_SAAS")
+	return r
+}
+
+func TestImportRota_ForwardsTheFileUntouched(t *testing.T) {
+	for _, c := range []struct {
+		query      string
+		wantDryRun bool
+		wantStatus int
+	}{
+		{"?dryRun=true", true, http.StatusOK},
+		{"?dryRun=false", false, http.StatusCreated},
+		{"", false, http.StatusCreated},
+	} {
+		fake := &fakeRotaGenerateClient{resp: []byte(`{"rotaCode":"SRE_SAAS"}`)}
+		w := httptest.NewRecorder()
+		NewRotaGenerateHandler(fake).ImportRota(w, withUser(importRequest(c.query, importFileBody)))
+		if w.Code != c.wantStatus {
+			t.Fatalf("%q: status %d, want %d", c.query, w.Code, c.wantStatus)
+		}
+		if fake.gotCode != "SRE_SAAS" || fake.gotBody != importFileBody || fake.gotDryRun != c.wantDryRun {
+			t.Fatalf("%q: forwarded %q dryRun=%v %q", c.query, fake.gotCode, fake.gotDryRun, fake.gotBody)
+		}
+	}
+}
+
+func TestImportRota_RefusesBeforeAskingUpstream(t *testing.T) {
+	w := httptest.NewRecorder()
+	NewRotaGenerateHandler(&fakeRotaGenerateClient{}).ImportRota(w, importRequest("", importFileBody))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("no user: status %d, want 401", w.Code)
+	}
+	for _, c := range []struct{ query, body string }{
+		{"?dryRun=maybe", importFileBody},
+		{"", `{"schemaVersion":`},
+	} {
+		fake := &fakeRotaGenerateClient{}
+		w := httptest.NewRecorder()
+		NewRotaGenerateHandler(fake).ImportRota(w, withUser(importRequest(c.query, c.body)))
+		if w.Code != http.StatusBadRequest || fake.gotCode != "" {
+			t.Fatalf("%q %q: status %d, upstream asked %v", c.query, c.body, w.Code, fake.gotCode != "")
+		}
+	}
+}
+
+// The refusal names the entry at fault, so it has to reach the lead as entity-service wrote it.
+func TestImportRota_KeepsTheRefusalReason(t *testing.T) {
+	for _, c := range []struct {
+		status int
+		msg    string
+		want   string
+	}{
+		{http.StatusBadRequest, "the rota file has problems: assignments[0]: nobody on the team schedule has the email user9@example.com", "assignments[0]"},
+		{http.StatusForbidden, "assignments[2]: changing artemis's rota needs a lead of that team", "assignments[2]"},
+		{http.StatusConflict, "assignments[1]: TZ3 L1 on 2026-11-03 is already held", "already held"},
+		{http.StatusNotFound, `no rota "SRE_PAAS"`, "no rota"},
+		{http.StatusInternalServerError, "pq: relation does not exist", "Failed to import the rota."},
+	} {
+		fake := &fakeRotaGenerateClient{err: &apierror.Error{StatusCode: c.status, Body: `{"code":1,"message":"` + strings.ReplaceAll(c.msg, `"`, `\"`) + `"}`}}
+		w := httptest.NewRecorder()
+		NewRotaGenerateHandler(fake).ImportRota(w, withUser(importRequest("", importFileBody)))
+		if w.Code != c.status {
+			t.Fatalf("status %d, want %d", w.Code, c.status)
+		}
+		if !strings.Contains(w.Body.String(), c.want) {
+			t.Fatalf("body %s, want it to carry %q", w.Body.String(), c.want)
+		}
+		if c.status == http.StatusInternalServerError && strings.Contains(w.Body.String(), "relation") {
+			t.Fatal("upstream internals leaked")
+		}
 	}
 }

@@ -61,7 +61,7 @@ export function invalidateCaseById(queryClient: QueryClient, caseId: string): vo
     ApiQueryKeys.CSM_CASE_COMMENTS,
     ApiQueryKeys.CSM_CASE_ACTIVITIES,
     ApiQueryKeys.CSM_CASE_DETAIL,
-    ApiQueryKeys.CSM_CASE_SLAS,
+    ApiQueryKeys.WORK_ITEM_SLAS,
   ];
   for (const key of byCase) {
     void queryClient.invalidateQueries({ queryKey: [key, caseId] });

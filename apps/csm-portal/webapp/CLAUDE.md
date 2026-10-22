@@ -50,8 +50,17 @@ permission (see `apps/csm-portal/backend`'s own `CLAUDE.md`, "PATCH /projects/{i
 requires PermAdmin") — hiding the pencil icon for a `cs_engineer` just avoids offering an action that
 would 403 for them.
 
+**`AddUserDialog.tsx` only collects an email — there are no first/last name fields.** The backend
+(`apps/csm-portal/backend`'s own `CLAUDE.md`, "Creating a user") looks that email up in SCIM and fills
+`firstName`/`lastName`/phone from that record; a 400 from SCIM having no matching user (or a match with
+no name on file) surfaces in the form's error banner like any other create failure. This is a different
+mechanism from the token-sourced `cs_engineer` auto-provisioning on `GET /users/me` (same backend
+doc) — that path has the-caller's-own token to read from, this one doesn't (the admin is creating a
+row for someone else's email), so it has no choice but to ask SCIM.
+
 `AddUserDialog.tsx` has two independent role-shaped controls that must not be confused with each
-other. One narrower, required control: **"User type" (Internal/External)**. entity-service's `user_type` has no plain settable
+other. One narrower, required control: **"User type" (Internal/External)**, defaulting to **Internal**
+(`EMPTY_FORM.userType`). entity-service's `user_type` has no plain settable
 column — it's derived by a DB trigger from role membership (`recompute_user_type`, migration 0011) —
 so this selector works by sending exactly one of `roles: ["internal"]`/`["external"]` on submit, not a
 `type` field on the wire; `external` (not `customer`/`partner`/...) is the role every
@@ -270,7 +279,7 @@ The change request create page and edit dialog share `useChangeRequestScope` (`f
 - Changing or clearing the project clears the deployments below it and re-derives the Customer Group. Deployment products are never picked — they are derived (`productsReady` is false while the lookup for the current selection is in flight, and the products are then not sent).
 - **Customer Group is read-only and derived.** It is the chosen project's registered contacts (the people asked at the customer gates, who answer in the customer portal), shown as name chips with a lock icon, helper "Derived from the customer project's registered contacts" ("Select a Customer Project first." / "—" until a project is chosen, "No registered contacts on this project…" when empty). It is not form state, not in drafts or clones, and **never sent**: the backend refuses `customerGroupId` (and `environmentIds`) with a 400. The detail page shows the same list from `customerContacts`; at a customer gate with an empty list the Approval tab explains that no customer approvers were assigned (`noCustomerContactsHelper`).
 - **Refusals of the create are worded by the entity service and shown as written.** A person with no ServiceNow account (a user created in this database, which nothing in the web can tell apart in the picker) or an assignment group ServiceNow does not have is refused by the create itself with a 400 that says who or what cannot be used, why, and which field to change. The create form shows every 4xx message of the entity service as written in its error banner (`CreateChangeRequestPage` `onError`), so keep that wording on the entity-service side and do not replace it with a generic message here.
-- Sent only when non-empty. The create page sends `projectId`, `deploymentIds`, `deploymentProductIds` (plus `category`, `comment`, `workNote`); the edit dialog sends the three scope fields **together** when any of them changed (the backend validates them as a unit), and not at all once the CR has reached `implement` (the dialog locks the deployments with the reason; the backend refuses from there on). The **Customer Project itself is editable only in New** (see the next section): after New the dialog shows it read-only and, when only the deployments changed, sends the stored project beside them, which the backend accepts as a no-op. A saved project can be swapped (in New) but not cleared (the patch cannot express "no project").
+- Sent only when non-empty. The create page sends `projectId`, `deploymentIds`, `deploymentProductIds` (plus `category`, `comment`, `workNote`); the edit dialog sends the three scope fields **together** when any of them changed (the backend validates them as a unit), and not at all once the CR has been approved -- from Customer Approval / Scheduled on, i.e. editable only in New, Assess and Authorize (the dialog locks the deployments with the reason; the backend refuses from there on). The **Customer Project itself is editable only in New** (see the next section): after New the dialog shows it read-only and, when only the deployments changed, sends the stored project beside them, which the backend accepts as a no-op. A saved project can be swapped (in New) but not cleared (the patch cannot express "no project").
 - Clone carries the project and category, but deliberately **not** deployments / products: they name the deployment the change targets, and a clone exists to promote the change to another one. A draft or clone from before this change may still hold `customerGroupId` / `environmentIds`; they are ignored (not read, not re-saved).
 - The draft keeps display names next to the ids (`*Labels`), because the pickers only know ids; without them a restored form shows raw UUIDs.
 - The detail response's `category` is the enum value (or an `{id, name|label}` ref on older responses) — always read it through `changeRequestCategoryValue` / `changeRequestCategoryLabel`.
@@ -304,9 +313,26 @@ Who the customer is (the **Customer Project**, from which the read-only Customer
 - **After New** (Request Approval was pressed; a change request never returns to New) the Customer Project is **frozen for everyone**: the dialog shows it read-only with "Fixed when approval was requested. Cancel and clone to change it." (`customerProjectLockedReason`). A correction is Cancel + Clone; there is no override.
 - **After New a tick box is add-only** (`customerApprovalLockedReason` / `customerReviewLockedReason`, each taking `(state, {stored, hasProject})`): a **ticked** box is read-only ("Once approval has been requested a customer requirement can be added but never removed."); an **unticked** one stays tickable until the gate it controls (Customer Approval: while the change is New / Assess / Authorize; Customer Review: until Customer Review), with the helper "Once saved this can't be removed." (`customerRequirementOnceSavedHelper`), is disabled past its gate with "Locked: the change request has already reached the customer approval|review step or later.", and is disabled when the change has **no project** ("Needs a Customer Project, which can no longer be set. Cancel and clone."). A ticked box can never be unticked, so nothing can untick the customer's part to skip it: a Re-schedule asks the same contacts again.
 - **Request Approval needs somebody to ask** when a customer box is ticked. The backend refuses it (a 400 in words, `REQUEST_APPROVAL_NEEDS_PROJECT` / `REQUEST_APPROVAL_NEEDS_CONTACT` in the fake) when the change has no Customer Project, and when it has one but nobody on it can be asked (no registered portal-user contact other than the requester, none still active): such a change would reach Customer Approval / Customer Review with nobody to answer and, with no staff action that answers for the customer, could only be cancelled (or rolled back from Review). The action bar says so up front where the page knows: disabled with "Select a Customer Project before requesting approval" (`requestApprovalNeedsProjectReason`) or, when the change's own `customerContacts` is an EMPTY list, "Register a contact for the Customer Project before requesting approval" (`requestApprovalNeedsContactReason`); both are wired into `TARGET_BLOCKED_REASON.assess` after the team check, as a focusable labelled wrapper (`Request Approval: <reason>`). Neither reason is ever given for an Emergency change (both helpers return `null` for `isEmergencyChangeRequestType(cr.type)`): the backend ignores its two customer boxes, so a box still ticked on an older or synced row asks nobody and Request Approval stays enabled with no project and no registered contact. Where the page cannot tell (the requester is the project's only contact, or a contact cannot sign in yet: `customerContacts` lists them all) nothing is guessed and there is deliberately no second definition of who can be asked in the web: the request goes out and the backend's words show in the error banner (`showError`), the place every refused transition uses. Ticking a box on after New is refused the same way when nobody on the project can be asked; the Edit dialog does not pre-empt it (the box stays tickable) and shows the words in `saveError`, and the create form shows any refused create's message verbatim in the same banner (a create in New is never refused for this).
-- Deployments and deployment products keep their own window (editable until Implement) and always within the frozen project.
+- Deployments and deployment products keep their own window (editable until the change request is approved: New, Assess, Authorize) and always within the frozen project.
 - **One table, two modules.** `utils/__tests__/changeRequests.test.ts` writes the rule out one row per state under the ids `"<STATE>/<column>"` and outcome codes of the backend's Go truth table (`entity-service/internal/repository/change_request_customer_lock_test.go`); neither imports the other's file (the container tests copy only entity-service), so a rule change must change both and a drift shows as a failing row. `NO_CUSTOMER_CONTACTS_HELPER` no longer promises that changing the project routes the step (it cannot be changed any more).
 - e2e: the fake API enforces the same freeze, add-only and Request Approval rules with the backend's own messages (`projectFrozenMessage`, `requirementCannotBeRemovedMessage`, `requirementNeedsProjectMessage`, `requirementGatePassedMessage`, `REQUEST_APPROVAL_NEEDS_PROJECT`, `CANNOT_RETURN_TO_NEW`, exported from `fakeChangeRequestApi.ts`). A spec whose change has a customer box ticked needs a Customer Project (`{ projectId }` as the fake's scope) with a registered contact other than the creator (Acme: Mia and Max) before Request Approval; Gamma has none, so `describe("Request Approval is refused when nobody can be asked")` uses it. The dead end that remains for OLDER changes (already at a gate with nobody asked) starts there instead: `api.startAtState("customer_approval" | "customer_review" | "review")` in the Playwright fake (`openOlderChangeAt` in the lifecycle spec) and `lcSeedAtGate` in the page test's fake backend; a real-stack row is CHG0039104 (below). Real stack, in "the customer requirements lock": the refusal test finds a project whose throwaway change reports no `customerContacts` (the generated projects hold no registered portal-user contact, so the backend's own answer picks it, not a second definition in the spec) and asserts the fake's exported words against the real API, the disabled button and the Edit dialog's `saveError`; it skips when every project of the database has a contact.
+
+### Every create field is editable, and an approved change request is read-only
+
+The edit form (`EditChangeRequestDialog`, inline on the detail page) offers every field the create form sets: Subject,
+Type (New only: it decides the approval flow, `CHANGE_REQUEST_TYPE_FROZEN_REASON` after; choosing Emergency unticks both
+customer boxes in the same request, which the backend requires), Impact, Priority (read through
+`changeRequestPriorityValue`: a value, or the previous system's `{ id, label }` ref), Description, Justification and Risk and
+impact analysis (sent as `impactDescription`), beside the fields it already had. Only what changed is sent.
+
+Once the change request has been approved (`changeRequestApprovedReadOnlyReason`: Customer Approval, Scheduled, Implement,
+Review, Customer Review, Closed, Rollback -- CAB approval received, or a Standard change scheduled; not Canceled) every
+field is disabled under one notice and the form's only input is the internal **Work note**, sent as `workNote` with the
+button "Add work note". This mirrors entity-service's approved-content lock (400 `change_request_approved_read_only`),
+which is the authority; the deployments' window (`changeRequestScopeLockedReason`) closes at the same point, and the review
+box can no longer be added after the approval. A work note can ride with any save before the approval too;
+`usePatchChangeRequest` refreshes the comments query when one was sent. The CSM microapp disables its Edit button in the
+same states. e2e: the fake API refuses the same edits in the backend's words (`approvedReadOnlyMessage`, `APPROVED_STATES`).
 
 ### Customers never decide in the CSM portal
 
@@ -340,6 +366,74 @@ The previous system's own mechanism, which the schema already carries: a custome
 - **"Proposed time accepted".** A change scheduled by Accept is never stamped as the customer's approval, so every reader of `hasCustomerApproved` that prints Yes / No reads `customerApprovedDisplay(cr)`: the Overview cell, the PDF row (`changeRequestReportPdf.ts`) and, with the same gate in its own model (`isProposedTimeAccepted` in `apps/csm-portal/microapp/src/types/changeRequest.model.ts`), the CSM microapp's Approval card. It reads "Proposed time accepted" only once the change has moved on from Customer Approval (Scheduled or later): the Agree (`customerProposal.answer === "agreed"` or the raw `agree`) stays on the row after it, and **nothing clears it when the customers are asked again**: entity-service writes `AGREE` only in Accept, a plain Re-schedule never touches it (a Re-schedule is only possible out of Customer Approval, so a standing Agree there comes from the previous system's data) and only a customer's own new proposal clears it. So a change that is (back) in Customer Approval with an Agree standing reads No: the customers are being asked, and "accepted" would say there is nothing left to answer. Out of scope here: the legacy Ballerina customer-portal backend mapping (`apps/customer-portal/backend/utils.bal`); the customer portal's own readers (webapp `isProposalAccepted`, microapp `isProposedTimeAccepted`) carry the same gate.
 - **Not mirrored.** Proposals and WSO2's answers are PostgreSQL-only until the sync stops (the previous system's PATCH API has no field for them); Accept's mirror to the previous system is best effort (a failure is recorded in entity-service's table of failed write-backs) and while the sync runs it can rewrite `customer_updated_on`, the confirmation, `state`, `start_on` and `end_on`.
 - **Tests.** vitest: `ChangeRequestProposedTimeBanner.test.tsx`, `ChangeRequestAcceptProposedTimeDialog.test.tsx`, `ChangeRequestRescheduleDialog.test.tsx` (counter, stored-time and plain modes), `ChangeRequestActionBar.test.tsx` (the label), `CsmChangeRequestDetailPage.test.tsx` ("lifecycle: Re-schedule" holds the stateful fake of the contract: pending allowlist, Accept, counter, decline, the nobody-to-ask refusal, version checks, `lcCustomerProposes`). e2e, fake API (`utils/fakeChangeRequestApi.ts`; `customerProposes`, `seedProposal`, `setOnHold`, `addInternalRequestedRow`; the refusal texts are exported and the real-stack describe asserts the same strings): describes "change request approval flow — Re-schedule" and "— a customer's proposed time (mocked backend)". e2e, real stack ("a customer's proposed time (real stack)"): a native proposal accepted from the page, a counter and a decline, and the rows the sync writes (a migrated change in Customer Approval with a customer date and no answer -- a stored time nobody is recorded as having proposed: Accept refused, a plain Re-schedule that writes no answer --, one in Authorize with an unlabeled approval, a date equal to the plan, a standing answer, a date left far ahead). The customer proposes there the way the customer portal does (`proposeAsCustomer`, `utils/customerPortalDecision.ts`).
+
+## List bulk actions and export (Change requests, Incidents)
+
+Both lists have a checkbox column (for `canWrite` only), a selection bar (`BulkSelectionBar`: "N selected", **Edit (n)**,
+**Assign to me (n)**, Clear selection), a result banner (`BulkResultAlert`) and an **Export** menu (`FilteredExportMenu`).
+
+- **Selection** is `useRowSelection(getId, canSelect, currentRows)` (`features/csm-operations/hooks`): kept by id across
+  pages, a filter change clears it, a closed / cancelled incident and a closed / canceled / rolled-back change request are
+  never added (`isIncidentTerminal`, `isChangeRequestTerminal`; the row shows a disabled box with a tooltip naming its
+  state). `selected` gives a picked row as the current page shows it (`currentRows`), so a run plans from fresh data; a
+  row that has become final since it was picked keeps an enabled, checked box ("Deselect …, now canceled") and can always
+  be taken out. The checkbox cell stops the row's own click, so ticking never opens the record. The boxes are disabled
+  while a run is in flight, and the page box while a page loads (the rows held are still the previous page's).
+- **There is no bulk endpoint.** `runBulkUpdate` (`utils/bulkUpdate.ts`) sends one PATCH per record, four at a time, and
+  never stops on a refusal: the banner lists each record that was not updated with the backend's own 4xx words
+  (`bulkFailureMessage`; a 5xx is a generic line) and each record skipped before sending. The backend stays the authority
+  for every rule; the dialogs only keep from offering what cannot work.
+- **Edit, incidents** (`BulkEditIncidentsDialog`): the whole incident form, laid out in ServiceNow's sections, with
+  every field `PATCH /incidents/{id}` accepts: short description, state, channel, impact, urgency, environment,
+  category, subcategory, service, service offering, configuration item, assignment group, assigned to, watch list,
+  work note, additional comment (customer-visible), parent incident, change request, problem, caused by change,
+  resolution code and notes, incident report. "No change" is the default of every field and only set fields are sent
+  (`bulkIncidentPlan`, `utils/bulkIncidentEdit.ts`).
+  - State offers what every selected incident can move to (`bulkIncidentTargetStates`, the Edit dialog's table), never
+    narrowed by one closed since it was picked (it is skipped). Resolved / Closed need a resolution code and notes,
+    applied to all; the two can also be set alone.
+  - Subcategory follows the category being set, or the category every selected incident shares (else it is disabled
+    with the reason). Service offering narrows to the service being set.
+  - Watch list: add people to each incident's own list, remove them, or replace the list. The API only replaces, so
+    adding or removing reads each incident's detail first (`incidentDetailQuery`, the detail page's cache entry);
+    one whose list cannot be read is skipped, and a list that would not change is not sent.
+  - Parent incident never offers a selected incident (`useSearchIncidentsExcludingIds`), and the plan refuses one as
+    its own parent. Caused by change is a change request picker (its column references `change_request`).
+  - Not offered: priority (it follows from impact and urgency) and `parentIncidentId` (a second parent column with no
+    label in the portal).
+- **Edit, change requests** (`BulkEditChangeRequestsDialog`): State offers the moves every selected change request can
+  make, read from each one's own `legalNextStates` (fetched with `changeRequestDetailQuery`, the detail page's own cache
+  entry) through the action bar's filter (`bulkChangeRequestTargets`: `isOfferedChangeRequestTarget`, never `authorize`,
+  never `scheduled`, never a Close out of Customer Review). Cancel change / Roll back need a reason, sent as `workNote`
+  **in the same PATCH as the state** (a refused move then records no reason; the detail page posts its reason first
+  because it handles one record). The per-record request is `bulkChangeRequestPlan` (`utils/bulkChangeRequestEdit.ts`):
+  an approved change request (Customer Approval and later) gets only the state and the work note, since its fields are
+  read-only (400 `change_request_approved_read_only`), and one left with nothing to send is skipped with the reason.
+- **Assign to me** sends `{assignedEngineerId: <me>}`; it skips a record already assigned to the user, and for change
+  requests `assignChangeRequestToMePlan` also skips an approved one (its assignee is read-only).
+- **Plan from the record as it is now.** A change request run reads each one's detail first (`queryClient.fetchQuery` of
+  `changeRequestDetailQuery`, which the dialog has just loaded, so it is a cache hit) and plans from it, so one approved
+  since it was picked gets only its state and note, as the dialog says, instead of a refused PATCH. An incident run plans
+  from the refreshed row and skips one closed since it was picked. The dialogs leave such a record out of the moves they
+  offer and say how many will be skipped.
+- **After a run** the dialog is closed with `flushSync` before anything is refreshed (its per-record detail queries would
+  otherwise all refetch), then each record is refreshed exactly as a single edit refreshes it:
+  `refreshChangeRequestRecord` (detail, approvals, comments when a work note was sent) and `refreshIncidentRecord` (detail,
+  tasks, and again after the In Progress / Resolved flows), both exported from the single-record PATCH hooks so the two
+  paths cannot drift. Only the run's own ids leave the selection (`remove`).
+- **Focus and announcements**: the result banner takes focus when it appears (the button that started the run has gone
+  with the bar, and focus makes a screen reader read the outcome); Clear selection puts focus on the page's select-all
+  box; `BulkSelectionBar` keeps one hidden `role="status"` region mounted even at 0, so the first count is announced.
+- **Export** (`FilteredExportMenu` + `useFilteredListExport`) pages the current filtered **and sorted** search to the end
+  or the safety cap (`fetchAllPages`, as the CSV button did) and builds CSV (`rowsToCsvText`, formula-guarded), Excel
+  (`utils/xlsxWriter.ts`: a stored zip with inline strings, bold frozen header; no dependency; `_xHHHH_` in text is
+  escaped, since Excel would read it as a character, and a cell is cut at Excel's 32,767 characters), JSON (one object per row
+  keyed by the column header) or PDF (`utils/tableExportPdf.ts`, jsPDF + autotable, loaded on demand). A capped export is
+  named `-partial`. `FilteredCsvExportButton` is still used by the other lists.
+- Tests: the two tabs' tests ("bulk selection", "Assign to me", "bulk edit", "export"), `BulkEditIncidentsDialog.test.tsx`,
+  `utils/__tests__/bulk*.test.ts`, `useRowSelection.test.ts`, `FilteredExportMenu.test.tsx`, `xlsxWriter.test.ts`,
+  `listExport.test.ts`, `tableExportPdf.test.ts`; e2e `tests/e2e/specs/operations/list-bulk-actions.spec.ts` (the list
+  searches and PATCHes faked in memory, sign-in and pickers real; every export format downloaded and read back).
 
 ## Change request Approval tab: Approve / Reject follow the backend, never the state
 

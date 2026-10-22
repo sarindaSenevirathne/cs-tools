@@ -627,3 +627,292 @@ describe("DayLadder: a reader west of the office", () => {
     expect(container.querySelectorAll(".zbp.tiers")).toHaveLength(2);
   });
 });
+
+describe("DayLadder: where the Sri Lankan day and the Americas day meet", () => {
+  /** 08:00-18:00 on a fixed UTC-7 clock: 20:30-06:30 IST all year. */
+  const AMERICAS_PT = shift({
+    code: "CRE_AMERICAS_PT",
+    shortCode: "NLK",
+    label: "Americas regular hours",
+    startMinute: 480,
+    endMinute: 1080,
+    authoringTimeZone: "Etc/GMT+7",
+    isRotation: false,
+    colourToken: "NLK",
+    sortOrder: 55,
+  });
+  /** The window as it was: 21:00-06:00 on the Colombo clock. */
+  const AMERICAS_COVER = shift({
+    code: "CRE_AMERICAS",
+    shortCode: "NLK",
+    label: "Americas cover",
+    startMinute: 1260,
+    endMinute: 1800,
+    crossesMidnight: true,
+    isRotation: false,
+    colourToken: "NLK",
+    sortOrder: 50,
+  });
+  const shifts = shiftMap(REGULAR, EVENING, MORNING, AMERICAS_PT, AMERICAS_COVER);
+
+  const evening = assignment({
+    name: "Eve Ning",
+    rotaDate: ISO,
+    shiftCode: "CRE_EVENING",
+    startsAt: `${ISO}T12:30:00.000Z`,
+    endsAt: `${ISO}T15:30:00.000Z`,
+  });
+  const americas = (shiftCode: string, startsAt: string, endsAt: string) =>
+    assignment({ name: "Ann Merica", teamKey: "americas", rotaDate: ISO, shiftCode, startsAt, endsAt });
+
+  function renderCre(assignments: LadderLane["assignments"], regions = true) {
+    return render(
+      <DayLadder
+        day={WEDNESDAY}
+        tz={TZ}
+        zoneLabel="IST"
+        lanes={[{ name: "Rotations", assignments, layout: "flat", regions }]}
+        shifts={shifts}
+        zones={ZONES}
+        absences={[]}
+        absenceKinds={[ANNUAL_LEAVE]}
+        {...scopeControls()}
+      />,
+    );
+  }
+
+  it("marks the half hour both are on, and gives each side its own column", () => {
+    const { container } = renderCre([
+      nineToFive("Reg Ular", "CRE_REGULAR"),
+      evening,
+      americas("CRE_AMERICAS_PT", `${ISO}T15:00:00.000Z`, "2026-09-24T01:00:00.000Z"),
+    ]);
+    const overlap = screen.getByRole("note", { name: /Overlap 20:30–21:00, 30 min/ });
+    // A mark only: the time is in its tooltip, never written across the cards.
+    expect(overlap.textContent).not.toMatch(/\d/);
+    expect(overlap).toHaveAttribute("title", expect.stringContaining("20:30–21:00"));
+    const columns = container.querySelectorAll(".lane:not(.offlane) .lncol");
+    expect(columns).toHaveLength(2);
+    // On the edge the two columns share: it lives in the US column, not over
+    // the whole lane.
+    expect(columns[1]).toContainElement(overlap);
+    expect(columns[0]).toHaveTextContent("Eve Ning");
+    expect(columns[0]).toHaveTextContent("Reg Ular");
+    expect(columns[0]).not.toHaveTextContent("Ann Merica");
+    expect(columns[1]).toHaveTextContent("Ann Merica");
+  });
+
+  it("keeps the whole Sri Lankan day in one column, the morning handover included", () => {
+    // Packed by time, last night's Americas crew (in until 06:30) would push
+    // the morning into a second column and leave regular hours in the first.
+    const { container } = renderCre([
+      assignment({
+        name: "Ann Merica",
+        teamKey: "americas",
+        rotaDate: "2026-09-22",
+        shiftCode: "CRE_AMERICAS_PT",
+        startsAt: "2026-09-22T15:00:00.000Z",
+        endsAt: `${ISO}T01:00:00.000Z`,
+      }),
+      assignment({
+        name: "Mor Ning",
+        rotaDate: ISO,
+        shiftCode: "CRE_MORNING",
+        startsAt: `${ISO}T00:30:00.000Z`,
+        endsAt: `${ISO}T03:30:00.000Z`,
+      }),
+      nineToFive("Reg Ular", "CRE_REGULAR"),
+      evening,
+      americas("CRE_AMERICAS_PT", `${ISO}T15:00:00.000Z`, "2026-09-24T01:00:00.000Z"),
+    ]);
+    expect(screen.getByRole("note", { name: /Overlap 06:00–06:30/ })).toBeInTheDocument();
+    expect(screen.getByRole("note", { name: /Overlap 20:30–21:00/ })).toBeInTheDocument();
+    const columns = container.querySelectorAll(".lane:not(.offlane) .lncol");
+    expect(columns).toHaveLength(2);
+    expect(columns[0]).toHaveTextContent("Mor Ning");
+    expect(columns[0]).toHaveTextContent("Reg Ular");
+    expect(columns[0]).not.toHaveTextContent("Ann Merica");
+  });
+
+  it("marks nothing for a hole between the two days, and still keeps LK left and the US right", () => {
+    const { container } = renderCre([
+      evening,
+      americas("CRE_AMERICAS_PT", `${ISO}T16:00:00.000Z`, "2026-09-24T02:00:00.000Z"),
+    ]);
+    expect(screen.queryByRole("note")).not.toBeInTheDocument();
+    const columns = container.querySelectorAll(".lane:not(.offlane) .lncol");
+    expect(columns).toHaveLength(2);
+    expect(columns[0]).toHaveTextContent("Eve Ning");
+    expect(columns[1]).toHaveTextContent("Ann Merica");
+  });
+
+  it("marks nothing where one day starts as the other ends, and still keeps LK left and the US right", () => {
+    const { container } = renderCre([
+      evening,
+      americas("CRE_AMERICAS", `${ISO}T15:30:00.000Z`, "2026-09-24T00:30:00.000Z"),
+    ]);
+    expect(screen.queryByRole("note")).not.toBeInTheDocument();
+    const columns = container.querySelectorAll(".lane:not(.offlane) .lncol");
+    expect(columns).toHaveLength(2);
+    expect(columns[0]).toHaveTextContent("Eve Ning");
+    expect(columns[1]).toHaveTextContent("Ann Merica");
+  });
+
+  it("keeps the US card on the right even when it comes first in the day", () => {
+    // Last night's US crew is the first card of the morning, and packed by
+    // time it took the left column.
+    const { container } = renderCre([
+      assignment({
+        name: "Ann Merica",
+        teamKey: "americas",
+        rotaDate: "2026-09-22",
+        shiftCode: "CRE_AMERICAS",
+        startsAt: "2026-09-22T15:30:00.000Z",
+        endsAt: `${ISO}T00:30:00.000Z`,
+      }),
+      nineToFive("Reg Ular", "CRE_REGULAR"),
+    ]);
+    const columns = container.querySelectorAll(".lane:not(.offlane) .lncol");
+    expect(columns).toHaveLength(2);
+    expect(columns[0]).toHaveTextContent("Reg Ular");
+    expect(columns[1]).toHaveTextContent("Ann Merica");
+  });
+
+  it("is one column when only one side is on screen", () => {
+    const { container } = renderCre([nineToFive("Reg Ular", "CRE_REGULAR"), evening]);
+    expect(container.querySelectorAll(".lane:not(.offlane) .lncol")).toHaveLength(1);
+  });
+
+  it("leaves a lane that does not ask for it alone", () => {
+    renderCre([evening, americas("CRE_AMERICAS_PT", `${ISO}T15:00:00.000Z`, "2026-09-24T01:00:00.000Z")], false);
+    expect(screen.queryByRole("note")).not.toBeInTheDocument();
+  });
+});
+
+describe("DayLadder: every name on a one-team card, and the clock", () => {
+  const AMERICAS_PT = shift({
+    code: "CRE_AMERICAS_PT",
+    shortCode: "NLK",
+    label: "Americas regular hours",
+    startMinute: 480,
+    endMinute: 1080,
+    authoringTimeZone: "Etc/GMT+7",
+    isRotation: false,
+    colourToken: "NLK",
+    sortOrder: 55,
+  });
+  const shifts = shiftMap(REGULAR, AMERICAS_PT);
+  const americasCrew = Array.from({ length: 15 }, (_, i) =>
+    assignment({
+      name: `Americas Engineer ${String(i + 1).padStart(2, "0")}`,
+      teamKey: "americas",
+      rotaDate: ISO,
+      shiftCode: "CRE_AMERICAS_PT",
+      startsAt: `${ISO}T15:00:00.000Z`,
+      endsAt: "2026-09-24T01:00:00.000Z",
+    }),
+  );
+
+  function renderWith(
+    assignments: LadderLane["assignments"],
+    clock?: { tz: string; onClockChange: (tz: string) => void },
+  ) {
+    return render(
+      <DayLadder
+        day={WEDNESDAY}
+        tz={clock?.tz ?? TZ}
+        zoneLabel="IST"
+        lanes={[{ name: "Rotations", assignments, layout: "flat", regions: true }]}
+        shifts={shifts}
+        zones={ZONES}
+        absences={[]}
+        absenceKinds={[ANNUAL_LEAVE]}
+        clockOptions={
+          clock
+            ? [
+                { value: "Asia/Colombo", label: "IST" },
+                { value: "Etc/GMT+7", label: "PDT" },
+              ]
+            : undefined
+        }
+        onClockChange={clock?.onClockChange}
+        {...scopeControls()}
+      />,
+    );
+  }
+
+  it("lists all fifteen people of a one-team card rather than splitting it by team", () => {
+    renderWith(americasCrew);
+    for (const a of americasCrew) expect(screen.getByText(a.engineer.name)).toBeInTheDocument();
+    expect(screen.queryByText(/more$/)).not.toBeInTheDocument();
+  });
+
+  it("keeps a cut-off card at its own hours, and opens it on hover with everyone", () => {
+    // jsdom lays nothing out: make every card report more content than room.
+    const scroll = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(900);
+    const client = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(100);
+    try {
+      const { container } = renderWith(americasCrew);
+      const cards = [...container.querySelectorAll<HTMLElement>(".zblk")];
+      expect(cards.length).toBeGreaterThan(0);
+      for (const card of cards) {
+        // At rest, exactly its hours.
+        expect(card).toHaveClass("canopen");
+        expect(card.style.height).toMatch(/^\d+(\.\d+)?px$/);
+        expect(card).toHaveTextContent("Show all 15");
+        // On hover, the whole list.
+        fireEvent.mouseEnter(card);
+        expect(card).toHaveClass("open");
+        expect(card.style.height).toBe("auto");
+        for (const a of americasCrew) expect(card).toHaveTextContent(a.engineer.name);
+        fireEvent.mouseLeave(card);
+        expect(card).not.toHaveClass("open");
+      }
+    } finally {
+      scroll.mockRestore();
+      client.mockRestore();
+    }
+  });
+
+  it("still splits a crowded card of several teams by team", () => {
+    const mixed = Array.from({ length: 14 }, (_, i) =>
+      nineToFive(`Engineer ${String(i + 1).padStart(2, "0")}`, "CRE_REGULAR", i % 2 === 0 ? "alpha" : "beta"),
+    );
+    renderWith(mixed);
+    expect(screen.queryByText("Engineer 01")).not.toBeInTheDocument();
+  });
+
+  it("draws no clock picker without choices", () => {
+    renderWith(americasCrew);
+    expect(screen.queryByRole("combobox", { name: "Read the day on" })).not.toBeInTheDocument();
+  });
+
+  it("offers IST and PDT, and reads the day on the one picked", () => {
+    const onClockChange = vi.fn();
+    const { rerender } = renderWith(americasCrew, { tz: TZ, onClockChange });
+    const picker = screen.getByRole("combobox", { name: "Read the day on" });
+    expect(picker).toHaveValue("Asia/Colombo");
+    fireEvent.change(picker, { target: { value: "Etc/GMT+7" } });
+    expect(onClockChange).toHaveBeenCalledWith("Etc/GMT+7");
+    // On the PDT clock the Americas day reads 08:00-18:00.
+    rerender(
+      <DayLadder
+        day={WEDNESDAY}
+        tz="Etc/GMT+7"
+        zoneLabel="PDT"
+        lanes={[{ name: "Rotations", assignments: americasCrew, layout: "flat", regions: true }]}
+        shifts={shifts}
+        zones={ZONES}
+        absences={[]}
+        absenceKinds={[ANNUAL_LEAVE]}
+        clockOptions={[
+          { value: "Asia/Colombo", label: "IST" },
+          { value: "Etc/GMT+7", label: "PDT" },
+        ]}
+        onClockChange={onClockChange}
+        {...scopeControls()}
+      />,
+    );
+    expect(screen.getByText("08:00 – 18:00")).toBeInTheDocument();
+  });
+});

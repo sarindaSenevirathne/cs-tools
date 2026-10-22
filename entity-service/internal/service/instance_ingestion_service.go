@@ -42,10 +42,11 @@ type InstanceIngestionService interface {
 	GetDeploymentConsumptionSecret(ctx context.Context, deploymentNumber string) (domain.DeploymentConsumptionSecretResponse, error)
 }
 
-// Column widths of the usage tables (migration 0054), checked here so an
-// oversized value is a 400 naming the field rather than a database error.
+// Column widths of the usage tables (migrations 0054 and 0111), checked here so an
+// oversized value is a 400 naming the field rather than a database error. A node id
+// is 128 wide: real products report 64-character hashes, not dashed UUIDs.
 const (
-	maxNodeIDLen           = 36
+	maxNodeIDLen           = 128
 	maxProjectKeyLen       = 128
 	maxDeploymentNumberLen = 50
 	maxHourlyCountTypeLen  = 50

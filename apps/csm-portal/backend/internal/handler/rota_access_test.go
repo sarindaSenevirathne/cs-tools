@@ -126,9 +126,9 @@ func TestRotaAccess_KeepsTheRefusalReason(t *testing.T) {
 		want   string
 	}{
 		{http.StatusForbidden, "only a CSM admin can grant or remove rota admin", "only a CSM admin"},
-		{http.StatusBadRequest, "a rota marker marks their own team, and that person is not on lyra", "not on lyra"},
+		{http.StatusBadRequest, "a rota manager marks their own team, and that person is not on lyra", "not on lyra"},
 		{http.StatusNotFound, "cab is not a team on the schedule", "not a team on the schedule"},
-		{http.StatusInternalServerError, "pq: relation does not exist", "Failed to add the rota marker."},
+		{http.StatusInternalServerError, "pq: relation does not exist", "Failed to add the rota manager."},
 	} {
 		fake := &fakeRotaAccessClient{err: &apierror.Error{StatusCode: c.status, Body: `{"code":1,"message":"` + c.msg + `"}`}}
 		w := httptest.NewRecorder()

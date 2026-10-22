@@ -90,9 +90,15 @@ type stubIncidentRepo struct {
 	getIncidentByID         func(ctx context.Context, id string) (domain.IncidentView, error)
 	updateIncidentLifecycle func(ctx context.Context, id string, u repository.IncidentLifecycleUpdate, actorEmail string) error
 	applySpecialistHandoff  func(ctx context.Context, id, actorEmail string, plan func(repository.SpecialistHandoffSnapshot) (repository.SpecialistHandoffPlan, error)) (repository.SpecialistHandoffWritten, error)
-	supportGroups           map[string]string // service id -> support group id ("" = none); a key is a service that exists
-	serviceNames            map[string]string // service id -> name; a key is a service that exists
-	groupNames              map[string]string // group id -> name
+	searchActivities        func(ctx context.Context, req domain.SearchIncidentActivitiesRequest) ([]domain.CaseActivity, int, error)
+	// recordedChanges collects every RecordIncidentFieldChanges call; recordChangesErr fails them.
+	// Unlike the other hooks it is not a panic when unset: the activity write rides on every update.
+	recordedChanges  []recordedIncidentChanges
+	recordChangesErr error
+
+	supportGroups map[string]string // service id -> support group id ("" = none); a key is a service that exists
+	serviceNames  map[string]string // service id -> name; a key is a service that exists
+	groupNames    map[string]string // group id -> name
 	// allowedGroups is the support-group set IsSupportGroup answers from;
 	// nil means every group in supportGroups (all active).
 	allowedGroups map[string]bool
@@ -141,7 +147,10 @@ func (s *stubIncidentRepo) GetIncidentByID(ctx context.Context, id string) (doma
 	}
 	panic("not implemented")
 }
-func (s *stubIncidentRepo) SearchIncidentActivities(context.Context, domain.SearchIncidentActivitiesRequest) ([]domain.CaseActivity, int, error) {
+func (s *stubIncidentRepo) SearchIncidentActivities(ctx context.Context, req domain.SearchIncidentActivitiesRequest) ([]domain.CaseActivity, int, error) {
+	if s.searchActivities != nil {
+		return s.searchActivities(ctx, req)
+	}
 	panic("not implemented")
 }
 
@@ -186,6 +195,18 @@ func (s *stubIncidentRepo) UpdateIncidentLifecycle(ctx context.Context, id strin
 		return s.updateIncidentLifecycle(ctx, id, u, actorEmail)
 	}
 	panic("UpdateIncidentLifecycle called unexpectedly")
+}
+
+// recordedIncidentChanges is one RecordIncidentFieldChanges call the stub saw.
+type recordedIncidentChanges struct {
+	incidentID string
+	changes    []repository.IncidentFieldChange
+	actorEmail string
+}
+
+func (s *stubIncidentRepo) RecordIncidentFieldChanges(_ context.Context, incidentID string, changes []repository.IncidentFieldChange, actorEmail string) error {
+	s.recordedChanges = append(s.recordedChanges, recordedIncidentChanges{incidentID: incidentID, changes: changes, actorEmail: actorEmail})
+	return s.recordChangesErr
 }
 
 func (s *stubIncidentRepo) ApplySpecialistHandoff(ctx context.Context, id, actorEmail string, plan func(repository.SpecialistHandoffSnapshot) (repository.SpecialistHandoffPlan, error)) (repository.SpecialistHandoffWritten, error) {

@@ -76,7 +76,8 @@ const NUMERIC_STATE_KEY: Record<string, BeCallRequestStateKey> = {
  * (`CALL_REQUEST_STATE_LABEL`) is worded independently of the data source's
  * labels (e.g. our `customer_rejected` -> "Rejected by customer" vs the source's
  * "Customer Rejected"), so a reverse label lookup would resolve only some states
- * and silently miss others. The label is display-only (see `callRequestStateLabel`).
+ * and silently miss others. Display uses the resolved id (`callRequestStateLabel`),
+ * and only falls back to `state.label` when the id does not resolve.
  * In practice the backend always sends a usable `state.id`.
  */
 export function resolveCallRequestStateKey(
@@ -84,23 +85,27 @@ export function resolveCallRequestStateKey(
 ): BeCallRequestStateKey | null {
   if (!state) return null;
   const raw = String(state.id);
-  if (raw in CALL_REQUEST_STATE_LABEL) return raw as BeCallRequestStateKey;
+  const lower = raw.toLowerCase();
+  if (lower in CALL_REQUEST_STATE_LABEL) return lower as BeCallRequestStateKey;
   if (raw in NUMERIC_STATE_KEY) return NUMERIC_STATE_KEY[raw];
   return null;
 }
 
 /**
- * Resolve the display label for a call request state returned by the backend.
- * Prefers the backend-supplied `label`, else maps the id (string or integer).
+ * Display label for a call request state. The id is the source of truth:
+ * pending on the customer and pending on the agent (WSO2) must not follow a
+ * data-source label that names the other party. A label is used only when
+ * the id does not resolve.
  */
 export function callRequestStateLabel(state: {
   id: number | string;
   label?: string;
 } | undefined): string {
   if (!state) return "Unknown";
-  if (state.label) return state.label;
   const key = resolveCallRequestStateKey(state);
-  return key ? CALL_REQUEST_STATE_LABEL[key] : String(state.id);
+  if (key) return CALL_REQUEST_STATE_LABEL[key];
+  if (state.label) return state.label;
+  return String(state.id);
 }
 
 /**

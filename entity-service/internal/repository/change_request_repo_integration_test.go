@@ -1621,6 +1621,14 @@ func seedReviewGateGroup(t *testing.T, pool *pgxpool.Pool) {
 		changeRequestReviewGateGroupID); err != nil {
 		t.Fatalf("seed group: %v", err)
 	}
+	// The change request reaches Review from Implement, where it has been approved and
+	// its assignment group can no longer be changed (change_request_approved_lock.go):
+	// the group is the one it was assigned before its approval, so it is stored here and
+	// the tests' {assignedTeamId, state: review} resends it.
+	if _, err := pool.Exec(repository.WithSystemIdentity(ctx),
+		`UPDATE work_item SET assignment_group_id = $1 WHERE id = $2`, changeRequestReviewGateGroupID, changeRequestReviewGateTestID); err != nil {
+		t.Fatalf("assign the review gate group: %v", err)
+	}
 }
 
 // seedTeamMembersForReviewGateTest inserts one "user" row and one
@@ -2142,10 +2150,12 @@ func TestChangeRequestIntegration_AssessAuthorizeAndReviewStagesCoexist(t *testi
 		t.Fatalf("read back Authorize approval_stage: %v", scanErr)
 	}
 
-	// Review's own entry point: a direct {state: "review"} PATCH, supplying
-	// a deliberately different assigned team so this test also confirms
-	// Review's own provisioning uses THIS request's team, not whatever was
-	// left on work_item by the Assess/Authorize steps above.
+	// Review's own entry point: a direct {state: "review"} PATCH. The change's
+	// assigned team is a deliberately different one by then, so this test also
+	// confirms Review's own provisioning uses the team stored at that point, not
+	// whatever the Assess/Authorize steps above used. (Once approved the team can
+	// no longer be changed by PATCH -- change_request_approved_lock.go -- so the
+	// fixture stores it directly, as a reassignment before the approval would.)
 	//
 	// Review is entered from Implement, the only edge into it (the CAB approval
 	// and Start implementation have tests of their own): the change is put there
@@ -2154,10 +2164,13 @@ func TestChangeRequestIntegration_AssessAuthorizeAndReviewStagesCoexist(t *testi
 		t.Fatalf("put the change request in Implement: %v", err)
 	}
 	reviewTeamID := changeRequestReviewGateGroupID
+	if _, err := scoped.Exec(sys, `UPDATE work_item SET assignment_group_id = $1 WHERE id = $2`, reviewTeamID, changeRequestAssessGateTestID); err != nil {
+		t.Fatalf("reassign the change request: %v", err)
+	}
 	review := domain.ChangeRequestStateReview
 	if _, err := repo.PatchChangeRequest(sys, changeRequestAssessGateTestID,
-		domain.PatchChangeRequestRequest{AssignedTeamID: &reviewTeamID, State: &review}, "cr-assess-gate-test"); err != nil {
-		t.Fatalf("PatchChangeRequest(assignedTeamId=%s, state=review): %v", reviewTeamID, err)
+		domain.PatchChangeRequestRequest{State: &review}, "cr-assess-gate-test"); err != nil {
+		t.Fatalf("PatchChangeRequest(state=review): %v", err)
 	}
 
 	var stageCount int
@@ -5326,9 +5339,11 @@ func TestChangeRequestFlowIntegration_CustomerApprovalRequiredEditableUntilGateP
 }
 
 // customerReviewRequired is free in New and ADD-ONLY afterwards -- it decides
-// what Review offers, and ticking it stays possible until the change leaves
-// Review (a project is needed once approval has been requested) -- and refused
-// from Customer Review on; unticking is refused in every state after New.
+// what Review offers -- and, like every field, read-only once the change has been
+// approved (change_request_approved_lock.go). A Standard change is approved by
+// Request Approval itself (it goes straight to Scheduled), so for one the box is
+// decided in New; unticking is refused in every state after New, with the
+// customer lock's own words.
 func TestChangeRequestFlowIntegration_CustomerReviewRequiredEditableUntilReviewLeft(t *testing.T) {
 	f := newCRFlow(t)
 	f.seedAssignedGroup()
@@ -5345,7 +5360,8 @@ func TestChangeRequestFlowIntegration_CustomerReviewRequiredEditableUntilReviewL
 		}
 	}
 	// After New ticking needs a Customer Project, which can no longer be set:
-	// this change has none, so the add is refused...
+	// this change has none, so the add is refused with that reason (the customer
+	// lock is judged before the approved-content lock)...
 	f.requestApproval(id)
 	f.expect(id, "after Request Approval (nothing ticked, no project needed)", "SCHEDULED", "implement", "canceled")
 	f.wantValidationError("tick on a change with no project", func() error { return set(true) }(), "customerReviewRequired cannot be turned on")
@@ -5354,15 +5370,18 @@ func TestChangeRequestFlowIntegration_CustomerReviewRequiredEditableUntilReviewL
 		return err
 	}(), "projectId can no longer be changed")
 
-	// ... and a change that has one can tick it through Review, once.
+	// ... and a change that has one is ticked in New and keeps it through Review.
 	id = f.create(domain.ChangeRequestTypeStandard, crFlowGroupID)
 	if _, err := f.patch(id, domain.PatchChangeRequestRequest{ProjectID: f.customerProject()}); err != nil {
 		t.Fatalf("set the project in New: %v", err)
 	}
+	if err := set(true); err != nil {
+		t.Fatalf("tick in New: %v", err)
+	}
 	f.requestApproval(id)
 	f.step(id, domain.ChangeRequestStateImplement, "IMPLEMENT", "review", "canceled")
 	if err := set(true); err != nil {
-		t.Fatalf("tick in Implement: %v", err)
+		t.Fatalf("resend the ticked box in Implement: %v", err)
 	}
 	f.wantValidationError("untick in Implement", set(false), "customerReviewRequired can no longer be turned off")
 
@@ -5391,8 +5410,9 @@ func TestChangeRequestFlowIntegration_CustomerReviewRequiredEditableUntilReviewL
 		t.Fatal("customerReviewRequired changed although the edit was refused")
 	}
 
-	// A box that was not ticked can still be ticked while the change is in Review,
-	// and Review then offers Customer Review.
+	// A box that was not ticked can no longer be ticked once the change has been
+	// approved, Review included: it was approved without the customer's review, and
+	// Review keeps offering Close.
 	other := f.create(domain.ChangeRequestTypeStandard, crFlowGroupID)
 	if _, err := f.patch(other, domain.PatchChangeRequestRequest{ProjectID: f.customerProject()}); err != nil {
 		t.Fatalf("set the project: %v", err)
@@ -5400,13 +5420,9 @@ func TestChangeRequestFlowIntegration_CustomerReviewRequiredEditableUntilReviewL
 	f.requestApproval(other)
 	f.step(other, domain.ChangeRequestStateImplement, "IMPLEMENT", "review", "canceled")
 	f.step(other, domain.ChangeRequestStateReview, "REVIEW", "closed", "rollback", "canceled")
-	if _, err := f.patch(other, domain.PatchChangeRequestRequest{CustomerReviewRequired: boolp(true)}); err != nil {
-		t.Fatalf("tick in Review: %v", err)
-	}
-	f.expect(other, "after ticking in Review", "REVIEW", "customer_review", "rollback", "canceled")
-	f.step(other, domain.ChangeRequestStateCustomerReview, "CUSTOMER_REVIEW", "canceled")
-	f.customerConfirmsReview(other)
-	f.expect(other, "after the customer's review", "CLOSED")
+	_, err := f.patch(other, domain.PatchChangeRequestRequest{CustomerReviewRequired: boolp(true)})
+	f.wantValidationError("tick in Review", err, "customerReviewRequired can no longer be changed: the change request has been approved")
+	f.expect(other, "after the refused tick in Review", "REVIEW", "closed", "rollback", "canceled")
 }
 
 // A required review cannot be skipped by closing a Review: closing from Review is
@@ -6361,7 +6377,9 @@ func TestChangeRequestScopeIntegration_PatchDeploymentProductsReadOnly(t *testin
 // the stored values is always accepted; everything else stays editable.
 func TestChangeRequestScopeIntegration_PatchEditWindow(t *testing.T) {
 	for state, open := range map[string]bool{
-		"NEW": true, "ASSESS": true, "AUTHORIZE": true, "CUSTOMER_APPROVAL": true, "SCHEDULED": true,
+		// The window closes when the change is approved (Customer Approval and
+		// Scheduled are reached only through it).
+		"NEW": true, "ASSESS": true, "AUTHORIZE": true, "CUSTOMER_APPROVAL": false, "SCHEDULED": false,
 		"IMPLEMENT": false, "REVIEW": false, "CUSTOMER_REVIEW": false, "ROLLBACK": false, "CLOSED": false, "CANCELED": false,
 	} {
 		state, open := state, open
@@ -6388,7 +6406,7 @@ func TestChangeRequestScopeIntegration_PatchEditWindow(t *testing.T) {
 			}
 			for field, req := range attempts {
 				_, err := f.patch(id, req)
-				// The project is open in New only; the lists stay open until Implement.
+				// The project is open in New only; the lists stay open until the approval.
 				open := open
 				if field == "projectId" {
 					open = state == "NEW"
@@ -6408,10 +6426,19 @@ func TestChangeRequestScopeIntegration_PatchEditWindow(t *testing.T) {
 				f.assertScope("after refused "+field, f.get(id), crScopeProjectA, []string{crScopeDepProd, crScopeDepStage}, storedProducts)
 			}
 
-			// Not part of the window, in any state: journal entries and category.
+			// Not part of the window, in any state: journal entries. The category is
+			// another field: editable until the change is approved, read-only after
+			// (change_request_approved_lock.go), but never by the links rule.
+			f.mustPatch(id, domain.PatchChangeRequestRequest{Comment: scopeStrp("still allowed"), WorkNote: scopeStrp("still allowed")})
 			cat := domain.ChangeRequestCategoryNetwork
 			cp := &cat
-			f.mustPatch(id, domain.PatchChangeRequestRequest{Comment: scopeStrp("still allowed"), WorkNote: scopeStrp("still allowed"), Category: &cp})
+			_, err := f.patch(id, domain.PatchChangeRequestRequest{Category: &cp})
+			approved := map[string]bool{"CUSTOMER_APPROVAL": true, "SCHEDULED": true, "IMPLEMENT": true, "REVIEW": true, "CUSTOMER_REVIEW": true, "CLOSED": true, "ROLLBACK": true}[state]
+			if approved {
+				f.wantValidationError("category in "+state, err, "has been approved")
+			} else if err != nil {
+				t.Fatalf("category in %s: %v", state, err)
+			}
 		})
 	}
 }
@@ -6560,8 +6587,10 @@ func TestChangeRequestScopeIntegration_SurvivesNormalLifecycle(t *testing.T) {
 		t.Fatalf("state = %s, want SCHEDULED", got)
 	}
 	check("after CAB approval")
-	// Still editable while Scheduled.
-	f.mustPatch(id, domain.PatchChangeRequestRequest{DeploymentIDs: &[]string{crScopeDepProd}})
+	// Approved: the scope it was approved for is fixed (a resend is still accepted).
+	_, err = f.patch(id, domain.PatchChangeRequestRequest{DeploymentIDs: &[]string{crScopeDepProd}})
+	f.wantValidationError("edit after the CAB approval", err, "can no longer be changed")
+	check("after the refused edit in Scheduled")
 	f.mustPatch(id, domain.PatchChangeRequestRequest{DeploymentIDs: &deps})
 	for _, step := range []domain.ChangeRequestState{domain.ChangeRequestStateImplement, domain.ChangeRequestStateReview, domain.ChangeRequestStateClosed} {
 		step := step

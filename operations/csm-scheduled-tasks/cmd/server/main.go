@@ -32,6 +32,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -44,11 +45,23 @@ import (
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/engine"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/entitycases"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/housekeeping"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/httpsec"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/ledger"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/migrationreport"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/migrationscan"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/notify"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/opencases"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/queryhours"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/queryhoursreport"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/registry"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/regressionreport"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/regressionscan"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/rotareminder"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/schedule"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/stalecases"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/teamschedule"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/worklogreport"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/worklogsreport"
 )
 
 func main() {
@@ -102,6 +115,68 @@ func main() {
 	})
 	if err != nil {
 		slog.Error("failed to construct entity-service case-search client", "err", err)
+		os.Exit(1)
+	}
+
+	// The migration scan's own client: the same deployment and credentials,
+	// a distinct endpoint (GET /reports/migration-cases) with its own
+	// timeout.
+	migrationReportClient, err := migrationreport.NewClient(migrationreport.Config{
+		BaseURL:      entityServiceBaseURL,
+		TokenURL:     oauthTokenURL,
+		ClientID:     oauthClientID,
+		ClientSecret: oauthClientSecret,
+		Scopes:       entityServiceScopes,
+	})
+	if err != nil {
+		slog.Error("failed to construct entity-service migration-scan client", "err", err)
+		os.Exit(1)
+	}
+
+	// The product regression reports' own client: the same deployment and
+	// credentials, a distinct endpoint (GET /reports/product-regressions).
+	regressionReportClient, err := regressionreport.NewClient(regressionreport.Config{
+		BaseURL:      entityServiceBaseURL,
+		TokenURL:     oauthTokenURL,
+		ClientID:     oauthClientID,
+		ClientSecret: oauthClientSecret,
+		Scopes:       entityServiceScopes,
+	})
+	if err != nil {
+		slog.Error("failed to construct entity-service product-regression-report client", "err", err)
+		os.Exit(1)
+	}
+
+	// The CS Worklogs reports' own client. Same deployment and
+	// credentials, separate client for the same reason as the others: a
+	// distinct endpoint whose timeout differs materially. A weekly report
+	// reads every time card in a seven-day window across every delivery
+	// team, so it allows ninety seconds.
+	// The query-hour client. Same deployment and credentials; its own
+	// client because a recompute walks every opportunity in service and
+	// every project linked to each, so it needs minutes rather than the
+	// seconds a read allows.
+	queryHourClient, err := queryhours.NewClient(queryhours.Config{
+		BaseURL:      entityServiceBaseURL,
+		TokenURL:     oauthTokenURL,
+		ClientID:     oauthClientID,
+		ClientSecret: oauthClientSecret,
+		Scopes:       entityServiceScopes,
+	})
+	if err != nil {
+		slog.Error("failed to construct entity-service query-hour client", "err", err)
+		os.Exit(1)
+	}
+
+	worklogReportClient, err := worklogreport.NewClient(worklogreport.Config{
+		BaseURL:      entityServiceBaseURL,
+		TokenURL:     oauthTokenURL,
+		ClientID:     oauthClientID,
+		ClientSecret: oauthClientSecret,
+		Scopes:       entityServiceScopes,
+	})
+	if err != nil {
+		slog.Error("failed to construct entity-service worklog-report client", "err", err)
 		os.Exit(1)
 	}
 
@@ -213,6 +288,38 @@ func main() {
 		}
 	}
 
+	// Rota reminders: emails to the people rostered on a rotation shift in the
+	// Team Schedule. *** OFF UNLESS ROTA_REMINDERS_ENABLED=true. *** They
+	// email real staff from the real rota, so an environment that holds the
+	// rota but must not mail people turns them on only with
+	// ROTA_REMINDER_REDIRECT_TO set. Registered only when enabled, like
+	// cloud_status_webhooks, so the ledger shows no run for a task that is off.
+	rotaRemindersEnabled := envBool("ROTA_REMINDERS_ENABLED", false)
+	var teamScheduleClient *teamschedule.Client
+	rotaZone := time.UTC
+	if rotaRemindersEnabled {
+		teamScheduleClient, err = teamschedule.NewClient(teamschedule.Config{
+			BaseURL:      entityServiceBaseURL,
+			TokenURL:     oauthTokenURL,
+			ClientID:     oauthClientID,
+			ClientSecret: oauthClientSecret,
+			Scopes:       entityServiceScopes,
+		})
+		if err != nil {
+			slog.Error("failed to construct entity-service team-schedule client", "err", err)
+			os.Exit(1)
+		}
+		rotaZone, err = time.LoadLocation(envString("ROTA_REMINDER_TIME_ZONE", "Asia/Colombo"))
+		if err != nil {
+			slog.Error("ROTA_REMINDER_TIME_ZONE is not a known time zone", "err", err)
+			os.Exit(1)
+		}
+		if u := os.Getenv("ROTA_REMINDER_SCHEDULE_URL"); u != "" && !strings.HasPrefix(u, "https://") && !strings.HasPrefix(u, "http://") {
+			slog.Error("ROTA_REMINDER_SCHEDULE_URL must be an http(s) URL", "value", u)
+			os.Exit(1)
+		}
+	}
+
 	// Global kill switch for every failure alert email — see
 	// engine.Engine.AlertsEnabled's own doc comment. Defaults to true (the
 	// current always-alert behavior); set to false to go quiet without
@@ -250,6 +357,15 @@ func main() {
 	// parseSubCronSchedules/parseSubCronRecipients's own doc comments.
 	scheduleOverrides := parseSubCronSchedules(os.Getenv("SUB_CRON_SCHEDULES"))
 	recipientOverrides := parseSubCronRecipients(os.Getenv("SUB_CRON_RECIPIENTS"))
+	// Debug mail mode is per report -- see notify.ForReport. A task whose
+	// SUB_CRON_RECIPIENTS entry carries a "debug" list sends its report to
+	// that list only, with [Test copy] in the subject, until the list is
+	// removed. Startup names every such task: left in place, a report on
+	// trial looks exactly like a quiet week to its real audience.
+	if onTrial := tasksWithDebugRecipients(recipientOverrides); len(onTrial) > 0 {
+		slog.Warn("debug mail mode is on for these reports: they go to their debug recipients only, with [Test copy] in the subject",
+			"tasks", onTrial)
+	}
 
 	const housekeepingTaskName = "housekeeping_cleanup"
 	housekeepingTo, housekeepingCc := recipientsFor(recipientOverrides, housekeepingTaskName)
@@ -259,6 +375,7 @@ func main() {
 
 	const staleCasesTaskName = "stale_cases_report"
 	staleCasesTo, staleCasesCc := recipientsFor(recipientOverrides, staleCasesTaskName)
+	staleCasesEmail := notify.ForReport(emailClient, debugFor(recipientOverrides, staleCasesTaskName))
 	// Fixed, not env-configurable — unlike HOUSEKEEPING_RETENTION_DAYS, there's
 	// no operational reason to tune this per deployment today. Revisit as an
 	// env var (mirroring envDays("HOUSEKEEPING_RETENTION_DAYS", 30)'s shape)
@@ -266,13 +383,165 @@ func main() {
 	const staleCaseThreshold = 30 * 24 * time.Hour
 
 	const openCasesTaskName = "open_cases_report"
+	// Where an issue key in a CS Worklogs mail points: the CSM portal,
+	// which is where the engineers who receive these reports work. NOT
+	// the customer portal -- that is a different audience and most of
+	// them cannot even open it. ServiceNow linked into its own agent
+	// workspace, the equivalent internal surface, and that URL dies at
+	// cutover.
+	//
+	// Same variable and same path shape as csm-notification-service's
+	// recipientlinks resolver, which already builds
+	// <CSM_PORTAL_WEB_BASE_URL>/cases/{id} for internal recipients.
+	//
+	// Default is EMPTY, which renders the keys as plain text: better
+	// than linking every engineer at a host nobody configured.
+	// Validated like the other outbound URLs, so a typo stops startup
+	// rather than producing a mail full of dead links.
+	// Where the CS Worklogs audience comes from. "configured" is the
+	// default and reproduces the delivered mails; "derived" hands the
+	// decision to the team registry and WILL change who receives them,
+	// so it is a deliberate switch rather than a fallback. The drift
+	// line logged on every send shows the size of that change first.
+	worklogRecipientSource, ok := worklogreport.ParseSource(os.Getenv("WORKLOG_RECIPIENTS_SOURCE"))
+	if !ok {
+		slog.Error("WORKLOG_RECIPIENTS_SOURCE must be configured or derived",
+			"value", os.Getenv("WORKLOG_RECIPIENTS_SOURCE"))
+		os.Exit(1)
+	}
+
+	worklogCaseLinkBase := strings.TrimRight(os.Getenv("CSM_PORTAL_WEB_BASE_URL"), "/")
+	if worklogCaseLinkBase != "" {
+		if err := httpsec.RequireSecureURL(worklogCaseLinkBase); err != nil {
+			slog.Error("invalid CSM_PORTAL_WEB_BASE_URL", "err", err)
+			os.Exit(1)
+		}
+	}
+
+	const queryHoursWeeklyTaskName = "query_hours_weekly_report"
+	const queryHoursNoticeTaskName = "query_hours_usage_notifications"
+	const worklogsDailyTaskName = "cs_worklogs_daily_report"
+	const worklogsWeeklyTaskName = "cs_worklogs_weekly_report"
 	openCasesTo, openCasesCc := recipientsFor(recipientOverrides, openCasesTaskName)
+	openCasesEmail := notify.ForReport(emailClient, debugFor(recipientOverrides, openCasesTaskName))
+	// For the query-hour tasks these are ADDITIONS to the derived
+	// audience, not the audience itself -- see the package doc.
+	queryHoursWeeklyTo, queryHoursWeeklyCc := recipientsFor(recipientOverrides, queryHoursWeeklyTaskName)
+	_, queryHoursNoticeCc := recipientsFor(recipientOverrides, queryHoursNoticeTaskName)
+	// Both query-hour tasks go through the per-report debug wrapper,
+	// like every other report here. It matters more for these two than
+	// for most: their audience is DERIVED from the accounts being
+	// reported on, so without a debug list a tryout would mail account
+	// managers and technical owners directly.
+	queryHoursWeeklyEmail := notify.ForReport(emailClient, debugFor(recipientOverrides, queryHoursWeeklyTaskName))
+	queryHoursNoticeEmail := notify.ForReport(emailClient, debugFor(recipientOverrides, queryHoursNoticeTaskName))
+	worklogsDailyTo, worklogsDailyCc := recipientsFor(recipientOverrides, worklogsDailyTaskName)
+	worklogsWeeklyTo, worklogsWeeklyCc := recipientsFor(recipientOverrides, worklogsWeeklyTaskName)
+	worklogsDailySchedule := scheduleFor(scheduleOverrides, worklogsDailyTaskName, "55 3 * * *")
+	worklogsWeeklySchedule := scheduleFor(scheduleOverrides, worklogsWeeklyTaskName, "0 16 * * 1")
+	worklogsDailyEmail := notify.ForReport(emailClient, debugFor(recipientOverrides, worklogsDailyTaskName))
+	worklogsWeeklyEmail := notify.ForReport(emailClient, debugFor(recipientOverrides, worklogsWeeklyTaskName))
+
+	const migrationCaseReportTaskName = "migration_case_report"
+	migrationCaseTo, migrationCaseCc := recipientsFor(recipientOverrides, migrationCaseReportTaskName)
+	migrationCaseEmail := notify.ForReport(emailClient, debugFor(recipientOverrides, migrationCaseReportTaskName))
+	// The age a migration must reach before the weekly scan lists it. One
+	// value, read once: the source report hard-coded its window in three
+	// places and the CS team asked for six months in place of three.
+	migrationCaseOlderThanDays := int(envDays("MIGRATION_CASE_REPORT_OLDER_THAN_DAYS", 180).Hours() / 24)
+	// entity-service caps the age at ten years and answers 400 above it; a
+	// larger value would fail every run until corrected, visible only in
+	// the failure alerts. Refuse to start instead.
+	if migrationCaseOlderThanDays > migrationCaseMaxOlderThanDays {
+		slog.Error("MIGRATION_CASE_REPORT_OLDER_THAN_DAYS exceeds the maximum entity-service accepts; refusing to start",
+			"value", migrationCaseOlderThanDays, "max", migrationCaseMaxOlderThanDays)
+		os.Exit(1)
+	}
+	// The support portal's case page prefix for the links in the scan
+	// (<prefix>/<case number>), the link the scan has always carried.
+	// Unset renders the issue keys as plain text; a non-https value
+	// refuses to start, as every URL here does.
+	migrationCaseLinkBase := strings.TrimRight(os.Getenv("MIGRATION_CASE_REPORT_LINK_BASE_URL"), "/")
+	if migrationCaseLinkBase != "" {
+		if err := httpsec.RequireSecureURL(migrationCaseLinkBase); err != nil {
+			slog.Error("invalid MIGRATION_CASE_REPORT_LINK_BASE_URL", "err", err)
+			os.Exit(1)
+		}
+	}
+
+	// The monthly product regression reports: one task per business unit
+	// (product_regression_report_apim / _iam / _integration), each mailing
+	// last month's regression cases for its own products. The product lists
+	// are built in (regressionscan.DefaultVariants) and may be replaced per
+	// report with PRODUCT_REGRESSION_REPORT_PRODUCTS, a JSON object of
+	// report key to product names; a key that names no report, or an empty
+	// list, refuses to start rather than mailing an empty report every
+	// month.
+	regressionVariants, err := regressionscan.ApplyProductOverrides(regressionscan.DefaultVariants(), os.Getenv("PRODUCT_REGRESSION_REPORT_PRODUCTS"))
+	if err != nil {
+		slog.Error("invalid PRODUCT_REGRESSION_REPORT_PRODUCTS", "err", err)
+		os.Exit(1)
+	}
+	// An optional case page prefix for the links in the reports
+	// (<prefix>/<case number>). Unset renders the case ids as plain text,
+	// as the source report's PDF did; a non-https value refuses to start,
+	// as every URL here does.
+	regressionCaseLinkBase := strings.TrimRight(os.Getenv("PRODUCT_REGRESSION_REPORT_LINK_BASE_URL"), "/")
+	if regressionCaseLinkBase != "" {
+		if err := httpsec.RequireSecureURL(regressionCaseLinkBase); err != nil {
+			slog.Error("invalid PRODUCT_REGRESSION_REPORT_LINK_BASE_URL", "err", err)
+			os.Exit(1)
+		}
+	}
+	// Default schedule: 09:00 on the 1st in India Standard Time, the hour
+	// the reports have always arrived, which is 03:30 UTC (these cron
+	// strings are UTC). Each report's schedule and recipients are looked
+	// up by its own task name, like every other task here. To and Cc are
+	// its SUB_CRON_RECIPIENTS entry: the report goes only to them, and
+	// with no "to" the task skips its query and succeeds, as the stale and
+	// open case reports do. A month with no regression cases sends nothing
+	// (the source report omitted itself when empty).
+	//
+	// registry.Task.To/Cc are left nil DELIBERATELY, as for the migration
+	// scan: the engine mails task.To plus ALERT_RECIPIENTS on every failed
+	// attempt, and a failed period is retried on every tick. The audience
+	// is business unit mail groups; an entity-service outage must not send
+	// them an hourly FAILED notice. Failures go to ALERT_RECIPIENTS alone.
+	// Because To is nil, the EMAIL_BASE_URL check below cannot see these
+	// tasks' own audiences; regressionTasksWithRecipients carries them
+	// there, so a deployment that names readers but no email service still
+	// refuses to start instead of failing silently on the 1st.
+	var regressionTasks []registry.Task
+	var regressionTasksWithRecipients []string
+	for _, v := range regressionVariants {
+		name := regressionscan.TaskName(v)
+		to, cc := recipientsFor(recipientOverrides, name)
+		if len(to) > 0 {
+			regressionTasksWithRecipients = append(regressionTasksWithRecipients, name)
+		}
+		regressionTasks = append(regressionTasks, registry.Task{
+			Name:     name,
+			Schedule: scheduleFor(scheduleOverrides, name, "30 3 1 * *"),
+			Handler: regressionscan.SendReport(regressionReportClient,
+				notify.ForReport(emailClient, debugFor(recipientOverrides, name)),
+				v, to, cc, regressionCaseLinkBase, alertsEnabled),
+		})
+	}
 
 	const publishScheduledAnnouncementsTaskName = "publish_scheduled_announcements"
 	publishScheduledAnnouncementsTo, publishScheduledAnnouncementsCc := recipientsFor(recipientOverrides, publishScheduledAnnouncementsTaskName)
 
 	const cloudStatusTaskName = "cloud_status_webhooks"
 	cloudStatusTo, cloudStatusCc := recipientsFor(recipientOverrides, cloudStatusTaskName)
+
+	const rotaWeekdayTaskName = "rota_weekday_reminder"
+	rotaWeekdayTo, rotaWeekdayCc := recipientsFor(recipientOverrides, rotaWeekdayTaskName)
+	const rotaWeekendTaskName = "rota_weekend_notice"
+	rotaWeekendTo, rotaWeekendCc := recipientsFor(recipientOverrides, rotaWeekendTaskName)
+	const rotaWeekendReminderTaskName = "rota_weekend_reminder"
+	rotaWeekendReminderTo, rotaWeekendReminderCc := recipientsFor(recipientOverrides, rotaWeekendReminderTaskName)
+	const rotaManualTaskName = "rota_manual_reminder"
+	rotaManualTo, rotaManualCc := recipientsFor(recipientOverrides, rotaManualTaskName)
 
 	tasks := []registry.Task{
 		// This component's first real sub-cron: deletes rows from
@@ -300,7 +569,7 @@ func main() {
 		{
 			Name:     staleCasesTaskName,
 			Schedule: scheduleFor(scheduleOverrides, staleCasesTaskName, "0 7 * * *"),
-			Handler: stalecases.SendReport(entityCasesClient, emailClient,
+			Handler: stalecases.SendReport(entityCasesClient, staleCasesEmail,
 				staleCaseThreshold, staleCasesTo, staleCasesCc, alertsEnabled),
 			To: staleCasesTo,
 			Cc: staleCasesCc,
@@ -314,9 +583,92 @@ func main() {
 		{
 			Name:     openCasesTaskName,
 			Schedule: scheduleFor(scheduleOverrides, openCasesTaskName, "0 8 * * *"),
-			Handler:  opencases.SendReport(entityCasesClient, emailClient, openCasesTo, openCasesCc, alertsEnabled),
+			Handler:  opencases.SendReport(entityCasesClient, openCasesEmail, openCasesTo, openCasesCc, alertsEnabled),
 			To:       openCasesTo,
 			Cc:       openCasesCc,
+		},
+		// Emails the weekly migration case scan — see internal/migrationscan's
+		// own doc comment. The audience is the mail groups of the teams
+		// entity-service is configured with, plus this task's own
+		// SUB_CRON_RECIPIENTS entry; an empty audience fails the run so it is
+		// noticed. Default schedule is Sunday 22:30 UTC, which is Monday
+		// 04:00 in Colombo, the hour the scan has always arrived; override
+		// via SUB_CRON_SCHEDULES if needed.
+		//
+		// To and Cc are left nil DELIBERATELY: the engine mails task.To plus
+		// ALERT_RECIPIENTS on every failed attempt, and a failed period is
+		// retried on every tick for a week. The report audience is several
+		// team mail groups; an entity-service outage must not send them an
+		// hourly FAILED notice. Failures go to ALERT_RECIPIENTS alone.
+		{
+			Name:     migrationCaseReportTaskName,
+			Schedule: scheduleFor(scheduleOverrides, migrationCaseReportTaskName, "30 22 * * 0"),
+			Handler: migrationscan.SendReport(migrationReportClient, migrationCaseEmail,
+				migrationCaseOlderThanDays, migrationCaseTo, migrationCaseCc, migrationCaseLinkBase, alertsEnabled),
+		},
+		// The CS Worklogs reports. Both default schedules are the times
+		// ServiceNow actually sends at, expressed in UTC because these
+		// cron strings are UTC: WeeklyReportAutomation V2 triggers Monday
+		// 16:00 UTC, which is 21:30 Asia/Colombo and the timestamp on the
+		// delivered weekly mail; the daily one arrives 09:25 Colombo,
+		// which is 03:55 UTC. The REPORTED range is derived in
+		// Asia/Colombo regardless -- see worklogsreport.ReportTimezone --
+		// because at 03:55 UTC the two zones disagree about which day
+		// "yesterday" is.
+		//
+		// Recipients come from SUB_CRON_RECIPIENTS and the two lists are
+		// NOT the same: the delivered mails have different audiences,
+		// with group addresses in To on the daily and in Cc on the
+		// weekly. Sends nothing (but still succeeds) if the To list is
+		// empty.
+		//
+		// To and Cc are left nil DELIBERATELY. The engine mails
+		// task.To plus ALERT_RECIPIENTS on every failed attempt, and a
+		// failed period is retried on every tick until the next
+		// firing. These two audiences are the whole CS leadership plus
+		// several distribution lists, so an entity-service outage
+		// would send them an hourly FAILED notice for up to a day
+		// (daily) or a week (weekly). The report audience and the
+		// alert audience are not the same people: the recipients go to
+		// the handler, the failures go to ALERT_RECIPIENTS.
+		// Query-hour utilisation, ported from ServiceNow's two flows.
+		//
+		// The weekly report's audience is DERIVED from the accounts it
+		// reports on, so To and Cc are left nil here: failure alerts
+		// go to ALERT_RECIPIENTS, and the report goes to the owners of
+		// whichever accounts are breaching that week.
+		//
+		// The notification task also RECOMPUTES, which is what makes a
+		// crossing detectable at all -- it compares the state it
+		// derives against the one already stored. Hourly, so a breach
+		// is noticed the same day rather than at the weekly.
+		{
+			Name:     queryHoursNoticeTaskName,
+			Schedule: scheduleFor(scheduleOverrides, queryHoursNoticeTaskName, "15 * * * *"),
+			Handler: queryhoursreport.SendUsageNotifications(queryHourClient, queryHoursNoticeEmail,
+				queryHoursNoticeCc, nil, alertsEnabled),
+		},
+		{
+			Name:     queryHoursWeeklyTaskName,
+			Schedule: scheduleFor(scheduleOverrides, queryHoursWeeklyTaskName, "0 4 * * 1"),
+			Handler: queryhoursreport.SendWeeklyReport(queryHourClient, queryHoursWeeklyEmail,
+				queryHoursWeeklyTo, queryHoursWeeklyCc, nil, alertsEnabled),
+		},
+		{
+			Name:     worklogsDailyTaskName,
+			Schedule: worklogsDailySchedule,
+			Handler: worklogsreport.SendDaily(worklogReportClient, worklogsDailyEmail,
+				periodStart(worklogsDailySchedule),
+				worklogsDailyTo, worklogsDailyCc, worklogRecipientSource,
+				worklogCaseLinkBase, alertsEnabled),
+		},
+		{
+			Name:     worklogsWeeklyTaskName,
+			Schedule: worklogsWeeklySchedule,
+			Handler: worklogsreport.SendWeekly(worklogReportClient, worklogsWeeklyEmail,
+				periodStart(worklogsWeeklySchedule),
+				worklogsWeeklyTo, worklogsWeeklyCc, worklogRecipientSource,
+				worklogCaseLinkBase, alertsEnabled),
 		},
 		// The first sub-cron here that does real, per-row, multi-step,
 		// partial-failure-tolerant work rather than a bulk delete or a
@@ -339,6 +691,7 @@ func main() {
 		// entity-service's outage notice drainer and csm-notification-service,
 		// which send them seconds after the change rather than on this tick.
 	}
+	tasks = append(tasks, regressionTasks...)
 
 	// Registered only when enabled, rather than registered-and-inert, so the
 	// ledger shows no run at all for a task that is switched off -- an inert
@@ -392,6 +745,122 @@ func main() {
 		})
 	}
 
+	// The three rota reminder tasks, on the days and times the rota's owners
+	// asked for (Colombo has no DST; TZ=UTC-dependent like every schedule
+	// here, see internal/schedule.PeriodKey):
+	//   - rota_weekday_reminder, 09:30 UTC = 15:00 Colombo, Mon-Fri: the next
+	//     working day's windows (Friday announces Monday), one email each with
+	//     its calendar invitation;
+	//   - rota_weekend_notice, 14:30 UTC = 20:00 Colombo, Sun-Thu: once the
+	//     coming weekend is fully marked, its summary and one invitation per
+	//     team per day, sent once; until then the rota admins are asked every
+	//     evening;
+	//   - rota_weekend_reminder, 09:30 UTC = 15:00 Colombo, Fri: the weekend
+	//     summary again, the invitations as updates, and cancellations.
+	// A task's SUB_CRON_RECIPIENTS to/cc get its failure alerts; they are
+	// copied on its emails only with ROTA_REMINDER_COPY_TASK_RECIPIENTS=true.
+	if rotaRemindersEnabled {
+		family := envString("ROTA_REMINDER_FAMILY", "CRE")
+		copyTaskRecipients := envBool("ROTA_REMINDER_COPY_TASK_RECIPIENTS", false)
+		// Invitations need an organizer: the address the emails come from.
+		organizer := strings.TrimSpace(os.Getenv("EMAIL_FROM_ADDRESS"))
+		invites := envBool("ROTA_REMINDER_INVITES_ENABLED", true)
+		if invites && !rotareminder.ValidInviteAddress(organizer) {
+			slog.Warn("rota reminder calendar invitations are off: EMAIL_FROM_ADDRESS is not set or is not a plain email address, and an invitation needs an organizer")
+			invites = false
+		}
+		scheduleURL := strings.TrimSpace(os.Getenv("ROTA_REMINDER_SCHEDULE_URL"))
+		if scheduleURL != "" && !rotareminder.ValidScheduleURL(scheduleURL) {
+			slog.Warn("ROTA_REMINDER_SCHEDULE_URL is not an http(s) URL; the rota reminders go without the Team Schedule link")
+			scheduleURL = ""
+		}
+		weekendRequired := parseRequired("ROTA_REMINDER_WEEKEND_REQUIRED",
+			envString("ROTA_REMINDER_WEEKEND_REQUIRED", "CRE_WEEKEND=3,CRE_WEEKEND_NIGHT=1"))
+		// Each task's config carries its schedule's period (the run's rota
+		// days are counted from it, so a retry announces what the scheduled
+		// run would have) and the engine's failure audience for it (a run in
+		// which only some emails failed reports them itself; see
+		// rotareminder.Config.AlertTo).
+		// A rotation worked on another clock keeps its hours there: the
+		// Americas Weekend is 08:00-18:00 in Los Angeles, whatever span of
+		// IST that is.
+		rotaWindows, err := rotareminder.ParseWindows(envString("ROTA_REMINDER_WINDOWS", "CRE_WEEKEND_NIGHT=08:00-18:00 America/Los_Angeles,CRE_WEEKEND_NIGHT_OC=08:00-18:00 America/Los_Angeles"))
+		if err != nil {
+			slog.Error("ROTA_REMINDER_WINDOWS is malformed; refusing to start", "err", err)
+			os.Exit(1)
+		}
+		rotaConfig := func(task, sched string, rotations map[string]string, to, cc []string) rotareminder.Config {
+			var copied []string
+			if copyTaskRecipients {
+				copied = append(append(copied, to...), cc...)
+			}
+			return rotareminder.Config{
+				Family:         family,
+				Rotations:      rotations,
+				Copy:           copied,
+				RedirectTo:     splitComma(os.Getenv("ROTA_REMINDER_REDIRECT_TO")),
+				ScheduleURL:    scheduleURL,
+				Invites:        invites,
+				OrganizerEmail: organizer,
+				Required:       weekendRequired,
+				Windows:        rotaWindows,
+				Settings:       teamScheduleClient,
+				EmailsEnabled:  alertsEnabled,
+				Zone:           rotaZone,
+				Now:            time.Now,
+				Anchor:         periodStart(sched),
+				Task:           task,
+				AlertTo:        append(append([]string{}, to...), alertRecipients...),
+				AlertCc:        cc,
+			}
+		}
+		weekdayRotations := parseRotations("ROTA_REMINDER_WEEKDAY_SHIFTS",
+			envString("ROTA_REMINDER_WEEKDAY_SHIFTS", "CRE_MORNING=Morning,CRE_MORNING_OC=On-call,CRE_EVENING=Evening"))
+		weekendRotations := parseRotations("ROTA_REMINDER_WEEKEND_SHIFTS",
+			envString("ROTA_REMINDER_WEEKEND_SHIFTS", "CRE_WEEKEND=LK Weekend,CRE_WEEKEND_NIGHT=Americas Weekend,CRE_WEEKEND_NIGHT_OC=LK On-call"))
+		rotaWeekdaySchedule := scheduleFor(scheduleOverrides, rotaWeekdayTaskName, "30 9 * * 1-5")
+		rotaWeekendSchedule := scheduleFor(scheduleOverrides, rotaWeekendTaskName, "30 14 * * 0-4")
+		rotaWeekendReminderSchedule := scheduleFor(scheduleOverrides, rotaWeekendReminderTaskName, "30 9 * * 5")
+		// "Send now" requests are picked up at every run: the schedule is finer
+		// than the driver, so it is due at each tick.
+		rotaManualSchedule := scheduleFor(scheduleOverrides, rotaManualTaskName, "*/5 * * * *")
+		tasks = append(tasks,
+			registry.Task{
+				Name:     rotaWeekdayTaskName,
+				Schedule: rotaWeekdaySchedule,
+				Handler: rotareminder.WeekdayReminder(teamScheduleClient, emailClient,
+					rotaConfig(rotaWeekdayTaskName, rotaWeekdaySchedule, weekdayRotations, rotaWeekdayTo, rotaWeekdayCc)),
+				To: rotaWeekdayTo,
+				Cc: rotaWeekdayCc,
+			},
+			registry.Task{
+				Name:     rotaWeekendTaskName,
+				Schedule: rotaWeekendSchedule,
+				Handler: rotareminder.WeekendNotice(teamScheduleClient, teamScheduleClient, emailClient,
+					rotaConfig(rotaWeekendTaskName, rotaWeekendSchedule, weekendRotations, rotaWeekendTo, rotaWeekendCc)),
+				To: rotaWeekendTo,
+				Cc: rotaWeekendCc,
+			},
+			registry.Task{
+				Name:     rotaWeekendReminderTaskName,
+				Schedule: rotaWeekendReminderSchedule,
+				Handler: rotareminder.WeekendReminder(teamScheduleClient, teamScheduleClient, emailClient,
+					rotaConfig(rotaWeekendReminderTaskName, rotaWeekendReminderSchedule, weekendRotations, rotaWeekendReminderTo, rotaWeekendReminderCc)),
+				To: rotaWeekendReminderTo,
+				Cc: rotaWeekendReminderCc,
+			},
+			registry.Task{
+				Name:     rotaManualTaskName,
+				Schedule: rotaManualSchedule,
+				Handler: rotareminder.ManualReminder(teamScheduleClient, teamScheduleClient, teamScheduleClient, emailClient,
+					rotaConfig(rotaManualTaskName, rotaManualSchedule, weekdayRotations, rotaManualTo, rotaManualCc),
+					rotaConfig(rotaManualTaskName, rotaManualSchedule, weekendRotations, rotaManualTo, rotaManualCc)),
+				To: rotaManualTo,
+				Cc: rotaManualCc,
+			},
+		)
+	}
+
 	var tasksWithRecipients []string
 	for _, t := range tasks {
 		if !gronx.IsValid(t.Schedule) {
@@ -411,10 +880,33 @@ func main() {
 	// just the standing ALERT_RECIPIENTS audience. Skipped entirely when
 	// ALERTS_ENABLED=false — no email will ever be sent in that case, so an
 	// unset EMAIL_BASE_URL isn't a misconfiguration.
-	if alertsEnabled && emailBaseURL == "" && (len(alertRecipients) > 0 || len(tasksWithRecipients) > 0) {
-		slog.Error("failure alert recipients are configured but EMAIL_BASE_URL is not; refusing to start since those alerts could never actually send",
-			"alertRecipientsSet", len(alertRecipients) > 0, "tasksWithOwnRecipients", tasksWithRecipients)
+	// Rota reminders always have recipients (the people on the shift), so
+	// turning them on with email unconfigured is the same misconfiguration.
+	if alertsEnabled && emailBaseURL == "" && rotaRemindersEnabled {
+		slog.Error("ROTA_REMINDERS_ENABLED is true but EMAIL_BASE_URL is not set; refusing to start since no reminder could be sent")
 		os.Exit(1)
+	}
+	// The product regression reports keep their audience out of task.To (see
+	// their registration above), so it is checked here by name instead.
+	if alertsEnabled && emailBaseURL == "" && (len(alertRecipients) > 0 || len(tasksWithRecipients) > 0 || len(regressionTasksWithRecipients) > 0) {
+		slog.Error("failure alert recipients are configured but EMAIL_BASE_URL is not; refusing to start since those alerts could never actually send",
+			"alertRecipientsSet", len(alertRecipients) > 0, "tasksWithOwnRecipients", tasksWithRecipients,
+			"reportTasksWithOwnRecipients", regressionTasksWithRecipients)
+		os.Exit(1)
+	}
+
+	// A tryout runs one named task's handler once, right now, outside its
+	// schedule and without touching the ledger, so the run is neither
+	// recorded as the period's success nor retried. It exists to see a
+	// report land -- which is why it refuses to run unless that task has
+	// debug recipients: a tryout is for checking, and checking must not
+	// reach the real audience. The process exits once the handler returns;
+	// the engine never ticks. In Choreo: add the task's "debug" list to
+	// SUB_CRON_RECIPIENTS, set TRYOUT_TASK, run the task once by hand, read
+	// the log and the debug inbox, then remove both.
+	if tryout := strings.TrimSpace(os.Getenv("TRYOUT_TASK")); tryout != "" {
+		runTryout(tasks, tryout, debugFor(recipientOverrides, tryout), alertsEnabled)
+		return
 	}
 
 	eng := engine.New(tasks, ledgerClient, emailClient, driverInterval, alertRecipients, alertsEnabled)
@@ -500,6 +992,10 @@ func scheduleFor(overrides map[string]string, taskName, def string) string {
 type subCronRecipients struct {
 	To []string `json:"to"`
 	Cc []string `json:"cc"`
+	// Debug, when set on a report-style task, puts that report in debug
+	// mail mode -- see notify.ForReport. Ignored on a task that sends no
+	// report of its own. Also what TRYOUT_TASK requires.
+	Debug []string `json:"debug"`
 }
 
 // parseSubCronRecipients decodes SUB_CRON_RECIPIENTS, a JSON object mapping
@@ -529,6 +1025,139 @@ func parseSubCronRecipients(raw string) map[string]subCronRecipients {
 func recipientsFor(overrides map[string]subCronRecipients, taskName string) (to, cc []string) {
 	r := overrides[taskName]
 	return r.To, r.Cc
+}
+
+// debugFor returns a task's "debug" list from SUB_CRON_RECIPIENTS, trimmed
+// and blank-free; nil when the task has none.
+func debugFor(overrides map[string]subCronRecipients, taskName string) []string {
+	var out []string
+	for _, a := range overrides[taskName].Debug {
+		if a = strings.TrimSpace(a); a != "" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// tasksWithDebugRecipients names every task whose SUB_CRON_RECIPIENTS entry
+// carries a debug list, sorted, for the startup warning.
+func tasksWithDebugRecipients(overrides map[string]subCronRecipients) []string {
+	var names []string
+	for name := range overrides {
+		if len(debugFor(overrides, name)) > 0 {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// migrationCaseMaxOlderThanDays mirrors entity-service's own cap on the
+// scan's olderThanDays (ten years); see its MigrationCaseReportMaxOlderThanDays.
+const migrationCaseMaxOlderThanDays = 3650
+
+// runTryout runs the task named name once and exits the process: 0 when the
+// handler returned nil, 1 when it failed or when the tryout was refused.
+// It is refused unless the task has debug recipients, since the only thing
+// a tryout must never do is send a real report to real people on
+// somebody's say-so; and it warns, rather than refuses, when
+// ALERTS_ENABLED is false, because every report task then succeeds without
+// sending anything, which is a confusing way to learn nothing.
+func runTryout(tasks []registry.Task, name string, debugRecipients []string, emailsEnabled bool) {
+	if len(debugRecipients) == 0 {
+		slog.Error("TRYOUT_TASK is set but the task has no \"debug\" list in SUB_CRON_RECIPIENTS; refusing: a tryout sends to the debug recipients only",
+			"task", name)
+		os.Exit(1)
+	}
+	var names []string
+	var task *registry.Task
+	for i := range tasks {
+		names = append(names, tasks[i].Name)
+		if tasks[i].Name == name {
+			task = &tasks[i]
+		}
+	}
+	if task == nil {
+		slog.Error("TRYOUT_TASK names no registered task", "task", name, "registered", names)
+		os.Exit(1)
+	}
+	if !emailsEnabled {
+		slog.Warn("tryout with ALERTS_ENABLED=false: report tasks send nothing in that mode, so expect no email", "task", name)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	slog.Warn("tryout: running the task once, outside its schedule and the ledger",
+		"task", name, "debugRecipients", len(debugRecipients))
+	start := time.Now()
+	if err := task.Handler(ctx); err != nil {
+		slog.Error("tryout failed", "task", name, "elapsed", time.Since(start).String(), "err", err)
+		os.Exit(1)
+	}
+	slog.Info("tryout complete", "task", name, "elapsed", time.Since(start).String())
+}
+
+// periodStart returns the scheduled firing time a run of expr made now belongs
+// to: the period key the engine claims it under (schedule.PeriodKey), and so
+// the same for every retry of that run. The schedule is checked at startup, so
+// the error is not expected; now is the fallback all the same.
+func periodStart(expr string) func() time.Time {
+	return func() time.Time {
+		now := time.Now()
+		if p, err := schedule.PeriodKey(expr, now); err == nil {
+			return p
+		}
+		return now
+	}
+}
+
+// parseRotations reads a rota reminder's shift list, "CODE=Name,CODE=Name": the
+// shift codes the task announces and the rotation name the email shows for
+// each. A malformed entry stops startup: a reminder that silently drops a
+// rotation is worse than one that never starts.
+func parseRotations(key, raw string) map[string]string {
+	out := map[string]string{}
+	for _, entry := range splitComma(raw) {
+		code, name, ok := strings.Cut(entry, "=")
+		code, name = strings.TrimSpace(code), strings.TrimSpace(name)
+		if !ok || code == "" || name == "" {
+			slog.Error("malformed rota reminder shift list; expected CODE=Name,CODE=Name", "key", key, "entry", entry)
+			os.Exit(1)
+		}
+		out[code] = name
+	}
+	if len(out) == 0 {
+		slog.Error("empty rota reminder shift list", "key", key)
+		os.Exit(1)
+	}
+	return out
+}
+
+// parseRequired reads the weekend's required headcounts, "CODE=N,CODE=N": how
+// many people each shift needs on each weekend day before the weekend is
+// announced. A malformed entry stops startup, like the shift lists.
+func parseRequired(key, raw string) map[string]int {
+	out := map[string]int{}
+	for _, entry := range splitComma(raw) {
+		code, n, ok := strings.Cut(entry, "=")
+		code = strings.TrimSpace(code)
+		count, err := strconv.Atoi(strings.TrimSpace(n))
+		if !ok || code == "" || err != nil || count < 0 {
+			slog.Error("malformed rota reminder headcount list; expected CODE=N,CODE=N", "key", key, "entry", entry)
+			os.Exit(1)
+		}
+		out[code] = count
+	}
+	return out
+}
+
+// envString returns the given environment variable, or def if unset or blank.
+func envString(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
 }
 
 // envBool returns the given environment variable parsed with

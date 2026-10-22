@@ -129,9 +129,9 @@ function make(over: Partial<Settings> = {}): Settings {
   };
 }
 
-/** A row of the chat routing table, by its team's name. */
+/** A row of the chat space table, by its team's name. */
 function chatRow(name: string): HTMLElement {
-  const table = screen.getByRole("table", { name: "Team chat routing" });
+  const table = screen.getByRole("table", { name: "Chat space for each team" });
   const tr = within(table).getByText(name).closest("tr");
   if (!tr) throw new Error(`no row for ${name}`);
   return tr;
@@ -145,36 +145,37 @@ function optionNames(select: HTMLElement): string[] {
 
 function openAdd(): { button: HTMLElement; dialog: HTMLElement } {
   const button = screen.getByRole("button", {
-    name: "+ Add team chat routing",
+    name: "+ Add chat space",
   });
   button.focus();
   fireEvent.click(button);
   return {
     button,
-    dialog: screen.getByRole("dialog", { name: "Add team chat routing" }),
+    dialog: screen.getByRole("dialog", { name: "Add a team's chat space" }),
   };
 }
 
 beforeEach(() => {
   vi.resetAllMocks();
+  window.localStorage.clear();
+  // The chat spaces sit under "Where alerts go", which starts closed; these
+  // tests work inside it, so it opens as for a person who opened it before.
+  window.localStorage.setItem("csm-ts.alert-settings.open", JSON.stringify(["SRE.where", "CRE.where"]));
   settings.data = make();
 });
 
-describe("Team chat routing", () => {
-  it("says in the add dialog that a routing takes effect after the alert service restarts", () => {
+describe("Chat space for each team", () => {
+  it("leaves when a change is used to the header's chip, not each dialog", () => {
     render(<CaseAlertSettings chain="SRE_SAAS" />);
     const { dialog } = openAdd();
-    expect(
-      within(dialog).getByText(
-        "Saved with this tab's Submit. The alert service uses it after its next restart.",
-      ),
-    ).toBeInTheDocument();
+    expect(within(dialog).queryByText(/restart/)).not.toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Add to changes" })).toBeInTheDocument();
   });
 
   it("lists only the routings saved here, with the hint and last test: the space alone", () => {
     render(<CaseAlertSettings chain="SRE_SAAS" />);
     expect(
-      screen.getByRole("heading", { name: "Team chat routing" }),
+      screen.getByRole("heading", { name: "Chat space for each team" }),
     ).toBeInTheDocument();
     expect(
       screen.getByText(
@@ -185,7 +186,7 @@ describe("Team chat routing", () => {
     expect(
       screen.queryByRole("columnheader", { name: "Alerts by" }),
     ).not.toBeInTheDocument();
-    const table = screen.getByRole("table", { name: "Team chat routing" });
+    const table = screen.getByRole("table", { name: "Chat space for each team" });
     // Artemis has none saved: not listed.
     expect(within(table).queryByText("Artemis")).not.toBeInTheDocument();
     expect(within(table).getAllByRole("row")).toHaveLength(3);
@@ -213,7 +214,7 @@ describe("Team chat routing", () => {
     for (const chain of ["SRE_SAAS", "SRE_IAAS"] as const) {
       const { unmount } = render(<CaseAlertSettings chain={chain} />);
       const rows = within(
-        screen.getByRole("table", { name: "Team chat routing" }),
+        screen.getByRole("table", { name: "Chat space for each team" }),
       ).getAllByRole("row");
       expect(
         rows.map((r) => r.querySelector("b")?.textContent).slice(1),
@@ -227,11 +228,11 @@ describe("Team chat routing", () => {
     render(<CaseAlertSettings chain="SRE_SAAS" />);
     expect(
       screen.getByText(
-        "No team chat routing saved here yet. Alerts go to the chat spaces in the alert service's file.",
+        "No chat space saved here yet. Alerts go to the chat spaces in the alert service's file.",
       ),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("table", { name: "Team chat routing" }),
+      screen.queryByRole("table", { name: "Chat space for each team" }),
     ).not.toBeInTheDocument();
   });
 
@@ -284,7 +285,7 @@ describe("Team chat routing", () => {
       screen.getByText("Webhook URLs can't be saved on this server."),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "+ Add team chat routing" }),
+      screen.getByRole("button", { name: "+ Add chat space" }),
     ).toBeDisabled();
   });
 
@@ -317,7 +318,7 @@ const asgardeo = room({
   webhookHint: HINT,
 });
 
-describe("Team chat routing: changes wait for Submit", () => {
+describe("Chat space for each team: changes wait for Submit", () => {
   it("offers every team of the reader's ladders, marking those with a space, and hides teams people are only moved onto", () => {
     settings.data = make({
       canManage: { view: true, roomLadders: ["SRE", "SME"], routeLadders: ["SRE"] },
@@ -378,7 +379,7 @@ describe("Team chat routing: changes wait for Submit", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(button).toHaveFocus();
     expect(screen.getByText(/^Added to this tab's changes:/)).toHaveTextContent(
-      "Added to this tab's changes: Artemis chat routing. Submit to save them.",
+      "Added to this tab's changes: Artemis chat space. Submit to save them.",
     );
     expect(pending()).toHaveTextContent("1 change not saved yet");
     expect(saveRoom.mutateAsync).not.toHaveBeenCalled();
@@ -418,7 +419,7 @@ describe("Team chat routing: changes wait for Submit", () => {
     const edit = within(chatRow("IaaS")).getByRole("button", { name: "Edit" });
     edit.focus();
     fireEvent.click(edit);
-    const dialog = screen.getByRole("dialog", { name: "Edit IaaS chat routing" });
+    const dialog = screen.getByRole("dialog", { name: "Edit IaaS chat space" });
     expect(within(dialog).queryByLabelText("Team")).not.toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("checkbox", { name: "Also gets incidents with no SRE team" }));
     fireEvent.click(within(dialog).getByRole("button", { name: "Add to changes" }));
@@ -448,8 +449,8 @@ describe("Team chat routing: changes wait for Submit", () => {
     fireEvent.click(within(chatRow("IaaS")).getByRole("button", { name: "More" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "Remove" }));
     fireEvent.click(within(chatRow("IaaS")).getByRole("button", { name: "Remove" }));
-    expect(pending()).toHaveTextContent("Apollo chat routing turned off");
-    expect(pending()).toHaveTextContent("IaaS chat routing removed");
+    expect(pending()).toHaveTextContent("Apollo chat space turned off");
+    expect(pending()).toHaveTextContent("IaaS chat space removed");
     expect(saveRoom.mutateAsync).not.toHaveBeenCalled();
     expect(deleteRoom.mutateAsync).not.toHaveBeenCalled();
 
@@ -470,7 +471,7 @@ describe("Team chat routing: changes wait for Submit", () => {
     fireEvent.click(within(chatRow("Apollo")).getByRole("button", { name: "More" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "Turn off" }));
     fireEvent.click(within(chatRow("Apollo")).getByRole("button", { name: "Turn off" }));
-    fireEvent.click(within(pending()).getByRole("button", { name: "Undo: Apollo chat routing turned off" }));
+    fireEvent.click(within(pending()).getByRole("button", { name: "Undo: Apollo chat space turned off" }));
     expect(pending()).toHaveTextContent("No changes to submit.");
 
     fireEvent.click(within(chatRow("IaaS")).getByRole("button", { name: "More" }));

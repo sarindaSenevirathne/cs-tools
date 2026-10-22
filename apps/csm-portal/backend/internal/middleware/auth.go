@@ -60,6 +60,12 @@ type UserInfo struct {
 	// Empty when the token doesn't carry either claim.
 	FirstName string
 	LastName  string
+	// PhoneNumber is the token's "phone_number" claim -- optional, same as
+	// FirstName/LastName above. Consumed by provisionCsEngineerUser
+	// (handler/users.go), which needs it to provision a cs_engineer caller's
+	// entity-service "user" row on their first GET /users/me. Empty when the
+	// token doesn't carry it.
+	PhoneNumber string
 	// Roles is the token's "roles" claim, which portal authorisation checks
 	// (see handler.AccessGuard).
 	Roles []string
@@ -97,6 +103,9 @@ type jwtClaims struct {
 	// Groups above.
 	FirstName string `json:"given_name"`
 	LastName  string `json:"family_name"`
+	// PhoneNumber — see UserInfo.PhoneNumber's own doc comment. Not required,
+	// same as FirstName/LastName above.
+	PhoneNumber string `json:"phone_number"`
 	jwt.RegisteredClaims
 }
 
@@ -273,12 +282,13 @@ func extractUserInfo(tokenStr string, cfg Config, keyFunc jwt.Keyfunc) (*UserInf
 	}
 
 	return &UserInfo{
-		Email:     c.Email,
-		UserID:    c.UserID,
-		FirstName: c.FirstName,
-		LastName:  c.LastName,
-		Roles:     []string(c.Roles),
-		Groups:    []string(c.Groups),
+		Email:       c.Email,
+		UserID:      c.UserID,
+		FirstName:   c.FirstName,
+		LastName:    c.LastName,
+		PhoneNumber: c.PhoneNumber,
+		Roles:       []string(c.Roles),
+		Groups:      []string(c.Groups),
 	}, nil
 }
 

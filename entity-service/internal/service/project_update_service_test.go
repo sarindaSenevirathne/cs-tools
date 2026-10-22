@@ -416,3 +416,70 @@ func TestPgProjectUpdateService_DualWriteDispatchesExactlyOneMirrorCallOnSuccess
 		t.Fatalf("ServiceNow mirror UpdateProject id = %q, want %q", mirror.gotID, id)
 	}
 }
+
+// TestPgProjectUpdateService_AcceptsOnboardingFields pins that an onboarding-only
+// request counts as a stored field, reaches the repository, and is never
+// dispatched to the dual-write mirror.
+func TestPgProjectUpdateService_AcceptsOnboardingFields(t *testing.T) {
+	status := "In-Progress"
+	owner := "00000000-0000-0000-0000-000000000001"
+	repo := &stubProjectUpdateRepo{}
+	mirror := &stubProjectMirror{}
+	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
+	svc := NewProjectUpdateServiceWithSNWriteback(repo, testProjectUserRepo(), alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+
+	req := domain.ProjectUpdateRequest{OnboardingStatus: &status, OnboardingOwner: &owner}
+	if _, err := svc.UpdateProject(ctx, "11111111-1111-1111-1111-111111111111", req); err != nil {
+		t.Fatalf("UpdateProject() error = %v, want success", err)
+	}
+	if !repo.called || repo.gotReq.OnboardingStatus == nil || *repo.gotReq.OnboardingStatus != status ||
+		repo.gotReq.OnboardingOwner == nil || *repo.gotReq.OnboardingOwner != owner {
+		t.Fatalf("repo called = %v with %+v, want onboarding fields passed through", repo.called, repo.gotReq)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if mirror.calls != 0 {
+		t.Fatalf("mirror calls = %d, want 0 for an onboarding-only request", mirror.calls)
+	}
+}
+
+// TestPgProjectUpdateService_RejectsMalformedOnboardingOwner pins that a
+// non-UUID owner is a 400 from the service, before the repository is called.
+func TestPgProjectUpdateService_RejectsMalformedOnboardingOwner(t *testing.T) {
+	owner := "not-a-uuid"
+	repo := &stubProjectUpdateRepo{}
+	svc := NewProjectUpdateService(repo, testProjectUserRepo(), alwaysUnrestrictedAccess{})
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+
+	_, err := svc.UpdateProject(ctx, "11111111-1111-1111-1111-111111111111", domain.ProjectUpdateRequest{OnboardingOwner: &owner})
+	var ve *apierror.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("UpdateProject() error = %v, want *apierror.ValidationError", err)
+	}
+	if repo.called {
+		t.Fatal("repository must not be called for a malformed onboardingOwner")
+	}
+}
+
+// TestSNProjectUpdateService_RejectsOnboardingFields pins that the ServiceNow
+// data source rejects the Postgres-only onboarding fields with a 400 before
+// any upstream call (the nil client would panic if one were attempted).
+func TestSNProjectUpdateService_RejectsOnboardingFields(t *testing.T) {
+	status := "Completed"
+	owner := "00000000-0000-0000-0000-000000000001"
+	hasAgent := true
+	svc := &snProjectUpdateService{}
+	for name, req := range map[string]domain.ProjectUpdateRequest{
+		"status":            {OnboardingStatus: &status},
+		"owner":             {OnboardingOwner: &owner},
+		"with other fields": {HasAgent: &hasAgent, OnboardingStatus: &status},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := svc.UpdateProject(context.Background(), "11111111-1111-1111-1111-111111111111", req)
+			var ve *apierror.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want ValidationError", err)
+			}
+		})
+	}
+}

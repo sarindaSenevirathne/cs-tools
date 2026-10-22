@@ -26,7 +26,7 @@ func TestLoadAccessConfig(t *testing.T) {
 		"AUTH_VIEWER_ROLES", "AUTH_ESCALATOR_ROLES",
 		"AUTH_ATTACHMENT_DOWNLOADER_ROLES", "AUTH_USAGE_METRICS_VIEWER_ROLES",
 		"AUTH_SUPPORT_ENGINEER_ROLES", "AUTH_ADMIN_ROLES", "AUTH_TIMECARD_APPROVER_ROLES",
-		"AUTH_DASHBOARD_DESIGNER_ROLES", "AUTH_ANNOUNCEMENT_CREATOR_ROLES", "AUTH_SECURITY_TEAM_ROLES",
+		"AUTH_DASHBOARD_DESIGNER_ROLES", "AUTH_ANNOUNCEMENT_CREATOR_ROLES", "AUTH_SECURITY_TEAM_ROLES", "AUTH_ONBOARDING_LEAD_ROLES",
 	}
 	resetEnv := func(t *testing.T) {
 		for _, name := range envs {
@@ -86,6 +86,19 @@ func TestLoadAccessConfig(t *testing.T) {
 	// Creating an announcement needs this role on top of write access, so an
 	// unset variable means only admin can create one -- see
 	// handler.AccessConfig.AnnouncementCreator.
+	t.Run("the onboarding lead role reads its own variable and is optional", func(t *testing.T) {
+		resetEnv(t)
+		t.Setenv("AUTH_ONBOARDING_LEAD_ROLES", " test-onboarders , test-leads ")
+		got := loadAccessConfig()
+		if want := []string{"test-onboarders", "test-leads"}; !slices.Equal(got.OnboardingLead, want) {
+			t.Errorf("OnboardingLead = %v, want %v", got.OnboardingLead, want)
+		}
+		t.Setenv("AUTH_ONBOARDING_LEAD_ROLES", "")
+		if got := loadAccessConfig().OnboardingLead; len(got) != 0 {
+			t.Errorf("OnboardingLead = %v, want empty when unset", got)
+		}
+	})
+
 	t.Run("the announcement creator role reads its own variable", func(t *testing.T) {
 		resetEnv(t)
 		t.Setenv("AUTH_ANNOUNCEMENT_CREATOR_ROLES", " test-announcers , test-leads ")

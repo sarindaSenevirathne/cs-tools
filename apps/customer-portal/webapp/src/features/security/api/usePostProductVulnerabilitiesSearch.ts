@@ -14,7 +14,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import { keepPreviousData, useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { useAsgardeo } from "@asgardeo/react";
 import { useAuthApiClient } from "@/hooks/useAuthApiClient";
 import { useLogger } from "@hooks/useLogger";
@@ -27,12 +27,14 @@ import { parseApiResponseMessage } from "@utils/ApiError";
  * Searches product vulnerabilities (POST /products/vulnerabilities/search).
  *
  * @param {ProductVulnerabilitiesSearchRequest} request - Search filters, pagination, and sort.
- * @param {{ staleTime?: number }} [options] - Optional override of how long a cached result counts as fresh.
+ * @param {{ staleTime?: number, keepPreviousData?: boolean }} [options] - Optional override of how long a cached
+ *   result counts as fresh, and opt-in to keep showing the previous result while the next request loads
+ *   (paged tables); off by default.
  * @returns {UseQueryResult<ProductVulnerabilitiesSearchResponse, Error>} Query result.
  */
 export function usePostProductVulnerabilitiesSearch(
   request: ProductVulnerabilitiesSearchRequest,
-  options?: { staleTime?: number },
+  options?: { staleTime?: number; keepPreviousData?: boolean },
 ): UseQueryResult<ProductVulnerabilitiesSearchResponse, Error> {
   const logger = useLogger();
   const { isSignedIn, isLoading: isAuthLoading } = useAsgardeo();
@@ -76,5 +78,6 @@ export function usePostProductVulnerabilitiesSearch(
     },
     enabled: isSignedIn && !isAuthLoading,
     staleTime: options?.staleTime ?? 0,
+    placeholderData: options?.keepPreviousData ? keepPreviousData : undefined,
   });
 }

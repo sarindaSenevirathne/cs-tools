@@ -157,3 +157,42 @@ func errorsAsValidationError(err error, target **apierror.ValidationError) bool 
 	*target = ve
 	return true
 }
+
+func TestIncidentWhereClause_SLAFilters(t *testing.T) {
+	min, max := 75, 100
+	where, args := incidentWhereClause(domain.SearchIncidentsFilters{ParsedTaskSLA: &domain.TaskSLAFilter{MinBusinessElapsedPercent: &min, MaxBusinessElapsedPercent: &max}},
+		nil, nil, nil, nil, nil, boolPtr(true), nil, nil)
+
+	for _, want := range []string{
+		"AND EXISTS (SELECT 1 FROM sla_live bs WHERE bs.work_item_id = wi.id AND bs.live_has_breached IS TRUE)",
+		"AND EXISTS (SELECT 1 FROM sla_live tsla WHERE tsla.work_item_id = wi.id AND tsla.live_elapsed_percentage >= $1::numeric AND tsla.live_elapsed_percentage <= $2::numeric)",
+	} {
+		if !strings.Contains(where, want) {
+			t.Errorf("where %q missing %q", where, want)
+		}
+	}
+	if len(args) != 2 || args[0] != 75 || args[1] != 100 {
+		t.Errorf("args = %v, want [75 100]", args)
+	}
+
+	where, _ = incidentWhereClause(domain.SearchIncidentsFilters{}, nil, nil, nil, nil, nil, boolPtr(false), nil, nil)
+	if !strings.Contains(where, "AND NOT EXISTS (SELECT 1 FROM sla_live bs") {
+		t.Errorf("slaViolated=false should emit NOT EXISTS, got %q", where)
+	}
+}
+
+// The shared predicates must produce exactly what the case search used to
+// inline, with the work-item id expression the only variable.
+func TestSLAPredicates_WorkItemIDIsParameter(t *testing.T) {
+	if got, want := slaBreachedPredicate("x.id", false), " AND NOT EXISTS (SELECT 1 FROM sla_live bs WHERE bs.work_item_id = x.id AND bs.live_has_breached IS TRUE)"; got != want {
+		t.Errorf("breached = %q, want %q", got, want)
+	}
+	zero := 0
+	clause, args, next := slaPercentPredicate("x.id", &domain.TaskSLAFilter{MaxBusinessElapsedPercent: &zero}, []any{"a"}, 2)
+	if clause != " AND EXISTS (SELECT 1 FROM sla_live tsla WHERE tsla.work_item_id = x.id AND tsla.live_elapsed_percentage <= $2::numeric)" || len(args) != 2 || next != 3 {
+		t.Errorf("percent = %q %v %d", clause, args, next)
+	}
+	if clause, _, next := slaPercentPredicate("x.id", nil, nil, 5); clause != "" || next != 5 {
+		t.Errorf("nil filter should be a no-op, got %q %d", clause, next)
+	}
+}

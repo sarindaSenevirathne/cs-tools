@@ -54,8 +54,13 @@ describe("resolveCallRequestStateKey", () => {
     // label is not a reliable key source; only state.id resolves a key. An
     // unmappable id is not rescued by a label.
     expect(resolveCallRequestStateKey({ id: 99, label: "Scheduled" })).toBeNull();
-    // The label is still honoured for display, though:
+    // The label is still honoured for display when the id itself does not resolve:
     expect(callRequestStateLabel({ id: 99, label: "Scheduled" })).toBe("Scheduled");
+  });
+
+  it("maps an upper-case enum id the same way as the lowercase key", () => {
+    expect(resolveCallRequestStateKey({ id: "PENDING_ON_CUSTOMER" })).toBe("pending_on_customer");
+    expect(resolveCallRequestStateKey({ id: "PENDING_ON_WSO2" })).toBe("pending_on_wso2");
   });
 
   it("regression: agent-action lookup is always an array, never undefined", () => {
@@ -96,8 +101,17 @@ describe("resolveCallRequestStateKey", () => {
 });
 
 describe("callRequestStateLabel / callRequestStateColor", () => {
-  it("prefers the backend label", () => {
-    expect(callRequestStateLabel({ id: 3, label: "Scheduled" })).toBe("Scheduled");
+  it("names the party the call is actually waiting on, not a conflicting source label", () => {
+    expect(callRequestStateLabel({ id: 1, label: "Pending on WSO2" })).toBe("Pending on customer");
+    expect(callRequestStateLabel({ id: "pending_on_customer", label: "Pending" })).toBe(
+      "Pending on customer",
+    );
+    expect(callRequestStateLabel({ id: 2, label: "Pending on customer" })).toBe("Pending on WSO2");
+    expect(callRequestStateLabel({ id: "pending_on_wso2" })).toBe("Pending on WSO2");
+  });
+
+  it("uses our wording for a known id even when the source also sent a label", () => {
+    expect(callRequestStateLabel({ id: 3, label: "Booked" })).toBe("Scheduled");
   });
 
   it("falls back to our label/color via the numeric id when label is absent", () => {

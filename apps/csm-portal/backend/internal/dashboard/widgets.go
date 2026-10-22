@@ -153,6 +153,42 @@ type GroupByConfig struct {
 	LinkResourceType ResourceType `json:"linkResourceType,omitempty"`
 }
 
+// DefaultDistinctByMaxGroups is the maxGroups a Shape "count" widget's
+// DistinctBy gets when the config omits it (filled in at load time, so the
+// frontend always sees an explicit value). It is deliberately far above the
+// aggregate endpoint's own default (10): DistinctBy needs EVERY group, since
+// the count is len(groups) and anything folded into othersCount is an
+// under-count. The endpoint applies no ceiling of its own, and 1000 covers
+// every realistic distinct-account cardinality for a single filtered widget
+// while keeping the response a bounded few tens of KB.
+const DefaultDistinctByMaxGroups = 1000
+
+// MaxDistinctByMaxGroups is the largest DistinctBy.MaxGroups the registry
+// accepts. The aggregate endpoint has no ceiling, so this is a BFF-side
+// guard against a config typo requesting an unbounded response on every
+// dashboard load.
+const MaxDistinctByMaxGroups = 10000
+
+// DistinctByConfig makes a Shape "count" widget show the number of DISTINCT
+// values of Field among the records matching Query, instead of the record
+// total. Resolved entirely client-side, same philosophy as GroupByConfig: the
+// frontend calls POST /cases/aggregate once (filters = the widget's Query,
+// groupBy = Field, maxGroups = MaxGroups) and shows len(groups). If the
+// response's othersCount is greater than zero the number would be an
+// under-count, so the frontend must render an error state, not the number.
+// This layer never calls the endpoint; it only validates and forwards the
+// config. Only valid on resourceType "case", and mutually exclusive with
+// GroupBy/Slices (checked at load time).
+type DistinctByConfig struct {
+	// Field is what to count distinct values of. Must be one of
+	// validDistinctByFields (the aggregate endpoint's groupBy allowlist).
+	Field string `json:"field"`
+	// MaxGroups is the maxGroups sent to the aggregate call. Omitted/zero is
+	// replaced with DefaultDistinctByMaxGroups at load time; the registry
+	// rejects values above MaxDistinctByMaxGroups or below zero.
+	MaxGroups int `json:"maxGroups,omitempty"`
+}
+
 // PieSlice is one wedge of a Shape "pie" widget. The caller resolves its
 // value by issuing that widget's own ResourceType's /search with Query
 // merged under the widget's own base Query (this slice's keys win on
@@ -248,6 +284,9 @@ type WidgetTemplate struct {
 	// are meaningless for count/list.
 	Slices  []PieSlice     `json:"slices,omitempty"`
 	GroupBy *GroupByConfig `json:"groupBy,omitempty"`
+	// DistinctBy is only meaningful for Shape count (resourceType "case"):
+	// absent is today's behaviour (the record total). See DistinctByConfig.
+	DistinctBy *DistinctByConfig `json:"distinctBy,omitempty"`
 	// Section groups widgets sharing the same (non-empty) value under a
 	// titled sub-section within the dashboard, in the order that value
 	// first appears among the dashboard's widgets — e.g. a handful of
@@ -776,4 +815,14 @@ func resolveDashboardFilterPresets(d *Dashboard, sharedPresets map[string]map[st
 		}
 	}
 	return nil
+}
+
+// applyDistinctByDefaults fills in DistinctBy.MaxGroups when omitted, so the
+// widget view the frontend receives always carries an explicit value.
+func applyDistinctByDefaults(d *Dashboard) {
+	for i := range d.Widgets {
+		if db := d.Widgets[i].DistinctBy; db != nil && db.MaxGroups == 0 {
+			db.MaxGroups = DefaultDistinctByMaxGroups
+		}
+	}
 }

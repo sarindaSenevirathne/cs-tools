@@ -617,6 +617,7 @@ func finalize(loaded []sourced, requireType bool, sharedPresets map[string]map[s
 			return nil, err
 		}
 		injectImpliedTypeFilters(d, loaded[i].source)
+		applyDistinctByDefaults(d)
 		// Presets are a pure config-authoring convenience: once every
 		// {"preset": ...} reference in this dashboard has been expanded,
 		// nothing downstream (validation, the handler, the frontend) has any
@@ -793,6 +794,14 @@ var validGroupByBuckets = map[string]bool{
 	"reasons_satisfied": true, "reasons_very_satisfied": true,
 }
 
+// validDistinctByFields is the legal values of DistinctByConfig.Field -- the
+// groupBy allowlist of POST /cases/aggregate (entity-service's
+// AggregateCasesRequest.groupBy enum). Kept in sync by hand, same as
+// validGroupByBuckets.
+var validDistinctByFields = map[string]bool{
+	"account": true, "state": true, "severity": true, "type": true,
+}
+
 // validateWidgets applies the loader's own fail-loud rationale one level down.
 // Dashboard-level fields were already rejected by filename; a widget with a
 // typo'd resourceType or shape, a blank or duplicated id, or a gridWidth
@@ -885,6 +894,25 @@ func validateWidgets(d Dashboard, source string) error {
 					return fmt.Errorf("dashboard definitions: %s (id %q): widget %q: \"groupBy.linkResourceType\" %q only supports \"groupBy.field\" %q, got %q",
 						source, d.ID, w.ID, w.GroupBy.LinkResourceType, w.GroupBy.LinkResourceType, w.GroupBy.Field)
 				}
+			}
+		}
+		if w.DistinctBy != nil {
+			switch {
+			case w.Shape != ShapeCount:
+				return fmt.Errorf("dashboard definitions: %s (id %q): widget %q: \"distinctBy\" is only supported on shape %q, got %q",
+					source, d.ID, w.ID, ShapeCount, w.Shape)
+			case w.ResourceType != ResourceCase:
+				return fmt.Errorf("dashboard definitions: %s (id %q): widget %q: \"distinctBy\" only supports resourceType %q, got %q",
+					source, d.ID, w.ID, ResourceCase, w.ResourceType)
+			case w.GroupBy != nil || len(w.Slices) > 0:
+				return fmt.Errorf("dashboard definitions: %s (id %q): widget %q: \"distinctBy\" cannot be combined with \"groupBy\" or \"slices\"",
+					source, d.ID, w.ID)
+			case !validDistinctByFields[w.DistinctBy.Field]:
+				return fmt.Errorf("dashboard definitions: %s (id %q): widget %q: unknown \"distinctBy.field\" %q; expected one of \"account\", \"state\", \"severity\", \"type\"",
+					source, d.ID, w.ID, w.DistinctBy.Field)
+			case w.DistinctBy.MaxGroups < 0 || w.DistinctBy.MaxGroups > MaxDistinctByMaxGroups:
+				return fmt.Errorf("dashboard definitions: %s (id %q): widget %q: \"distinctBy.maxGroups\" is %d; it must be between 1 and %d (or omitted for the default %d)",
+					source, d.ID, w.ID, w.DistinctBy.MaxGroups, MaxDistinctByMaxGroups, DefaultDistinctByMaxGroups)
 			}
 		}
 		if w.Shape == ShapeLine {

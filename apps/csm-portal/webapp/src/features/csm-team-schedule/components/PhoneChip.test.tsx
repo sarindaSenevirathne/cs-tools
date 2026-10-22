@@ -65,22 +65,67 @@ describe("PhoneChip", () => {
     expect(screen.queryByText(/Alert number/)).not.toBeInTheDocument();
   });
 
-  it("offers Remove and Test call on an existing paging number, not Change, and says Calling while a test is awaited", () => {
+  it("offers Remove to a reader who may edit, and Test call only to one who may test", () => {
     const c = controls();
-    const m = pagingMember({ membershipId: "a", name: "Jane Doe", hasProfilePhone: false, canEditPhone: true, pagingPhone: paging });
-    const { rerender } = render(<PhoneChip member={m} controls={c} />);
+    const editor = pagingMember({ membershipId: "a", name: "Jane Doe", hasProfilePhone: false, canEditPhone: true, pagingPhone: paging });
+    const { rerender } = render(<PhoneChip member={editor} controls={c} />);
     expect(screen.queryByRole("button", { name: /Change/ })).not.toBeInTheDocument();
     expect(screen.queryByText(ADD_TO_PROFILE_HINT)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Remove Jane Doe's alert number" }));
-    fireEvent.click(screen.getByRole("button", { name: "Test call Jane Doe's alert number" }));
-    expect(c.remove).toHaveBeenCalledWith(m);
+    expect(c.remove).toHaveBeenCalledWith(editor);
+    // A lead or head may edit the number but not ring it.
+    expect(screen.queryByRole("button", { name: /Test call/ })).not.toBeInTheDocument();
+
+    const tester = { ...editor, canTestCall: true, testCall: { masked: paging.masked, source: "paging" as const } };
+    rerender(<PhoneChip member={tester} controls={c} />);
+    fireEvent.click(screen.getByRole("button", { name: "Test call Jane Doe's alert number +94•••••123" }));
     expect(c.test).toHaveBeenCalledTimes(1);
 
-    rerender(<PhoneChip member={m} controls={{ ...c, calling: () => true }} />);
+    rerender(<PhoneChip member={tester} controls={{ ...c, calling: () => true }} />);
     const calling = screen.getByRole("button", { name: new RegExp(CALLING_LABEL) });
     expect(calling).toHaveTextContent(CALLING_LABEL);
     expect(calling).toHaveAttribute("aria-disabled", "true");
     fireEvent.click(calling);
     expect(c.test).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets a rota admin test a profile number, and says how the last test went", () => {
+    const c = controls();
+    const m = pagingMember({
+      membershipId: "a",
+      name: "Jane Doe",
+      hasProfilePhone: true,
+      canTestCall: true,
+      testCall: { masked: "+94•••••001", source: "profile" },
+    });
+    const { rerender } = render(<PhoneChip member={m} controls={c} />);
+    expect(screen.queryByText("Profile ✓")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Remove/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Test call Jane Doe's profile number +94•••••001" }));
+    expect(c.test).toHaveBeenCalledWith(m);
+
+    rerender(
+      <PhoneChip
+        member={{ ...m, testCall: { ...m.testCall!, lastTestStatus: "no-answer", lastTestAt: "2026-10-08T09:00:00Z" } }}
+        controls={c}
+      />,
+    );
+    expect(screen.getByText("Test call failed (no-answer)")).toBeInTheDocument();
+    rerender(<PhoneChip member={{ ...m, testCall: { ...m.testCall!, lastTestStatus: "completed" } }} controls={c} />);
+    expect(screen.getByText("Test call answered")).toBeInTheDocument();
+  });
+
+  it("offers no test call where CSM holds no number, even to an admin", () => {
+    // The profile number is known only to the identity provider: nothing to ring from CSM.
+    const { container } = render(
+      <PhoneChip member={pagingMember({ membershipId: "a", hasProfilePhone: true, canTestCall: true, testCall: null })} controls={controls()} />,
+    );
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("offers no test call to a read-only view, whatever the member says", () => {
+    const m = pagingMember({ membershipId: "a", hasProfilePhone: true, canTestCall: true, testCall: { masked: "+94•••••001", source: "profile" } });
+    const { container } = render(<PhoneChip member={m} />);
+    expect(container).toBeEmptyDOMElement();
   });
 });

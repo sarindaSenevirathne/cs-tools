@@ -38,6 +38,8 @@ vi.mock("@api/useSearchUsersByName", () => ({
 }));
 // The search waits a moment for typing to stop; the tests do not.
 vi.mock("@hooks/useDebouncedValue", () => ({ useDebouncedValue: <T,>(v: T) => v }));
+// The reminder settings card has its own tests; here only whether it is shown.
+vi.mock("./RotaReminderSettings", () => ({ default: () => <div>reminder settings card</div> }));
 
 const ME = "11111111-1111-4111-8111-111111111111";
 const ANA = "22222222-2222-4222-8222-222222222222";
@@ -92,19 +94,19 @@ describe("RotaAccessTab", () => {
     expect(lastChange()).toEqual({ kind: "admin", family: "CRE", userId: ME, grant: true });
   });
 
-  it("names a team's rota marker from its members, leaving out the lead and anyone already one", () => {
+  it("names a team's Rota Manager from its members, leaving out the lead and anyone already one", () => {
     render(<RotaAccessTab teams={TEAMS} />);
     fireEvent.click(screen.getByRole("tab", { name: "SRE" }));
-    const pick = screen.getByRole("combobox", { name: "Add rota marker for Apollo" });
+    const pick = screen.getByRole("combobox", { name: "Add Rota Manager for Apollo" });
     const offered = within(pick)
       .getAllByRole("option")
       .map((o) => o.textContent);
-    expect(offered).toEqual(["+ Add rota marker", "Ben"]);
+    expect(offered).toEqual(["+ Add Rota Manager", "Ben"]);
 
     fireEvent.change(pick, { target: { value: BEN } });
     expect(lastChange()).toEqual({ kind: "marker", teamKey: "apollo", userId: BEN, grant: true });
 
-    fireEvent.click(screen.getByRole("button", { name: "Remove Ana as Apollo rota marker" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove Ana as Apollo Rota Manager" }));
     expect(lastChange()).toEqual({ kind: "marker", teamKey: "apollo", userId: ANA, grant: false });
   });
 
@@ -128,11 +130,28 @@ describe("RotaAccessTab", () => {
     expect(screen.queryByRole("rowheader", { name: "Lyra" })).not.toBeInTheDocument();
   });
 
+  it("shows the CRE rota reminder settings to a CSM admin", () => {
+    render(<RotaAccessTab teams={TEAMS} />);
+    expect(screen.getByText("reminder settings card")).toBeInTheDocument();
+  });
+
+  it("shows the CRE rota reminder settings to the CRE rota admin", () => {
+    access.data = { ...access.data!, canManage: { rotaAdmins: false, markerFamilies: ["CRE"] } };
+    render(<RotaAccessTab teams={TEAMS} />);
+    expect(screen.getByText("reminder settings card")).toBeInTheDocument();
+  });
+
+  it("leaves the CRE rota reminder settings out for a rota admin of another group", () => {
+    access.data = { ...access.data!, canManage: { rotaAdmins: false, markerFamilies: ["SRE"] } };
+    render(<RotaAccessTab teams={TEAMS} />);
+    expect(screen.queryByText("reminder settings card")).not.toBeInTheDocument();
+  });
+
   it("marks a grant that does nothing any more, so it can be removed", () => {
     access.data!.markers[0] = { ...access.data!.markers[0], active: false };
     render(<RotaAccessTab teams={TEAMS} />);
     fireEvent.click(screen.getByRole("tab", { name: "SRE" }));
-    const list = screen.getByRole("list", { name: "Apollo rota markers" });
+    const list = screen.getByRole("list", { name: "Apollo Rota Managers" });
     expect(within(list).getByText("inactive")).toBeInTheDocument();
   });
 

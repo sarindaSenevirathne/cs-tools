@@ -38,6 +38,7 @@ import {
   CALL_REQUEST_ACTION_LABEL,
   CALL_REQUEST_AGENT_ACTIONS,
   CALL_REQUEST_STATE_COLOR,
+  CALL_REQUEST_STATE_LABEL,
   callRequestLeadTimeMinutes,
   formatCallRequestLeadTime,
   resolveCallRequestStateKey,
@@ -234,7 +235,7 @@ function CallRequestRow({
         </Typography>
         <Chip
           size="small"
-          label={callRequest.stateLabel}
+          label={stateKey ? CALL_REQUEST_STATE_LABEL[stateKey] : callRequest.stateLabel}
           color={stateKey ? CALL_REQUEST_STATE_COLOR[stateKey] : "default"}
         />
       </Stack>

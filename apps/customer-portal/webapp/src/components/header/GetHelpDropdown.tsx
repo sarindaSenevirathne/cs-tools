@@ -38,6 +38,7 @@ import { useNavigate, useParams } from "react-router";
 import useInfiniteProjects, { flattenProjectPages } from "@api/useGetProjects";
 import useGetProjectFeatures from "@api/useGetProjectFeatures";
 import useGetProjectDetails from "@api/useGetProjectDetails";
+import { useCustomerPermissions } from "@hooks/useCustomerPermissions";
 import {
   getProjectPermissions,
   isProjectRestricted,
@@ -315,6 +316,8 @@ function GetHelpDropdownContent(): JSX.Element {
  */
 export default function GetHelpDropdown(): JSX.Element {
   const { projectId } = useParams<{ projectId?: string }>();
+  const { canCreateCase, isLoading: isPermissionsLoading } =
+    useCustomerPermissions();
   const {
     data: projectsData,
     isLoading: isProjectsLoading,
@@ -330,6 +333,13 @@ export default function GetHelpDropdown(): JSX.Element {
     isProjectsLoading ||
     (isProjectsFetching && projects.length === 0) ||
     (!!projectId && isProjectDetailsLoading);
+  // Fails closed while permissions are still loading, matching
+  // CustomerRoleGuard's own posture -- rendering the controls optimistically
+  // would let a read-only user briefly see (and click into) a case-creation
+  // action before canCreateCase resolves to false.
+  if (isPermissionsLoading || !canCreateCase) {
+    return <></>;
+  }
   if (
     !isProjectsListBusy &&
     (isProjectRestricted(projectDetails?.closureState) ||

@@ -83,6 +83,7 @@ export default function WallboardSreSection({
                   displayName={widget.displayName}
                   resourceType={widget.resourceType}
                   filters={widget.query ?? {}}
+                  distinctBy={widget.distinctBy}
                   section="sre"
                   variant="sre"
                   selectedTeamCreGroupId={selectedTeamCreGroupId}

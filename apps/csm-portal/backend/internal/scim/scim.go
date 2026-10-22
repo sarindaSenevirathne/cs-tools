@@ -41,6 +41,7 @@ const (
 	attrUserName     = "userName"
 	attrSchema       = "urn:scim:wso2:schema"
 	attrRoles        = "roles"
+	attrName         = "name.givenName,name.familyName"
 
 	mobilePhoneType = "mobile"
 
@@ -65,7 +66,7 @@ func (c *Client) SearchUser(ctx context.Context, email string) (*UserInfo, error
 	for {
 		reqBody, err := json.Marshal(scimSearchRequest{
 			Domain:     domainDefault,
-			Attributes: []string{attrID, attrPhoneNumbers, attrUserName, attrSchema, attrRoles},
+			Attributes: []string{attrID, attrPhoneNumbers, attrUserName, attrSchema, attrRoles, attrName},
 			Filter:     fmt.Sprintf("userName eq %s", email),
 			StartIndex: startIndex,
 		})
@@ -100,12 +101,17 @@ func (c *Client) SearchUser(ctx context.Context, email string) (*UserInfo, error
 		return nil, nil
 	}
 
-	return &UserInfo{
+	info := &UserInfo{
 		ID:                     found.ID,
 		PhoneNumber:            extractMobilePhone(*found),
 		LastPasswordUpdateTime: extractLastPasswordUpdateTime(*found),
 		Roles:                  []string(found.Roles),
-	}, nil
+	}
+	if found.Name != nil {
+		info.FirstName = found.Name.GivenName
+		info.LastName = found.Name.FamilyName
+	}
+	return info, nil
 }
 
 // SearchExternalUser checks whether the given email exists in the SCIM

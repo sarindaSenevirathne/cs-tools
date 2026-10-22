@@ -264,6 +264,15 @@ func (s *incidentService) HandOffIncidentToSpecialist(ctx context.Context, req d
 		return domain.HandOffIncidentToSpecialistResponse{}, err
 	}
 
+	// The incident before the handoff: the activity feed records the group it moves and the
+	// assignee it clears. Without it the handoff still runs, with no activity entry.
+	before, err := s.repo.GetIncidentByID(ctx, req.IncidentID)
+	if err != nil {
+		slog.WarnContext(ctx, "specialist handoff: could not read the incident before the handoff; no activity entry will be written",
+			"incidentId", req.IncidentID, "error", err)
+		before = domain.IncidentView{}
+	}
+
 	var product *SpecialistHandoffProduct
 	written, err := s.repo.ApplySpecialistHandoff(ctx, req.IncidentID, email,
 		func(snap repository.SpecialistHandoffSnapshot) (repository.SpecialistHandoffPlan, error) {
@@ -311,6 +320,7 @@ func (s *incidentService) HandOffIncidentToSpecialist(ctx context.Context, req d
 	if err != nil {
 		return domain.HandOffIncidentToSpecialistResponse{}, err
 	}
+	s.recordHandoffFieldChanges(ctx, req.IncidentID, before, view, email)
 	result.Incident = view
 	if view.AssignmentGroup != nil {
 		result.AssignmentGroup = *view.AssignmentGroup

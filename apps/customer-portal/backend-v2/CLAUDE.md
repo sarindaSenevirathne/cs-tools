@@ -613,6 +613,61 @@ validated here.
 **When you add a field a customer may set, add it to `ChangeRequestCustomerUpdateRequest` and say
 why here; a field in `ChangeRequestUpdateRequest` is staff-only.**
 
+## The internal-write-group gate: an INTERNAL-type user needs a token-proven group to write here
+
+entity-service grants a caller classified `user_type = INTERNAL` a much broader ("Unrestricted")
+access scope than a genuine customer/partner gets (see that service's own CLAUDE.md,
+`AccessService.ResolveScope`). That matters here specifically because a WSO2-internal person can
+end up `INTERNAL` there for reasons that have nothing to do with the customer portal — e.g. being
+corrected from a misclassified `EXTERNAL` after being granted the entity-service `internal` role so
+they read correctly as an account manager / technical owner elsewhere. Without a separate check,
+becoming `INTERNAL` there would silently also hand that person full write access to every project's
+cases, change requests, deployments, etc. in *this* portal, since `permissionMatrix` already grants
+`RoleInternal` the same CRUD as `RoleAgent`.
+
+**The gate**: an `INTERNAL`-type caller (entity-service's `user_type`) may reach a write path here
+only if their own JWT `groups` claim — the token they authenticated with, not entity-service's
+business roles from `GetMe().Roles` — contains at least one of the names configured in
+`AUTH_INTERNAL_WRITE_GROUPS` (comma-separated, optional — see README.md). Unset/empty means the
+gate is off: every `INTERNAL` caller keeps full write access, same as before this gate existed; set
+it only once the real write-access group is known. A non-`INTERNAL` caller (a genuine
+customer/partner) is never touched by this gate; their write access
+is still decided entirely by `permissionMatrix`. `groups`, not `roles`, is deliberate: this app's
+own OAuth client has never been provisioned to emit a `roles` claim at all — the deprecated v1
+Ballerina backend's own JWT payload type (`modules/authorization/types.bal`) only ever decoded
+`email`/`groups`/`userid`, confirming `groups` is the claim this app's tokens actually carry
+(`middleware.UserInfo.Groups` already existed before this gate, unused until now).
+
+- **`user_type` plumbing**: `entity.GetUserMeResponse.UserType` (`internal/entity/types.go`,
+  `entity.UserTypeInternal = "internal"`) — entity-service's response was previously silently
+  dropping this field.
+- **Backend enforcement**: `middleware.CachedRoleResolver.IsInternalWriteBlocked` (`internal/middleware/rbac.go`)
+  answers the gate from the same cached `GetMe` entry `GetRoles` already populates (one round trip
+  serves both, not two). `RequirePermission`/`RequirePermissionOneOf`/`RequireRoles` apply it via an
+  optional-interface check (`WriteAccessResolver`), so adding it needed **no new parameter on any of
+  the ~40 call sites in `main.go`** — a resolver that doesn't implement it (every existing test fake)
+  is simply never blocked. `RequirePermission`/`RequirePermissionOneOf` only apply the gate to a
+  non-`ActionRead` action; every `RequireRoles` call site is a write route already, so it always
+  applies there. Construct the live resolver with `.WithInternalWriteGroups(groups)` (`main.go`); a
+  resolver built without it (every test) is inert, matching pre-feature behaviour exactly.
+- **Frontend signal**: `GetMe` additionally computes `dto.UserMeResponse.IsReadOnly` (same rule,
+  computed a second time there purely because the handler already has `entity.GetMe`'s result in
+  hand and isn't itself behind this gate — any authenticated caller may always read their own
+  profile). The webapp's `useCustomerPermissions.ts` folds it straight into `can()`: `isReadOnly &&
+  action !== "read"` always denies, so every existing `can("module", "create"/"update"/"delete")`
+  call site is covered with no changes elsewhere. **This is a UI hint, not the security boundary** —
+  the backend gate above is what actually matters; the frontend flag only decides what gets shown.
+
+**Known gap, not covered by this change**: a handful of write-shaped routes are registered as bare
+`mux.HandleFunc` with no `RequirePermission`/`RequirePermissionOneOf`/`RequireRoles` wrapper at all
+today — `POST`/`PATCH /projects/{id}/conversations*`, `PATCH /conversations/{id}`,
+`DELETE /attachments/{id}`, `POST /projects/{projectId}/deployments/{deploymentId}/license`, and
+`POST /deployment-usages`. The gate above only ever fires through those three guard functions, so an
+`INTERNAL` caller with no configured write group can still reach these specific routes. This predates
+the gate (those routes were already open to any authenticated caller of any role) and wasn't widened
+or narrowed by this change — closing it means first deciding what module/action (or a new one) each
+belongs under in `permissionMatrix`, which is a separate decision.
+
 ## Response shaping — the "wrapper" pattern
 
 **Never return an entity-service response struct directly to the frontend.** This is the one

@@ -86,12 +86,12 @@ func (h *RotaAccessHandler) DeleteRotaAdmin(w http.ResponseWriter, r *http.Reque
 
 // PutRotaMarker handles PUT /team-schedule/rota-access/markers/{teamKey}/{userId}.
 func (h *RotaAccessHandler) PutRotaMarker(w http.ResponseWriter, r *http.Request) {
-	h.change(w, r, "teamKey", rotaTeamKeyRe, "PutRotaMarker", "Failed to add the rota marker.", h.entity.PutRotaMarker)
+	h.change(w, r, "teamKey", rotaTeamKeyRe, "PutRotaMarker", "Failed to add the rota manager.", h.entity.PutRotaMarker)
 }
 
 // DeleteRotaMarker handles DELETE /team-schedule/rota-access/markers/{teamKey}/{userId}.
 func (h *RotaAccessHandler) DeleteRotaMarker(w http.ResponseWriter, r *http.Request) {
-	h.change(w, r, "teamKey", rotaTeamKeyRe, "DeleteRotaMarker", "Failed to remove the rota marker.", h.entity.DeleteRotaMarker)
+	h.change(w, r, "teamKey", rotaTeamKeyRe, "DeleteRotaMarker", "Failed to remove the rota manager.", h.entity.DeleteRotaMarker)
 }
 
 // change checks one grant or removal's path, forwards it, and answers 204.

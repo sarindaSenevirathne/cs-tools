@@ -3118,7 +3118,7 @@
 .csm-ts .cas-dlg .cas-edit label.cas-check { flex-direction: row; }
 .csm-ts .cas-dlg-file { margin-top: 4px; }
 
-/* Team chat routing: its heading and Add on one line. */
+/* Chat space for each team: its heading and Add on one line. */
 .csm-ts .cas-h4row { display: flex; align-items: center; gap: 10px; margin: 16px 0 6px; }
 .csm-ts .cas-h4row h4 { margin: 0; }
 /* The confirmation after a save: one line, replaced by the next. */
@@ -3134,9 +3134,86 @@
 .csm-ts .cas-sec > .cas-det > summary:focus-visible { outline: none; box-shadow: var(--focus); }
 .csm-ts .cas-mark { width: 12px; color: var(--muted); }
 .csm-ts .cas-sec .cas-sec { margin-left: 14px; }
+/* The status chip in the settings' header: what the alert service does with them. */
+.csm-ts .cas-state { white-space: nowrap; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line-2); background: var(--surface-2); color: var(--ink-2); cursor: help; }
+.csm-ts .cas-state.ok { background: color-mix(in srgb, var(--ok) 12%, var(--surface)); border-color: color-mix(in srgb, var(--ok) 35%, var(--line)); }
+.csm-ts .cas-state.warn { background: color-mix(in srgb, var(--warn) 12%, var(--surface)); border-color: color-mix(in srgb, var(--warn) 35%, var(--line)); }
+/* A part of a section: a ladder's group, the assignment groups, the chat spaces. */
+.csm-ts .cas-block { margin-top: 10px; }
+/* A chip never breaks inside its words, on a phone either. */
+.csm-ts .cas-chip { white-space: nowrap; display: inline-block; }
+.csm-ts .cas h5 { margin: 12px 0 4px; font-size: 12.5px; font-weight: 600; color: var(--ink-2); }
+.csm-ts .cas-sec > .cas-det > .cas-block:first-of-type,
+.csm-ts .cas-sec > .cas-det > .cas-sub:first-of-type { margin-top: 4px; }
+.csm-ts .cas-groups tr.cas-unmapped td:first-child { font-weight: 600; }
 
 /* A note said in the page rather than in a disabled button's tooltip. */
 .csm-ts .cas-note { margin: 4px 0 8px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+
+/* Rota Access: the CRE rota reminders card. It sits in a .ra-sec, not under
+   .cas, so the form controls are styled here. The header (title, one line,
+   status badge) sits over two bordered panels, Settings and Send now, side by
+   side; under 1100px they stack, Settings first. The panels borrow the look of
+   .ra-fam, the boxes of the Rota admins section. */
+.csm-ts .rrs-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.csm-ts .rrs-title { min-width: 0; }
+.csm-ts .rrs-title h3 { margin: 0 0 4px; }
+.csm-ts .rrs-intro { margin: 0; font-size: 12.5px; color: var(--ink-2); }
+.csm-ts .rrs-badge { flex: none; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 8px; border-radius: 999px; background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--line-2); white-space: nowrap; }
+.csm-ts .rrs-badge.saved { background: color-mix(in srgb, var(--ok) 9%, var(--surface)); border-color: color-mix(in srgb, var(--ok) 30%, var(--line)); }
+.csm-ts .rrs-meta { margin: 6px 0 0; }
+.csm-ts .rrs-grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 14px; align-items: start; }
+@media (max-width: 1099px) {
+  .csm-ts .rrs-grid2 { grid-template-columns: minmax(0, 1fr); }
+}
+.csm-ts .rrs-panel { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; background: var(--surface-2); display: grid; gap: 12px; min-width: 0; }
+.csm-ts .rrs-panel > h4 { margin: 0; font-size: 13px; font-weight: 600; }
+.csm-ts .rrs { display: grid; gap: 16px; }
+.csm-ts .rrs-group { margin: 0; padding: 0; border: 0; min-width: 0; display: grid; gap: 10px; }
+.csm-ts .rrs-group > legend { padding: 0; margin-bottom: 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
+.csm-ts .rrs-checks { display: grid; gap: 10px; }
+.csm-ts .rrs-checks .cas-check { margin-top: 0; }
+.csm-ts .rrs-checks .cp-help { margin-top: 2px; margin-left: 22px; font-size: 11.5px; }
+.csm-ts .rrs-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px 16px; }
+.csm-ts .rrs-grid .rrs-field { justify-content: space-between; }
+.csm-ts .rrs-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; font-size: 12px; color: var(--ink-2); }
+.csm-ts .rrs-group .cp-help { font-size: 11.5px; }
+.csm-ts .rrs input:not([type="checkbox"]), .csm-ts .rrs select, .csm-ts .rrs textarea { border: 1px solid var(--line-2); border-radius: 6px; font: inherit; font-size: 12.5px; background: var(--surface); color: inherit; }
+.csm-ts .rrs input:not([type="checkbox"]), .csm-ts .rrs select { height: 28px; padding: 0 8px; }
+.csm-ts .rrs input[type="number"] { width: 90px; }
+.csm-ts .rrs textarea { width: 100%; padding: 6px 8px; resize: vertical; }
+.csm-ts .rrs-win { margin: 0; padding: 0; border: 0; min-width: 0; }
+.csm-ts .rrs-win legend { padding: 0; margin-bottom: 4px; font-size: 12px; color: var(--ink-2); }
+.csm-ts .rrs-times { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 12px; }
+.csm-ts .rrs-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.csm-ts .rrs-msg { flex: 1 1 200px; min-width: 0; }
+.csm-ts .rrs .ra-err { margin: 0; }
+.csm-ts .rrs .cas-status.ok { margin-top: 0; }
+.csm-ts .rrs-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+.csm-ts .rrs-foot .rrs-acts { margin-left: auto; }
+
+/* Rota Access: "Send now", the right-hand panel of the same card. */
+.csm-ts .rrs-send h5 { margin: 0 0 4px; font-size: 12px; color: var(--ink-2); }
+.csm-ts .rrs-send .cp-help, .csm-ts .rrs-send .ra-err, .csm-ts .rrs-send .cas-status { margin: 0; }
+.csm-ts .rrs-kinds { display: grid; gap: 6px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.csm-ts .rrs-kinds legend { padding: 0; margin-bottom: 4px; font-size: 12px; color: var(--ink-2); }
+/* The kind picker: real radio inputs drawn as the page's .seg segments. The
+   input fills its label, invisibly, so a click and the keyboard both reach it. */
+.csm-ts .rrs-seg { justify-self: start; }
+.csm-ts .rrs-seg label { position: relative; display: inline-flex; align-items: center; height: 28px; padding: 0 12px; font-size: 12.5px; font-weight: 500; color: var(--muted); cursor: pointer; }
+.csm-ts .rrs-seg label.on { background: var(--accent-soft); color: var(--accent-ink); }
+.csm-ts .rrs-seg label + label { border-left: 1px solid var(--line); }
+.csm-ts .rrs-seg input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.csm-ts .rrs-seg label:focus-within { outline: 2px solid var(--accent); outline-offset: -2px; }
+.csm-ts .rrs-when { margin: 0; font-size: 12.5px; font-weight: 600; color: var(--ink-2); }
+.csm-ts .rrs-tblwrap { min-width: 0; overflow-x: auto; }
+.csm-ts .rrs-preview, .csm-ts .rrs-recent { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.csm-ts .rrs-preview caption { padding: 0 0 4px; text-align: left; font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.csm-ts .rrs-preview th, .csm-ts .rrs-preview td, .csm-ts .rrs-recent th, .csm-ts .rrs-recent td { padding: 5px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.csm-ts .rrs-preview thead th, .csm-ts .rrs-recent thead th { font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
+.csm-ts .rrs-preview td:first-child, .csm-ts .rrs-preview td:nth-child(2) { white-space: nowrap; }
+.csm-ts .rrs-tblwrap > .cp-help { margin-top: 6px; }
+.csm-ts .rrs-send .rrs-acts { align-items: center; }
 
 /* Loading skeletons (ScheduleSkeleton.tsx): each view drawn in its own shape
    while its data is on the way, instead of one line of text on an empty card.
@@ -3199,3 +3276,12 @@
 @media (prefers-reduced-motion: reduce) {
   .csm-ts .sk, .csm-ts .sk-bar, .csm-ts .sk-spin { animation: none; }
 }
+
+/* Where the Sri Lankan day and the Americas day are both on: a small link on
+   the edge the LK and US columns share, as tall as the overlap. It sits in
+   the first US column, centred on the 6px gap, so it joins the two cards
+   without lying across either one's hours or names; an opened card covers
+   it. The time is in its tooltip. */
+.csm-ts .ladder .lane .lhand { position: absolute; left: -13px; width: 20px; min-height: 20px; z-index: 3; box-sizing: border-box; display: flex; align-items: center; justify-content: center; border-radius: 9px; background: var(--accent); color: #fff; box-shadow: 0 0 0 2px var(--surface-solid), 0 1px 3px rgba(0,0,0,.25); cursor: default; }
+.csm-ts .ladder .lane .lhand i { font-style: normal; font-size: 12px; font-weight: 800; line-height: 1; }
+.csm-ts .ladder .lax .laxhand { position: absolute; right: 0; width: 3px; border-radius: 2px; background: var(--accent); }

@@ -121,6 +121,10 @@ type EngineConfig struct {
 	SME SMEConfig
 	// IncidentChatFanout is INCIDENT_CHAT_FANOUT, so an incident's paging replies in every space its card went to.
 	IncidentChatFanout map[string][]string
+	// IncidentRoutes is the Alert Settings group fan-out the dispatcher's
+	// card uses too (cmd/server builds one and gives it to both); nil holds
+	// none.
+	IncidentRoutes *notifications.IncidentRoutes
 }
 
 // Engine runs the incident call-escalation ladder.
@@ -566,17 +570,25 @@ func (e *Engine) sreReplies(t Trigger) bool {
 	return t.sreIncident() && e.channelFor(t).Uses(ChannelChat)
 }
 
-// incidentRooms is the INCIDENT_CHAT_SPACES spaces an incident's card went to; a case or a group without one keeps the ladder's space.
+// incidentRooms is the rooms an incident's card went to: its SRE team's room from the Alert Settings
+// mapping, else its INCIDENT_CHAT_SPACES space, else the shared SRE room (IncidentFallbackAudience).
+// A case, or an incident with none of these, keeps the ladder's own spaces.
 func (e *Engine) incidentRooms(t Trigger) []chatRoom {
 	if t.isCase() || e.incidentChat == nil {
 		return nil
 	}
-	var rooms []chatRoom
-	for _, group := range notifications.IncidentGroups(e.cfg.IncidentChatFanout, t.Team) {
-		audience := notifications.IncidentAudience(group)
-		if !e.incidentChat.HasAudienceSpace(audience) || slices.ContainsFunc(rooms, func(r chatRoom) bool { return r.room == audience }) {
-			continue
+	// The dispatcher's card picks its rooms with the same call, so the
+	// replies always land in the threads the card started.
+	// The shared SRE room is the SRE ladder's: another ladder never falls back to it.
+	has := e.incidentChat.HasAudienceSpace
+	if e.cfg.Kind != LadderSRE {
+		has = func(audience string) bool {
+			return audience != notifications.IncidentFallbackAudience && e.incidentChat.HasAudienceSpace(audience)
 		}
+	}
+	audiences, _ := notifications.IncidentAudiences(e.cfg.IncidentRoutes, e.cfg.IncidentChatFanout, t.Team, has)
+	var rooms []chatRoom
+	for _, audience := range audiences {
 		rooms = append(rooms, chatRoom{chat: e.incidentChat, room: audience, reply: true})
 	}
 	return rooms
@@ -856,6 +868,109 @@ func (e *Engine) admit(ctx context.Context, t *Trigger) bool {
 	return true
 }
 
+// postNoOneOnCall tells the team's Chat space that nobody could be paged for a
+// fresh trigger, reusing the stopped-ladder card: with nobody to call, the
+// room would otherwise hear nothing at all. Best effort, like every other
+// ladder post: a failure is logged, never returned, because a returned error
+// retries the whole trigger and would append the work note again.
+//
+// One post per trigger. A claim keyed by the trigger time dedupes a
+// redelivered record, and a trigger older than staleTriggerGrace posts nothing
+// (a replay after a restart is not news), so the claim only has to outlive
+// that window.
+func (e *Engine) postNoOneOnCall(ctx context.Context, plan Plan, why string) {
+	t := plan.Trigger
+	if !e.cfg.CallSendingEnabled || e.channelFor(t) == ChannelLog || e.now().Sub(t.At) > staleTriggerGrace {
+		return
+	}
+	rooms := e.emptyPlanRooms(plan)
+	if len(rooms) == 0 {
+		slog.WarnContext(ctx, "escalation: no Chat space for the no-one-on-call alert; none posted",
+			"incidentId", t.IncidentID, "team", t.Team)
+		return
+	}
+	claim := fmt.Sprintf("empty-plan|%s@%d", t.IncidentID, t.At.UnixNano())
+	switch claimed, err := e.store.ClaimCall(ctx, claim, 2*staleTriggerGrace); {
+	case err != nil:
+		// Fail open: an alert twice beats an alert never.
+		slog.WarnContext(ctx, "escalation: could not claim the no-one-on-call alert; posting anyway",
+			"incidentId", t.IncidentID, "err", err)
+	case !claimed:
+		slog.InfoContext(ctx, "escalation: no-one-on-call alert already posted for this trigger",
+			"incidentId", t.IncidentID)
+		return
+	}
+
+	record, label := "incident", "View incident"
+	if t.isCase() {
+		record, label = "case", "View case"
+	}
+	msg := notifications.EscalationStopped{
+		Chain:       chainLabel(t),
+		IncidentRef: t.caseRef(),
+		Title:       t.Title,
+		Priority:    t.Priority,
+		Outcome:     "No one on call",
+		Detail: fmt.Sprintf("No reachable recipient for this %s, so nobody was paged. Priority %s, team %s. Reason: %s.",
+			record, orNone(t.Priority), orNone(t.Team), why),
+		ThreadKey:   t.chatThreadKey(),
+		PortalLabel: label,
+	}
+	for _, r := range rooms {
+		room := r.roomFor()
+		var links incidentLinker = e.links
+		if r.links != nil {
+			links = r.links
+		}
+		msg.Audience, msg.Reply = room, r.reply || e.sreReplies(t)
+		msg.PortalURL = links.IncidentLink(t.IncidentID)
+		if t.isCase() {
+			msg.PortalURL = links.CaseLink(t.IncidentID)
+		}
+		if err := r.chat.SendEscalationStopped(ctx, msg); err != nil {
+			slog.ErrorContext(ctx, "escalation: the no-one-on-call alert was not posted",
+				"incidentId", t.IncidentID, "audience", room, "err", err)
+			continue
+		}
+		slog.InfoContext(ctx, "escalation: no-one-on-call alert posted", "incidentId", t.IncidentID, "audience", room)
+	}
+}
+
+// emptyPlanRooms is where the no-one-on-call alert goes: the rooms the ladder's
+// own cards would have gone to (the incident's space, else its team's), else
+// the incident's INCIDENT_CHAT_SPACES space, else the Incident Monitor
+// audience. A room the deployment has no space for is skipped.
+func (e *Engine) emptyPlanRooms(plan Plan) []chatNotifier {
+	var out []chatNotifier
+	add := func(n chatNotifier) {
+		room := n.roomFor()
+		if n.chat.HasAudienceSpace(room) && !slices.ContainsFunc(out, func(o chatNotifier) bool { return o.roomFor() == room }) {
+			out = append(out, n)
+		}
+	}
+	for _, n := range e.cardRooms(plan) {
+		add(n)
+	}
+	if len(out) == 0 {
+		for _, r := range e.incidentRooms(plan.Trigger) {
+			add(chatNotifier{chat: r.chat, links: e.links, audience: r.room, reply: r.reply})
+		}
+	}
+	if len(out) == 0 && e.incidentChat != nil {
+		add(chatNotifier{chat: e.incidentChat, links: e.links, audience: chataudience.IncidentMonitor})
+	}
+	return out
+}
+
+// staleTriggerGrace is how old a trigger must be before a ladder that has
+// fully elapsed is dropped as a replay. It is far longer than the delay
+// between an event being raised and this engine evaluating it (consumer lag,
+// retries), so a live incident is never mistaken for a replay, and far
+// shorter than the window a replayed, redelivered or dead-lettered trigger
+// arrives in after a restart or outage, so those are still dropped rather
+// than burst-dialled.
+const staleTriggerGrace = 5 * time.Minute
+
 // schedule builds an admitted trigger's plan and stores it; see start.
 func (e *Engine) schedule(ctx context.Context, t Trigger, replace bool) error {
 	// USA_WEEKEND is the one shift whose LEVEL_0 depends on ABT eligibility
@@ -910,16 +1025,26 @@ func (e *Engine) schedule(ctx context.Context, t Trigger, replace bool) error {
 	}
 	// A plan with rung emails still has something to deliver when it has no
 	// calls; only a plan with neither ends here.
-	if len(plan.Calls) == 0 && len(plan.Emails) == 0 && plan.CallsHeld {
-		// Setup, not an incident outcome: the lead pool has no numbers yet,
-		// and a call-only ladder has nothing else to deliver. No work note.
-		return nil
-	}
 	if len(plan.Calls) == 0 && len(plan.Emails) == 0 {
+		// Nothing to deliver, and nobody was told: this ends the incident's
+		// paging, so it is announced, never swallowed. A held plan (the lead
+		// pool is not verified, see Safety.CallWithoutVerifiedLeads) is
+		// reported the same way as one with nobody to reach, with the reason
+		// named, so the work note says why and not merely that.
+		why := "no level has a recipient"
+		if plan.CallsHeld {
+			why = "calls held: the lead pool is not verified with phone numbers"
+			plan.Issues = append(plan.Issues, PlanIssue{
+				Level: Level0, At: t.At, Reason: "CALLS_HELD",
+				Detail: "the lead pool is not verified with phone numbers",
+			})
+		}
 		slog.WarnContext(ctx, "escalation: plan has no reachable recipients; nothing scheduled",
 			"incidentId", t.IncidentID, "priority", t.Priority, "rule", t.Routing.Rule(),
-			"shift", string(t.Routing.Shift), "product", t.Routing.Product, "team", t.Routing.AssignedCRETeam)
+			"shift", string(t.Routing.Shift), "product", t.Routing.Product, "team", t.Routing.AssignedCRETeam,
+			"why", why)
 		e.writeNote(ctx, plan, nil, nil, nil, "")
+		e.postNoOneOnCall(ctx, plan, why)
 		return nil
 	}
 
@@ -934,7 +1059,14 @@ func (e *Engine) schedule(ctx context.Context, t Trigger, replace bool) error {
 	// catches up correctly (the due calls go out on the next tick, at the
 	// rung the ladder should be on by now); it is the ladder that has run
 	// its whole course before we heard about it that must be dropped.
-	if last := plan.lastScheduled(); last.Before(e.now()) {
+	//
+	// "Run its whole course" is judged on the trigger as well as the ladder:
+	// rota coverage decides which levels are callable at the trigger instant,
+	// so a single-rung ladder (only LEVEL_0, offset 0) is a normal state, and
+	// its last call is the trigger time itself -- already a moment in the
+	// past by the time it is evaluated. Comparing the ladder alone dropped
+	// every such fresh incident unpaged. staleTriggerGrace is the slack.
+	if last := plan.lastScheduled(); last.Before(e.now()) && e.now().Sub(t.At) > staleTriggerGrace {
 		slog.WarnContext(ctx, "escalation: trigger is older than its whole ladder; not scheduling",
 			"incidentId", t.IncidentID, "priority", t.Priority, "trigger", string(t.Kind),
 			"triggeredAt", t.At.Format(time.RFC3339), "lastCallAt", last.Format(time.RFC3339))

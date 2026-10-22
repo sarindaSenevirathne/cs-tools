@@ -41,7 +41,7 @@ import { useEffect, useRef, useState, type JSX } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { BackendApiError } from "@api/backend/client";
 import { useErrorBanner } from "@context/error-banner/ErrorBannerContext";
-import Editor from "@components/rich-text-editor/Editor";
+import ExpandableRichTextField from "@features/csm-operations/components/ExpandableRichTextField";
 import { isBlankHtml } from "@utils/sanitizeHtml";
 import { isPastZonedInput, zonedInputToBackendUtc } from "@utils/dateTime";
 import { usePostChangeRequest } from "@features/csm-operations/api/usePostChangeRequest";
@@ -253,9 +253,13 @@ export default function CreateChangeRequestPage(): JSX.Element {
   const [justification, setJustification] = useState(
     draft?.justification ?? cloneState?.justification ?? "",
   );
-  const [implementationPlan, setImplementationPlan] = useState(draft?.implementationPlan ?? "");
-  const [riskImpactAnalysis, setRiskImpactAnalysis] = useState(draft?.riskImpactAnalysis ?? "");
-  const [backoutPlan, setBackoutPlan] = useState(draft?.backoutPlan ?? "");
+  const [implementationPlan, setImplementationPlan] = useState(
+    draft?.implementationPlan ?? cloneState?.implementationPlan ?? "",
+  );
+  const [riskImpactAnalysis, setRiskImpactAnalysis] = useState(
+    draft?.riskImpactAnalysis ?? cloneState?.riskImpactAnalysis ?? "",
+  );
+  const [backoutPlan, setBackoutPlan] = useState(draft?.backoutPlan ?? cloneState?.backoutPlan ?? "");
   const [testPlan, setTestPlan] = useState(draft?.testPlan ?? cloneState?.testPlan ?? "");
   const [isPlanningVisibleToCustomers, setIsPlanningVisibleToCustomers] = useState(
     draft?.isPlanningVisibleToCustomers ?? false,
@@ -650,27 +654,15 @@ export default function CreateChangeRequestPage(): JSX.Element {
     onChange: (v: string) => void,
     placeholder?: string,
   ): JSX.Element => (
-    <Box>
-      <Typography
-        id={`${id}-label`}
-        variant="caption"
-        color="text.secondary"
-        sx={{ display: "block", mb: 0.5 }}
-      >
-        {label}
-      </Typography>
-      <Box role="group" aria-labelledby={`${id}-label`}>
-        <Editor
-          value={value}
-          onChange={onChange}
-          placeholder={placeholder}
-          minHeight={100}
-          maxHeight={300}
-          toolbarVariant="full"
-          disabled={isSubmitting}
-        />
-      </Box>
-    </Box>
+    // Resizable, and Expand opens it full screen (ExpandableRichTextField).
+    <ExpandableRichTextField
+      id={id}
+      label={label}
+      value={value}
+      onChange={onChange}
+      placeholder={placeholder}
+      disabled={isSubmitting}
+    />
   );
 
   return (

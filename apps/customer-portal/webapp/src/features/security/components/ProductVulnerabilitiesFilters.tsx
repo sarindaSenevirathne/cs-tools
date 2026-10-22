@@ -17,6 +17,7 @@
 import {
   Box,
   FormControl,
+  FormHelperText,
   InputLabel,
   MenuItem,
   Select,
@@ -27,6 +28,7 @@ import type { SelectChangeEvent } from "@wso2/oxygen-ui";
 import {
   PRODUCT_VULNERABILITIES_ALL_PRODUCTS_LABEL,
   PRODUCT_VULNERABILITIES_ALL_VERSIONS_LABEL,
+  PRODUCT_VULNERABILITIES_NO_VERSIONS_LABEL,
   PRODUCT_VULNERABILITIES_PRODUCT_LABEL,
   PRODUCT_VULNERABILITIES_PRODUCT_VERSION_LABEL,
   PRODUCT_VULNERABILITIES_SEVERITY_ALL_LABEL,
@@ -48,6 +50,10 @@ export default function ProductVulnerabilitiesFilters({
   productVersionOptions = [],
   onFilterChange,
 }: ProductVulnerabilitiesFiltersProps): JSX.Element {
+  // Versions come from the chosen product; none chosen, or none recorded, disables the control.
+  const hasProduct = Boolean(filters.productName);
+  const hasVersions = productVersionOptions.length > 0;
+
   const handleSeverityChange = (event: SelectChangeEvent<string | number>) => {
     onFilterChange("severityId", event.target.value);
   };
@@ -116,7 +122,7 @@ export default function ProductVulnerabilitiesFilters({
       <FormControl
         size="small"
         sx={{ flex: 1, minWidth: 200 }}
-        disabled={!filters.productName}
+        disabled={!hasProduct || !hasVersions}
       >
         <InputLabel id="product-version-label">
           {PRODUCT_VULNERABILITIES_PRODUCT_VERSION_LABEL}
@@ -138,8 +144,12 @@ export default function ProductVulnerabilitiesFilters({
             </MenuItem>
           ))}
         </Select>
+        {hasProduct && !hasVersions && (
+          <FormHelperText>
+            {PRODUCT_VULNERABILITIES_NO_VERSIONS_LABEL}
+          </FormHelperText>
+        )}
       </FormControl>
-
     </Box>
   );
 }

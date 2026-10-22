@@ -66,6 +66,7 @@ import {
 import {
   activityLimitToReveal,
   compareFeedEntries,
+  describeChangeDetails,
   feedEntryId,
   nextActivityLimit,
   type FeedEntry,
@@ -74,9 +75,11 @@ import type { SnLinkType } from "@features/csm-cases/utils/snLinkRegistry";
 import type {
   CaseAttachment,
   CaseAuditEntry,
+  CaseAuditFieldChange,
   CaseFeedbackEntry,
   CsmCaseComment,
 } from "@features/csm-cases/types/csmCases";
+import { incidentPriorityBadge } from "@features/csm-operations/utils/incidentPriorityMatrix";
 
 interface CaseActivitiesFeedProps {
   comments: CsmCaseComment[];
@@ -207,32 +210,48 @@ function formatChangeValue(
   return value;
 }
 
-/** One "<label>: <old> → <new>" line for a field-change entry's audit strip. */
-function FieldChangeLine({
-  field,
-}: {
-  field: {
-    field: string;
-    fieldLabel: string;
-    previousValue?: string;
-    newValue?: string;
-  };
-}): JSX.Element {
+/** An incident priority value ("High") as the same coloured badge the incident pages use; the
+ * plain value when it is not a known priority. */
+function PriorityValue({ value }: { value: string }): JSX.Element {
+  const badge = incidentPriorityBadge(value.trim().toUpperCase());
+  if (!badge) return <>{value}</>;
+  return (
+    <Chip
+      size="small"
+      label={badge.label}
+      sx={{ bgcolor: badge.bg, color: badge.fg, fontWeight: 600, height: 20 }}
+    />
+  );
+}
+
+/** One "<label>: <old> → <new>" line for a field-change entry's audit strip, with the changes
+ * that drove it (`details`, e.g. an incident's impact/urgency) in a smaller line beneath. */
+function FieldChangeLine({ field }: { field: CaseAuditFieldChange }): JSX.Element {
   const hadPrevious = !!field.previousValue?.trim();
   const hasNew = !!field.newValue?.trim();
+  const asPriority = field.field === "priority";
+  const value = (v: string | undefined) =>
+    asPriority && v ? <PriorityValue value={v} /> : formatChangeValue(v, field.field);
   return (
-    <Typography variant="body2" component="div">
-      <strong>{field.fieldLabel}:</strong>{" "}
-      {hadPrevious && (
-        <>
-          <Box component="span" sx={{ color: "text.secondary" }}>
-            {formatChangeValue(field.previousValue, field.field)}
-          </Box>
-          {" → "}
-        </>
+    <Box>
+      <Typography variant="body2" component="div">
+        <strong>{field.fieldLabel}:</strong>{" "}
+        {hadPrevious && (
+          <>
+            <Box component="span" sx={{ color: "text.secondary" }}>
+              {value(field.previousValue)}
+            </Box>
+            {" → "}
+          </>
+        )}
+        {hasNew ? value(field.newValue) : <em>cleared</em>}
+      </Typography>
+      {field.details && field.details.length > 0 && (
+        <Typography variant="caption" color="text.secondary" component="div">
+          {describeChangeDetails(field.details)}
+        </Typography>
       )}
-      {hasNew ? formatChangeValue(field.newValue, field.field) : <em>cleared</em>}
-    </Typography>
+    </Box>
   );
 }
 

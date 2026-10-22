@@ -30,7 +30,13 @@ reviewed cutover.
 - Runtime: Go `1.26.5+`
 - Entry point: `cmd/acp-closure/main.go`
 - Calls `csm-integration-service`, not entity-service directly — see
-  `internal/entity`'s package doc for why
+  `internal/entity`'s package doc for why — for the open-project list,
+  closure states, notices sent and every write
+- Reads each project's Salesforce data (dates, account people and
+  classification, primary partner, contacts, opportunities, invoices) live
+  from `sales-entity-service` (`internal/salesentity`), and sets a
+  suspended project's Salesforce `State__c` to `Suspended` there
+  (`PATCH /projects/{sfId}`)
 - Authentication: OAuth2 client-credentials (M2M), scoped via
   `entity.RequiredScopes`
 
@@ -81,6 +87,18 @@ Copy `.env.example` to `.env` and fill in the values.
 | `CSM_INTEGRATION_CLIENT_SECRET` | OAuth2 client secret |
 | `CSM_INTEGRATION_SCOPES` | Required, space-separated. Kept out of code (rather than hardcoded) so the requested grant can be adjusted without a redeploy. Asgardeo enforces the actual grant regardless, so this only controls what's requested. See `entity.RequiredScopes` for the scope set csm-integration-service's token endpoint currently requires. |
 
+### sales-entity-service
+
+| Variable | Description |
+|---|---|
+| `SALES_ENTITY_BASE_URL` | Base URL of sales-entity-service. Required |
+| `SALES_ENTITY_TOKEN_URL` | OAuth2 token endpoint. Required |
+| `SALES_ENTITY_CLIENT_ID` | OAuth2 client ID. Required |
+| `SALES_ENTITY_CLIENT_SECRET` | OAuth2 client secret. Required |
+| `SALES_ENTITY_SCOPES` | Optional, space-separated (sales-entity-service relies on the gateway) |
+
+The run stops at startup if a required one is missing.
+
 ### Run behavior
 
 | Variable | Default | Description |
@@ -99,6 +117,7 @@ acp-closure-service/
 │   ├── entity/                    # HTTP client for csm-integration-service
 │   ├── notify/                    # Notice shape + logging notifier (real sending: not yet built)
 │   ├── recipients/                # Pure customer-contact fallback + AM-email resolution
+│   ├── salesentity/               # HTTP client for sales-entity-service (Salesforce reads, State__c write)
 │   ├── suspensionstate/           # suspensionProcessState blob <-> closure.NoticeWindow translation
 │   └── sweep/                     # Orchestration: fetch -> decide -> notify -> write back
 ├── .env.example

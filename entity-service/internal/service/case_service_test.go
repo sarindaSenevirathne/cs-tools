@@ -55,6 +55,7 @@ type stubCaseRepo struct {
 	searchCases                func(ctx context.Context, req domain.SearchCasesRequest) ([]domain.SearchCaseView, int, error)
 	createCaseAttachment       func(ctx context.Context, req domain.CreateAttachmentRequest) (domain.Attachment, error)
 	createCaseAttachmentFromSN func(ctx context.Context, req domain.CreateAttachmentRequest, id string, sizeBytes int, uploadedBy string) (domain.Attachment, error)
+	recordCRAttachmentFromSN   func(ctx context.Context, req domain.CreateAttachmentRequest, id string, sizeBytes int, createdByEmail string) (time.Time, error)
 	searchCaseAttachments      func(ctx context.Context, caseID string, pagination domain.Pagination) ([]domain.Attachment, int, error)
 	searchWorkItemAttachments  func(ctx context.Context, workItemID string, referenceType domain.ReferenceType, pagination domain.Pagination) ([]domain.Attachment, int, error)
 	getCaseAttachmentByID      func(ctx context.Context, id string) (domain.Attachment, error)
@@ -79,6 +80,7 @@ type stubCaseRepo struct {
 	accountDefaultWatcherEmails   func(ctx context.Context, projectID string) ([]string, error)
 	projectOnboardingInfo         func(ctx context.Context, projectID string) (string, bool, error)
 	getCaseEtaSharedOn            func(ctx context.Context, caseID string) (*time.Time, error)
+	getCaseWorkaroundProvidedOn   func(ctx context.Context, caseID string) (*time.Time, error)
 	projectContactEmailsByRole    func(ctx context.Context, projectID, role string) ([]string, error)
 	updateCaseAssignee            func(ctx context.Context, caseID string, userID *string, callerEmail string) (time.Time, bool, error)
 	acknowledgeCase               func(ctx context.Context, caseID, actorID, actorEmail string) (bool, domain.AssignedEngineerRef, string, time.Time, error)
@@ -185,6 +187,12 @@ func (s *stubCaseRepo) CreateCaseAttachment(ctx context.Context, req domain.Crea
 func (s *stubCaseRepo) CreateCaseAttachmentFromServiceNow(ctx context.Context, req domain.CreateAttachmentRequest, id string, sizeBytes int, uploadedBy string) (domain.Attachment, error) {
 	if s.createCaseAttachmentFromSN != nil {
 		return s.createCaseAttachmentFromSN(ctx, req, id, sizeBytes, uploadedBy)
+	}
+	panic("not implemented")
+}
+func (s *stubCaseRepo) RecordChangeRequestAttachmentFromServiceNow(ctx context.Context, req domain.CreateAttachmentRequest, id string, sizeBytes int, createdByEmail string) (time.Time, error) {
+	if s.recordCRAttachmentFromSN != nil {
+		return s.recordCRAttachmentFromSN(ctx, req, id, sizeBytes, createdByEmail)
 	}
 	panic("not implemented")
 }
@@ -315,6 +323,15 @@ func (s *stubCaseRepo) ProjectOnboardingInfo(ctx context.Context, projectID stri
 func (s *stubCaseRepo) GetCaseEtaSharedOn(ctx context.Context, caseID string) (*time.Time, error) {
 	if s.getCaseEtaSharedOn != nil {
 		return s.getCaseEtaSharedOn(ctx, caseID)
+	}
+	return nil, nil
+}
+
+// GetCaseWorkaroundProvidedOn defaults to nil (no workaround marked) rather
+// than panicking, same reasoning as GetCaseEtaSharedOn above.
+func (s *stubCaseRepo) GetCaseWorkaroundProvidedOn(ctx context.Context, caseID string) (*time.Time, error) {
+	if s.getCaseWorkaroundProvidedOn != nil {
+		return s.getCaseWorkaroundProvidedOn(ctx, caseID)
 	}
 	return nil, nil
 }
@@ -459,6 +476,28 @@ func (stubUserRepo) GetUsersByIDs(context.Context, []string) ([]domain.User, err
 // support for (they dot-walk into SN-specific concepts with no Postgres
 // query support yet), rather than silently accepting the request and
 // returning a broader-than-requested result set.
+// TestCaseService_SearchCases_AppliesUnassignedAndAccountExclusion: both used
+// to be refused here; the repository now applies them, so they must reach it.
+func TestCaseService_SearchCases_AppliesUnassignedAndAccountExclusion(t *testing.T) {
+	var got domain.SearchCasesRequest
+	repo := &stubCaseRepo{searchCases: func(_ context.Context, req domain.SearchCasesRequest) ([]domain.SearchCaseView, int, error) {
+		got = req
+		return nil, 0, nil
+	}}
+	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	req := domain.SearchCasesRequest{Filters: domain.SearchCasesFilters{Filters: []domain.CaseFieldFilter{
+		{Field: "assignedUserId", Op: "isEmpty"},
+		{Field: "accountId", Op: "notIn", Values: []string{"00000000-0000-0000-0000-000000000001"}},
+	}}}
+	if _, err := svc.SearchCases(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got.Parsed.Unassigned || len(got.Parsed.ExcludeAccountIDs) != 1 {
+		t.Fatalf("repository got Parsed = %+v", got.Parsed)
+	}
+}
+
 func TestCaseService_SearchCases_RejectsUnsupportedPostgresFields(t *testing.T) {
 	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
@@ -468,7 +507,6 @@ func TestCaseService_SearchCases_RejectsUnsupportedPostgresFields(t *testing.T) 
 		filter domain.CaseFieldFilter
 	}{
 		{name: "accountEscalationActive", filter: domain.CaseFieldFilter{Field: "accountEscalationActive", Op: "eq", Values: []string{"true"}}},
-		{name: "assignedUserId isEmpty (Unassigned)", filter: domain.CaseFieldFilter{Field: "assignedUserId", Op: "isEmpty"}},
 		{name: "resolutionNotes isEmpty", filter: domain.CaseFieldFilter{Field: "resolutionNotes", Op: "isEmpty"}},
 	}
 

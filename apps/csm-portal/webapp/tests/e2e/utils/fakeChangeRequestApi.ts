@@ -23,6 +23,10 @@
 // suite runs against, and the browser session is still the captured one.
 //
 // The contract encoded here is the one the UI is built against:
+//   - Once the change has been approved (APPROVED_STATES: CAB approval received, or a
+//     Standard change scheduled) every field is read-only: a PATCH that changes one is a
+//     400 in the backend's words (`approvedReadOnlyMessage`), work notes and the lifecycle
+//     still go through.
 //   - `legalNextStates` offers no manual way to `scheduled` at all, nor to `closed`
 //     out of `customer_review`: staff never record a customer's approval or review.
 //     They are given by the customer, in the Customer Portal (a manual PATCH of
@@ -335,7 +339,21 @@ export const FAKE_ECAB_GROUP: FakeApprovalGroup = {
 const FAKE_APPROVAL_GROUPS: FakeApprovalGroup[] = [FAKE_PEER_GROUP, FAKE_CAB_GROUP, FAKE_ECAB_GROUP];
 
 /** States from which project / deployments can no longer change. */
-const SCOPE_LOCKED = ["implement", "review", "customer_review", "closed", "rollback", "canceled"];
+/**
+ * The states a change request is in only once it has been approved: CAB approval received, or a Standard change scheduled by
+ * Request Approval (entity-service `changeRequestApprovedStates`, change_request_approved_lock.go). Canceled is not one.
+ */
+export const APPROVED_STATES = ["customer_approval", "scheduled", "implement", "review", "customer_review", "closed", "rollback"];
+/** The deployments' edit window closes at the approval (entity-service `changeRequestLinksLockedStates`). */
+const SCOPE_LOCKED = [...APPROVED_STATES, "canceled"];
+/** The fields the approved-content lock judges, in the order the backend's refusal names them. */
+const APPROVED_LOCK_FIELDS = [
+  "title", "description", "justification", "impactDescription", "implementationPlan", "rollbackPlan", "testPlan",
+  "serviceOutage", "communicationPlan", "affectedServicesText", "affectedComponentsText", "rollbackDurationText",
+  "impact", "priority", "category", "plannedStartOn", "plannedEndOn", "assignedTeamId", "assignedEngineerId",
+  "requestedById", "caseId", "serviceId", "serviceOfferingId", "isPlanningVisibleToCustomers",
+  "customerApprovalRequired", "customerReviewRequired",
+] as const;
 
 const CATEGORIES = [
   "hardware", "software", "service", "system_software", "applications_software", "network",
@@ -407,6 +425,9 @@ export const stateJumpMessage = (target: string, from: string, reviewRequired: b
     WAITING_ON[from] ?? "that is not a step of the change request's lifecycle from here"
   }; the moves open to staff from ${from} are: ${opens}`;
 };
+/** The refusal of a PATCH that changes a field of an approved change request (entity-service `approvedContentLockedMsg`). */
+export const approvedReadOnlyMessage = (fields: string[], state: string): string =>
+  `${fields.join(", ")} can no longer be changed: the change request has been approved (current state: ${state}), so its fields are read-only; only work notes can be added`;
 export const projectFrozenMessage = (state: string): string =>
   `projectId can no longer be changed: the Customer Project is fixed once approval has been requested (current state: ${state}). Cancel this change request and clone it to use another project.`;
 export const requirementCannotBeRemovedMessage = (field: string, state: string): string =>
@@ -1126,6 +1147,34 @@ export async function installFakeChangeRequestApi(
   };
 
   /**
+   * The backend's approved-content lock: once the change has been approved every field is read-only (only work notes and the
+   * lifecycle move on). A value the fake holds is compared with it, so a resend is accepted; any other field the fake does not
+   * hold counts as a change when it is sent (the Edit form sends only what changed). The window of a Re-schedule
+   * (`{state: "authorize"}`) is not judged: that is how an approved change's time moves.
+   */
+  const approvedLockProblem = (body: Record<string, unknown>): string | null => {
+    if (!APPROVED_STATES.includes(state)) return null;
+    const timeResponse = body.state === "authorize";
+    const changed = APPROVED_LOCK_FIELDS.filter((field) => {
+      if (body[field] === undefined) return false;
+      switch (field) {
+        case "plannedStartOn":
+          return !timeResponse && instantOf(body.plannedStartOn as string) !== instantOf(plannedStartOn);
+        case "plannedEndOn":
+          return !timeResponse && instantOf(body.plannedEndOn as string) !== instantOf(plannedEndOn);
+        case "category":
+          return body.category !== scope.category;
+        case "customerApprovalRequired":
+        case "customerReviewRequired":
+          return body[field] !== flags[field];
+        default:
+          return true;
+      }
+    });
+    return changed.length > 0 ? approvedReadOnlyMessage([...changed], state) : null;
+  };
+
+  /**
    * The backend's manual state change (a PATCH body's `state`, already trimmed and lower-cased), in its order; returns the
    * 400 message, or null when it is allowed. Nothing is written when one applies.
    *
@@ -1667,6 +1716,9 @@ export async function installFakeChangeRequestApi(
         // The creation-phase gate: nothing below is written when it refuses.
         const gateProblem = creationPhaseProblem(body);
         if (gateProblem) return json(route, { message: gateProblem }, 400);
+        // Once approved, every field is read-only: the rest of the request is not written either.
+        const approvedProblem = approvedLockProblem(body);
+        if (approvedProblem) return json(route, { message: approvedProblem, errorCode: "change_request_approved_read_only" }, 400);
         // A refused state change writes nothing either, not even the rest of its own request (a comment, a scope field,
         // a tick box): the backend refuses inside the one transaction.
         const refusal = typeof body.state === "string" ? manualStateRefusal(body.state, body) : null;

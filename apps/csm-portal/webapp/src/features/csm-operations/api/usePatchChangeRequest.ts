@@ -17,6 +17,7 @@
 import {
   useMutation,
   useQueryClient,
+  type QueryClient,
   type UseMutationResult,
 } from "@tanstack/react-query";
 import { ApiQueryKeys } from "@constants/apiConstants";
@@ -76,14 +77,28 @@ export function usePatchChangeRequest(): UseMutationResult<
       ),
     onSettled: (_data, _error, variables) => {
       void queryClient.invalidateQueries({
-        queryKey: [ApiQueryKeys.CHANGE_REQUEST_DETAILS, variables.id],
-      });
-      void queryClient.invalidateQueries({
         queryKey: [ApiQueryKeys.CHANGE_REQUESTS],
       });
-      void queryClient.invalidateQueries({
-        queryKey: [ApiQueryKeys.CHANGE_REQUEST_APPROVALS, variables.id],
-      });
+      refreshChangeRequestRecord(queryClient, variables.id, variables.patch);
     },
   });
+}
+
+/**
+ * What a change request's PATCH makes stale, beside the list: its detail, its
+ * approvals (entering Assess, Authorize or Review provisions approvers on the
+ * server, and leaving a stage cancels the rows nobody answered) and, when a
+ * work note was sent, its journal (the activity feed reads it through the
+ * comments query). Shared by the single-record edit and the list's bulk edit.
+ */
+export function refreshChangeRequestRecord(
+  queryClient: QueryClient,
+  id: string,
+  patch: BePatchChangeRequestPayload,
+): void {
+  void queryClient.invalidateQueries({ queryKey: [ApiQueryKeys.CHANGE_REQUEST_DETAILS, id] });
+  void queryClient.invalidateQueries({ queryKey: [ApiQueryKeys.CHANGE_REQUEST_APPROVALS, id] });
+  if (patch.workNote) {
+    void queryClient.invalidateQueries({ queryKey: [ApiQueryKeys.CHANGE_REQUEST_COMMENTS, id] });
+  }
 }

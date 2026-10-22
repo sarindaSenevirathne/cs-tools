@@ -51,6 +51,10 @@ export const PORTAL_ROLE = {
   // else: never PermWrite, so both sections render read-only for a holder
   // with no other role. See canUseOperations/canUseSecurityCenter below.
   securityTeam: "security_team",
+  // Grants PermManageOnboarding on the backend (internal/handler/access.go) --
+  // setting a project's onboarding status and owner via PATCH /projects/{id},
+  // and nothing else. It grants no read access. See canEditProjectOnboarding.
+  onboardingLead: "onboarding_lead",
 } as const;
 
 // Roles that, held alone, let someone use the portal at all. announcement_creator
@@ -58,12 +62,16 @@ export const PORTAL_ROLE = {
 // write may send an announcement (see canCreateAnnouncement), so on its own it
 // grants nothing, and counting it would let a caller holding nothing else in
 // past the "no access" screen into a portal where every call is a 403.
+// onboarding_lead is excluded too: the backend gives it no read permission,
+// only the one onboarding PATCH.
 // comment_updater is excluded for the identical reason: on its own it grants
 // only editing/deleting someone else's comment (canUpdateDeleteAnyComment),
 // and reaching a comment at all first requires being able to view the case
 // it's on -- a comment_updater-only caller has no view access of any kind.
 const ROLES_THAT_GRANT_ACCESS: readonly string[] = Object.values(PORTAL_ROLE).filter(
-  (role) => role !== PORTAL_ROLE.announcementCreator && role !== PORTAL_ROLE.commentUpdater,
+  (role) => role !== PORTAL_ROLE.announcementCreator &&
+    role !== PORTAL_ROLE.commentUpdater &&
+    role !== PORTAL_ROLE.onboardingLead,
 );
 
 export interface PortalAccess {
@@ -125,6 +133,17 @@ export interface PortalAccess {
    * "PATCH /projects/{id}: closureState requires PermAdmin").
    */
   canUpdateProjectClosureState: boolean;
+  /**
+   * Setting a project's onboarding status and onboarding owner via
+   * `PATCH /projects/{id}`'s `onboardingStatus`/`onboardingOwner` fields.
+   * `onboarding_lead` or `admin` -- `cs_engineer` alone does not hold it.
+   * Mirrors the backend's in-handler `PermManageOnboarding` check on those
+   * two fields (see `apps/csm-portal/backend`'s own CLAUDE.md,
+   * "PermManageOnboarding is checked in-handler on PATCH /projects/{id}").
+   * The backend's 403 is the real gate; this only decides whether the
+   * controls are offered.
+   */
+  canEditProjectOnboarding: boolean;
   /**
    * The Security Center section (Security reports + Vulnerabilities tabs)
    * and the API calls behind it. `admin`, `cs_engineer`, and the dedicated
@@ -314,6 +333,7 @@ export function getPortalAccess(roles: string[] | undefined): PortalAccess {
       canAddWorkNotes: true,
       canCreateUser: true,
       canUpdateProjectClosureState: true,
+      canEditProjectOnboarding: true,
       canUseSecurityCenter: true,
       canUsePlg: true,
       canManagePlaybooks: true,
@@ -349,6 +369,7 @@ export function getPortalAccess(roles: string[] | undefined): PortalAccess {
     canAddWorkNotes: full || has(PORTAL_ROLE.worknoteCreator),
     canCreateUser: isAdmin,
     canUpdateProjectClosureState: isAdmin,
+    canEditProjectOnboarding: isAdmin || has(PORTAL_ROLE.onboardingLead),
     canUseSecurityCenter: full || has(PORTAL_ROLE.securityTeam),
     canUsePlg: full,
     canManagePlaybooks: isAdmin,

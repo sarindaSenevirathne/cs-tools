@@ -303,6 +303,9 @@ func (s *snChangeRequestService) SearchChangeRequests(ctx context.Context, req d
 	if err != nil {
 		return domain.SearchChangeRequestsResponse{}, err
 	}
+	if len(parsedFilters.Tags) > 0 || len(parsedFilters.ExcludeTags) > 0 || changeRequestPostgresOnlyFilters(parsedFilters) || len(req.Filters.AnyOf) > 0 {
+		return domain.SearchChangeRequestsResponse{}, &apierror.ValidationError{Msg: "filters: tag, updatedOn, plannedStartOn, plannedEndOn, type and anyOf are not supported by this data source"}
+	}
 	if parsedFilters.CreatedEndDate != nil && parsedFilters.CreatedStartDate != nil &&
 		parsedFilters.CreatedEndDate.Before(*parsedFilters.CreatedStartDate) {
 		return domain.SearchChangeRequestsResponse{}, &apierror.ValidationError{Msg: "createdOn: lte value must not be before gte value"}
@@ -485,6 +488,9 @@ func (s *snChangeRequestService) AggregateChangeRequests(ctx context.Context, re
 	parsedFilters, err := ParseChangeRequestFieldFilters(req.Filters.Filters, time.Now().UTC())
 	if err != nil {
 		return domain.AggregateResponse{}, err
+	}
+	if len(parsedFilters.Tags) > 0 || len(parsedFilters.ExcludeTags) > 0 || changeRequestPostgresOnlyFilters(parsedFilters) || len(req.Filters.AnyOf) > 0 {
+		return domain.AggregateResponse{}, &apierror.ValidationError{Msg: "filters: tag, updatedOn, plannedStartOn, plannedEndOn, type and anyOf are not supported by this data source"}
 	}
 	if parsedFilters.CreatedEndDate != nil && parsedFilters.CreatedStartDate != nil &&
 		parsedFilters.CreatedEndDate.Before(*parsedFilters.CreatedStartDate) {
@@ -1697,4 +1703,14 @@ func withoutCustomerOutcomeStates(states []string, state *string) []string {
 // it is not available when ServiceNow is the data source.
 func (s *snChangeRequestService) GetChangeRequestLinkOptions(_ context.Context, _ domain.ChangeRequestLinkOptionsRequest) (domain.ChangeRequestLinkOptionsResponse, error) {
 	return domain.ChangeRequestLinkOptionsResponse{}, &apierror.ValidationError{Msg: "change request link options are not supported on the ServiceNow data source"}
+}
+
+// changeRequestPostgresOnlyFilters reports whether the request uses a list
+// filter only the PostgreSQL search applies. The ServiceNow integration has no
+// such parameters, so dropping them would answer with a wider list than asked.
+func changeRequestPostgresOnlyFilters(p parsedChangeRequestFilters) bool {
+	return p.UpdatedStart != nil || p.UpdatedEnd != nil ||
+		p.PlannedStartFrom != nil || p.PlannedStartTo != nil ||
+		p.PlannedEndFrom != nil || p.PlannedEndTo != nil ||
+		len(p.Types) > 0
 }

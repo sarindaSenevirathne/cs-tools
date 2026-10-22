@@ -168,13 +168,11 @@ export const CUSTOMER_PERMISSION_MATRIX: Record<
       "partner_admin",
       "partner_user",
     ],
-    // customer_admin was deliberately re-added here: PATCH /projects/{id}
-    // (the only route this permission gates -- see rbac.go) is narrowly
-    // scoped to exactly two AI-assistant settings (hasAgent/hasKbReferences),
-    // not general project data, so letting a customer's own Admin toggle
-    // their project's AI Assistant doesn't reopen the broader write access
-    // this permission used to (over-)grant before it was first removed here.
-    update: ["admin", "agent", "internal", "customer_admin"],
+    // Held by customer_admin ONLY. PATCH /projects/{id} (the only route this
+    // permission gates) changes the project's AI-assistant settings, and only
+    // a customer's own admin may change them. WSO2-side roles (admin, agent,
+    // internal) are intentionally excluded. Must mirror rbac.go in backend-v2.
+    update: ["customer_admin"],
     delete: ["admin"],
   },
   change_requests: {
@@ -328,6 +326,11 @@ export function hasCustomerPermission(
 export function useCustomerPermissions() {
   const { data: userDetails, isLoading, isError } = useGetUserDetails();
   const rawRoles = userDetails?.roles;
+  // True only for an INTERNAL-type user who holds none of the deployment's
+  // configured write groups on their own token (see UserDetails.isReadOnly's
+  // own doc comment). Always false for a genuine customer/partner, so this
+  // never narrows what one of them can already do.
+  const isReadOnly = userDetails?.isReadOnly === true;
 
   return useMemo(() => {
     const roles = normalizeCustomerRoles(rawRoles);
@@ -340,8 +343,12 @@ export function useCustomerPermissions() {
     const isExternalUser =
       isCustomerAdmin || isCustomerUser || isPartnerAdmin || isPartnerUser;
 
-    const can = (module: CustomerModule, action: CustomerAction): boolean =>
-      hasCustomerPermission(roles, module, action);
+    // isReadOnly only ever narrows a write action -- a read never needs the
+    // write-role check, matching the backend's identical gate in rbac.go.
+    const can = (module: CustomerModule, action: CustomerAction): boolean => {
+      if (isReadOnly && action !== "read") return false;
+      return hasCustomerPermission(roles, module, action);
+    };
 
     const hasRole = (role: CanonicalRole): boolean => roles.includes(role);
     const hasAnyRole = (checkRoles: CanonicalRole[]): boolean =>
@@ -358,6 +365,7 @@ export function useCustomerPermissions() {
       isPartnerAdmin,
       isPartnerUser,
       isExternalUser,
+      isReadOnly,
       can,
       hasRole,
       hasAnyRole,
@@ -366,13 +374,11 @@ export function useCustomerPermissions() {
       canDeleteCase: can("cases", "delete"),
       canAccessTimeCards: can("time_cards", "read"),
       canAccessChangeRequests: can("change_requests", "read"),
-      canManageContacts: hasAnyRole([
-        "admin",
-        "customer_admin",
-        "partner_admin",
-      ]),
+      canManageContacts:
+        !isReadOnly &&
+        hasAnyRole(["admin", "customer_admin", "partner_admin"]),
     };
-  }, [rawRoles, isLoading, isError]);
+  }, [rawRoles, isLoading, isError, isReadOnly]);
 }
 
 export default useCustomerPermissions;

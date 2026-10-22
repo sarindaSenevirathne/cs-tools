@@ -19,6 +19,7 @@ package paging
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -229,8 +230,9 @@ func TestApplySafety_VerifiedLeadsGate(t *testing.T) {
 }
 
 // Through the real engine: a call-only ladder held by an unverified lead pool
-// schedules nothing and writes no work note -- it is setup, not an outcome.
-func TestEngine_UnverifiedLeadsHoldQuietly(t *testing.T) {
+// schedules nothing, but says so on the incident: a held ladder pages nobody,
+// and silence there once hid that for hours.
+func TestEngine_UnverifiedLeadsHoldIsAnnounced(t *testing.T) {
 	store, caller, notes := newMemStore(), &fakeCaller{}, &fakeNotes{}
 	e := testEngine(store, caller, notes, enabled())
 	e.resolver = poolResolver{StaticResolver: fullResolver(),
@@ -241,8 +243,8 @@ func TestEngine_UnverifiedLeadsHoldQuietly(t *testing.T) {
 	if len(store.wakes) != 0 {
 		t.Errorf("%d calls scheduled; a held ladder schedules none", len(store.wakes))
 	}
-	if len(notes.notes) != 0 {
-		t.Errorf("work notes written = %d; a held ladder writes none", len(notes.notes))
+	if len(notes.notes) != 1 || !strings.Contains(notes.notes[0], "CALLS_HELD") {
+		t.Errorf("work notes = %q; a held ladder writes one naming the hold", notes.notes)
 	}
 }
 

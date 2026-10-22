@@ -616,10 +616,15 @@ func TestChangeRequestCustomerOutcomeIntegration_ExternalWhitelist(t *testing.T)
 		t.Fatalf("a refused PATCH changed the change request:\n  before: %s\n  after:  %s", before, after)
 	}
 
-	// WSO2 users (an internal identity) are unaffected: the whole contract.
-	if _, err := f.patch(id, domain.PatchChangeRequestRequest{Title: sp("edited by WSO2")}); err != nil {
-		t.Fatalf("an internal PATCH of the title: %v", err)
+	// WSO2 users (an internal identity) are unaffected: the whole contract -- in
+	// Customer Approval the change has been approved, so its fields are read-only for
+	// them too (change_request_approved_lock.go), but a work note and the lifecycle
+	// are theirs.
+	if _, err := f.patch(id, domain.PatchChangeRequestRequest{WorkNote: sp("noted by WSO2")}); err != nil {
+		t.Fatalf("an internal work note: %v", err)
 	}
+	_, err = f.patch(id, domain.PatchChangeRequestRequest{Title: sp("edited by WSO2")})
+	f.wantValidationError("an internal PATCH of the title of an approved change", err, "has been approved")
 }
 
 // WSO2 cannot record the customer's answer by hand: {isCustomerApproved: true}

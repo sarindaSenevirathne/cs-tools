@@ -36,6 +36,7 @@ import {
   requestApprovalNeedsProjectReason,
   rollbackPendingReviewReason,
   type PendingCustomerReview,
+  isOfferedChangeRequestTarget,
 } from "@features/csm-operations/utils/changeRequests";
 import type { BeChangeRequestDetail } from "@api/backend/types";
 
@@ -55,7 +56,7 @@ const TARGET_CONFIG: Record<string, TargetConfig> = {
   review: { color: "primary", icon: <CheckCircle size={16} /> },
   customer_review: { color: "primary", icon: <UserCheck size={16} /> },
   // Plain Close, out of Review when no customer review is required. Out of
-  // `customer_review` it is never offered: see `NEVER_OFFERED_TARGETS`.
+  // `customer_review` it is never offered: see `NEVER_OFFERED_TARGETS` (utils/changeRequests.ts).
   closed: { color: "primary", icon: <CheckCircle size={16} /> },
   // Only ever rendered from `customer_approval`: "Re-schedule", or "Propose a different
   // time" while a customer's proposed time waits for WSO2's answer.
@@ -101,7 +102,7 @@ const FORWARD_ORDER: readonly string[] = [
  * Actions shown as an outlined (secondary) button beside the primary one
  * rather than inside the overflow menu: `authorize` is "Re-schedule" (or, with a
  * customer's proposed time waiting, "Propose a different time"), the
- * non-destructive Time Change loop out of `customer_approval` (see `isOfferedTarget`).
+ * non-destructive Time Change loop out of `customer_approval` (see `isOfferedChangeRequestTarget`).
  */
 const SECONDARY_ORDER: readonly string[] = ["authorize"];
 
@@ -111,92 +112,6 @@ const SECONDARY_ORDER: readonly string[] = ["authorize"];
  */
 const MENU_ORDER: readonly string[] = [...FORWARD_ORDER, ...SECONDARY_ORDER, "rollback", "canceled"];
 
-/**
- * States this bar never offers, no matter what `legalNextStates` contains.
- *
- * THE RULE: staff never record a customer's approval or review. While a change
- * request is in Customer Approval or Customer Review it moves on only through
- * the customer's own answer in the Customer Portal. A staff member answering
- * for the customer would be a decision the customer never made, written into
- * data that is audited, so there is no such action here: no button, no menu
- * entry, not even a disabled one. The backend refuses the same PATCH from any
- * caller; this filter is the second wall, so a backend that ever started
- * offering it again could not silently reopen it. Staff keep Re-schedule (out
- * of Customer Approval: the customer is asked again), Roll back (out of Review
- * and Customer Review) and Cancel change. `scheduled` and `closed` below carry
- * the rule; the rest are older exclusions, kept for their own reasons.
- *
- * "Accept proposed time" is not an exception to it and is not in this bar at all:
- * it is the banner's own action, it applies the time the customer PROPOSED (the
- * customer's own consent, kept in `customer_updated_on`), it is never a `state` in
- * a PATCH, and nothing here records the customer's approval or review.
- *
- * `scheduled` is never offered. A CR is moved to Scheduled automatically the
- * moment its approval is granted (CAB, Standard's Request Approval, or the
- * customer's own approval at Customer Approval). There is no manual "Schedule"
- * action anywhere, and none out of `customer_approval` either: that move is
- * the customer's approval.
- *
- * `closed` is never offered out of `customer_review`: that move is the
- * customer's review. (The plain Close out of Review, when no customer review
- * is required, is an ordinary forward move and stays: see `isOfferedTarget`.)
- *
- * `customer_approval` is not human-enterable in the backing system: of its 38
- * UI actions on the change-request table, none sets it. It is reached only by
- * the approval process itself. Setting it by hand from here would leave a
- * record sitting in an approval state with no approver record behind it,
- * which is an audit hole rather than a shortcut.
- *
- * `authorize` is a different case: it IS reachable by a human action, just
- * never this one. It's the automatic side effect of an approver approving in
- * the Approvers section (`ChangeRequestApprovals.tsx` / the decide-approval
- * endpoint), which already correctly cascades the change request's own state
- * forward on approval — not "automation-only" the way the other two are, but
- * gated by a real human decision made somewhere else in the UI, not here.
- * Offering it as a directly-clickable button/menu item from here would let
- * someone skip the actual approval process entirely and land the record in
- * Authorize with no approval behind it — the same audit hole as above, by a
- * different route. The one exception is keyed on the record's own state: from
- * `customer_approval` it means "Re-schedule" (the planned time changed, so the
- * customer is asked to approve the new time -- the change stays in Customer
- * Approval and never goes back through CAB: the change itself has not changed),
- * and the page collects the new planned window before sending it. The wire name
- * stays `authorize` although nothing moves to Authorize any more: it is the
- * contract of the CSM page, the BFF and the fakes, and renaming it breaks them for nothing.
- *
- * `rollback` is the failed-review off-ramp of the process diagram: a human
- * action ("Roll back"), but only from the two review states, `review` and
- * `customer_review` (the backend offers and accepts it from nowhere else).
- * It is a destructive, menu-only item that requires a stated reason. It used
- * to be excluded here as "automation-only"; the backend now owns the manual
- * transition. The carve-out is still keyed on the record's own state.
- *
- * The exclusions are deliberately unconditional (the `authorize`, `rollback`
- * and `closed` carve-outs are keyed on the record's own state, never on what
- * `legalNextStates` claims) so a future backend change that starts returning
- * any of these cannot silently reopen them.
- */
-const NEVER_OFFERED_TARGETS: readonly string[] = ["customer_approval", "scheduled"];
-
-/** States a change request can be manually rolled back from. */
-const ROLLBACK_FROM_STATES: readonly string[] = ["review", "customer_review"];
-
-/**
- * `authorize` ("Re-schedule" / "Propose a different time") is a manual action only from `customer_approval`;
- * `rollback` only from the two review states; `closed` anywhere but
- * `customer_review` (see `NEVER_OFFERED_TARGETS` for the rule behind it).
- * Everywhere else they are not offered.
- */
-function isOfferedTarget(target: string, currentState: string | null | undefined): boolean {
-  if (!target || target === currentState) return false;
-  if (target === "authorize") return currentState === "customer_approval";
-  if (target === "rollback") {
-    return !!currentState && ROLLBACK_FROM_STATES.includes(currentState);
-  }
-  // The customer's review is theirs to give: no Close out of Customer Review.
-  if (target === "closed" && currentState === "customer_review") return false;
-  return !NEVER_OFFERED_TARGETS.includes(target);
-}
 
 /**
  * Sort key for a target in the "Change state" menu: forward moves first, then
@@ -277,6 +192,13 @@ interface ChangeRequestActionBarProps {
    */
   pendingCustomerReview?: PendingCustomerReview | null;
   /**
+   * Why no action can be taken right now (e.g. the page's edit form is open:
+   * a move such as Request Approval would lock fields the form still holds
+   * unsaved changes to). Every action then renders disabled with this reason,
+   * the same way a blocked target does; null/absent leaves them as they are.
+   */
+  lockedReason?: string | null;
+  /**
    * Fired with the target state the engineer picked. The caller decides how
    * to apply it — a direct patch for most targets, or (for the ones flagged by
    * `changeRequestTransitionRequiresReason`: the destructive off-ramps) opening
@@ -310,6 +232,7 @@ export default function ChangeRequestActionBar({
   cr,
   isPending,
   pendingCustomerReview = null,
+  lockedReason = null,
   onAction,
 }: ChangeRequestActionBarProps): JSX.Element | null {
   const [stateMenuAnchor, setStateMenuAnchor] = useState<HTMLElement | null>(null);
@@ -320,7 +243,7 @@ export default function ChangeRequestActionBar({
   // `DEFAULT_TARGET_CONFIG` alike.
   const offered = Array.from(
     new Set(
-      (cr.legalNextStates ?? []).filter((s) => isOfferedTarget(s, cr.state)),
+      (cr.legalNextStates ?? []).filter((s) => isOfferedChangeRequestTarget(s, cr.state)),
     ),
   );
   if (offered.length === 0) return null;
@@ -353,7 +276,7 @@ export default function ChangeRequestActionBar({
   const proposalPending = !!pendingCustomerProposal(cr);
 
   const blockedReason = (target: string): string | null =>
-    TARGET_BLOCKED_REASON[target]?.(cr, { pendingCustomerReview }) ?? null;
+    lockedReason ?? TARGET_BLOCKED_REASON[target]?.(cr, { pendingCustomerReview }) ?? null;
 
   const renderPrimary = (target: string): JSX.Element => {
     const { color, icon } = configFor(target);
@@ -405,19 +328,29 @@ export default function ChangeRequestActionBar({
       {primaryTarget && renderPrimary(primaryTarget)}
       {secondaryTargets.map((target) => {
         const { color, icon } = configFor(target);
-        return (
+        const label = changeRequestTransitionLabel(target, cr.state, proposalPending);
+        const button = (
           <Button
             key={target}
             size="small"
             variant="outlined"
             color={color}
             startIcon={icon}
-            disabled={isPending}
+            disabled={isPending || !!lockedReason}
             onClick={() => dispatch(target)}
             sx={{ flexShrink: 0 }}
           >
-            {changeRequestTransitionLabel(target, cr.state, proposalPending)}
+            {label}
           </Button>
+        );
+        return lockedReason ? (
+          <Tooltip key={target} title={lockedReason}>
+            <Box component="span" tabIndex={0} aria-label={`${label}: ${lockedReason}`} sx={{ flexShrink: 0 }}>
+              {button}
+            </Box>
+          </Tooltip>
+        ) : (
+          button
         );
       })}
       {menuTargets.length > 0 && (

@@ -182,7 +182,7 @@ func (f *fakeCaseAlertRepo) ListRoutes(context.Context) ([]repository.CaseAlertR
 
 func (f *fakeCaseAlertRepo) SaveRoute(_ context.Context, actor string, w repository.CaseAlertRouteWrite) (repository.CaseAlertRouteRow, error) {
 	f.actor, f.route = actor, &w
-	return repository.CaseAlertRouteRow{ID: routeSRE, Ladder: w.Ladder, GroupName: w.GroupName, TeamKey: w.TeamKey, RotaCode: w.RotaCode, Enabled: w.Enabled}, nil
+	return repository.CaseAlertRouteRow{ID: routeSRE, Ladder: w.Ladder, GroupName: w.GroupName, GroupID: w.GroupID, TeamKey: w.TeamKey, RotaCode: w.RotaCode, Enabled: w.Enabled}, nil
 }
 
 func (f *fakeCaseAlertRepo) DeleteRoute(_ context.Context, actor, id string) (bool, error) {
@@ -273,7 +273,7 @@ func TestCaseAlertSettingsRights(t *testing.T) {
 		{"CRE rota admin: CRE's only", asPerson("cre.rota@wso2.com"), true, []string{"CRE"}, []string{"CRE"}, 1},
 		{"SME rota admin: SME's only", asPerson("sme.rota@wso2.com"), true, []string{"SME"}, []string{}, 0},
 		{"CRE head: CRE's, in full", asPerson("crehead@wso2.com"), true, []string{"CRE"}, []string{"CRE"}, 1},
-		{"CS head: CRE's, in full", asPerson("cshead@wso2.com"), true, []string{"CRE"}, []string{"CRE"}, 1},
+		{"CS head: all three families", asPerson("cshead@wso2.com"), true, []string{"CRE", "SRE", "SME"}, []string{"CRE", "SRE"}, 3},
 		{"team lead sees nothing", asPerson("lead@wso2.com"), false, []string{}, []string{}, 0},
 		{"engineer sees nothing", asPerson("eng@wso2.com"), false, []string{}, []string{}, 0},
 		{"admin role matched exactly", asPerson("eng@wso2.com", "CS_ADMIN"), false, []string{}, []string{}, 0},

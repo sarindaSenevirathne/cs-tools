@@ -83,6 +83,10 @@ func main() {
 	}
 	incidentChatSpaces := parseIncidentChatSpaces(os.Getenv("INCIDENT_CHAT_SPACES"))
 	incidentChatFanout := parseIncidentChatFanout(os.Getenv("INCIDENT_CHAT_FANOUT"), incidentChatSpaces)
+	// The Alert Settings group -> SRE team room mapping, shared by the
+	// dispatcher's incident card and the SRE ladder's replies under it; filled
+	// once the paging configuration is loaded (applyIncidentRoutes).
+	incidentRoutes := &notifications.IncidentRoutes{}
 	googleChatClient := notifications.NewGoogleChatClient(notifications.GoogleChatConfig{
 		AudienceSpaces: append(parseGoogleChatAudienceSpaces(os.Getenv("GOOGLE_CHAT_SPACES")),
 			incidentChatSpaces...),
@@ -370,7 +374,8 @@ func main() {
 		// handleCaseCreated/handleCommentAdded already fall back from (see
 		// resolveFullCaseDescription/resolveFullCommentContent).
 		WithFullContentFetcher(customerEntityClient).
-		WithIncidentChatFanout(incidentChatFanout)
+		WithIncidentChatFanout(incidentChatFanout).
+		WithIncidentRoutes(incidentRoutes)
 
 	// Status page webhooks (outage.status_page_due on sre-events): posted here
 	// the moment entity-service publishes them, reported back to
@@ -879,6 +884,9 @@ func main() {
 		}
 		creCfg, creRunning := escalationCfg.For(paging.LadderKeyCRE)
 		sreCfg, sreRunning := escalationCfg.For(paging.LadderKeySRE)
+		if cfgErr == nil {
+			applyIncidentRoutes(sreCfg, googleChatClient, incidentRoutes)
+		}
 		escalationRunning := creRunning || sreRunning
 		if cfgErr == nil {
 			// The file wins over INCIDENT_ESCALATION_CHANNEL when there is
@@ -1043,11 +1051,12 @@ func main() {
 			// its own consumer group and its own store namespace, because a
 			// P0 CRE incident climbs both ladders at the same time and the
 			// two must not mistake each other for a redelivery.
-			// ALERTING_CALL_OUTCOME_CHECK (default false): log how each placed
-			// call ended, asked of Twilio after the ring timeout -- the log
-			// otherwise stops at "queued". Shared by both engines; logging only.
+			// ALERTING_CALL_OUTCOME_CHECK (default true; "false" turns it off):
+			// log how each placed call ended, asked of Twilio after the ring
+			// timeout -- the log otherwise stops at "queued". Shared by both
+			// engines; logging only.
 			var callOutcomes *paging.CallOutcomeWatcher
-			if envBool("ALERTING_CALL_OUTCOME_CHECK", false) {
+			if envBool("ALERTING_CALL_OUTCOME_CHECK", true) {
 				callOutcomes = paging.NewCallOutcomeWatcher(ctx, twilioClient)
 			}
 
@@ -1112,6 +1121,7 @@ func main() {
 						SME: escalationCfg.SME,
 						// An incident's paging replies under its card, in the spaces INCIDENT_CHAT_SPACES and INCIDENT_CHAT_FANOUT give it.
 						IncidentChatFanout: incidentChatFanout,
+						IncidentRoutes:     incidentRoutes,
 						// Which ladders a record climbs is DefaultRouting, in
 						// code -- not configurable (see paging.Config).
 					},
@@ -1778,4 +1788,23 @@ func resolverTeams(cre, sre paging.LadderConfig) paging.TeamKeys {
 		teams.Aliases = merged
 	}
 	return teams
+}
+
+// applyIncidentRoutes points incident cards, and the paging replies under
+// them, at the SRE team rooms the Alert Settings mapping gives each
+// assignment group (paging.BuildIncidentRoutes): the mapping wins over
+// INCIDENT_CHAT_SPACES, and a group with no room goes to the shared SRE room.
+// Logs counts only, never a URL.
+func applyIncidentRoutes(sre paging.LadderConfig, chat *notifications.GoogleChatClient, routes *notifications.IncidentRoutes) {
+	table := paging.BuildIncidentRoutes(sre, func(c paging.Chat) (string, bool) {
+		return paging.ChatWebhookURL(c, chat, os.Getenv)
+	})
+	chat.SetIncidentRouteSpaces(table.Spaces)
+	routes.Set(table.Fanout)
+	_, fallback := table.Spaces[notifications.IncidentFallbackAudience]
+	slog.Info("incident cards follow the Alert Settings group mapping",
+		"mappedGroups", table.Mapped, "defaultGroupsFannedOut", len(table.Fanout), "sharedSRERoom", fallback)
+	if !fallback {
+		slog.Warn("incident cards: the SRE ladder has no shared room (sre.chat), so an incident whose group maps to no team room still gets no card")
+	}
 }

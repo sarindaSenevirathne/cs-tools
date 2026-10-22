@@ -348,10 +348,18 @@ func TestChangeRequestPatchNeedsGate(t *testing.T) {
 		}
 	}
 	for name, req := range map[string]domain.PatchChangeRequestRequest{
-		"title": {Title: &s}, "comment": {Comment: &s}, "onHold": {OnHold: &b}, "dates": {PlannedStartOn: &s},
+		"comment": {Comment: &s}, "workNote": {WorkNote: &s}, "onHold": {OnHold: &b},
 	} {
 		if changeRequestPatchNeedsGate(req) {
 			t.Errorf("a PATCH carrying only %s takes the work_item lock for nothing", name)
+		}
+	}
+	// The fields the approved-content lock judges need the state read under the lock.
+	for name, req := range map[string]domain.PatchChangeRequestRequest{
+		"title": {Title: &s}, "dates": {PlannedStartOn: &s},
+	} {
+		if !changeRequestPatchNeedsGate(req) {
+			t.Errorf("a PATCH carrying %s skips the state the approved-content lock needs", name)
 		}
 	}
 }

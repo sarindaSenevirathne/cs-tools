@@ -29,6 +29,7 @@ import {
   timeOf,
   toIsoDate,
 } from "../utils/rota";
+import { coverSideOf, handoverBands, minuteLabel, spanLength, type HandoverBand } from "../utils/handover";
 import { accentOf } from "../utils/rotaHues";
 import { useTeamColour, useTeamName } from "../utils/teamColourContext";
 
@@ -87,6 +88,13 @@ export interface LadderLane {
    * scanning; off a labelled row it is immediate.
    */
   layout?: "flat" | "zone";
+  /**
+   * A flat lane whose cards cover two offices' days (CRE: the Sri Lankan day
+   * and the Americas day). Where the two overlap, the cards are kept in a
+   * column per side rather than packed by time, and the overlap is marked
+   * across the lane.
+   */
+  regions?: boolean;
   /** The zone's tiers are one crew for every team (SaaS TZ3, the night
    *  cover): its escalation card is titled as such, and each person on it
    *  says which team they are on, since the crew mixes them. */
@@ -99,6 +107,10 @@ interface DayLadderProps {
   tz: string;
   /** Short name for that clock, shown at the head of the hour axis. */
   zoneLabel: string;
+  /** The clocks the reader may read the day on (IST, PDT, ...); with fewer
+   *  than two there is nothing to pick and no control is drawn. */
+  clockOptions?: readonly { value: string; label: string }[];
+  onClockChange?: (timeZone: string) => void;
   lanes: LadderLane[];
   shifts: Map<string, ScheduleShift>;
   zones: ScheduleZone[];
@@ -221,6 +233,8 @@ export default function DayLadder({
   teamDefaultShift,
   tz,
   zoneLabel,
+  clockOptions,
+  onClockChange,
   family,
   onFamilyChange,
   teamKey,
@@ -427,9 +441,26 @@ export default function DayLadder({
         .sort((a, b) => a.startMin - b.startMin);
     };
 
+    const noBands: HandoverBand[] = [];
     return lanes.map((lane) => {
       if (lane.layout !== "zone") {
-        return { ...lane, columns: packIntoColumns(cardsPerWindow(lane.name, lane.assignments)) };
+        const cards = cardsPerWindow(lane.name, lane.assignments);
+        if (!lane.regions) return { ...lane, columns: packIntoColumns(cards), bands: noBands, usFrom: 0 };
+        const sides = cards.map((c) => coverSideOf(c.shift));
+        const bands = handoverBands(cards.map((c, i) => ({ startMin: c.startMin, endMin: c.endMin, side: sides[i] })));
+        // The Sri Lankan rota on the left and the US rota on the right, every
+        // day, whether or not they overlap: packed by time instead, a card
+        // landed in whichever column was free, so the Americas moved from side
+        // to side from one day to the next. The overlap then reads as the rows
+        // where both columns hold a card. Only a day with one side on screen
+        // (one team picked, or nobody on the other side) is a single column.
+        const lk = cards.filter((_, i) => sides[i] === "lk");
+        const americas = cards.filter((_, i) => sides[i] === "americas");
+        if (lk.length === 0 || americas.length === 0) {
+          return { ...lane, columns: packIntoColumns(cards), bands, usFrom: 0 };
+        }
+        const lkColumns = packIntoColumns(lk);
+        return { ...lane, columns: [...lkColumns, ...packIntoColumns(americas)], bands, usFrom: lkColumns.length };
       }
       const tiered = lane.assignments.filter((a) => a.tier);
       const ordinary = lane.assignments.filter((a) => !a.tier);
@@ -459,7 +490,7 @@ export default function DayLadder({
       // on ordinary hours that day should not hold half its width open for
       // them, while the zones beside it cut their card titles short.
       const columns = [escalation, apart].filter((c) => c.length > 0);
-      return { ...lane, columns: columns.length > 0 ? columns : [[]] };
+      return { ...lane, columns: columns.length > 0 ? columns : [[]], bands: noBands, usFrom: 0 };
     });
   }, [day, lanes, shifts, tz]);
 
@@ -545,6 +576,21 @@ export default function DayLadder({
             {day.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", year: "numeric" })}
             {day.getDay() === 0 || day.getDay() === 6 ? " · weekend" : ""}
           </span>
+          {clockOptions && clockOptions.length > 1 && onClockChange ? (
+            <select
+              className="teampick clockpick"
+              aria-label="Read the day on"
+              title="The clock the day is drawn on"
+              value={tz}
+              onChange={(e) => onClockChange(e.target.value)}
+            >
+              {clockOptions.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          ) : null}
           <select
             className="teampick"
             aria-label="Show one team"
@@ -573,7 +619,7 @@ export default function DayLadder({
             aligned with the hours below it -- the same place a table puts a
             unit. A sentence above the card said the same thing in a whole row
             of space, nowhere near the numbers it was about. */}
-        <span className="axistz" title={`${tz} — from your CSM profile`}>
+        <span className="axistz" title={tz}>
           {zoneLabel}
         </span>
         {built.map((lane) => (
@@ -608,6 +654,19 @@ export default function DayLadder({
                 {String(h % 24).padStart(2, "0")}:00
               </span>
             ))}
+            {/* The overlap again against the clock, so its time reads off the
+                same axis as every card's. */}
+            {built
+              .filter((lane) => lane.usFrom > 0)
+              .flatMap((lane) => lane.bands)
+              .map((band) => (
+                <span
+                  key={band.startMin}
+                  className="laxhand"
+                  aria-hidden="true"
+                  style={{ top: px(band.startMin), height: Math.max(px(band.endMin - band.startMin), 2) }}
+                />
+              ))}
           </div>
           <div className="lgrid">
             {hours.map((h) => (
@@ -634,6 +693,11 @@ export default function DayLadder({
                       {column.map((block) => (
                         <LadderBlock key={block.key} block={block} tz={tz} teamDefaultShift={teamDefaultShift} />
                       ))}
+                      {/* Where the two rotas overlap, a link across the edge
+                          the LK and US columns share. */}
+                      {lane.usFrom > 0 && columnIndex === lane.usFrom
+                        ? lane.bands.map((band) => <HandoverMark key={band.startMin} band={band} />)
+                        : null}
                     </div>
                   ))}
                 </div>
@@ -673,6 +737,29 @@ export default function DayLadder({
   );
 }
 
+/**
+ * Where the Sri Lankan day and the Americas day are both at work: a small
+ * link on the edge the two columns share, spanning the overlap, so it joins
+ * the two cards without lying over either one's hours or names. The time is
+ * in its tooltip and said to a screen reader; on screen it is only the mark.
+ */
+function HandoverMark({ band }: { band: HandoverBand }): JSX.Element {
+  const range = `${minuteLabel(band.startMin)}–${minuteLabel(band.endMin)}`;
+  const said = `Overlap ${range}, ${spanLength(band.endMin - band.startMin)}: the Sri Lankan day and the Americas day are both on`;
+  const height = px(band.endMin - band.startMin);
+  return (
+    <div
+      className="lhand handover"
+      style={{ top: px(band.startMin), height: Math.max(height, 2) }}
+      role="note"
+      aria-label={said}
+      title={said}
+    >
+      <i aria-hidden="true">⇄</i>
+    </div>
+  );
+}
+
 /** One card on the ladder: its hours as a chip, its label, and who is on it. */
 function LadderBlock({
   block,
@@ -695,14 +782,17 @@ function LadderBlock({
     .filter((a) => !a.isOnCall)
     .sort((a, b) => Number(always(b)) - Number(always(a)));
   const onCall = block.rows.filter((a) => a.isOnCall);
-  const shown = working.slice(0, NAME_LIMIT);
-  const hidden = working.length - shown.length;
   // A card with more people than it can list is not a list -- seventy names is
   // nothing anyone reads. The teams become the list, and a team hands over its
   // own people when the cursor rests on it. Counted on who works the hours:
   // whoever is on call keeps their own column either way, so a big shift's
-  // team list never takes them in as one more person working it.
-  const crowded = working.length > NAME_LIMIT;
+  // team list never takes them in as one more person working it. A card of
+  // one team (the Americas team on its own hours) has no teams to split by, so
+  // it lists every name, however many.
+  const teamsOnCard = new Set(working.map((a) => a.teamKey.toLowerCase())).size;
+  const crowded = working.length > NAME_LIMIT && teamsOnCard > 1;
+  const shown = crowded ? working.slice(0, NAME_LIMIT) : working;
+  const hidden = working.length - shown.length;
 
   // A card is as tall as its hours, and some hours are short: the Americas
   // weekend night shows only 21:00-24:00 on the Sunday it starts, three hours

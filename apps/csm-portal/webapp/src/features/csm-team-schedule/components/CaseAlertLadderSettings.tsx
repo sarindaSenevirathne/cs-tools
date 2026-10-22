@@ -16,18 +16,20 @@
  * under the License.
  */
 
-import { useId, useRef, useState, type FormEvent, type JSX, type RefObject } from "react";
+import { useId, useRef, useState, type FormEvent, type JSX, type ReactNode, type RefObject } from "react";
 import { familyOfLadder } from "../utils/caseAlertChainSettings";
 import { useCaseAlertDrafts } from "../utils/caseAlertDrafts";
 import type {
   CaseAlertFileOnly,
+  CaseAlertLadderChannels,
   CaseAlertRoomLadder,
   CaseAlertLadderValue,
   CaseAlertRunningValue,
   CaseAlertSettings as Settings,
 } from "../types";
 import {
-  LADDER_KEY_GROUPS,
+  ADVANCED_GROUPS,
+  channelWords,
   draftFor,
   fileOnlyRows,
   formatLadderValue,
@@ -36,154 +38,198 @@ import {
   parseDraft,
   sameLadderValue,
   type LadderDraft,
+  type LadderKeyGroup,
   type LadderKeySpec,
 } from "../utils/caseAlertLadderKeys";
 import CaseAlertModal from "./CaseAlertModal";
-import CaseAlertSection from "./CaseAlertSection";
 
 function when(iso: string | undefined): string {
   return iso ? new Date(iso).toLocaleString() : "";
 }
 
-/** Where "In use" comes from, in one line. */
-function runningLine(s: Settings): string {
-  const r = s.running;
-  if (!r) {
-    return "The alert service hasn't reported what it uses yet. It does when it starts in shadow or db mode.";
-  }
-  const base = `"In use" is what the alert service reported at ${when(r.reportedAt)}, in ${r.mode} mode.`;
-  return r.mode === "shadow"
-    ? `${base} In shadow mode it still uses its file; saved values take over in db mode.`
-    : base;
+/** The saved keys of a ladder this page doesn't know. */
+function unknownSaved(s: Settings, ladder: CaseAlertRoomLadder): CaseAlertLadderValue[] {
+  const known = new Set(ladderKeysFor(ladder).map((k) => k.key));
+  return s.values.filter((v) => v.ladder === ladder && !known.has(v.key));
 }
 
-interface Props {
+interface GroupProps {
   ladder: CaseAlertRoomLadder;
   settings: Settings;
+  group: LadderKeyGroup;
+  /** Shown above the table, e.g. the ladder's name when a family has two. */
+  heading?: string;
   /** Says what was saved, for the settings' confirmation line. */
   onSaved: (what: string) => void;
 }
 
 /**
- * The rest of a ladder's paging file, key by key: who gets alerts, when a
- * ladder starts, how it climbs, the heads and the chat messages. Each row
- * shows the value the alert service runs with and where it came from, and,
- * when one is saved here that isn't in use yet, the saved one. A saved value
- * replaces that one key of the file; going back to the file's removes it.
- *
- * The ladder's groups sit in one section, each group in its own, all closed
- * until opened (CaseAlertSection); the file's own settings come last, closed
- * too. Changes are made in a dialog from the row's Edit. Who may change a
- * ladder's values is who may change its rooms (canManage.roomLadders);
- * everyone else who may see the section reads it.
+ * One group of a ladder's paging file, key by key. Each row shows the value
+ * the alert service runs with and where it came from, and, when one is saved
+ * here that isn't in use yet, the saved one. A saved value replaces that one
+ * key of the file; going back to the file's removes it. Changes are made in a
+ * dialog from the row's Edit. Who may change a ladder's values is who may
+ * change its rooms (canManage.roomLadders); everyone else reads it. Nothing
+ * when the ladder has no key in the group.
  */
-export default function CaseAlertLadderSettings({ ladder, settings: s, onSaved }: Props): JSX.Element {
+export function LadderValueGroup({ ladder, settings: s, group, heading, onSaved }: GroupProps): JSX.Element | null {
+  const rows = ladderKeysFor(ladder).filter((k) => k.group === group);
+  if (rows.length === 0) return null;
   const canEdit = s.canManage.roomLadders.includes(ladder);
-  const specs = ladderKeysFor(ladder);
-  const saved = s.values.filter((v) => v.ladder === ladder);
+  const running = s.running?.ladders[ladder] ?? {};
+  return (
+    <div className="cas-block">
+      {heading ? <h5>{heading}</h5> : null}
+      <ValueTable canEdit={canEdit}>
+        {rows.map((spec) => (
+          <ValueRow
+            key={spec.key}
+            ladder={ladder}
+            spec={spec}
+            saved={s.values.find((v) => v.ladder === ladder && v.key === spec.key)}
+            running={running[spec.key]}
+            reported={Boolean(s.running)}
+            canEdit={canEdit}
+            onSaved={onSaved}
+          />
+        ))}
+      </ValueTable>
+    </div>
+  );
+}
+
+interface AdvancedProps {
+  ladder: CaseAlertRoomLadder;
+  settings: Settings;
+  /** The ladder's step of copying the file's values here, when it has one. */
+  setup?: ReactNode;
+  onSaved: (what: string) => void;
+}
+
+/**
+ * The rest of a ladder, under the family's Advanced: copying the file's values
+ * here, when a ladder starts, how it climbs, the heads, the chat messages, any
+ * saved key this page doesn't know, who gets which channel as running, and
+ * what only the file sets.
+ */
+export function LadderAdvanced({ ladder, settings: s, setup, onSaved }: AdvancedProps): JSX.Element {
+  const canEdit = s.canManage.roomLadders.includes(ladder);
   const running = s.running?.ladders[ladder] ?? {};
   // A saved key this page doesn't know is still shown, so nothing saved is
   // hidden, and can be taken back to the file's.
-  const known = new Set(specs.map((k) => k.key));
-  const others = saved.filter((v) => !known.has(v.key));
-
-  const rowProps = (spec: LadderKeySpec) => ({
-    ladder,
-    spec,
-    saved: saved.find((v) => v.key === spec.key),
-    running: running[spec.key],
-    reported: Boolean(s.running),
-    canEdit,
-    onSaved,
-  });
-
-  const savedWords = (n: number) => (n > 0 ? `${n} saved here` : "all from the file");
-
+  const others = unknownSaved(s, ladder);
   return (
-    <div className="cas-ladder">
-      <CaseAlertSection
-        id={`${ladder}.ladder`}
-        label={`${ladder} ladder settings`}
-        summary={`${ladder} ladder settings · ${savedWords(saved.length)}`}
-      >
-        {ladder === "SRE" ? (
-          <p className="cas-status">One SRE ladder: these apply to both the SaaS and IaaS chains.</p>
-        ) : null}
-        <p className="cas-sub cas-running">{runningLine(s)}</p>
+    <div className="cas-ladder" role="group" aria-label={`${ladder} ladder`}>
+      <h4>{ladder} ladder</h4>
+      {setup}
+      {ADVANCED_GROUPS.map((group) => (
+        <LadderValueGroup key={group} ladder={ladder} settings={s} group={group} heading={group} onSaved={onSaved} />
+      ))}
+      {others.length > 0 ? (
+        <div className="cas-block">
+          <h5>Other saved settings</h5>
+          <ValueTable canEdit={canEdit}>
+            {others.map((v) => (
+              <ValueRow
+                key={v.id}
+                ladder={ladder}
+                spec={{
+                  key: v.key,
+                  ladders: [ladder],
+                  group: "How it climbs",
+                  label: v.key,
+                  help: "Not a setting this page knows. Go back to the file's value to remove it.",
+                  editor: "text",
+                }}
+                saved={v}
+                running={running[v.key]}
+                reported={Boolean(s.running)}
+                canEdit={canEdit}
+                unknown
+                onSaved={onSaved}
+              />
+            ))}
+          </ValueTable>
+        </div>
+      ) : null}
+      <ChannelsGroup ladder={ladder} channels={s.running?.channels?.[ladder]} />
+      <FileOnlyGroup ladder={ladder} fileOnly={s.running?.fileOnly?.[ladder]} onTab={new Set(Object.keys(running))} />
+    </div>
+  );
+}
 
-        {LADDER_KEY_GROUPS.map((group) => {
-          const rows = specs.filter((k) => k.group === group);
-          if (rows.length === 0) return null;
-          const savedHere = rows.filter((k) => saved.some((v) => v.key === k.key)).length;
-          return (
-            <CaseAlertSection
-              key={group}
-              id={`${ladder}.ladder.${group}`}
-              label={group}
-              summary={`${group} · ${savedWords(savedHere)}`}
-            >
-              <ValueTable canEdit={canEdit}>
-                {rows.map((spec) => (
-                  <ValueRow key={spec.key} {...rowProps(spec)} />
-                ))}
-              </ValueTable>
-            </CaseAlertSection>
-          );
-        })}
-
-        {others.length > 0 ? (
-          <CaseAlertSection
-            id={`${ladder}.ladder.other`}
-            label="Other saved settings"
-            summary={`Other saved settings · ${others.length} saved here`}
-          >
-            <ValueTable canEdit={canEdit}>
-              {others.map((v) => (
-                <ValueRow
-                  key={v.id}
-                  ladder={ladder}
-                  spec={{
-                    key: v.key,
-                    ladders: [ladder],
-                    group: "How it climbs",
-                    label: v.key,
-                    help: "Not a setting this page knows. Go back to the file's value to remove it.",
-                    editor: "text",
-                  }}
-                  saved={v}
-                  running={running[v.key]}
-                  reported={Boolean(s.running)}
-                  canEdit={canEdit}
-                  unknown
-                  onSaved={onSaved}
-                />
-              ))}
-            </ValueTable>
-          </CaseAlertSection>
-        ) : null}
-      </CaseAlertSection>
-
-      <FileOnlyGroup ladder={ladder} fileOnly={s.running?.fileOnly?.[ladder]} />
+/** Who gets which channel, as the alert service runs it now: whether the
+ *  ladder runs, its channel, and each team's (the ladder's narrowed by the
+ *  team's own). Read-only: the ladder's switches are edited under On/off and
+ *  channel, a team's channel and room under Where alerts go. */
+function ChannelsGroup({
+  ladder,
+  channels,
+}: {
+  ladder: CaseAlertRoomLadder;
+  channels?: CaseAlertLadderChannels;
+}): JSX.Element | null {
+  if (!channels) return null;
+  return (
+    <div className="cas-block" role="group" aria-label={`${ladder}: who gets which channel`}>
+      <h5>Who gets which channel</h5>
+      <p className="cas-sub">
+        {channels.enabled
+          ? `The ${ladder} ladder is on: ${channelWords(channels.channel) ?? channels.channel}.`
+          : `The ${ladder} ladder is off: nobody is alerted.`}{" "}
+        A team's own channel can only narrow the ladder's.
+      </p>
+      {channels.teams.length > 0 ? (
+        <table className="ra-tbl cas-values cas-channels">
+          <thead>
+            <tr>
+              <th>Team</th>
+              <th>Channel in use</th>
+              <th>Own room</th>
+            </tr>
+          </thead>
+          <tbody>
+            {channels.teams.map((t) => (
+              <tr key={t.team}>
+                <td>
+                  <b>{t.team}</b>
+                </td>
+                <td>
+                  <span className="cas-val">
+                    {channels.enabled ? (channelWords(t.channel) ?? t.channel) : "Off"}
+                    {t.teamChannel ? " (team's own)" : ""}
+                  </span>
+                </td>
+                <td>{t.room ? "Yes" : "No (shared room)"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : (
+        <p className="cas-sub cas-empty">Every team uses the ladder's channel.</p>
+      )}
     </div>
   );
 }
 
 /** The settings only the alert service's file can set, read-only for
- *  everyone and closed until opened: whether alerts run and what they may
- *  cost stay a reviewed change to the file, not a click. */
+ *  everyone. Whether a ladder runs, its channel and its safety holds are
+ *  edited under On/off and channel once the alert service reports them; the
+ *  rest stay a reviewed change to the file. */
 function FileOnlyGroup({
   ladder,
   fileOnly,
+  onTab,
 }: {
   ladder: CaseAlertRoomLadder;
   fileOnly?: CaseAlertFileOnly;
+  onTab: ReadonlySet<string>;
 }): JSX.Element {
-  // Named by ladder: the SRE tab shows SRE's and SME's.
-  const title = `${ladder}: set in the alert service's file`;
   return (
-    <CaseAlertSection id={`${ladder}.file`} label={title} summary={`${title} · read-only`}>
+    <div className="cas-block" role="group" aria-label={`${ladder}: set in the alert service's file`}>
+      <h5>Set in the alert service&apos;s file (read-only)</h5>
       <p className="cas-sub">
-        These decide whether alerts run and what it may cost. They change only with a reviewed change to the file.
+        These decide what alerts may cost. They change only with a reviewed change to the file.
       </p>
       {fileOnly ? (
         <table className="ra-tbl cas-values cas-file-only">
@@ -198,7 +244,7 @@ function FileOnlyGroup({
             </tr>
           </thead>
           <tbody>
-            {fileOnlyRows(ladder, fileOnly).map((r) => (
+            {fileOnlyRows(ladder, fileOnly, onTab).map((r) => (
               <tr key={r.label}>
                 <td>
                   <b>{r.label}</b>
@@ -215,7 +261,7 @@ function FileOnlyGroup({
           Not reported yet: the alert service reports these when it runs in shadow or db mode.
         </p>
       )}
-    </CaseAlertSection>
+    </div>
   );
 }
 
@@ -292,7 +338,7 @@ function ValueRow({
         )}
         {pending ? (
           <div className="cas-sub cas-saved" title={`Saved by ${saved.updatedBy} at ${when(saved.updatedOn)}`}>
-            Saved: {formatLadderValue(spec, saved.value)} · used after the alert service restarts
+            Saved: {formatLadderValue(spec, saved.value)} · not in use yet
           </div>
         ) : null}
       </td>

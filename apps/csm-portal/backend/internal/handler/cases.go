@@ -1907,6 +1907,24 @@ func injectCaseIDField(body []byte, caseID string) ([]byte, error) {
 	return json.Marshal(m)
 }
 
+// injectJSONStringField sets key to value on a JSON object, replacing any
+// client-supplied value for that key.
+func injectJSONStringField(body []byte, key, value string) ([]byte, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, err
+	}
+	if m == nil {
+		return nil, errors.New("request body must be a JSON object")
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	m[key] = encoded
+	return json.Marshal(m)
+}
+
 // CreateCallRequest handles POST /cases/{id}/call-requests.
 // Injects the case ID from the URL path into the body as caseId before forwarding
 // to the entity service.
@@ -1941,6 +1959,13 @@ func (h *CaseHandler) CreateCallRequest(w http.ResponseWriter, r *http.Request) 
 	}
 
 	entityBody, err := injectCaseIDField(body, caseID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
+		return
+	}
+	// An agent-raised request waits on the customer. The customer portal's
+	// own create omits state, so entity-service keeps that path pending on WSO2.
+	entityBody, err = injectJSONStringField(entityBody, "state", "pending_on_customer")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
 		return

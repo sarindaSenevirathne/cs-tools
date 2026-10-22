@@ -80,3 +80,22 @@ export function useSearchIncidentsExcludingSelf(
     data: excludeId ? result.data?.filter((i) => i.id !== excludeId) : result.data,
   } as UseQueryResult<BeIncident[], Error>;
 }
+
+/**
+ * {@link useSearchIncidentsForSelect} without the incidents whose ids are in
+ * `excludeIds` (comma-separated, `AsyncEntitySelect`'s `searchExtra`): the
+ * list's bulk edit "Parent incident" picker, so no selected incident can be
+ * made a parent of itself.
+ */
+export function useSearchIncidentsExcludingIds(
+  query: string,
+  enabled: boolean,
+  excludeIds?: string,
+): UseQueryResult<BeIncident[], Error> {
+  const result = useSearchIncidentsForSelect(query, enabled);
+  const excluded = new Set((excludeIds ?? "").split(",").filter(Boolean));
+  return {
+    ...result,
+    data: excluded.size > 0 ? result.data?.filter((i) => !excluded.has(i.id ?? "")) : result.data,
+  } as UseQueryResult<BeIncident[], Error>;
+}

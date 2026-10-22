@@ -243,11 +243,30 @@ func MapGlobalSearchResponse(r entity.GlobalSearchResponse) GlobalSearchResponse
 // VulnerabilityMetaResponse is the portal's response for
 // GET /products/vulnerabilities/meta.
 type VulnerabilityMetaResponse struct {
-	Severities []ReferenceItem `json:"severities"`
+	Severities []ReferenceItem              `json:"severities"`
+	Products   []VulnerabilityProductOption `json:"products"`
+}
+
+// VulnerabilityProductOption is one product name with the distinct versions
+// available for it, used to populate the product/version search filters.
+type VulnerabilityProductOption struct {
+	Name     string   `json:"name"`
+	Versions []string `json:"versions"`
 }
 
 // MapVulnerabilityMeta builds the portal response from entity-service's
 // VulnerabilityMetaResponse.
 func MapVulnerabilityMeta(r entity.VulnerabilityMetaResponse) VulnerabilityMetaResponse {
-	return VulnerabilityMetaResponse{Severities: mapChoiceListItems(r.Severities)}
+	// products and versions are always arrays (never null), even when
+	// entity-service omits them.
+	products := make([]VulnerabilityProductOption, 0, len(r.Products))
+	for _, p := range r.Products {
+		versions := make([]string, 0, len(p.Versions))
+		versions = append(versions, p.Versions...)
+		products = append(products, VulnerabilityProductOption{Name: p.Name, Versions: versions})
+	}
+	return VulnerabilityMetaResponse{
+		Severities: mapChoiceListItems(r.Severities),
+		Products:   products,
+	}
 }

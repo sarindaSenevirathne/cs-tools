@@ -144,17 +144,17 @@ var permissionMatrix = map[Module]map[Action][]CanonicalRole{
 	ModuleProjects: {
 		ActionCreate: {RoleAdmin},
 		ActionRead:   {RoleAdmin, RoleAgent, RoleInternal, RoleCustomerAdmin, RoleCustomerUser, RolePartnerAdmin, RolePartnerUser},
-		// RoleCustomerAdmin was deliberately re-added here: PATCH /projects/{id}
-		// (the only route gated by ModuleProjects/ActionUpdate) is narrowly
-		// scoped to exactly two AI-assistant settings (hasAgent/hasKbReferences
-		// -- see entity.UpdateProjectRequest), not general project data, so
-		// this doesn't reopen the broader write access this permission used
-		// to (over-)grant before RoleCustomerAdmin was first removed here.
-		// This grant's safety depends on entity.UpdateProjectRequest staying
-		// that narrow -- it must never gain entity-service's closureState
-		// field (a direct, admin-only closure-status override), which would
-		// silently hand that override to a customer admin through this route.
-		ActionUpdate: {RoleAdmin, RoleAgent, RoleInternal, RoleCustomerAdmin},
+		// Update is held by RoleCustomerAdmin ONLY. PATCH /projects/{id} (the
+		// only route gated by ModuleProjects/ActionUpdate) is narrowly scoped to
+		// exactly two AI-assistant settings (hasAgent/hasKbReferences -- see
+		// entity.UpdateProjectRequest), and only a customer's own admin may change
+		// them. WSO2-side roles (admin, agent, internal) are intentionally
+		// excluded: they must not toggle a customer's assistant from this portal.
+		// This grant's safety depends on entity.UpdateProjectRequest staying that
+		// narrow -- it must never gain entity-service's closureState field (a
+		// direct, admin-only closure-status override), which would silently hand
+		// that override to a customer admin through this route.
+		ActionUpdate: {RoleCustomerAdmin},
 		ActionDelete: {RoleAdmin},
 	},
 	ModuleChangeRequests: {
@@ -240,6 +240,7 @@ type RoleResolver interface {
 // cachedRoleEntry holds cached user roles alongside an expiration timestamp.
 type cachedRoleEntry struct {
 	roles     []CanonicalRole
+	userType  string
 	expiresAt time.Time
 }
 
@@ -249,6 +250,9 @@ type CachedRoleResolver struct {
 	ttl    time.Duration
 	mu     sync.RWMutex
 	cache  map[string]cachedRoleEntry
+	// internalWriteGroups is set via WithInternalWriteGroups; see
+	// IsInternalWriteBlocked.
+	internalWriteGroups []string
 }
 
 // NewCachedRoleResolver creates a CachedRoleResolver backed by the given entity client and TTL.
@@ -263,11 +267,27 @@ func NewCachedRoleResolver(client EntityUserClient, ttl time.Duration) *CachedRo
 	}
 }
 
-// GetRoles returns the caller's canonical roles from cache or by fetching from entity-service.
-func (r *CachedRoleResolver) GetRoles(ctx context.Context) ([]CanonicalRole, error) {
+// WithInternalWriteGroups sets the JWT "groups" claim values that let an
+// INTERNAL-type caller (entity-service's own user_type) reach a write path in
+// this portal -- see IsInternalWriteBlocked's own doc comment. Returns r for
+// chaining at the construction site. Leaving this unset (nil/empty) makes
+// IsInternalWriteBlocked always report "not blocked" -- the gate is opt-in,
+// not a default-on restriction, so a resolver built without it (every
+// existing test fake and every resolver built before this feature) behaves
+// exactly as it always has.
+func (r *CachedRoleResolver) WithInternalWriteGroups(groups []string) *CachedRoleResolver {
+	r.internalWriteGroups = groups
+	return r
+}
+
+// resolve returns the caller's cached entry (roles + user_type), fetching
+// and caching it from entity-service on a miss. GetRoles and
+// IsInternalWriteBlocked both go through this, so a cache hit never costs a
+// second GetMe call to look up the other field.
+func (r *CachedRoleResolver) resolve(ctx context.Context) (cachedRoleEntry, error) {
 	user := UserInfoFromContext(ctx)
 	if user == nil || user.UserID == "" {
-		return nil, errors.New("rbac: unauthenticated request")
+		return cachedRoleEntry{}, errors.New("rbac: unauthenticated request")
 	}
 
 	r.mu.RLock()
@@ -275,15 +295,18 @@ func (r *CachedRoleResolver) GetRoles(ctx context.Context) ([]CanonicalRole, err
 	r.mu.RUnlock()
 
 	if found && time.Now().Before(entry.expiresAt) {
-		return entry.roles, nil
+		return entry, nil
 	}
 
 	resp, err := r.client.GetMe(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("rbac: failed to resolve user roles: %w", err)
+		return cachedRoleEntry{}, fmt.Errorf("rbac: failed to resolve user roles: %w", err)
 	}
 
-	roles := NormalizeRoles(resp.Roles)
+	entry = cachedRoleEntry{
+		roles:    NormalizeRoles(resp.Roles),
+		userType: resp.UserType,
+	}
 
 	// Sweeping the whole map under the write lock is O(n), but it runs only on
 	// a cache miss, never on a hit: a hit returns above without ever taking
@@ -304,13 +327,89 @@ func (r *CachedRoleResolver) GetRoles(ctx context.Context) ([]CanonicalRole, err
 			delete(r.cache, uid)
 		}
 	}
-	r.cache[user.UserID] = cachedRoleEntry{
-		roles:     roles,
-		expiresAt: now.Add(r.ttl),
-	}
+	entry.expiresAt = now.Add(r.ttl)
+	r.cache[user.UserID] = entry
 	r.mu.Unlock()
 
-	return roles, nil
+	return entry, nil
+}
+
+// GetRoles returns the caller's canonical roles from cache or by fetching from entity-service.
+func (r *CachedRoleResolver) GetRoles(ctx context.Context) ([]CanonicalRole, error) {
+	entry, err := r.resolve(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return entry.roles, nil
+}
+
+// IsInternalWriteBlocked reports whether the caller is an INTERNAL-type user
+// (entity-service's own user_type) who belongs to none of the configured
+// internalWriteGroups on their own JWT token's "groups" claim.
+//
+// Why this exists: entity-service grants an INTERNAL-classified caller a much
+// broader ("Unrestricted") access scope than a genuine customer/partner gets
+// (see that service's own CLAUDE.md, AccessService.ResolveScope) -- so once a
+// WSO2-internal account manager/technical owner is correctly reclassified as
+// INTERNAL there, this portal must not let that alone grant them write access
+// here too. Write access for an INTERNAL caller additionally requires proof,
+// on the token itself, that they belong to one of the groups this deployment
+// trusts for writing in the customer portal. A non-INTERNAL caller (a
+// genuine customer/partner) is never blocked by this gate -- their write
+// access is governed entirely by permissionMatrix, unaffected.
+func (r *CachedRoleResolver) IsInternalWriteBlocked(ctx context.Context) (bool, error) {
+	if len(r.internalWriteGroups) == 0 {
+		return false, nil
+	}
+	entry, err := r.resolve(ctx)
+	if err != nil {
+		return false, err
+	}
+	if entry.userType != entity.UserTypeInternal {
+		return false, nil
+	}
+	user := UserInfoFromContext(ctx)
+	if user == nil {
+		return true, nil
+	}
+	for _, want := range r.internalWriteGroups {
+		for _, got := range user.Groups {
+			if got == want {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
+// WriteAccessResolver is the optional extension of RoleResolver that backs
+// the internal-write-role gate. A resolver that doesn't implement it (e.g. a
+// test fake implementing bare RoleResolver) is treated as never blocking --
+// see internalWriteBlocked.
+type WriteAccessResolver interface {
+	RoleResolver
+	IsInternalWriteBlocked(ctx context.Context) (bool, error)
+}
+
+// internalWriteBlocked applies the gate via an optional-interface check, so
+// RequirePermission/RequirePermissionOneOf/RequireRoles need no new
+// parameter and every existing caller/test fake keeps compiling and
+// behaving exactly as before.
+func internalWriteBlocked(ctx context.Context, resolver RoleResolver) (bool, error) {
+	wr, ok := resolver.(WriteAccessResolver)
+	if !ok {
+		return false, nil
+	}
+	return wr.IsInternalWriteBlocked(ctx)
+}
+
+// writeRolesResolutionError writes the same 502 resolveRolesForRequest uses,
+// for a failure in the internal-write-role gate specifically.
+func writeRolesResolutionError(w http.ResponseWriter, r *http.Request, err error) {
+	slog.ErrorContext(r.Context(), "rbac: failed to resolve internal write access", "err", err)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadGateway)
+	_ = json.NewEncoder(w).Encode(authErrorBody{Message: "Failed to resolve user roles."})
 }
 
 func writeForbiddenError(w http.ResponseWriter, message string) {
@@ -375,6 +474,21 @@ func RequirePermission(resolver RoleResolver, module Module, action Action) func
 				return
 			}
 
+			// The internal-write-role gate only ever narrows a write action;
+			// a read never needs the caller's token to additionally prove a
+			// write role.
+			if action != ActionRead {
+				blocked, err := internalWriteBlocked(r.Context(), resolver)
+				if err != nil {
+					writeRolesResolutionError(w, r, err)
+					return
+				}
+				if blocked {
+					writeForbiddenError(w, "You do not have permission to perform this action.")
+					return
+				}
+			}
+
 			next.ServeHTTP(w, r)
 		})
 	}
@@ -394,11 +508,25 @@ func RequirePermissionOneOf(resolver RoleResolver, module Module, actions ...Act
 				return
 			}
 
+			// Resolved once per request, up front: the gate is a property of
+			// the caller, not of which action in the list ends up granting
+			// access, so it would otherwise cost one GetMe round trip (well,
+			// one cache read) per candidate action tried.
+			writeBlocked, err := internalWriteBlocked(r.Context(), resolver)
+			if err != nil {
+				writeRolesResolutionError(w, r, err)
+				return
+			}
+
 			for _, action := range actions {
-				if HasPermission(roles, module, action) {
-					next.ServeHTTP(w, r.WithContext(WithGrantedAction(r.Context(), action)))
-					return
+				if !HasPermission(roles, module, action) {
+					continue
 				}
+				if action != ActionRead && writeBlocked {
+					continue
+				}
+				next.ServeHTTP(w, r.WithContext(WithGrantedAction(r.Context(), action)))
+				return
 			}
 
 			writeForbiddenError(w, "You do not have permission to perform this action.")
@@ -406,7 +534,12 @@ func RequirePermissionOneOf(resolver RoleResolver, module Module, actions ...Act
 	}
 }
 
-// RequireRoles wraps next with authorization checking against an explicit set of allowed roles.
+// RequireRoles wraps next with authorization checking against an explicit set
+// of allowed roles. Every current call site of this guard registers a write
+// route (project-contact management), so the internal-write-role gate
+// (internalWriteBlocked) always applies here -- unlike RequirePermission,
+// which also guards reads and so only applies the gate for a non-read
+// action.
 func RequireRoles(resolver RoleResolver, allowedRoles ...CanonicalRole) func(http.Handler) http.Handler {
 	allowed := make(map[CanonicalRole]struct{}, len(allowedRoles))
 	for _, role := range allowedRoles {
@@ -415,31 +548,36 @@ func RequireRoles(resolver RoleResolver, allowedRoles ...CanonicalRole) func(htt
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			user := UserInfoFromContext(r.Context())
-			if user == nil {
-				writeAuthError(w, "You are not authorized to perform this action. Please try again.")
-				return
-			}
-
-			roles, err := resolver.GetRoles(r.Context())
-			if err != nil {
-				slog.ErrorContext(r.Context(), "rbac: failed to resolve roles", "err", err)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusBadGateway)
-				_ = json.NewEncoder(w).Encode(authErrorBody{Message: "Failed to resolve user roles."})
+			roles, ok := resolveRolesForRequest(w, r, resolver)
+			if !ok {
 				return
 			}
 
 			// No blanket-grant role here either, for the same reason as
 			// HasPermission: the allow-list at the call site is the whole rule.
+			allowedRole := false
 			for _, role := range roles {
 				if _, ok := allowed[role]; ok {
-					next.ServeHTTP(w, r)
-					return
+					allowedRole = true
+					break
 				}
 			}
+			if !allowedRole {
+				writeForbiddenError(w, "You do not have permission to perform this action.")
+				return
+			}
 
-			writeForbiddenError(w, "You do not have permission to perform this action.")
+			blocked, err := internalWriteBlocked(r.Context(), resolver)
+			if err != nil {
+				writeRolesResolutionError(w, r, err)
+				return
+			}
+			if blocked {
+				writeForbiddenError(w, "You do not have permission to perform this action.")
+				return
+			}
+
+			next.ServeHTTP(w, r)
 		})
 	}
 }

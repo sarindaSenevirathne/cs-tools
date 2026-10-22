@@ -212,16 +212,16 @@ function AlertTabs({
   const readAt = onScreen?.dataUpdatedAt ?? 0;
   const { controls: phone, dialog } = usePagingPhoneControls(members, readAt);
 
-  /** "Test call" on a phone gap for a paging-only number the reader may act
-   *  on. A missing number gets no action here: it is added on the person's
-   *  profile, which the gap's hint says. */
+  /** "Test call" on a phone gap for a number the reader may test (a portal
+   *  or rota admin). A missing number gets no action here: it is added on the
+   *  person's profile, which the gap's hint says. */
   const phoneActionFor = (gap: PagingReadinessGap): PhoneGapAction | null => {
     if (!PHONE_GAPS.has(gap.code) || !gap.userId || gap.code === "NO_PHONE")
       return null;
     const m = members.find(
-      (x) => x.userId === gap.userId && x.canEditPhone === true,
+      (x) => x.userId === gap.userId && x.canTestCall === true,
     );
-    if (!m?.pagingPhone) return null;
+    if (!m?.testCall) return null;
     const calling = phone.calling(m);
     return {
       label: calling ? CALLING_LABEL : "Test call",

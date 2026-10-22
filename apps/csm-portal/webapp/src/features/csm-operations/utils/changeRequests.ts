@@ -20,12 +20,14 @@ import type {
   BeChangeRequestCustomerProposal,
   BeChangeRequestDetail,
   BeChangeRequestImpact,
+  BeChangeRequestPriority,
   BeChangeRequestSearchPayload,
   BeChangeRequestState,
   BeChangeRequestType,
 } from "@api/backend/types";
 import { formatBackendTimestampForDisplay, parseBackendTimestamp } from "@utils/dateTime";
 import { isBlankHtml, sanitizeRichTextHtml } from "@utils/sanitizeHtml";
+import { anyOfPayload, completeAnyOfGroups, type AnyOfGroup } from "@features/csm-operations/utils/operationsAnyOf";
 
 type ChipColor = "default" | "info" | "warning" | "success" | "error";
 
@@ -1041,24 +1043,92 @@ export function requestApprovalNeedsContactReason(
 }
 
 /**
- * States from which the deployments / deployment products can no longer be
- * changed (the backend refuses with a 400 from `implement` onward). The Customer
- * Project is frozen far earlier (see `customerProjectLockedReason`).
+ * The states a change request is in only once it has been approved: CAB approval
+ * received (Normal, Emergency), or Request Approval having scheduled a Standard
+ * change, which is pre-approved. Canceled is not one: a change can be cancelled
+ * before anybody approved it. Mirrors the entity service's
+ * `changeRequestApprovedStates` (change_request_approved_lock.go).
  */
-const SCOPE_LOCKED_STATES: readonly string[] = [
+const CHANGE_REQUEST_APPROVED_STATES: readonly string[] = [
+  "customer_approval",
+  "scheduled",
   "implement",
   "review",
   "customer_review",
   "closed",
   "rollback",
-  "canceled",
 ];
 
-/** Why the deployments (and their products) are locked in `state`, or `null` when editable. */
+/** Why an approved change request's fields are read-only. */
+export const CHANGE_REQUEST_APPROVED_READ_ONLY_REASON =
+  "CAB approval has been received, so this change request's fields are read-only. Only work notes can be added.";
+
+/**
+ * Why every field of the change request is read-only in `state` (it has been
+ * approved), or `null` while it can still be edited. The entity service refuses
+ * the edit itself (400 `change_request_approved_read_only`); the form only keeps
+ * its fields from offering it. Work notes are still added.
+ */
+export function changeRequestApprovedReadOnlyReason(state?: string | null): string | null {
+  return state && CHANGE_REQUEST_APPROVED_STATES.includes(state) ? CHANGE_REQUEST_APPROVED_READ_ONLY_REASON : null;
+}
+
+/**
+ * States from which the deployments / deployment products can no longer be
+ * changed: the change has been approved (the scope it was approved for is
+ * fixed), or it was cancelled. The Customer Project is frozen far earlier (see
+ * `customerProjectLockedReason`).
+ */
+const SCOPE_LOCKED_STATES: readonly string[] = [...CHANGE_REQUEST_APPROVED_STATES, "canceled"];
+
+/** Why the deployments (and their products) are locked in `state`, or `null` when editable. A
+ * change can be cancelled before anybody approved it, so that state has its own words. */
 export function changeRequestScopeLockedReason(state?: string | null): string | null {
-  return state && SCOPE_LOCKED_STATES.includes(state)
-    ? "Locked: the deployments can't be changed once implementation has started."
-    : null;
+  if (!state || !SCOPE_LOCKED_STATES.includes(state)) return null;
+  return state === "canceled"
+    ? "Locked: the deployments can't be changed once the change request has been cancelled."
+    : "Locked: the deployments can't be changed once the change request has been approved.";
+}
+
+/** Why the type cannot be changed once approval has been requested (the backend's own rule). */
+export const CHANGE_REQUEST_TYPE_FROZEN_REASON =
+  "The type decides the approval flow, so it is fixed once approval has been requested. Cancel and clone to change it.";
+
+/** The priorities a change request can be given (the create form's list). */
+export const CHANGE_REQUEST_PRIORITY_OPTIONS: ReadonlyArray<{ value: BeChangeRequestPriority; label: string }> = [
+  { value: "critical", label: "Critical" },
+  { value: "high", label: "High" },
+  { value: "moderate", label: "Moderate" },
+  { value: "low", label: "Low" },
+];
+
+/** The impacts a change request can be given (the create form's list). */
+export const CHANGE_REQUEST_IMPACT_OPTIONS: ReadonlyArray<{ value: BeChangeRequestImpact; label: string }> = [
+  { value: "high", label: "High" },
+  { value: "medium", label: "Medium" },
+  { value: "low", label: "Low" },
+];
+
+/**
+ * A detail response's priority as one of the form's values, or "" when unset or
+ * unknown. The Postgres data source returns the value ("moderate"); the response
+ * of the previous system carried an `{ id, label }` ref ("3 - Moderate").
+ */
+export function changeRequestPriorityValue(priority: unknown): BeChangeRequestPriority | "" {
+  const raw =
+    typeof priority === "string"
+      ? priority
+      : priority && typeof priority === "object" && "label" in priority
+        ? String((priority as { label?: unknown }).label ?? "")
+        : "";
+  const lower = raw.trim().toLowerCase();
+  return CHANGE_REQUEST_PRIORITY_OPTIONS.find((o) => lower === o.value || lower.endsWith(` ${o.value}`))?.value ?? "";
+}
+
+/** A detail response's impact as one of the form's values, or "" when unset or unknown. */
+export function changeRequestImpactValue(impact: string | null | undefined): BeChangeRequestImpact | "" {
+  const lower = impact?.trim().toLowerCase() ?? "";
+  return CHANGE_REQUEST_IMPACT_OPTIONS.find((o) => o.value === lower)?.value ?? "";
 }
 
 // ---------------------------------------------------------------------------
@@ -1130,6 +1200,119 @@ export function changeRequestTransitionLabel(
     return customerProposalPending ? "Propose a different time" : "Re-schedule";
   }
   return TRANSITION_LABEL[target] ?? sentenceCase(target);
+}
+
+/**
+ * States this bar never offers, no matter what `legalNextStates` contains.
+ *
+ * THE RULE: staff never record a customer's approval or review. While a change
+ * request is in Customer Approval or Customer Review it moves on only through
+ * the customer's own answer in the Customer Portal. A staff member answering
+ * for the customer would be a decision the customer never made, written into
+ * data that is audited, so there is no such action here: no button, no menu
+ * entry, not even a disabled one. The backend refuses the same PATCH from any
+ * caller; this filter is the second wall, so a backend that ever started
+ * offering it again could not silently reopen it. Staff keep Re-schedule (out
+ * of Customer Approval: the customer is asked again), Roll back (out of Review
+ * and Customer Review) and Cancel change. `scheduled` and `closed` below carry
+ * the rule; the rest are older exclusions, kept for their own reasons.
+ *
+ * "Accept proposed time" is not an exception to it and is not in this bar at all:
+ * it is the banner's own action, it applies the time the customer PROPOSED (the
+ * customer's own consent, kept in `customer_updated_on`), it is never a `state` in
+ * a PATCH, and nothing here records the customer's approval or review.
+ *
+ * `scheduled` is never offered. A CR is moved to Scheduled automatically the
+ * moment its approval is granted (CAB, Standard's Request Approval, or the
+ * customer's own approval at Customer Approval). There is no manual "Schedule"
+ * action anywhere, and none out of `customer_approval` either: that move is
+ * the customer's approval.
+ *
+ * `closed` is never offered out of `customer_review`: that move is the
+ * customer's review. (The plain Close out of Review, when no customer review
+ * is required, is an ordinary forward move and stays: see `isOfferedTarget`.)
+ *
+ * `customer_approval` is not human-enterable in the backing system: of its 38
+ * UI actions on the change-request table, none sets it. It is reached only by
+ * the approval process itself. Setting it by hand from here would leave a
+ * record sitting in an approval state with no approver record behind it,
+ * which is an audit hole rather than a shortcut.
+ *
+ * `authorize` is a different case: it IS reachable by a human action, just
+ * never this one. It's the automatic side effect of an approver approving in
+ * the Approvers section (`ChangeRequestApprovals.tsx` / the decide-approval
+ * endpoint), which already correctly cascades the change request's own state
+ * forward on approval — not "automation-only" the way the other two are, but
+ * gated by a real human decision made somewhere else in the UI, not here.
+ * Offering it as a directly-clickable button/menu item from here would let
+ * someone skip the actual approval process entirely and land the record in
+ * Authorize with no approval behind it — the same audit hole as above, by a
+ * different route. The one exception is keyed on the record's own state: from
+ * `customer_approval` it means "Re-schedule" (the planned time changed, so the
+ * customer is asked to approve the new time -- the change stays in Customer
+ * Approval and never goes back through CAB: the change itself has not changed),
+ * and the page collects the new planned window before sending it. The wire name
+ * stays `authorize` although nothing moves to Authorize any more: it is the
+ * contract of the CSM page, the BFF and the fakes, and renaming it breaks them for nothing.
+ *
+ * `rollback` is the failed-review off-ramp of the process diagram: a human
+ * action ("Roll back"), but only from the two review states, `review` and
+ * `customer_review` (the backend offers and accepts it from nowhere else).
+ * It is a destructive, menu-only item that requires a stated reason. It used
+ * to be excluded here as "automation-only"; the backend now owns the manual
+ * transition. The carve-out is still keyed on the record's own state.
+ *
+ * The exclusions are deliberately unconditional (the `authorize`, `rollback`
+ * and `closed` carve-outs are keyed on the record's own state, never on what
+ * `legalNextStates` claims) so a future backend change that starts returning
+ * any of these cannot silently reopen them.
+ */
+export const NEVER_OFFERED_TARGETS: readonly string[] = ["customer_approval", "scheduled"];
+
+/** States a change request can be manually rolled back from. */
+const ROLLBACK_FROM_STATES: readonly string[] = ["review", "customer_review"];
+
+/**
+ * `authorize` ("Re-schedule" / "Propose a different time") is a manual action only from `customer_approval`;
+ * `rollback` only from the two review states; `closed` anywhere but
+ * `customer_review` (see `NEVER_OFFERED_TARGETS` for the rule behind it).
+ * Everywhere else they are not offered.
+ */
+export function isOfferedChangeRequestTarget(target: string, currentState: string | null | undefined): boolean {
+  if (!target || target === currentState) return false;
+  if (target === "authorize") return currentState === "customer_approval";
+  if (target === "rollback") {
+    return !!currentState && ROLLBACK_FROM_STATES.includes(currentState);
+  }
+  // The customer's review is theirs to give: no Close out of Customer Review.
+  if (target === "closed" && currentState === "customer_review") return false;
+  return !NEVER_OFFERED_TARGETS.includes(target);
+}
+
+/** The final states: a change request in one takes no transition and no edit. */
+const CHANGE_REQUEST_TERMINAL_STATES: readonly string[] = ["closed", "canceled", "rollback"];
+
+/** Whether a change request in `state` is over (Closed, Canceled, Rolled back): no bulk edit. */
+export function isChangeRequestTerminal(state?: string | null): boolean {
+  return !!state && CHANGE_REQUEST_TERMINAL_STATES.includes(state);
+}
+
+/**
+ * The moves every one of `crs` can make, from each one's own `legalNextStates`
+ * and the same filter the action bar applies (`isOfferedChangeRequestTarget`):
+ * what a bulk edit may set on all of them at once, Close / Cancel / Roll back
+ * included when legal for each. `authorize` (Re-schedule) is left out: it needs a
+ * planned window of its own per change request. Empty when they share none, or
+ * when a change request's moves are not known.
+ */
+export function bulkChangeRequestTargets(
+  crs: Array<Pick<BeChangeRequestDetail, "state" | "legalNextStates">>,
+): string[] {
+  if (crs.length === 0) return [];
+  const offered = crs.map((cr) =>
+    (cr.legalNextStates ?? []).filter((t) => t !== "authorize" && isOfferedChangeRequestTarget(t, cr.state)),
+  );
+  return offered[0].filter((t) => offered.every((targets) => targets.includes(t)));
 }
 
 /** True when this transition is destructive: menu-only, error-coloured. */
@@ -1248,7 +1431,50 @@ export interface ChangeRequestFilters {
    * (see `buildChangeRequestSearchFilters`), matching the entity-service's
    * own field name for this search. */
   projectIds: string[];
+  /** Selected tag names — sent as a generic `{ field: "tag", op: "in" }`
+   * filter entry: a change request carrying any of them matches. */
+  tags: string[];
+  /** Assigned engineer user ids — `{ field: "assignedUserId", op: "in" }`. */
+  assigneeIds: string[];
+  /** Change types — `{ field: "type", op: "in" }`. */
+  types: string[];
+  /** `YYYY-MM-DD` UTC date bounds, or empty, for created / updated / planned
+   * start / planned end — each a `gte`/`lte` pair on its own field. */
+  createdStartDate: string;
+  createdEndDate: string;
+  updatedStartDate: string;
+  updatedEndDate: string;
+  plannedStartFrom: string;
+  plannedStartTo: string;
+  plannedEndFrom: string;
+  plannedEndTo: string;
+  /** Advanced OR groups, sent as `filters.anyOf`. */
+  anyOf: AnyOfGroup[];
 }
+
+/** The search fields a change request OR group condition can use. */
+export const CHANGE_REQUEST_ANY_OF_FIELDS = [
+  "state",
+  "impact",
+  "projectId",
+  "type",
+  "tag",
+  "assignmentGroupId",
+  "assignedUserId",
+] as const;
+
+/** Change types a list can be filtered by: the three a change is created with,
+ * then the ones migrated changes still carry. */
+export const CHANGE_REQUEST_FILTER_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "standard", label: "Standard" },
+  { value: "normal", label: "Normal" },
+  { value: "emergency", label: "Emergency" },
+  { value: "azure", label: "Azure" },
+  { value: "change_registration", label: "Change registration" },
+  { value: "cloud_infrastructure", label: "Cloud infrastructure" },
+  { value: "infra", label: "Infra" },
+  { value: "unauthorized_change", label: "Unauthorized change" },
+];
 
 export const DEFAULT_CR_FILTERS: ChangeRequestFilters = {
   search: "",
@@ -1258,6 +1484,18 @@ export const DEFAULT_CR_FILTERS: ChangeRequestFilters = {
   closedEndDate: "",
   sreTeamIds: [],
   projectIds: [],
+  tags: [],
+  assigneeIds: [],
+  types: [],
+  createdStartDate: "",
+  createdEndDate: "",
+  updatedStartDate: "",
+  updatedEndDate: "",
+  plannedStartFrom: "",
+  plannedStartTo: "",
+  plannedEndFrom: "",
+  plannedEndTo: "",
+  anyOf: [],
 };
 
 /** Count non-search active filters (used for the badge on the Filters button). */
@@ -1268,7 +1506,21 @@ export function countActiveCRFilters(filters: ChangeRequestFilters): number {
     (filters.closedStartDate ? 1 : 0) +
     (filters.closedEndDate ? 1 : 0) +
     (filters.sreTeamIds.length > 0 ? 1 : 0) +
-    (filters.projectIds.length > 0 ? 1 : 0)
+    (filters.projectIds.length > 0 ? 1 : 0) +
+    (filters.tags.length > 0 ? 1 : 0) +
+    (filters.assigneeIds.length > 0 ? 1 : 0) +
+    (filters.types.length > 0 ? 1 : 0) +
+    [
+      filters.createdStartDate,
+      filters.createdEndDate,
+      filters.updatedStartDate,
+      filters.updatedEndDate,
+      filters.plannedStartFrom,
+      filters.plannedStartTo,
+      filters.plannedEndFrom,
+      filters.plannedEndTo,
+    ].filter(Boolean).length +
+    completeAnyOfGroups(filters.anyOf).length
   );
 }
 
@@ -1277,9 +1529,22 @@ export function crDateOnlyToISOStart(date: string): string {
   return `${date}T00:00:00Z`;
 }
 
-/** Convert a YYYY-MM-DD date picker value to an ISO 8601 string at end-of-day UTC. */
+/** Convert a YYYY-MM-DD date picker value to an ISO 8601 string at end-of-day UTC: the last
+ * microsecond of the day (the precision Postgres stores), so a record stamped at `23:59:59.500Z`
+ * is still inside an inclusive range. */
 export function crDateOnlyToISOEnd(date: string): string {
-  return `${date}T23:59:59Z`;
+  return `${date}T23:59:59.999999Z`;
+}
+
+/** One `gte`/`lte` entry of the generic filters array for a `YYYY-MM-DD` UTC
+ * date (start or end of that day), or none when the date is empty. */
+function dateBound(
+  field: "createdOn" | "updatedOn" | "plannedStartOn" | "plannedEndOn",
+  op: "gte" | "lte",
+  date: string,
+): Array<{ field: typeof field; op: typeof op; values: string[] }> {
+  if (!date) return [];
+  return [{ field, op, values: [op === "gte" ? crDateOnlyToISOStart(date) : crDateOnlyToISOEnd(date)] }];
 }
 
 /**
@@ -1291,6 +1556,27 @@ export function buildChangeRequestSearchFilters(
   filters: ChangeRequestFilters,
   debouncedSearch: string,
 ): NonNullable<BeChangeRequestSearchPayload["filters"]> {
+  // SRE team and tag share the one generic `filters` array, so both entries
+  // are collected here rather than each spreading its own `filters` key.
+  const fieldFilters = [
+    ...(filters.sreTeamIds.length > 0
+      ? [{ field: "assignmentGroupId" as const, op: "in" as const, values: filters.sreTeamIds }]
+      : []),
+    ...(filters.tags.length > 0 ? [{ field: "tag" as const, op: "in" as const, values: filters.tags }] : []),
+    ...(filters.assigneeIds.length > 0
+      ? [{ field: "assignedUserId" as const, op: "in" as const, values: filters.assigneeIds }]
+      : []),
+    ...(filters.types.length > 0 ? [{ field: "type" as const, op: "in" as const, values: filters.types }] : []),
+    ...dateBound("createdOn", "gte", filters.createdStartDate),
+    ...dateBound("createdOn", "lte", filters.createdEndDate),
+    ...dateBound("updatedOn", "gte", filters.updatedStartDate),
+    ...dateBound("updatedOn", "lte", filters.updatedEndDate),
+    ...dateBound("plannedStartOn", "gte", filters.plannedStartFrom),
+    ...dateBound("plannedStartOn", "lte", filters.plannedStartTo),
+    ...dateBound("plannedEndOn", "gte", filters.plannedEndFrom),
+    ...dateBound("plannedEndOn", "lte", filters.plannedEndTo),
+  ];
+  const anyOf = anyOfPayload(filters.anyOf);
   return {
     ...(debouncedSearch.length > 0 && { searchQuery: debouncedSearch }),
     ...(filters.states.length > 0 && { states: filters.states }),
@@ -1301,12 +1587,9 @@ export function buildChangeRequestSearchFilters(
     ...(filters.closedEndDate && {
       closedEndDate: crDateOnlyToISOEnd(filters.closedEndDate),
     }),
-    ...(filters.sreTeamIds.length > 0 && {
-      filters: [
-        { field: "assignmentGroupId" as const, op: "in" as const, values: filters.sreTeamIds },
-      ],
-    }),
+    ...(fieldFilters.length > 0 && { filters: fieldFilters }),
     ...(filters.projectIds.length > 0 && { projectIds: filters.projectIds }),
+    ...(anyOf && { anyOf }),
   };
 }
 
@@ -1325,14 +1608,13 @@ export function buildChangeRequestSearchFilters(
 //   - `priority` is write-only — accepted by create, never present on the
 //     read response — so there is no source value to copy from, ever,
 //     regardless of how the form is wired.
-//   - `riskImpactAnalysis` is write-only for the same reason.
-//     (`implementationPlan` was write-only too, but the read side now
-//     returns it — see `BeChangeRequestDetail.implementationPlan` — so it's
-//     no longer part of this gap. It isn't wired into the clone fields
-//     below yet, though: that's a separate feature decision, not a gap.)
-//   - `impactDescription`, `serviceOutage`, `communicationPlan`, and
-//     `rollbackPlan` are read-only today — the create payload has no field
-//     for any of them.
+//   - The create form's "Risk and impact analysis" (`riskImpactAnalysis`) and
+//     "Backout plan" (`backoutPlan`) come back on the read as
+//     `impactDescription` and `rollbackPlan` (the entity service writes both
+//     column pairs on create and reads the latter), so a clone carries them
+//     across under those names, along with `implementationPlan`.
+//   - `serviceOutage` and `communicationPlan` are read-only today — the
+//     create payload has no field for either.
 //   - `project`, `case`, `deployment`, `deployedProduct`, and `product` are
 //     read-only refs with no create-time field to set them from at all.
 //   - `assignedTeam` is read-only; create's nearest-sounding field
@@ -1347,7 +1629,8 @@ export function buildChangeRequestSearchFilters(
 // None of the above can be safely carried over without either fabricating
 // data or guessing at an unconfirmed field mapping, so this only clones the
 // fields that are genuinely the same field on both sides: `subject`,
-// `description`, `justification`, `testPlan`, `type`, `impact`, and
+// `description`, `justification`, `implementationPlan`, the risk and impact
+// analysis, the backout plan, `testPlan`, `type`, `impact`, and
 // `assignedEngineer`. Everything else resets to the create form's own
 // defaults, same as a from-scratch change request — see
 // `CLONE_SOURCE_GAP_MESSAGE` for the user-facing disclosure of this gap.
@@ -1357,6 +1640,11 @@ export interface CloneChangeRequestNavState {
   subject?: string;
   description?: string;
   justification?: string;
+  implementationPlan?: string;
+  /** Seeds the create form's "Risk and impact analysis"; read as `impactDescription`. */
+  riskImpactAnalysis?: string;
+  /** Seeds the create form's "Backout plan"; read as `rollbackPlan`. */
+  backoutPlan?: string;
   testPlan?: string;
   type?: BeChangeRequestType;
   impact?: BeChangeRequestImpact;
@@ -1406,6 +1694,9 @@ export function buildCloneChangeRequestNavState(
     subject: cr.subject ?? undefined,
     description: cloneableHtml(cr.description),
     justification: cloneableHtml(cr.justification),
+    implementationPlan: cloneableHtml(cr.implementationPlan),
+    riskImpactAnalysis: cloneableHtml(cr.impactDescription),
+    backoutPlan: cloneableHtml(cr.rollbackPlan),
     testPlan: cloneableHtml(cr.testPlan),
     type: (cr.type as BeChangeRequestType) ?? undefined,
     impact: (cr.impact as BeChangeRequestImpact) ?? undefined,
@@ -1426,8 +1717,8 @@ export function buildCloneChangeRequestNavState(
  * wants a preview) and the create page stay in sync.
  */
 export const CLONE_SOURCE_GAP_MESSAGE =
-  "Copied the subject, description, justification, test plan, type, impact, assigned engineer, customer project, category, and customer approval/review settings. " +
-  "Priority, implementation plan, risk/impact analysis, backout plan, assignment group, " +
+  "Copied the subject, description, justification, implementation plan, risk and impact analysis, backout plan, test plan, type, impact, assigned engineer, customer project, category, and customer approval/review settings. " +
+  "Priority, assignment group, " +
   "linked case, and affected product aren't available to copy and need to be re-entered. " +
   "Deployments, deployment products, schedule, and approval fields are intentionally left blank for you to set for the new environment. The Customer Group follows the customer project.";
 

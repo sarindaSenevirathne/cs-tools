@@ -40,14 +40,8 @@ function renderDialog() {
   );
 }
 
-function fillNameAndEmail(email: string): void {
-  fireEvent.change(screen.getByLabelText(/first name/i), { target: { value: "Jane" } });
+function fillEmail(email: string): void {
   fireEvent.change(screen.getByLabelText(/email/i), { target: { value: email } });
-}
-
-function selectUserType(label: string): void {
-  fireEvent.mouseDown(screen.getByLabelText(/user type/i));
-  fireEvent.click(screen.getByRole("option", { name: label }));
 }
 
 describe("AddUserDialog", () => {
@@ -58,25 +52,29 @@ describe("AddUserDialog", () => {
     getMock.mockResolvedValue({ roles: [{ key: "cs_engineer" }, { key: "escalator" }] });
   });
 
-  it("disables submit until a user type is chosen", () => {
+  it("defaults User type to Internal", () => {
     renderDialog();
-    fillNameAndEmail("jane@wso2.com");
+    expect(screen.getByLabelText(/user type/i)).toHaveTextContent("Internal (WSO2 staff)");
+  });
+
+  it("disables submit until a valid email is entered", () => {
+    renderDialog();
     expect(screen.getByRole("button", { name: /add user/i })).toBeDisabled();
+    fillEmail("jane@wso2.com");
+    expect(screen.getByRole("button", { name: /add user/i })).toBeEnabled();
   });
 
   it("blocks Internal with a non-wso2.com email and shows the constraint", () => {
     renderDialog();
-    fillNameAndEmail("jane@example.com");
-    selectUserType("Internal (WSO2 staff)");
+    fillEmail("jane@example.com");
 
     expect(screen.getByText(/an internal user must have a @wso2\.com email address/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /add user/i })).toBeDisabled();
   });
 
-  it("allows Internal with a wso2.com email and sends the internal role", async () => {
+  it("allows Internal with a wso2.com email and sends only email and roles -- no name fields", async () => {
     renderDialog();
-    fillNameAndEmail("jane@wso2.com");
-    selectUserType("Internal (WSO2 staff)");
+    fillEmail("jane@wso2.com");
 
     const submit = screen.getByRole("button", { name: /add user/i });
     expect(submit).toBeEnabled();
@@ -88,11 +86,14 @@ describe("AddUserDialog", () => {
         expect.objectContaining({ email: "jane@wso2.com", roles: ["internal"] }),
       ),
     );
+    const [, payload] = postMock.mock.calls[0];
+    expect(payload.firstName).toBeUndefined();
+    expect(payload.lastName).toBeUndefined();
   });
 
   it("disables the External option and marks it not available", () => {
     renderDialog();
-    fillNameAndEmail("jane@example.com");
+    fillEmail("jane@example.com");
     fireEvent.mouseDown(screen.getByLabelText(/user type/i));
 
     // MUI blocks a real click on a disabled option via CSS pointer-events,
@@ -107,8 +108,7 @@ describe("AddUserDialog", () => {
     renderDialog();
     await waitFor(() => expect(getMock).toHaveBeenCalledWith("/roles/grantable"));
 
-    fillNameAndEmail("jane@wso2.com");
-    selectUserType("Internal (WSO2 staff)");
+    fillEmail("jane@wso2.com");
 
     const csEngineer = await screen.findByRole("checkbox", { name: "CS Engineer" });
     expect(screen.getByRole("checkbox", { name: "Escalator" })).toBeInTheDocument();
@@ -128,8 +128,7 @@ describe("AddUserDialog", () => {
     renderDialog();
     await waitFor(() => expect(getMock).toHaveBeenCalled());
 
-    fillNameAndEmail("jane@wso2.com");
-    selectUserType("Internal (WSO2 staff)");
+    fillEmail("jane@wso2.com");
     fireEvent.click(screen.getByRole("button", { name: /add user/i }));
 
     await waitFor(() => expect(postMock).toHaveBeenCalled());

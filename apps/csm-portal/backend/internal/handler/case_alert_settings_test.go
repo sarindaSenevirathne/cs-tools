@@ -122,6 +122,9 @@ func TestCaseAlertSettings_ForwardsKnownFieldsOnly(t *testing.T) {
 		{"route to a rota", func(h *CaseAlertSettingsHandler) func(http.ResponseWriter, *http.Request) { return h.PutCaseAlertRoute },
 			caseAlertRequest(http.MethodPut, "/x", `{"ladder":"sre","groupName":"default sre group","rotaCode":"SRE_SAAS","enabled":false}`),
 			http.StatusOK, "put-route", "", map[string]any{"ladder": "sre", "groupName": "default sre group", "rotaCode": "SRE_SAAS", "enabled": false}},
+		{"route picked from the assignment groups", func(h *CaseAlertSettingsHandler) func(http.ResponseWriter, *http.Request) { return h.PutCaseAlertRoute },
+			caseAlertRequest(http.MethodPut, "/x", `{"ladder":"SRE","groupId":"`+caseAlertRoomID+`","groupName":"WSO2 IaaS Team","teamKey":"iaas","enabled":true}`),
+			http.StatusOK, "put-route", "", map[string]any{"ladder": "SRE", "groupId": caseAlertRoomID, "groupName": "WSO2 IaaS Team", "teamKey": "iaas", "enabled": true}},
 		{"test card", func(h *CaseAlertSettingsHandler) func(http.ResponseWriter, *http.Request) { return h.TestCaseAlertRoom },
 			caseAlertRequest(http.MethodPost, "/x", "", "roomId", caseAlertRoomID), http.StatusOK, "test-room", caseAlertRoomID, nil},
 		{"remove room", func(h *CaseAlertSettingsHandler) func(http.ResponseWriter, *http.Request) {
@@ -195,6 +198,8 @@ func TestCaseAlertSettings_RefusesABadRequestWithoutCallingOut(t *testing.T) {
 			caseAlertRequest(http.MethodPut, "/x", `{"ladder":"SRE","groupName":"g","teamKey":"apollo","rotaCode":"SRE_SAAS"}`)},
 		"route to neither": {func(h *CaseAlertSettingsHandler) func(http.ResponseWriter, *http.Request) { return h.PutCaseAlertRoute },
 			caseAlertRequest(http.MethodPut, "/x", `{"ladder":"SRE","groupName":"g"}`)},
+		"route with a bad group id": {func(h *CaseAlertSettingsHandler) func(http.ResponseWriter, *http.Request) { return h.PutCaseAlertRoute },
+			caseAlertRequest(http.MethodPut, "/x", `{"ladder":"SRE","groupId":"nope","groupName":"g","teamKey":"iaas"}`)},
 		"test a bad room id": {func(h *CaseAlertSettingsHandler) func(http.ResponseWriter, *http.Request) { return h.TestCaseAlertRoom },
 			caseAlertRequest(http.MethodPost, "/x", "", "roomId", "nope")},
 		"room with an unknown channel": {func(h *CaseAlertSettingsHandler) func(http.ResponseWriter, *http.Request) {

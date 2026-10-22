@@ -20,6 +20,7 @@ import { useSearchInternalUsersByName } from "@api/useSearchUsersByName";
 import { useDebouncedValue } from "@hooks/useDebouncedValue";
 import { useChangeRotaAccess, useRotaAccess, type RotaAccessChange } from "../api/useRotaAccess";
 import type { RotaAdminGrant, RotaFamily, RotaMarkerGrant, ScheduleTeam } from "../types";
+import RotaReminderSettings from "./RotaReminderSettings";
 import ScheduleSkeleton from "./ScheduleSkeleton";
 
 const FAMILIES: RotaFamily[] = ["CRE", "SRE", "SME"];
@@ -69,7 +70,7 @@ export default function RotaAccessTab({ teams }: Props): JSX.Element {
       </div>
       <p className="ra-intro">
         A team&apos;s lead always marks their own team. Here you can let others do it too. A{" "}
-        <b>Rota admin</b> marks every team in one group. A <b>Rota marker</b> marks one team&apos;s rotations,
+        <b>Rota admin</b> marks every team in one group. A <b>Rota Manager</b> marks one team&apos;s rotations,
         leave and allocations, but can&apos;t generate the month, change the tags or the alert chain.
       </p>
       {error ? (
@@ -98,7 +99,7 @@ export default function RotaAccessTab({ teams }: Props): JSX.Element {
       {family ? (
         <section className="ra-sec" aria-labelledby="ra-markers-h">
           <div className="ra-sech">
-            <h3 id="ra-markers-h">Rota markers</h3>
+            <h3 id="ra-markers-h">Rota Managers</h3>
             {markerFamilies.length > 1 ? (
               <div className="seg teamseg" role="tablist" aria-label="Group">
                 {markerFamilies.map((f) => (
@@ -134,6 +135,8 @@ export default function RotaAccessTab({ teams }: Props): JSX.Element {
           </div>
         </section>
       ) : null}
+
+      {markerFamilies.includes("CRE") ? <RotaReminderSettings /> : null}
     </div>
   );
 }
@@ -280,7 +283,7 @@ function MarkerTable({
         <tr>
           <th scope="col">Team</th>
           <th scope="col">Lead</th>
-          <th scope="col">Rota markers</th>
+          <th scope="col">Rota Managers</th>
         </tr>
       </thead>
       <tbody>
@@ -301,7 +304,7 @@ function MarkerTable({
               <td>
                 <div className="ra-cell">
                   {held.length > 0 ? (
-                    <ul className="ra-list" aria-label={`${t.name} rota markers`}>
+                    <ul className="ra-list" aria-label={`${t.name} Rota Managers`}>
                       {held.map((m) => (
                         <li key={m.userId} className={m.active ? undefined : "off"}>
                           <span
@@ -315,7 +318,7 @@ function MarkerTable({
                             type="button"
                             className="cp-x"
                             disabled={busy}
-                            aria-label={`Remove ${m.name || m.email} as ${t.name} rota marker`}
+                            aria-label={`Remove ${m.name || m.email} as ${t.name} Rota Manager`}
                             onClick={() => onChange({ kind: "marker", teamKey: t.key, userId: m.userId, grant: false })}
                           >
                             ×
@@ -326,14 +329,14 @@ function MarkerTable({
                   ) : null}
                   <select
                     className="cp-pick cp-add"
-                    aria-label={`Add rota marker for ${t.name}`}
+                    aria-label={`Add Rota Manager for ${t.name}`}
                     value=""
                     disabled={busy || pickable.length === 0}
                     onChange={(e) =>
                       e.target.value && onChange({ kind: "marker", teamKey: t.key, userId: e.target.value, grant: true })
                     }
                   >
-                    <option value="">{pickable.length === 0 ? "No one else on the team" : "+ Add rota marker"}</option>
+                    <option value="">{pickable.length === 0 ? "No one else on the team" : "+ Add Rota Manager"}</option>
                     {pickable.map((m) => (
                       <option key={m.userId} value={m.userId}>
                         {m.name}

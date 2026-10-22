@@ -129,3 +129,36 @@ describe("AsyncEntitySelect — pinned option", () => {
     expect(screen.getByText("Refused")).toBeInTheDocument();
   });
 });
+
+describe("AsyncEntitySelect — hideClearButton", () => {
+  const people: Item[] = [{ id: "u1", name: "Jane Doe" }];
+  const usePeople = () => ({ data: people, isFetching: false, isError: false });
+
+  function renderHidden(hideClearButton: boolean, onChange = vi.fn()): ReturnType<typeof vi.fn> {
+    render(
+      <AsyncEntitySelect<Item>
+        id="owner-select"
+        label="Owner"
+        value="u1"
+        onChange={onChange}
+        useSearch={usePeople}
+        getId={(i) => i.id}
+        getLabel={(i) => i.name}
+        hideClearButton={hideClearButton}
+      />,
+    );
+    return onChange;
+  }
+
+  it("does not report an empty value when the text is deleted", () => {
+    const onChange = renderHidden(true);
+    fireEvent.change(screen.getByRole("combobox", { name: /owner/i }), { target: { value: "" } });
+    expect(onChange).not.toHaveBeenCalledWith("", undefined);
+  });
+
+  it("still reports an empty value when the text is deleted without the prop", () => {
+    const onChange = renderHidden(false);
+    fireEvent.change(screen.getByRole("combobox", { name: /owner/i }), { target: { value: "" } });
+    expect(onChange).toHaveBeenCalledWith("", undefined);
+  });
+});

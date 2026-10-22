@@ -34,6 +34,8 @@ interface RunbookList {
 export interface ImportRunbooksResult {
   created: number;
   updated: number;
+  /** Runbooks left without alerts because the file moved all of them elsewhere, with the link each had. */
+  removed: { number: string; name: string; runbookUrl: string | null }[];
 }
 
 /** The whole runbook catalog; it is small enough to filter and page on the client. */

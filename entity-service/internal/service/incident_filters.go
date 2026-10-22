@@ -31,6 +31,10 @@ var incidentFilterFieldSet = map[string]bool{
 	"state": true, "assignmentGroupId": true, "businessServiceId": true,
 	"createdOn": true, "slaViolated": true, "madeSla": true, "productName": true,
 	"assignedUserId": true, "incidentStateKeys": true,
+	// The two SLA filters every work-item type shares; parsed by
+	// incidentSLAFilters (see sla_filters.go), not by the per-field switches.
+	slaFilterFieldBreached: true, slaFilterFieldPercent: true,
+	"category": true, "updatedOn": true,
 }
 
 // incidentFilterOpSet is the exact set of IncidentFieldFilter.Op values
@@ -46,19 +50,10 @@ var incidentFilterOpSet = map[string]bool{
 	"in": true, "gte": true, "lte": true, "eq": true,
 }
 
-// parseIncidentFilterBool mirrors case_filters.go's parseCaseFilterPercent
-// error-shape convention, retyped for a boolean-valued eq filter. Only the
-// exact lowercase "true"/"false" the OpenAPI contract documents are accepted
-// -- not every string strconv.ParseBool tolerates (e.g. "1", "t", "TRUE").
+// parseIncidentFilterBool parses a boolean-valued eq filter via the shared
+// parseBoolFilterValue.
 func parseIncidentFilterBool(f domain.IncidentFieldFilter, value string) (bool, error) {
-	switch value {
-	case "true":
-		return true, nil
-	case "false":
-		return false, nil
-	default:
-		return false, &apierror.ValidationError{Msg: fmt.Sprintf("filters: field %q op %q value %q must be a boolean", f.Field, f.Op, value)}
-	}
+	return parseBoolFilterValue(f.Field, f.Op, value)
 }
 
 // parseIncidentFilterDate mirrors case_filters.go's parseCaseFilterDate,
@@ -155,8 +150,12 @@ type parsedIncidentFilters struct {
 	EndCreatedDate *time.Time
 	// SlaViolated is set from a "slaViolated" "eq" filter: true/false restricts
 	// to incidents with/without at least one breached SLA record; nil means
-	// the filter was not supplied.
+	// the filter was not supplied. Also carries the shared "slaBreached"
+	// filter, which means the same thing (see incidentSLAFilters).
 	SlaViolated *bool
+	// TaskSLA is set from "taskSLABusinessElapsedPercent" gte/lte filters; nil
+	// means not supplied.
+	TaskSLA *domain.TaskSLAFilter
 	// MadeSla is set from a "madeSla" "eq" filter: true/false restricts to
 	// incidents matching ServiceNow's raw `made_sla` field; nil means the
 	// filter was not supplied. Deliberately kept separate from SlaViolated
@@ -191,6 +190,11 @@ func ParseIncidentFieldFilters(filters []domain.IncidentFieldFilter, now time.Ti
 		}
 
 		switch f.Field {
+		case "category", "updatedOn":
+			// Applied on the PostgreSQL data source only
+			// (parseIncidentListFiltersPostgres); refused here rather than
+			// dropped, which would answer with a wider list than asked for.
+			return parsedIncidentFilters{}, &apierror.ValidationError{Msg: fmt.Sprintf("filters: field %q is not supported by this data source", f.Field)}
 		case "state":
 			if f.Op != "in" {
 				return parsedIncidentFilters{}, badIncidentFilterCombo(f)
@@ -317,5 +321,39 @@ func ParseIncidentFieldFilters(filters []domain.IncidentFieldFilter, now time.Ti
 		}
 	}
 
+	var err error
+	if p.SlaViolated, p.TaskSLA, err = incidentSLAFilters(filters, p.SlaViolated); err != nil {
+		return parsedIncidentFilters{}, err
+	}
 	return p, nil
+}
+
+// incidentSLAFilters extracts the two shared SLA filters (slaBreached,
+// taskSLABusinessElapsedPercent) from the generic filter array via the one
+// work-item-agnostic parser. slaBreached means exactly what the incident
+// vocabulary's older slaViolated means, so it is folded into the returned
+// breached value: slaViolated is the already-parsed slaViolated (nil if not
+// supplied), and the two disagreeing is a 400. Both parsers of the incident
+// filter array (ParseIncidentFieldFilters and
+// parseIncidentFieldFiltersPostgres) leave these two fields to this function.
+func incidentSLAFilters(filters []domain.IncidentFieldFilter, slaViolated *bool) (breached *bool, taskSLA *domain.TaskSLAFilter, err error) {
+	var slaBreached *bool
+	for _, f := range filters {
+		if !isSLAFilterField(f.Field) {
+			continue
+		}
+		if !incidentFilterOpSet[f.Op] {
+			return nil, nil, &apierror.ValidationError{Msg: "filters: unsupported op: " + f.Op}
+		}
+		if err := parseSLAFilter(f.Field, f.Op, f.Values, &taskSLA, &slaBreached); err != nil {
+			return nil, nil, err
+		}
+	}
+	switch {
+	case slaBreached == nil:
+		return slaViolated, taskSLA, nil
+	case slaViolated != nil && *slaViolated != *slaBreached:
+		return nil, nil, &apierror.ValidationError{Msg: "filters: slaViolated and slaBreached must not disagree"}
+	}
+	return slaBreached, taskSLA, nil
 }

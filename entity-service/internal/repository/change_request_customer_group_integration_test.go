@@ -508,7 +508,7 @@ func TestChangeRequestFlowIntegration_CustomerGroupFollowsTheProject(t *testing.
 
 	// Resending the same project, or any unrelated PATCH, changes nothing.
 	f.setProject(id, crScopeProjectA)
-	if _, err := f.patch(id, domain.PatchChangeRequestRequest{Title: sp("renamed")}); err != nil {
+	if _, err := f.patch(id, domain.PatchChangeRequestRequest{WorkNote: sp("an unrelated note")}); err != nil {
 		t.Fatalf("unrelated PATCH: %v", err)
 	}
 	if st := f.customerStages(id); len(st) != 1 || liveStages(st) != 1 {

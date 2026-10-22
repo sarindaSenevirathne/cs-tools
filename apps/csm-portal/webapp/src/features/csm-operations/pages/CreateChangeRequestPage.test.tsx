@@ -261,7 +261,40 @@ describe("CreateChangeRequestPage — Clone prefill", () => {
     locationState = { sourceNumber: "CHG0009988", subject: "Upgrade the gateway cluster" };
     render(<CreateChangeRequestPage />);
     expect(screen.getByText(/cloned from chg0009988/i)).toBeInTheDocument();
-    expect(screen.getByText(/priority, implementation plan/i)).toBeInTheDocument();
+    expect(screen.getByText(/priority, assignment group/i)).toBeInTheDocument();
+  });
+
+  it("seeds every Planning field the clone carries and sends them on create", () => {
+    locationState = {
+      sourceNumber: "CHG0009988",
+      subject: "Upgrade the gateway cluster",
+      type: "normal",
+      description: "<p>Description text.</p>",
+      justification: "<p>Justification text.</p>",
+      implementationPlan: "<p>Implementation text.</p>",
+      riskImpactAnalysis: "<p>Risk text.</p>",
+      backoutPlan: "<p>Backout text.</p>",
+      testPlan: "<p>Test text.</p>",
+    };
+    render(<CreateChangeRequestPage />);
+    // Stubbed editors in DOM order: description, justification, implementation,
+    // risk and impact, backout, test.
+    expect(screen.getAllByLabelText("editor").map((e) => (e as HTMLTextAreaElement).value)).toEqual([
+      "<p>Description text.</p>",
+      "<p>Justification text.</p>",
+      "<p>Implementation text.</p>",
+      "<p>Risk text.</p>",
+      "<p>Backout text.</p>",
+      "<p>Test text.</p>",
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: /create change request/i }));
+    expect(postChangeRequestMutateMock).toHaveBeenCalledTimes(1);
+    expect(postChangeRequestMutateMock.mock.calls[0][0]).toMatchObject({
+      justification: "<p>Justification text.</p>",
+      implementationPlan: "<p>Implementation text.</p>",
+      riskImpactAnalysis: "<p>Risk text.</p>",
+      backoutPlan: "<p>Backout text.</p>",
+    });
   });
 
   it("shows a generic banner when the source number is unavailable", () => {

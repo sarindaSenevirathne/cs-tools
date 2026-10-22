@@ -118,6 +118,13 @@ type IncidentRepository interface {
 	// transaction: both are saved or neither is, so a retried request never saves one twice.
 	// nil or blank texts are skipped.
 	CreateIncidentNotes(ctx context.Context, incidentID string, workNotes, additionalComments *string, createdBy string) error
+	// RecordIncidentFieldChanges inserts one work_item_activity row per change, all in one
+	// statement, attributed to actorEmail -- the write half of SearchIncidentActivities'
+	// field_change branch, which nothing wrote on the Postgres data sources before (the same
+	// gap CaseRepository.RecordCaseFieldChangeActivity closed for cases). Values longer than
+	// the 255-character columns are cut. No changes is a no-op. Callers treat a failure as
+	// best-effort: the update it describes has already committed.
+	RecordIncidentFieldChanges(ctx context.Context, incidentID string, changes []IncidentFieldChange, actorEmail string) error
 	// CreateIncidentFromServiceNow inserts a new incident row (both work_item
 	// and "incident"), for DATA_SOURCE=postgres-servicenow-dual-write's SN-first
 	// incident creation (see incidentService.createIncidentSNFirst's own doc
@@ -429,11 +436,12 @@ func incidentWhereClause(f domain.SearchIncidentsFilters, priorities, states, se
 		add("inc.is_sla_met = $%d", *madeSla)
 	}
 	if slaViolated != nil {
-		if *slaViolated {
-			where += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM sla_live sla WHERE sla.work_item_id = wi.id AND sla.live_has_breached = true)")
-		} else {
-			where += fmt.Sprintf(" AND NOT EXISTS (SELECT 1 FROM sla_live sla WHERE sla.work_item_id = wi.id AND sla.live_has_breached = true)")
-		}
+		where += slaBreachedPredicate("wi.id", *slaViolated)
+	}
+	{
+		var slaClause string
+		slaClause, args, argIdx = slaPercentPredicate("wi.id", f.ParsedTaskSLA, args, argIdx)
+		where += slaClause
 	}
 	if createdStartDate != nil {
 		add("wi.created_on >= $%d", *createdStartDate)
@@ -441,10 +449,59 @@ func incidentWhereClause(f domain.SearchIncidentsFilters, priorities, states, se
 	if createdEndDate != nil {
 		add("wi.created_on <= $%d", *createdEndDate)
 	}
-	// assignmentGroupId/productName have no backing column or confirmed
-	// mapping -- deliberately not applied here, matching
-	// changeRequestWhereClause's own precedent for the identical class of
-	// gap. businessServiceId itself IS applied above, mapped to
+	if len(f.AssignmentGroupIDs) > 0 {
+		add("wi.assignment_group_id = ANY($%d::uuid[])", f.AssignmentGroupIDs)
+	}
+	if len(f.Categories) > 0 {
+		// Text, not an enum cast: a label the enum does not have matches
+		// nothing instead of failing the query.
+		add("inc.category::TEXT = ANY($%d::text[])", f.Categories)
+	}
+	if f.UpdatedStart != nil {
+		add("wi.updated_on >= $%d", *f.UpdatedStart)
+	}
+	if f.UpdatedEnd != nil {
+		add("wi.updated_on <= $%d", *f.UpdatedEnd)
+	}
+	// anyOf: each branch is the AND of its own conditions, the branches are
+	// OR'd, and the whole is ANDed with everything above (case search's shape).
+	if len(f.OrGroups) > 0 {
+		branches := make([]string, 0, len(f.OrGroups))
+		for _, g := range f.OrGroups {
+			var preds []string
+			bind := func(clause string, val any) {
+				preds = append(preds, fmt.Sprintf(clause, argIdx))
+				args = append(args, val)
+				argIdx++
+			}
+			if len(g.States) > 0 {
+				bind("inc.state::TEXT = ANY($%d::text[])", g.States)
+			}
+			if len(g.Priorities) > 0 {
+				bind("inc.priority::TEXT = ANY($%d::text[])", g.Priorities)
+			}
+			if len(g.Categories) > 0 {
+				bind("inc.category::TEXT = ANY($%d::text[])", g.Categories)
+			}
+			if len(g.ServiceIDs) > 0 {
+				bind("inc.service_id = ANY($%d::uuid[])", g.ServiceIDs)
+			}
+			if len(g.AssignmentGroupIDs) > 0 {
+				bind("wi.assignment_group_id = ANY($%d::uuid[])", g.AssignmentGroupIDs)
+			}
+			if len(g.AssignedUserIDs) > 0 {
+				bind("wi.assigned_to_id = ANY($%d::uuid[])", g.AssignedUserIDs)
+			}
+			if len(preds) == 0 {
+				branches = append(branches, "TRUE")
+				continue
+			}
+			branches = append(branches, "("+strings.Join(preds, " AND ")+")")
+		}
+		where += " AND (" + strings.Join(branches, " OR ") + ")"
+	}
+	// productName has no confirmed product-to-incident mapping -- deliberately
+	// not applied here. businessServiceId IS applied above, mapped to
 	// inc.service_id -- "business service" is ServiceNow's own name for
 	// what this schema calls "service" (service_offering.parent_id in
 	// service_offering_repo.go already makes the same identification).
@@ -459,7 +516,13 @@ const incidentSelectColumns = `
 	parent_wi.id, parent_wi.number,
 	parent_inc.id, parent_inc_wi.number,
 	ae.id, COALESCE(ae.name, NULLIF(TRIM(CONCAT_WS(' ', ae.first_name, ae.last_name)), '')),
-	wi.created_on, wi.created_by, wi.updated_on, wi.updated_by`
+	wi.created_on, wi.created_by, wi.updated_on, wi.updated_by,
+	sag.id, sag.name`
+
+// incidentSearchGroupJoin resolves the assignment group the search list shows
+// (its own alias: GetIncidentByID joins "group" as ag after incidentFromJoins).
+const incidentSearchGroupJoin = `
+	LEFT JOIN "group" sag ON sag.id = wi.assignment_group_id`
 
 func scanSearchIncidentView(row interface{ Scan(...any) error }) (domain.SearchIncidentView, error) {
 	var (
@@ -472,6 +535,7 @@ func scanSearchIncidentView(row interface{ Scan(...any) error }) (domain.SearchI
 		aeID, aeName                 *string
 		createdOn, updatedOn         time.Time
 		createdBy, updatedBy         string
+		agID, agName                 *string
 	)
 	if err := row.Scan(
 		&id, &number, &subject, &openedOn,
@@ -481,6 +545,7 @@ func scanSearchIncidentView(row interface{ Scan(...any) error }) (domain.SearchI
 		&parentIncID, &parentIncNumber,
 		&aeID, &aeName,
 		&createdOn, &createdBy, &updatedOn, &updatedBy,
+		&agID, &agName,
 	); err != nil {
 		return domain.SearchIncidentView{}, err
 	}
@@ -506,6 +571,9 @@ func scanSearchIncidentView(row interface{ Scan(...any) error }) (domain.SearchI
 	if aeID != nil {
 		v.AssignedTo = &domain.EntityRef{ID: *aeID, Name: stringOrEmpty(aeName)}
 	}
+	if agID != nil {
+		v.AssignmentGroup = &domain.EntityRef{ID: *agID, Name: stringOrEmpty(agName)}
+	}
 	return v, nil
 }
 
@@ -529,8 +597,8 @@ func (r *incidentRepo) SearchIncidents(ctx context.Context, req domain.SearchInc
 
 	countQuery := "SELECT COUNT(*) " + incidentFromJoins + " " + where
 	dataQuery := fmt.Sprintf(
-		`SELECT %s %s %s ORDER BY %s %s, wi.id LIMIT $%d OFFSET $%d`,
-		incidentSelectColumns, incidentFromJoins, where, sortCol, sortDir, len(args)+1, len(args)+2,
+		`SELECT %s %s %s %s ORDER BY %s %s, wi.id LIMIT $%d OFFSET $%d`,
+		incidentSelectColumns, incidentFromJoins, incidentSearchGroupJoin, where, sortCol, sortDir, len(args)+1, len(args)+2,
 	)
 	dataArgs := append(append([]any{}, args...), req.Pagination.Limit, req.Pagination.Offset)
 
@@ -1256,6 +1324,38 @@ func (r *incidentRepo) CreateIncidentNotes(ctx context.Context, incidentID strin
 	})
 }
 
+// IncidentFieldChange is one field of an incident that an update changed, as it is written to
+// work_item_activity: Field is the field_name key (labelled by caseActivityFieldChangeLabel),
+// OldValue/NewValue the display values, "" when the field had or has none.
+type IncidentFieldChange struct {
+	Field    string
+	OldValue string
+	NewValue string
+}
+
+// RecordIncidentFieldChanges implements IncidentRepository.
+func (r *incidentRepo) RecordIncidentFieldChanges(ctx context.Context, incidentID string, changes []IncidentFieldChange, actorEmail string) error {
+	if len(changes) == 0 {
+		return nil
+	}
+	fields := make([]string, len(changes))
+	oldValues := make([]string, len(changes))
+	newValues := make([]string, len(changes))
+	for i, c := range changes {
+		fields[i], oldValues[i], newValues[i] = c.Field, c.OldValue, c.NewValue
+	}
+	_, err := r.db.Exec(ctx,
+		`INSERT INTO work_item_activity (id, created_on, created_by, work_item_id, field_name, old_value, new_value, user_email)
+		 SELECT gen_random_uuid(), NOW(), $1, $2::uuid, left(c.f, 255), left(c.o, 255), left(c.n, 255), $1
+		   FROM unnest($3::text[], $4::text[], $5::text[]) AS c(f, o, n)`,
+		actorEmail, incidentID, fields, oldValues, newValues,
+	)
+	if err != nil {
+		return fmt.Errorf("record incident field changes: %w", err)
+	}
+	return nil
+}
+
 // insertIncidentNotesTx inserts the non-blank work note and public comment on incidentID inside tx,
 // with createIncidentCommentQuery's own existence check: an incident that is not there is a
 // ValidationError, and rolls the whole transaction back.
@@ -1277,21 +1377,6 @@ func insertIncidentNotesTx(ctx context.Context, tx pgx.Tx, incidentID string, wo
 		if err != nil {
 			return fmt.Errorf("create incident %s: %w", strings.ToLower(string(note.kind)), err)
 		}
-	}
-	return nil
-}
-
-// insertRunbookWorkNoteTx writes the runbook note as its own work note, stamped with the clock so it sorts after the notes written earlier in the same transaction.
-func insertRunbookWorkNoteTx(ctx context.Context, tx pgx.Tx, incidentID string, note *string, createdBy string) error {
-	if note == nil || strings.TrimSpace(*note) == "" {
-		return nil
-	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO comment (id, created_on, created_by, type, work_item_id, content)
-		 VALUES (gen_random_uuid(), clock_timestamp(), $1, $2::comment_type_enum, $3, $4)`,
-		createdBy, caseCommentTypeEnum[domain.CommentTypeWorkNote], incidentID, *note,
-	); err != nil {
-		return fmt.Errorf("insert incident runbook work note: %w", err)
 	}
 	return nil
 }
@@ -1346,8 +1431,9 @@ func (r *incidentRepo) UpdateIncidentLifecycle(ctx context.Context, id string, u
 // Work notes ServiceNow's OOB "Cascade closure of Incident Tasks" writes on
 // each task it closes (incident, after insert/update, state changes to
 // Closed or Canceled; on when com.snc.incident.incident_task.closure is
-// "true", as it is on WSO2's instance). Discovery scripts 57-59 in
-// integrations/csm-flow-service/docs/servicenow-discovery have the evidence.
+// "true", as it is on WSO2's instance). Established by reading the
+// business rule on the live instance; the discovery scripts that did so
+// are kept out of this repository.
 const (
 	incidentTaskClosedOnCloseNote  = "Incident Task is Closed Incomplete based on closure of %s."
 	incidentTaskClosedOnCancelNote = "Incident Task is Closed Skipped based on cancelation of %s."
@@ -1760,9 +1846,6 @@ func (r *incidentRepo) CreateIncident(ctx context.Context, req domain.CreateInci
 				return domain.CreateIncidentResponse{}, fmt.Errorf("insert incident %s: %w", j.commentType, err)
 			}
 		}
-		if err := insertRunbookWorkNoteTx(ctx, tx, outID, req.RunbookWorkNote, createdBy); err != nil {
-			return domain.CreateIncidentResponse{}, err
-		}
 
 		resp := domain.CreateIncidentResponse{Message: "Incident created successfully."}
 		resp.Incident.ID = outID
@@ -1911,10 +1994,7 @@ func (r *incidentRepo) CreateIncidentFromServiceNow(ctx context.Context, req dom
 		).Scan(&outID, &outNumber, &outSubject, &outCreatedOn, &outUpdatedOn, &outCreatedBy); err != nil {
 			return struct{}{}, err
 		}
-		if err := insertIncidentNotesTx(ctx, tx, outID, req.WorkNotes, req.AdditionalComments, createdBy); err != nil {
-			return struct{}{}, err
-		}
-		return struct{}{}, insertRunbookWorkNoteTx(ctx, tx, outID, req.RunbookWorkNote, createdBy)
+		return struct{}{}, insertIncidentNotesTx(ctx, tx, outID, req.WorkNotes, req.AdditionalComments, createdBy)
 	})
 	if err != nil {
 		var ve *apierror.ValidationError

@@ -1,0 +1,686 @@
+openapi: 3.0.1
+info:
+  title: CSM-SF Integration API
+  version: 1.0.0
+  description: Search products, product versions, deployments and deployed products. Fronted by Choreo's
+    API Manager gateway (subscription + client credentials).
+security:
+- oauth2ClientCredentials: []
+servers:
+- url: http://localhost:8080
+  description: Local
+paths:
+  /products/search:
+    post:
+      summary: Search products
+      operationId: searchProducts
+      description: Returns a page of WSO2 products. Filters and paging go in the request body; an empty
+        body returns the first page.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchProductsRequest'
+      responses:
+        '200':
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchProductsResponse'
+        '400':
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized (upstream rejected this service's credentials)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden (upstream reported an authorization failure)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: NotFound
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: Request body too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: ServiceUnavailable (the service is temporarily unavailable)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /products/{id}/versions/search:
+    post:
+      summary: Search versions of a product
+      operationId: searchProductVersions
+      description: Returns a page of the versions of a product. Filters and paging go in the request body;
+        an empty body returns the first page.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchProductVersionsRequest'
+      responses:
+        '200':
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchProductVersionsResponse'
+        '400':
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized (upstream rejected this service's credentials)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden (upstream reported an authorization failure)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: NotFound
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: Request body too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: ServiceUnavailable (the service is temporarily unavailable)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /deployments/search:
+    post:
+      summary: Search deployments
+      operationId: searchDeployments
+      description: Returns a page of deployments. Filters and paging go in the request body; an empty
+        body returns the first page.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchDeploymentsRequest'
+      responses:
+        '200':
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchDeploymentsResponse'
+        '400':
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized (upstream rejected this service's credentials)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden (upstream reported an authorization failure)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: NotFound
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: Request body too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: ServiceUnavailable (the service is temporarily unavailable)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /deployed-products/search:
+    post:
+      summary: Search deployed products
+      operationId: searchDeployedProducts
+      description: Returns a page of deployed products. Filters and paging go in the request body; an
+        empty body returns the first page.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchDeployedProductsRequest'
+      responses:
+        '200':
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchDeployedProductsResponse'
+        '400':
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized (upstream rejected this service's credentials)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Forbidden (upstream reported an authorization failure)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: NotFound
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: Request body too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: ServiceUnavailable (the service is temporarily unavailable)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+components:
+  securitySchemes:
+    oauth2ClientCredentials:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: <token_url>
+          scopes: {}
+  schemas:
+    SearchProductsRequest:
+      type: object
+      properties:
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+        searchQuery:
+          type: string
+          description: Case-insensitive match against product name.
+        class:
+          type: string
+          enum:
+          - software
+          - service
+          description: Optional filter restricting results to a single product class. Omit to return every
+            class.
+    SearchProductsResponse:
+      type: object
+      properties:
+        products:
+          type: array
+          items:
+            $ref: '#/components/schemas/Product'
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+        hasMore:
+          type: boolean
+    Product:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        class:
+          type: string
+          enum:
+          - SOFTWARE
+          - SERVICE
+        createdOn:
+          type: string
+          format: date-time
+        updatedOn:
+          type: string
+          format: date-time
+    ErrorResponse:
+      type: object
+      properties:
+        message:
+          type: string
+    Pagination:
+      type: object
+      properties:
+        limit:
+          type: integer
+          description: Number of results per page.
+        offset:
+          type: integer
+          description: Zero-based offset into the result set.
+    SearchProductVersionsRequest:
+      type: object
+      properties:
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+        searchQuery:
+          type: string
+          description: Case-insensitive match against version string.
+        deploymentProfile:
+          type: string
+          description: Only versions with this deployment profile (e.g. "All In One"), matched case-insensitively.
+            Omit it, or send an empty string, to return every profile.
+    SearchProductVersionsResponse:
+      type: object
+      properties:
+        productVersions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProductVersion'
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+        hasMore:
+          type: boolean
+    ProductVersion:
+      type: object
+      properties:
+        id:
+          type: string
+        productId:
+          type: string
+        version:
+          type: string
+        currentSupportStatus:
+          type: string
+          enum:
+          - AVAILABLE
+          - EXTENDED
+          - DEPRECATED
+          - DISCONTINUED
+          - null
+          nullable: true
+        releaseDate:
+          type: string
+          format: date-time
+          nullable: true
+        supportEolDate:
+          type: string
+          format: date-time
+          nullable: true
+        earliestPossibleSupportEolDate:
+          type: string
+          format: date-time
+          nullable: true
+        deploymentProfile:
+          type: string
+          nullable: true
+          description: Deployment profile of this version, e.g. "All In One"; null when it has none.
+        createdOn:
+          type: string
+          format: date-time
+        updatedOn:
+          type: string
+          format: date-time
+    SearchDeploymentsRequest:
+      type: object
+      properties:
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+        searchQuery:
+          type: string
+          description: Case-insensitive match against deployment name.
+        projectIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Filter by project UUIDs.
+        deploymentTypes:
+          type: array
+          items:
+            type: string
+            enum:
+            - primary_production
+            - staging
+            - qa
+            - stress
+            - uat
+            - development
+          description: Filter by deployment types.
+        ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Filter by the deployment's own UUID.
+        includeInactive:
+          type: boolean
+          description: 'When true, also includes deactivated deployments. Omitted or false returns active
+            deployments only.
+
+            '
+        active:
+          type: boolean
+          default: true
+          description: Filter on the deployment's active state. Defaults to true (active deployments only);
+            false returns deactivated deployments only. Cannot be combined with includeInactive true (400).
+        projectSfIds:
+          type: array
+          items:
+            type: string
+          description: Only deployments of the projects whose Salesforce id is any of the given values
+            (exact, case-sensitive; empty or padded values are rejected with 400, at most 100). Combines
+            with projectIds.
+    SearchDeploymentsResponse:
+      type: object
+      properties:
+        deployments:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeploymentView'
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+        hasMore:
+          type: boolean
+    DeploymentView:
+      type: object
+      properties:
+        id:
+          type: string
+        number:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+          enum:
+          - PRIMARY_PRODUCTION
+          - STAGING
+          - QA
+          - STRESS
+          - UAT
+          - DEVELOPMENT
+        description:
+          type: string
+          nullable: true
+        project:
+          $ref: '#/components/schemas/EntityRef'
+        projectSfId:
+          type: string
+          nullable: true
+          description: Salesforce id of the deployment's project; null when the project has none.
+        active:
+          type: boolean
+          nullable: true
+          description: Whether the deployment is active.
+        createdOn:
+          type: string
+          format: date-time
+        updatedOn:
+          type: string
+          format: date-time
+        url:
+          type: string
+          nullable: true
+        deployedProductCount:
+          type: integer
+          description: Number of deployed products in this deployment.
+    EntityRef:
+      type: object
+      description: A minimal reference to another entity — id plus a display name.
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          nullable: true
+    SearchDeployedProductsRequest:
+      type: object
+      properties:
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+        deploymentIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Filter by deployment UUIDs.
+        productCategories:
+          type: array
+          items:
+            type: string
+          description: Optional filter by product category (e.g. "pdp"). Combines with deploymentIds rather
+            than replacing it. Values are matched case-insensitively against the deployed product's category
+            (e.g. "pdp" or "PDP"). The category returned on each deployed product is upper case (e.g.
+            "PDP").
+        projectSfIds:
+          type: array
+          items:
+            type: string
+          description: Only deployed products of the projects whose Salesforce id is any of the given
+            values (exact, case-sensitive; empty or padded values are rejected with 400, at most 100).
+            Combines with deploymentIds.
+        active:
+          type: boolean
+          default: true
+          description: Filter on the deployed product's active state. Defaults to true (active deployed
+            products only); false returns deactivated ones only. A product with no recorded state counts
+            as active.
+    SearchDeployedProductsResponse:
+      type: object
+      properties:
+        deployedProducts:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeployedProductView'
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+        hasMore:
+          type: boolean
+    DeployedProductDeployment:
+      type: object
+      description: The deployment a deployed product belongs to.
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          nullable: true
+        type:
+          type: string
+          nullable: true
+          description: Type of the deployment; null when it has none.
+          enum:
+          - PRIMARY_PRODUCTION
+          - STAGING
+          - QA
+          - STRESS
+          - UAT
+          - DEVELOPMENT
+          - null
+    DeployedProductView:
+      type: object
+      properties:
+        id:
+          type: string
+        deployment:
+          $ref: '#/components/schemas/DeployedProductDeployment'
+        product:
+          $ref: '#/components/schemas/ProductRef'
+        version:
+          nullable: true
+          allOf:
+          - $ref: '#/components/schemas/DeployedProductVersionRef'
+        cores:
+          type: integer
+          nullable: true
+        tps:
+          type: number
+          nullable: true
+        category:
+          type: string
+          nullable: true
+          description: Product category in upper case, e.g. "PDP".
+        projectSfId:
+          type: string
+          nullable: true
+          description: Salesforce id of the deployed product's project; null when the project has none.
+        active:
+          type: boolean
+          nullable: true
+          description: Whether the deployed product is active.
+        description:
+          type: string
+          nullable: true
+          description: 'The customer''s own note about this deployed product. Editable via the update
+            endpoint, so it is readable here too.
+
+            '
+        updates:
+          type: array
+          nullable: true
+          items:
+            $ref: '#/components/schemas/ProductUpdateEntry'
+          description: Update-level history recorded against this deployed product.
+        createdOn:
+          type: string
+          format: date-time
+        updatedOn:
+          type: string
+          format: date-time
+    ProductRef:
+      type: object
+      description: 'A reference to a product, carrying its short key alongside the display name. The short
+        key (e.g. "wso2am") is distinct from the display name (e.g. "WSO2 API Manager").
+
+        '
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        abbreviation:
+          type: string
+          nullable: true
+          description: Short product key, e.g. "wso2am". Absent when the product has none.
+      required:
+      - id
+      - name
+    DeployedProductVersionRef:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        releasedDate:
+          type: string
+          format: date-time
+          nullable: true
+        supportEoLDate:
+          type: string
+          format: date-time
+          nullable: true
+    ProductUpdateEntry:
+      type: object
+      required:
+      - updateLevel
+      - date
+      properties:
+        updateLevel:
+          type: integer
+        date:
+          type: string
+          format: date
+        details:
+          type: string
+          nullable: true

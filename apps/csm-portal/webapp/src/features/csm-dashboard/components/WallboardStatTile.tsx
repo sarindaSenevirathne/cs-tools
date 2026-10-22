@@ -17,7 +17,7 @@
 import { Box, Skeleton, Typography } from "@wso2/oxygen-ui";
 import type { JSX } from "react";
 import { Link as RouterLink } from "react-router";
-import type { BeWidgetResourceType } from "@api/backend/types";
+import type { BeDashboardDistinctByConfig, BeWidgetResourceType } from "@api/backend/types";
 import { useWallboardTileData } from "@features/csm-dashboard/api/useWallboardTileData";
 import {
   getStatTileColors,
@@ -42,6 +42,8 @@ export interface WallboardStatTileProps {
   displayName: string;
   resourceType: BeWidgetResourceType;
   filters: Record<string, unknown>;
+  /** See `UseWidgetDataOptions.distinctBy`. */
+  distinctBy?: BeDashboardDistinctByConfig;
   /** Which of the four dashboard sections this tile belongs to — the color
    * lookup is keyed by (section, displayName), not displayName alone; see
    * `wallboardMetricStyle.ts` for why. */
@@ -75,6 +77,7 @@ export default function WallboardStatTile({
   displayName,
   resourceType,
   filters,
+  distinctBy,
   section,
   variant = "primary",
   valueLabelGap = 0.6,
@@ -88,6 +91,7 @@ export default function WallboardStatTile({
     displayName,
     resourceType,
     filters,
+    distinctBy,
     selectedTeamCreGroupId,
     selectedTeamSreGroupId,
     selectedTeamLabel,

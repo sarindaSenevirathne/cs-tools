@@ -956,6 +956,58 @@ describe("CsmChangeRequestDetailPage — Edit dialog error wiring", () => {
   });
 });
 
+describe("CsmChangeRequestDetailPage — while the edit form is open", () => {
+  const closeEdit = (): void => {
+    const [props] = editChangeRequestDialogMock.mock.calls.at(-1)! as [{ onClose: () => void }];
+    act(() => props.onClose());
+  };
+
+  it("holds the lifecycle actions back with the reason until the edit is saved or cancelled", () => {
+    mockQueryResult({ data: { ...BASE_CR, legalNextStates: ["assess", "canceled"] } });
+    renderPage();
+    expect(screen.getByRole("button", { name: /request approval/i })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
+    // Request Approval would freeze the project the open form may still be changing.
+    expect(screen.getByLabelText("Request Approval: Save or cancel the edit first.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /request approval/i })).toBeDisabled();
+    openStateMenu();
+    expect(screen.getByRole("menuitem", { name: /cancel change: save or cancel the edit first\./i })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+
+    closeEdit();
+    expect(screen.getByRole("button", { name: /request approval/i })).toBeEnabled();
+  });
+
+  it("keeps a reply being written (the same composer, not a fresh one) when the form opens and closes", () => {
+    mockQueryResult({ data: BASE_CR });
+    // The composer logs through the app's logger.
+    render(
+      <LoggerProvider>
+        <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+          <MemoryRouter initialEntries={["/operations/change-requests/chg-1?tab=comments"]}>
+            <Routes>
+              <Route path="/operations/change-requests/:id" element={<CsmChangeRequestDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>
+      </LoggerProvider>,
+    );
+    fireEvent.click(screen.getByText("Add a comment…"));
+    const composer = screen.getByText("Reply");
+
+    fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
+    expect(screen.queryByText("Reply")).not.toBeVisible();
+
+    closeEdit();
+    expect(screen.getByText("Reply")).toBe(composer);
+    expect(screen.getByText("Reply")).toBeVisible();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Lifecycle transitions. `ChangeRequestActionBar` is exercised in isolation by
 // its own test; these cover this page's half of the contract — which patch

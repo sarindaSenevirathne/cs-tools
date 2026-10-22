@@ -63,6 +63,14 @@ export function useHandOffIncident(): UseMutationResult<
         queryKey: [ApiQueryKeys.INCIDENT_DETAILS, variables.incidentId],
       });
       void queryClient.invalidateQueries({ queryKey: [ApiQueryKeys.INCIDENTS] });
+      // The handoff records its group/assignee change in the activity feed
+      // and writes two work notes (the reason, and the escalation notice).
+      void queryClient.invalidateQueries({
+        queryKey: [ApiQueryKeys.INCIDENT_ACTIVITIES, variables.incidentId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: [ApiQueryKeys.INCIDENT_COMMENTS, variables.incidentId],
+      });
     },
   });
 }

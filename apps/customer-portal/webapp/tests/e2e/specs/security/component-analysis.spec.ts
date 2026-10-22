@@ -21,19 +21,17 @@
 // Read-only throughout — this tab creates nothing, so unlike the rest of the
 // security suite these tests leave no permanent records and are safe to re-run.
 //
-// ⚠️ The thing to know before changing anything here: this table is entirely
-// CLIENT-side. ProductVulnerabilitiesTable fetches the whole dataset once
-// (POST /product-vulnerabilities/search with a fetch-all request) and then
-// narrows it in a `useMemo` for search, filters and pagination alike. So:
+// Search, filters and paging are all SERVER-side: ProductVulnerabilitiesTable
+// issues POST /products/vulnerabilities/search for one page (at most 50 rows)
+// on every change, and the footer's total is the response's `totalRecords`. So:
 //
-//   - typing in the search box issues NO request, and a test that waits for one
-//     hangs until it times out;
-//   - the search input is debounced, so a count read immediately after typing
-//     is a count of the PREVIOUS state, which presents as a search that matched
-//     everything;
-//   - pagination is client-side at ten rows a page, so counting rendered rows
-//     measures the page, not the result set. Narrowing is asserted against the
-//     footer's "1-10 of 1265" total instead.
+//   - every search, filter or Clear Filters step waits for its search response
+//     (SecurityCenterPage.waitForComponentSearch) and reads the total from it;
+//   - the search input is debounced, so the request follows typing by a moment;
+//   - a step that leaves the request unchanged (typing the text already in the
+//     box) issues nothing, so it must not be waited on;
+//   - rendered rows are one page, never the result set, so narrowing is
+//     asserted on the total, and row contents on the rows of that page.
 //
 // The tab is gated on the `hasComponentAnalysis` project feature, so it does
 // not exist for every project — hence the skip rather than a hard failure.
@@ -126,8 +124,7 @@ test.describe("Security Center — Component Analysis", () => {
 
     // Clearing restores the full set, which proves the narrowing was the search
     // and not the data having changed underneath.
-    await security.clearComponentSearch();
-    const restored = await security.searchComponents("");
+    const restored = await security.clearComponentSearch();
     expect(restored).toBe(total);
 
     console.log(
@@ -169,7 +166,8 @@ test.describe("Security Center — Component Analysis", () => {
       "Product filter offers no values beyond its All option.",
     );
 
-    const filtered = await security.searchComponents("");
+    // The total the server reported after the filter was applied.
+    const filtered = chosen!.total;
 
     // Every row on the page must actually be the product that was selected.
     // This is the assertion that a filter is doing its job — a count that merely
@@ -200,10 +198,7 @@ test.describe("Security Center — Component Analysis", () => {
 
     // Clear Filters must restore the full set. This is the half of filtering
     // that users actually get stuck on, and it is cheap to assert.
-    await page
-      .getByRole("button", { name: components.clearFiltersButton })
-      .click();
-    const restored = await security.searchComponents("");
+    const restored = await security.clearComponentFilters();
     expect(restored).toBe(total);
 
     console.log(

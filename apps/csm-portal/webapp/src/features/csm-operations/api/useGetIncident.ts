@@ -30,10 +30,28 @@ export function useGetIncident(
   const api = useBackendApi();
 
   return useQuery<BeIncidentDetail | null, Error>({
-    queryKey: [ApiQueryKeys.INCIDENT_DETAILS, id ?? ""],
-    queryFn: (): Promise<BeIncidentDetail | null> =>
-      api.get<BeIncidentDetail>(`/incidents/${encodeURIComponent(id as string)}`),
+    ...incidentDetailQuery(api, id ?? ""),
     enabled: !!id,
-    staleTime: 30_000,
   });
+}
+
+/**
+ * The detail query of one incident, shared by the detail page and by the list's
+ * bulk edit (which reads each selected incident's watch list to add or remove
+ * people), so they share one cache entry.
+ */
+export function incidentDetailQuery(
+  api: Pick<ReturnType<typeof useBackendApi>, "get">,
+  id: string,
+): {
+  queryKey: readonly [string, string];
+  queryFn: () => Promise<BeIncidentDetail | null>;
+  staleTime: number;
+} {
+  return {
+    queryKey: [ApiQueryKeys.INCIDENT_DETAILS, id] as const,
+    queryFn: (): Promise<BeIncidentDetail | null> =>
+      api.get<BeIncidentDetail>(`/incidents/${encodeURIComponent(id)}`),
+    staleTime: 30_000,
+  };
 }

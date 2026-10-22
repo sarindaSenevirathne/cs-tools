@@ -27,6 +27,7 @@ import (
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/auth"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
 )
 
 // fakeScheduleRepo records what the service asked it for, so a test can assert
@@ -77,6 +78,8 @@ type fakeScheduleRepo struct {
 	gotKindFamily  *string
 	gotKindAllowed []string
 	markers        []domain.ScheduleEditMarker
+	// gotImport is the write an import handed the repository, nil until one does.
+	gotImport *repository.RotaImportWrite
 }
 
 func (f *fakeScheduleRepo) AssignmentByID(context.Context, string) (domain.ScheduleAssignment, error) {
@@ -123,6 +126,18 @@ func (f *fakeScheduleRepo) ApplyRange(_ context.Context, req domain.ApplySchedul
 func (f *fakeScheduleRepo) ApplyAbsence(_ context.Context, req domain.ApplyScheduleAbsenceRequest, actor string) (domain.ApplyScheduleAbsenceResponse, error) {
 	f.called, f.gotActorEml, f.gotAbsence = true, actor, req
 	return domain.ApplyScheduleAbsenceResponse{Created: 1}, f.err
+}
+
+func (f *fakeScheduleRepo) ImportRota(_ context.Context, w repository.RotaImportWrite, actor string) (repository.RotaImportResult, error) {
+	f.called, f.gotActorEml, f.gotImport = true, actor, &w
+	res := repository.RotaImportResult{}
+	for range w.Assignments {
+		res.Assignments = append(res.Assignments, domain.ApplyScheduleRangeResponse{Applied: 1, SkippedDates: []string{}})
+	}
+	for range w.Absences {
+		res.Absences = append(res.Absences, domain.ApplyScheduleAbsenceResponse{Created: 1})
+	}
+	return res, f.err
 }
 
 func (f *fakeScheduleRepo) AbsenceByID(_ context.Context, id string) (domain.ScheduleAbsence, error) {

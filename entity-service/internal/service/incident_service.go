@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
@@ -325,7 +326,9 @@ func parseIncidentFieldFiltersPostgres(f domain.SearchIncidentsFilters, now time
 			if err := validateUUIDs("filters: assignmentGroupId", f.Values); err != nil {
 				return nil, nil, nil, nil, nil, nil, nil, nil, err
 			}
-			// Accepted, validated, but never applied -- no backing column.
+			// Applied by parseIncidentListFiltersPostgres.
+		case "category", "updatedOn":
+			// Parsed and applied by parseIncidentListFiltersPostgres.
 		case "businessServiceId":
 			if f.Op != "in" {
 				return nil, nil, nil, nil, nil, nil, nil, nil, badIncidentFilterCombo(f)
@@ -431,6 +434,60 @@ func parseIncidentFieldFiltersPostgres(f domain.SearchIncidentsFilters, now time
 	return priorities, states, serviceIDs, assignedUserIDs, madeSla, slaViolated, createdStartDate, createdEndDate, nil
 }
 
+// parseIncidentListFiltersPostgres parses the incident list filters this data
+// source applies beyond parseIncidentFieldFiltersPostgres's tuple -- the
+// assignment group (work_item.assignment_group_id), the category and the
+// last-updated window -- into the request's internal fields, where
+// incidentWhereClause reads them. The ServiceNow data source does not take
+// "category" / "updatedOn" (ParseIncidentFieldFilters rejects them there).
+func parseIncidentListFiltersPostgres(f *domain.SearchIncidentsFilters, now time.Time) error {
+	for _, ff := range f.Filters {
+		switch ff.Field {
+		case "assignmentGroupId":
+			if ff.Op != "in" {
+				return badIncidentFilterCombo(ff)
+			}
+			if err := requireIncidentFilterValues(ff); err != nil {
+				return err
+			}
+			if err := validateUUIDs("filters: assignmentGroupId", ff.Values); err != nil {
+				return err
+			}
+			f.AssignmentGroupIDs = append(f.AssignmentGroupIDs, ff.Values...)
+		case "category":
+			if ff.Op != "in" {
+				return badIncidentFilterCombo(ff)
+			}
+			if err := requireIncidentFilterValues(ff); err != nil {
+				return err
+			}
+			for _, v := range ff.Values {
+				f.Categories = append(f.Categories, strings.ToUpper(strings.TrimSpace(v)))
+			}
+		case "updatedOn":
+			if err := requireIncidentFilterValues(ff); err != nil {
+				return err
+			}
+			t, err := parseIncidentFilterDate(ff, ff.Values[0], now)
+			if err != nil {
+				return err
+			}
+			switch ff.Op {
+			case "gte":
+				f.UpdatedStart = t
+			case "lte":
+				f.UpdatedEnd = t
+			default:
+				return badIncidentFilterCombo(ff)
+			}
+		}
+	}
+	if f.UpdatedStart != nil && f.UpdatedEnd != nil && f.UpdatedEnd.Before(*f.UpdatedStart) {
+		return &apierror.ValidationError{Msg: "filters: updatedOn lte bound must not be before its gte bound"}
+	}
+	return nil
+}
+
 // appendUniqueString appends v to list unless it is already there.
 func appendUniqueString(list []string, v string) []string {
 	for _, existing := range list {
@@ -457,8 +514,6 @@ func intersectStrings(a, b []string) []string {
 
 type incidentService struct {
 	repo repository.IncidentRepository
-	// runbooks is the runbook catalog a new incident's work note is looked up in; nil leaves it out. Set with WithRunbookCatalog.
-	runbooks runbookLister
 	// userRepo is nil in every mode except DATA_SOURCE=postgres-servicenow-dual-write
 	// -- only needed there, to resolve UpdateIncident's caller identity for
 	// comment.created_by (see resolveActor).
@@ -516,6 +571,15 @@ type incidentService struct {
 	// (NewIncidentServiceWithPublisher, NewIncidentServiceWithSNMirror). NewIncidentService stays
 	// read-only for updates whatever it is given.
 	updatable bool
+	// slaSearchDelegate: see slaDelegate. When set (SLA_DATA_SOURCE=servicenow),
+	// an SLA-shaped search or aggregate is answered by it instead of the
+	// Postgres sla_live-backed query, exactly as caseService does.
+	slaSearchDelegate slaDelegate[IncidentService]
+}
+
+// setSLADelegate implements slaDelegateAcceptor[IncidentService].
+func (s *incidentService) setSLADelegate(delegate IncidentService) {
+	s.slaSearchDelegate = slaDelegate[IncidentService]{backend: delegate, set: delegate != nil}
 }
 
 // NewIncidentService constructs an IncidentService backed by Postgres.
@@ -613,6 +677,22 @@ func (s *incidentService) SearchIncidents(ctx context.Context, req domain.Search
 	if err != nil {
 		return domain.SearchIncidentsResponse{}, err
 	}
+	if err := parseIncidentListFiltersPostgres(&req.Filters, time.Now().UTC()); err != nil {
+		return domain.SearchIncidentsResponse{}, err
+	}
+	if err := parseIncidentAnyOfPostgres(&req.Filters); err != nil {
+		return domain.SearchIncidentsResponse{}, err
+	}
+
+	slaViolated, taskSLA, err := incidentSLAFilters(req.Filters.Filters, slaViolated)
+	if err != nil {
+		return domain.SearchIncidentsResponse{}, err
+	}
+	// Incident search has no caller scoping (every caller is internal).
+	if delegate, ok := s.slaSearchDelegate.route(true, slaViolated != nil || taskSLA != nil); ok {
+		return delegate.SearchIncidents(ctx, req)
+	}
+	req.Filters.ParsedTaskSLA = taskSLA
 
 	views, total, err := s.repo.SearchIncidents(ctx, req, priorities, states, serviceIDs, assignedUserIDs, madeSla, slaViolated, createdStart, createdEnd)
 	if err != nil {
@@ -637,8 +717,22 @@ func (s *incidentService) AggregateIncidents(ctx context.Context, req domain.Agg
 	if err != nil {
 		return domain.AggregateResponse{}, err
 	}
+	if err := parseIncidentListFiltersPostgres(&req.Filters, time.Now().UTC()); err != nil {
+		return domain.AggregateResponse{}, err
+	}
+	if err := parseIncidentAnyOfPostgres(&req.Filters); err != nil {
+		return domain.AggregateResponse{}, err
+	}
 
+	slaViolated, taskSLA, err := incidentSLAFilters(req.Filters.Filters, slaViolated)
+	if err != nil {
+		return domain.AggregateResponse{}, err
+	}
+	if delegate, ok := s.slaSearchDelegate.route(true, slaViolated != nil || taskSLA != nil); ok {
+		return delegate.AggregateIncidents(ctx, req)
+	}
 	searchReq := domain.SearchIncidentsRequest{Filters: req.Filters}
+	searchReq.Filters.ParsedTaskSLA = taskSLA
 	return s.repo.AggregateIncidents(ctx, searchReq, priorities, states, serviceIDs, assignedUserIDs, madeSla, slaViolated, createdStart, createdEnd, req.GroupBy, req.MaxGroups)
 }
 
@@ -669,6 +763,8 @@ func (s *incidentService) SearchIncidentActivities(ctx context.Context, req doma
 		Total:    total,
 		Limit:    req.Pagination.Limit,
 		Offset:   req.Pagination.Offset,
+		// The webapp pages until hasMore is false; without it a feed stopped at its first page.
+		HasMore: req.Pagination.Offset+len(activity) < total,
 	}, nil
 }
 
@@ -687,7 +783,6 @@ func (s *incidentService) CreateIncident(ctx context.Context, req domain.CreateI
 		return domain.CreateIncidentResponse{}, err
 	}
 	req = withAssignmentGroup(req, decision)
-	req = withRunbookNote(ctx, req, s.runbooks)
 	if s.snMirror != nil {
 		// ConfigurationItemID has no backing column on this data source at
 		// all (unlike Subcategory/AssignedEngineerID/WatchList/
@@ -956,15 +1051,15 @@ func (s *incidentService) UpdateIncident(ctx context.Context, req domain.UpdateI
 		return domain.UpdateIncidentResponse{}, err
 	}
 
-	// The incident before this change, so a claim or a move out of NEW can be told apart from a
-	// re-send of what it already had (publishIncidentStopSignals). Read only when one could follow.
+	// The incident before this change: the activity feed records what each field was, and a claim
+	// or a move out of NEW is told apart from a re-send of what it already had
+	// (publishIncidentStopSignals). Read whenever the request changes a field; notes alone need it not.
 	var before domain.IncidentView
-	if (s.eventPublisher != nil && (req.State != nil || req.AssignedEngineerID != nil)) ||
-		(s.workaroundProblems != nil && req.State != nil) {
+	if hasLifecycle || hasRecord {
 		if b, err := s.repo.GetIncidentByID(ctx, req.ID); err == nil {
 			before = b
 		} else {
-			slog.WarnContext(ctx, "update incident: could not read the incident before the change; no stop signal will be sent",
+			slog.WarnContext(ctx, "update incident: could not read the incident before the change; no stop signal or activity entry will be written",
 				"incidentId", req.ID, "error", err)
 		}
 	}
@@ -988,6 +1083,7 @@ func (s *incidentService) UpdateIncident(ctx context.Context, req domain.UpdateI
 		return domain.UpdateIncidentResponse{}, err
 	}
 	publishIncidentStopSignals(ctx, s.eventPublisher, req, before, view)
+	s.recordIncidentFieldChanges(ctx, req, before, view, actor.Email)
 
 	// Dual-write: a resolve with a workaround creates its problem in both stores.
 	problemID := s.createWorkaroundProblem(ctx, req, before, view)

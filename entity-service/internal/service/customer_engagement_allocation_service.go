@@ -209,12 +209,12 @@ func (s *customerEngagementAllocationService) findOrCreateEngagement(ctx context
 		return "", false, reason, err
 	}
 	id, created, err := store.InsertEngagement(ctx, domain.NewCustomerEngagement{
-		EngagementID:     in.engagementID,
-		EngagementCode:   in.engagementCode,
-		Name:             allocTruncate(engagementName(in.customerName, in.allocationTypeName), 200),
-		AccountID:        accountID,
-		IsPaid:           strings.TrimSpace(in.engagement.EngagementTypeName) == "Paid",
-		DeliveryMode:     deliveryModeFromNature(in.engagement.EngagementNature),
+		EngagementID:   in.engagementID,
+		EngagementCode: in.engagementCode,
+		Name:           allocTruncate(engagementName(in.customerName, in.allocationTypeName), 200),
+		AccountID:      accountID,
+		IsPaid:         strings.TrimSpace(in.engagement.EngagementTypeName) == "Paid",
+		DeliveryMode:   deliveryModeFromNature(in.engagement.EngagementNature),
 		// This path only ever creates a Firefighting engagement (gated above on
 		// s.firefightingTypeID, the feature's on/off switch -- a configured
 		// ServiceNow sys_id, never the value written here); the label is fixed.

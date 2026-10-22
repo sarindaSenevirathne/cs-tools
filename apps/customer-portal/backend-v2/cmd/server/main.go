@@ -162,6 +162,15 @@ func main() {
 	// grants admin privileges for registry-token and contact management.
 	adminRole := mustEnv("AUTH_ADMIN_ROLE")
 
+	// internalWriteGroups are the JWT "groups" claim values that let an
+	// INTERNAL-type caller (entity-service's own user_type) reach a write
+	// path in this portal -- optional, and deliberately so: unset/empty means
+	// the gate is off, so every INTERNAL caller keeps full write access, the
+	// same as before this gate existed. Set it only once the real
+	// write-access group is known; until then this must not block startup or
+	// change behavior. See middleware.CachedRoleResolver.IsInternalWriteBlocked.
+	internalWriteGroups := splitComma(os.Getenv("AUTH_INTERNAL_WRITE_GROUPS"))
+
 	authCfg := middleware.Config{
 		JWKSEndpoint:          mustURL("AUTH_JWKS_ENDPOINT", "http", "https"),
 		Issuer:                mustEnv("AUTH_ISSUER"),
@@ -191,7 +200,7 @@ func main() {
 		slog.Info("CSM_MIGRATION_PORTAL_CONTACTS_ENABLED=true; project contacts are read from the CSM database and written through the entity service")
 	}
 
-	userHandler := handler.NewUserHandler(entityClient, scimClient, csmMigrationFirstAccess)
+	userHandler := handler.NewUserHandler(entityClient, scimClient, csmMigrationFirstAccess, internalWriteGroups)
 	projectHandler := handler.NewProjectHandler(entityClient)
 	projectStatsHandler := handler.NewProjectStatsHandler(entityClient)
 	caseHandler := handler.NewCaseHandler(entityClient)
@@ -213,7 +222,7 @@ func main() {
 	instanceHandler := handler.NewInstanceHandler(entityClient)
 	registryHandler := handler.NewRegistryHandler(entityClient, registryClient, adminRole)
 	contactHandler := handler.NewContactHandler(entityClient, userManagementClient, entityClient, csmMigrationPortalContacts)
-	roleResolver := middleware.NewCachedRoleResolver(entityClient, 5*time.Minute)
+	roleResolver := middleware.NewCachedRoleResolver(entityClient, 5*time.Minute).WithInternalWriteGroups(internalWriteGroups)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {

@@ -118,6 +118,7 @@ const PROJECT_ONBOARDING_STATUS_PRESENTATION: Record<string, ProjectOnboardingSt
   Expired: { label: "Expired", severity: "warning" },
   Cancelled: { label: "Cancelled", severity: "default" },
   OnHold: { label: "On Hold", severity: "warning" },
+  "On-Hold": { label: "On Hold", severity: "warning" },
 };
 
 /**

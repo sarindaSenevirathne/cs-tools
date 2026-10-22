@@ -104,19 +104,19 @@ type caseService struct {
 	// unless wired via WithCaseTypeTransfer, in which case a request carrying a
 	// type is refused as it was before the transfer existed.
 	typeTransfer repository.CaseTypeTransferRepository
-	// slaSearchDelegate, when non-nil, is a ServiceNow-backed CaseService
+	// slaSearchDelegate, when set, is a ServiceNow-backed CaseService
 	// SearchCases forwards an entire search to -- instead of running its own
 	// Postgres sla_live-backed query -- whenever the request carries an
 	// SLA-shaped filter (taskSLABusinessElapsedPercent/slaBreached) and the
 	// caller is internal. Wired via WithSLASearchDelegate only when
-	// config.SLADataSource is servicenow; nil otherwise, in which case
+	// config.SLADataSource is servicenow; unset otherwise, in which case
 	// SearchCases behaves exactly as before this field existed. Deliberately
 	// a separate field from snMirror above, not a reuse of it: snMirror
 	// carries dual-write's write-mirroring semantics (nil publisher/slaEngine
 	// to avoid side effects, asynchronous PATCH/comment mirroring) that must
 	// not apply here, and this is wanted under plain DATA_SOURCE=postgres too,
 	// where snMirror is never set at all.
-	slaSearchDelegate CaseService
+	slaSearchDelegate slaDelegate[CaseService]
 	// volumeTrendCache backs CaseVolumeTrend's per-day caching (see that
 	// method's own doc comment) -- wired via WithCaseVolumeTrendCache,
 	// which routes.go always calls with either a Redis-backed or an
@@ -145,23 +145,16 @@ func WithSRNotices(svc CaseService, n *SRNoticeService) CaseService {
 	return svc
 }
 
-// WithSLASearchDelegate attaches a ServiceNow-backed CaseService that
-// SearchCases forwards to for SLA-filtered searches -- see
-// caseService.slaSearchDelegate's own doc comment for the full reasoning.
-// There is no narrower ServiceNow endpoint that answers "which case ids
-// match this SLA condition alone" (only the full case-search endpoint
-// already forwards taskSLAFilter/slaBreached to ServiceNow's own CaseUtils),
-// so the whole search is delegated wholesale rather than merging partial
-// result sets; snDelegate's own SearchCases already converts every id back
-// to the same UUID shape the Postgres path returns (every sn_*.go response
-// does this), so the response is indistinguishable in shape from the
-// Postgres path's own. A no-op if svc is not a *caseService -- defensive;
-// every real construction path is.
-func WithSLASearchDelegate(svc CaseService, snDelegate CaseService) CaseService {
-	if cs, ok := svc.(*caseService); ok {
-		cs.slaSearchDelegate = snDelegate
-	}
-	return svc
+// setSLADelegate implements slaDelegateAcceptor[CaseService]; see
+// WithSLASearchDelegate (sla_filters.go) and slaSearchDelegate above for the
+// routing contract. There is no narrower ServiceNow endpoint that answers
+// "which case ids match this SLA condition alone" (only the full case-search
+// endpoint already forwards taskSLAFilter/slaBreached to ServiceNow's own
+// CaseUtils), so the whole search is delegated wholesale rather than merging
+// partial result sets; the delegate's own SearchCases already converts every
+// id back to the same UUID shape the Postgres path returns.
+func (s *caseService) setSLADelegate(delegate CaseService) {
+	s.slaSearchDelegate = slaDelegate[CaseService]{backend: delegate, set: delegate != nil}
 }
 
 // WithProductCategoryEnforcement attaches the optional project-type
@@ -2720,6 +2713,15 @@ func (s *caseService) updateCaseMarkFixIssued(ctx context.Context, req domain.Up
 		return domain.UpdateCaseResponse{}, err
 	}
 
+	// resolveActorOrM2M so the integration that marks a fix released (an M2M
+	// caller with no end-user token) is still attributed, to its client id.
+	// Best-effort: an unresolvable caller just skips the entry.
+	if !alreadySet {
+		if actor, err := s.resolveActorOrM2M(ctx); err == nil {
+			s.recordFieldChangeActivity(ctx, req.ID, "fix_issued_on", "", fixIssued.UTC().Format(time.RFC3339), actor.Email)
+		}
+	}
+
 	if !alreadySet && s.snWriteback != nil {
 		if patcher, ok := s.snMirror.(snFieldPatcher); ok {
 			markFixIssued := true
@@ -3004,10 +3006,24 @@ func (s *caseService) updateCaseFields(ctx context.Context, req domain.UpdateCas
 		return domain.UpdateCaseResponse{}, &apierror.ValidationError{Msg: "workaroundProvided requires an authenticated end-user caller: a pure M2M caller has no user record to attribute it to"}
 	}
 
+	// The prior workaround stamp is read only for a workaround change: the
+	// recall entry needs it. A failed read is logged and never fails the
+	// update.
+	var prevWorkaround *time.Time
+	if req.WorkaroundProvided != nil {
+		if t, err := s.repo.GetCaseWorkaroundProvidedOn(ctx, req.ID); err != nil {
+			slog.ErrorContext(ctx, "update case: read prior workaround stamp for activity entry failed", "caseId", req.ID, "error", err)
+		} else {
+			prevWorkaround = t
+		}
+	}
+
 	updatedOn, err := s.repo.UpdateCaseFields(ctx, req, actor.ID, actor.Email)
 	if err != nil {
 		return domain.UpdateCaseResponse{}, err
 	}
+
+	s.recordCaseFieldsActivity(ctx, req, prevWorkaround, updatedOn, actor.Email)
 
 	// Deliberately independent of s.publisher (never touches Event Hub) --
 	// same reasoning every other SLAEngineService call site in this file
@@ -3101,6 +3117,25 @@ func (s *caseService) updateCaseFields(ctx context.Context, req domain.UpdateCas
 	resp.MostLikelyFixEta = req.MostLikelyFixEta
 	resp.WorstCaseFixEta = req.WorstCaseFixEta
 	return domain.UpdateCaseResponse{Message: "Case updated successfully", Case: resp}, nil
+}
+
+// recordCaseFieldsActivity logs the activity-feed entry for updateCaseFields'
+// workaround field: set stores the new timestamp, recall stores the prior one
+// as old (and nothing when it was not set), which the feed renders as a
+// date-time.
+func (s *caseService) recordCaseFieldsActivity(ctx context.Context, req domain.UpdateCaseRequest, prevOn *time.Time, updatedOn time.Time, actorEmail string) {
+	if req.WorkaroundProvided == nil {
+		return
+	}
+	var prev string
+	if prevOn != nil {
+		prev = prevOn.UTC().Format(time.RFC3339)
+	}
+	if *req.WorkaroundProvided {
+		s.recordFieldChangeActivity(ctx, req.ID, "workaround_provided_on", prev, updatedOn.UTC().Format(time.RFC3339), actorEmail)
+	} else if prev != "" {
+		s.recordFieldChangeActivity(ctx, req.ID, "workaround_provided_on", prev, "", actorEmail)
+	}
 }
 
 // validateCaseFieldValues rejects malformed ids and unknown enum spellings in the
@@ -3235,13 +3270,10 @@ func prepareCaseSearchFilters(ctx context.Context, req domain.SearchCasesRequest
 	// escalations lookup returned every case in the system). Fixed by wiring
 	// it into caseFieldPredicates like ProjectIDs' own identical shape;
 	// accountId+notIn stays rejected below rather than silently dropping the
-	// exclusion and widening the result set -- nothing has asked for it yet.
-	if len(parsed.ExcludeAccountIDs) > 0 {
-		return domain.SearchCasesRequest{}, &apierror.ValidationError{Msg: `field "accountId" (notIn) is not supported by this data source`}
-	}
-	if parsed.Unassigned {
-		return domain.SearchCasesRequest{}, &apierror.ValidationError{Msg: `field "assignedUserId" (isEmpty) is not supported by this data source`}
-	}
+	// exclusion and widening the result set -- until the SR list's Advanced
+	// "Customer is not one of" asked for it, and it was wired in too.
+	// accountId+notIn and assignedUserId+isEmpty are applied by
+	// caseRepo.SearchCases (top level only; both are refused inside anyOf).
 	if parsed.ResolutionNotesEmpty {
 		return domain.SearchCasesRequest{}, &apierror.ValidationError{Msg: `field "resolutionNotes" is not supported by this data source`}
 	}
@@ -3303,9 +3335,9 @@ func (s *caseService) SearchCases(ctx context.Context, req domain.SearchCasesReq
 	// callers only, so a customer-portal-scoped caller keeps this data
 	// source's own row-level security regardless of the SLA toggle. See
 	// WithSLASearchDelegate's own doc comment.
-	if s.slaSearchDelegate != nil && scope.Unrestricted &&
-		(req.Parsed.TaskSLAFilter != nil || req.Parsed.HasBreachedSLA != nil) {
-		return s.slaSearchDelegate.SearchCases(ctx, req)
+	if delegate, ok := s.slaSearchDelegate.route(scope.Unrestricted,
+		req.Parsed.TaskSLAFilter != nil || req.Parsed.HasBreachedSLA != nil); ok {
+		return delegate.SearchCases(ctx, req)
 	}
 
 	cases, total, err := s.repo.SearchCases(ctx, req, scope)

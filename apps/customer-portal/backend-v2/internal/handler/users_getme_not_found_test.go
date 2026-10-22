@@ -51,7 +51,7 @@ func (notFoundUserClient) RegisterInvitedMemberships(context.Context) error {
 // nothing to render and no 403 state to fall into, spinning forever instead.
 // GetMe now maps it to the same 403 the UI already knows how to show.
 func TestGetMe_UpstreamNotFoundMapsToForbidden(t *testing.T) {
-	h := NewUserHandler(notFoundUserClient{}, noopSCIMUserClient{}, false)
+	h := NewUserHandler(notFoundUserClient{}, noopSCIMUserClient{}, false, nil)
 
 	rec := httptest.NewRecorder()
 	h.GetMe(rec, getMeRequest())

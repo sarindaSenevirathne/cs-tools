@@ -30,13 +30,16 @@ import {
   Typography,
 } from "@wso2/oxygen-ui";
 import { ChevronDown, ChevronUp, ListFilter, Search, X } from "@wso2/oxygen-ui-icons-react";
-import { useMemo, type JSX } from "react";
+import { useMemo, useState, type JSX } from "react";
 import type { BeIncidentPriority } from "@api/backend/types";
 import { useTeams } from "@features/csm-dashboard/api/useTeams";
 import {
   countActiveIncidentFilters,
   incidentPriorityLabel,
+  incidentStateLabel,
+  INCIDENT_FILTER_CATEGORIES,
   INCIDENT_PRIORITIES,
+  INCIDENT_STATES,
   type IncidentFilters,
 } from "@features/csm-operations/utils/incidents";
 import {
@@ -46,6 +49,19 @@ import {
 import IncidentProductMultiSelect from "@features/csm-operations/components/IncidentProductMultiSelect";
 import SavedViewsMenu from "@features/csm-operations/components/SavedViewsMenu";
 import MultiSelectField from "@components/MultiSelectField";
+import OperationsAdvancedFilters from "@features/csm-operations/components/OperationsAdvancedFilters";
+import {
+  countAdvancedRows,
+  dateAdvancedField,
+  multiAdvancedField,
+  yesAdvancedField,
+  type OperationsAdvancedField,
+} from "@features/csm-operations/utils/operationsAdvancedFields";
+import OperationsAnyOfGroups, { type AnyOfFieldDef } from "@features/csm-operations/components/OperationsAnyOfGroups";
+import { completeAnyOfGroups } from "@features/csm-operations/utils/operationsAnyOf";
+import AsyncEntityMultiSelect from "@components/AsyncEntityMultiSelect";
+import { useSearchItServices } from "@api/useSearchItServices";
+import AsyncAssignedUserIdMultiSelect from "@features/csm-cases/components/AsyncAssignedUserIdMultiSelect";
 
 const { DatePicker, LocalizationProvider } = DatePickers;
 
@@ -90,10 +106,11 @@ interface IncidentsFilterBarProps {
 }
 
 /**
- * Search + filters bar for the Incidents tab: priority, product, SRE team,
- * SLA-violated, and created date range (see `IncidentSearchPayload.filters` in
- * openapi.yaml — there's still no server-side state/category filter to build
- * a control for). The created-date bounds are inclusive and interpreted in
+ * Search + filters bar for the Incidents tab: state, priority, category,
+ * service, assignee, product, SRE team, SLA-violated, and the created and
+ * updated date ranges (see `IncidentSearchPayload.filters` in openapi.yaml).
+ * Category and the updated range are PostgreSQL-only on the backend. The
+ * created-date bounds are inclusive and interpreted in
  * UTC by the backend, so both date fields are labelled "(UTC)" rather than
  * silently letting a viewer in another timezone assume their own — picking
  * "1 May" here means the UTC calendar day, not midnight in the viewer's
@@ -127,7 +144,8 @@ export default function IncidentsFilterBar({
   );
 
   // SRE Team: incidents are SRE-owned, so this is scoped to the `sre-abt`
-  // team family (unlike the cases list's own "SRE Team" filter, which is
+  // team family and listed the way the cases list lists its CRE teams. It
+  // matches the record's assignment group (the team's group id) (unlike the cases list's own "SRE Team" filter, which is
   // deliberately scoped to `cre-abt` per an explicit, later-flagged-as-
   // likely-mistaken product instruction — see `CasesFilterBar.tsx`'s
   // `sreTeamOptions`. This is a fresh field on a different resource, not a
@@ -143,6 +161,113 @@ export default function IncidentsFilterBar({
         .map((t) => ({ value: t.sreGroupId, label: t.name })),
     [teams],
   );
+
+  const stateOptions = useMemo(
+    () => INCIDENT_STATES.map((st) => ({ value: st, label: incidentStateLabel(st) })),
+    [],
+  );
+  const categoryOptions = useMemo(
+    () =>
+      INCIDENT_FILTER_CATEGORIES.map((c) => ({
+        value: c,
+        label: c
+          .toLowerCase()
+          .split("_")
+          .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+          .join(" "),
+      })),
+    [],
+  );
+
+  // Value pickers shared by the Advanced rows and the OR-group conditions, so
+  // a field is chosen the same way wherever it appears.
+  const pickers = useMemo(() => {
+    type P = { id: string; values: string[]; onChange: (values: string[]) => void };
+    return {
+      state: ({ id, values, onChange: set }: P) => (
+        <MultiSelectField id={id} label="Value(s)" values={values} options={stateOptions} onChange={set} />
+      ),
+      priority: ({ id, values, onChange: set }: P) => (
+        <MultiSelectField id={id} label="Value(s)" values={values} options={priorityOptions} onChange={set} />
+      ),
+      category: ({ id, values, onChange: set }: P) => (
+        <MultiSelectField id={id} label="Value(s)" values={values} options={categoryOptions} onChange={set} />
+      ),
+      service: ({ id, values, onChange: set }: P) => (
+        <AsyncEntityMultiSelect
+          id={id}
+          label="Value(s)"
+          placeholder="Search services…"
+          values={values}
+          onChange={set}
+          useSearch={useSearchItServices}
+          getId={(svc) => svc.id}
+          getLabel={(svc) => svc.name ?? svc.id}
+          compactSelectedValues
+        />
+      ),
+      group: ({ id, values, onChange: set }: P) => (
+        <MultiSelectField id={id} label="Value(s)" values={values} options={sreTeamOptions} onChange={set} />
+      ),
+      assignee: ({ id, values, onChange: set }: P) => (
+        <AsyncAssignedUserIdMultiSelect id={id} values={values} onChange={set} />
+      ),
+    };
+  }, [stateOptions, priorityOptions, categoryOptions, sreTeamOptions]);
+
+  // Advanced offers every filter as a Field / Operator / Value row, as on the
+  // service request list; each row reads and writes the same state the quick
+  // grid does, so a filter set either way shows in both.
+  const advancedFields = useMemo<OperationsAdvancedField<IncidentFilters>[]>(
+    () => [
+      multiAdvancedField<IncidentFilters>({ key: "state", label: "State", prop: "states", render: pickers.state }),
+      multiAdvancedField<IncidentFilters>({ key: "priority", label: "Priority", prop: "priorities", render: pickers.priority }),
+      multiAdvancedField<IncidentFilters>({ key: "category", label: "Category", prop: "categories", render: pickers.category }),
+      multiAdvancedField<IncidentFilters>({ key: "service", label: "Service", prop: "serviceIds", render: pickers.service }),
+      multiAdvancedField<IncidentFilters>({ key: "group", label: "SRE Team", prop: "sreTeamIds", render: pickers.group }),
+      multiAdvancedField<IncidentFilters>({ key: "assignee", label: "Assignee", prop: "assigneeIds", render: pickers.assignee }),
+      multiAdvancedField<IncidentFilters>({
+        key: "product",
+        label: "Product",
+        prop: "products",
+        render: ({ id, values, onChange: set }) => (
+          <IncidentProductMultiSelect id={id} label="Value(s)" values={values} onChange={set} />
+        ),
+      }),
+      yesAdvancedField<IncidentFilters>({
+        key: "slaViolated",
+        label: "SLA violated",
+        prop: "slaViolated",
+        render: ({ id, values, onChange: set }) => (
+          <MultiSelectField
+            id={id}
+            label="Value"
+            values={values}
+            options={[{ value: "true", label: "Yes" }]}
+            onChange={(next) => set(next.slice(-1))}
+          />
+        ),
+      }),
+      dateAdvancedField<IncidentFilters>({ key: "created", label: "Created", from: "createdStartDate", to: "createdEndDate" }),
+      dateAdvancedField<IncidentFilters>({ key: "updated", label: "Updated", from: "updatedStartDate", to: "updatedEndDate" }),
+    ],
+    [pickers],
+  );
+  // OR-group conditions: the fields the search accepts inside a group.
+  const anyOfFields = useMemo<AnyOfFieldDef[]>(
+    () => [
+      { field: "state", label: "State", render: pickers.state },
+      { field: "priority", label: "Priority", render: pickers.priority },
+      { field: "category", label: "Category", render: pickers.category },
+      { field: "businessServiceId", label: "Service", render: pickers.service },
+      { field: "assignmentGroupId", label: "SRE Team", render: pickers.group },
+      { field: "assignedUserId", label: "Assignee", render: pickers.assignee },
+    ],
+    [pickers],
+  );
+  const advancedCount =
+    countAdvancedRows(advancedFields, filters) + completeAnyOfGroups(filters.anyOf).length;
+  const [mode, setMode] = useState<"quick" | "advanced">("quick");
 
   const handlePriorityChange = (next: BeIncidentPriority[]): void => {
     onChange({ ...filters, priorities: next });
@@ -244,7 +369,55 @@ export default function IncidentsFilterBar({
       {isFiltersOpen && (
         <>
           <Divider />
+          <Box role="group" aria-label="Filter mode" sx={{ display: "flex", alignSelf: "flex-start" }}>
+            <Button
+              size="small"
+              variant={mode === "quick" ? "contained" : "outlined"}
+              color={mode === "quick" ? "primary" : "inherit"}
+              aria-pressed={mode === "quick"}
+              onClick={() => setMode("quick")}
+              sx={{ borderTopRightRadius: 0, borderBottomRightRadius: 0 }}
+            >
+              Quick filters
+            </Button>
+            <Button
+              size="small"
+              variant={mode === "advanced" ? "contained" : "outlined"}
+              color={mode === "advanced" ? "primary" : "inherit"}
+              aria-pressed={mode === "advanced"}
+              onClick={() => setMode("advanced")}
+              sx={{ borderTopLeftRadius: 0, borderBottomLeftRadius: 0, ml: "-1px" }}
+            >
+              {advancedCount > 0 ? `Advanced (${advancedCount})` : "Advanced"}
+            </Button>
+          </Box>
+          {mode === "advanced" ? (
+            <>
+              <OperationsAdvancedFilters
+                idPrefix="incident"
+                fields={advancedFields}
+                filters={filters}
+                onChange={onChange}
+              />
+              <Divider />
+              <OperationsAnyOfGroups
+                idPrefix="incident"
+                fields={anyOfFields}
+                groups={filters.anyOf}
+                onChange={(anyOf) => onChange({ ...filters, anyOf })}
+              />
+            </>
+          ) : (
           <Grid container spacing={2}>
+            <Grid size={{ xs: 12, sm: 6, md: 4 }}>
+              <MultiSelectField
+                id="incident-filter-state"
+                label="State"
+                values={filters.states}
+                options={stateOptions}
+                onChange={(next) => onChange({ ...filters, states: next })}
+              />
+            </Grid>
             <Grid size={{ xs: 12, sm: 6, md: 4 }}>
               <MultiSelectField
                 id="incident-filter-priority"
@@ -252,6 +425,20 @@ export default function IncidentsFilterBar({
                 values={filters.priorities}
                 options={priorityOptions}
                 onChange={handlePriorityChange}
+              />
+            </Grid>
+
+            <Grid size={{ xs: 12, sm: 6, md: 4 }}>
+              <AsyncEntityMultiSelect
+                id="incident-filter-service"
+                label="Service"
+                placeholder="Search services…"
+                values={filters.serviceIds}
+                onChange={(next) => onChange({ ...filters, serviceIds: next })}
+                useSearch={useSearchItServices}
+                getId={(svc) => svc.id}
+                getLabel={(svc) => svc.name ?? svc.id}
+                compactSelectedValues
               />
             </Grid>
 
@@ -320,6 +507,7 @@ export default function IncidentsFilterBar({
               </LocalizationProvider>
             </Grid>
           </Grid>
+          )}
           {activeCount > 0 && (
             <Box sx={{ display: "flex", justifyContent: "flex-end" }}>
               <Typography variant="caption" color="text.secondary">

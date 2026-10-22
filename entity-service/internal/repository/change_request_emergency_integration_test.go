@@ -154,22 +154,22 @@ func TestChangeRequestEmergencyIntegration_BoxesAreRefusedInEveryState(t *testin
 				{"both", domain.PatchChangeRequestRequest{CustomerApprovalRequired: boolp(true), CustomerReviewRequired: boolp(true)}, []string{"customerApprovalRequired", "customerReviewRequired"}},
 			} {
 				r := req.req
-				r.Title = sp("must not be written")
+				r.OnHoldReason = sp("must not be written")
 				_, err := f.patch(id, r)
 				f.wantEmergencyRefusal(label+" "+req.what, err, req.fields...)
 				if _, _, a, rv := f.lockStored(id); a || rv {
 					t.Fatalf("%s %s: a refused PATCH left the boxes %v/%v", label, req.what, a, rv)
 				}
-				if got := f.subjectOf(id); got != crFlowSubject {
+				if got := f.holdReasonOf(id); got != "" {
 					t.Fatalf("%s %s: a refused PATCH wrote the rest of the request: %q", label, req.what, got)
 				}
 			}
 			// Turning a box off / resending the type: no change, accepted.
 			emergency := domain.ChangeRequestTypeEmergency
-			if _, err := f.patch(id, domain.PatchChangeRequestRequest{CustomerApprovalRequired: boolp(false), CustomerReviewRequired: boolp(false), Type: &emergency, Title: sp("the whole form, sent back")}); err != nil {
+			if _, err := f.patch(id, domain.PatchChangeRequestRequest{CustomerApprovalRequired: boolp(false), CustomerReviewRequired: boolp(false), Type: &emergency, Title: sp(crFlowSubject), OnHoldReason: sp("the whole form, sent back")}); err != nil {
 				t.Fatalf("%s: resending the stored values: %v", label, err)
 			}
-			if got := f.subjectOf(id); got != "the whole form, sent back" {
+			if got := f.holdReasonOf(id); got != "the whole form, sent back" {
 				t.Fatalf("%s: the rest of the resend was not written: %q", label, got)
 			}
 		}

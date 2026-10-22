@@ -14,6 +14,79 @@ HTTP server. This one isn't: `cmd/acp-closure/main.go` performs one full
 sweep and exits. A Choreo Task component's cron owns the schedule — there is
 no in-process ticker, no long-running state, no health endpoint.
 
+## Two sources: CSM for ACP's own records, Salesforce for the rest
+
+Agreed with Sajith: Salesforce data is read live from sales-entity-service
+instead of CSM's copy; ACP's own records stay on CSM; ACP writes to both
+itself (see "Writes" below). Nothing syncs CSM to Salesforce.
+
+| Read | From | How |
+|---|---|---|
+| Open-project list (CSM id, `sfId`, key, name) | CSM | `POST /projects/search` via csm-integration-service |
+| Closure states, `suspensionProcessState` | CSM | same call. Salesforce has neither ACP's sub-states nor the notices-sent record |
+| Start / end date, account (`customerId`) | Salesforce | `/projects/search {id: sfId}` |
+| Account manager, technical owner, renewal manager, classification, primary partner | Salesforce | `/customer-search {ids, isRealTime: true}` |
+| Project contacts / account contacts | Salesforce | `/project-contacts/search {projectId, fetchAll}`, `/contacts/search {accountId}` |
+| Linked opportunities, opportunities, invoices | Salesforce | `/linked-opportunities/search`, `/opportunities/search {ids}`, `/invoices/search` |
+
+`Run` takes a `DetailSource`. `NewSalesforceDetails` (`sweep/salesforce_details.go`)
+reads the Salesforce project by the CSM project's `sfId`, then answers the
+sweep's per-project reads (`entityReader`) from Salesforce in the shapes the CSM
+reads return, so the decision code did not change. The project keeps its CSM id,
+key, name and closure records (every write goes to CSM by that id); its dates and
+account are Salesforce's. A project with no `sfId`, or one Salesforce does not
+have, is a failure of that project; the run goes on. `CSMDetails` (CSM for
+everything) exists for tests.
+
+Mapping rules, each pinned by a test:
+- **Partner** is `accountClassification == "Partner"`. sales-entity-service's
+  `isPartner` is Salesforce's Partner Portal checkbox; never read it.
+- **`hasPrimaryPartner`** is `primaryPartnerAccountId` non-blank (legacy's
+  `u_primary_partner_account_id` rule).
+- **Business Contact**: the Salesforce role label "Business Contact" maps to
+  `recipients.BusinessContactRole`. A `DEACTIVATED` membership is skipped, as
+  CSM's contact list does. A membership's email is the contact's, else the
+  invited address.
+- **Technical owner**: Salesforce gives an email only; it is also used as the name.
+- **EULA decimal**: entity-service's `deriveEulaVersion` rule (first `x.y` of
+  the text, `3.4` when the version is empty), since Salesforce has the text only.
+- **Customer search** always uses `isRealTime: true`: the other path reads a
+  database copy that can be stale and has no renewal manager.
+
+`internal/salesentity` is built like the other two clients (`httpsec`: https
+only, no redirects on the token or API client, success bodies capped at
+10 MiB). Its searches page 200 rows at a time up to 10 pages (inside
+sales-entity-service's 1,000-row and 2,000-offset caps); more is an error.
+
+Each open project costs a project, a customer and a linked-opportunities call,
+plus one opportunities call per linked opportunity and one invoices call per
+Closed Won one; contacts are read only when a notice goes out
+(`notifyForWindow`). Each is a live Salesforce API call. The customer is read
+for every project because the invoice gate needs the classification; reading it
+only when a project has a due invoice would save one call per project, at the
+cost of changing the sweep's decision code.
+
+### Writes
+
+| Write | To | How |
+|---|---|---|
+| Notice sent (`suspensionProcessState`) | CSM | `PATCH /projects/{csmId}` |
+| Suspension (`endDateClosureState: Closed` / `invoiceDueDateClosureState: Suspended`) | CSM | `PATCH /projects/{csmId}` |
+| `State__c = Suspended`, after the CSM suspension succeeded | Salesforce | sales-entity-service `PATCH /projects/{sfId}` `{"status":"Suspended"}` (digiops-sales #1725) |
+
+`suspend` and `suspendInvoice` call `suspendInSalesforce` after their CSM write;
+the suspend guard that skips the CSM write skips this too. `sweep.Writer`
+(`writer.go`) is the real `projectUpdater`: CSM writes to `*entity.Client`,
+`SuspendInSalesforce` to `*salesentity.Client`. If the CSM write fails,
+Salesforce is not written. If the Salesforce write fails, CSM stays suspended
+and the project is a failure of the run; the next run will not retry it (the
+project is no longer Open in CSM), so `State__c` must be set by hand.
+
+ACP never reopens, so it never writes `Open`. Whoever reopens a project (by
+hand today, the back-to-Open workflow later) sets both: CSM
+`PATCH /projects/{csmId}` and sales-entity-service `PATCH /projects/{sfId}`
+`{"status":"Open"}`.
+
 ## Calls csm-integration-service, not entity-service directly
 
 `internal/entity` is an HTTP client for `csm-integration-service`
@@ -252,9 +325,9 @@ issue was fixed.
 have exactly two side-effecting dependencies — `projectUpdater` (writes) and
 `notifier` (sends) — expressed as small interfaces. `main.go` decides which
 concrete implementation to inject for `projectUpdater` based on `DRY_RUN`:
-`sweep.DryRunProjectUpdater` (silently no-ops, never calls `UpdateProject`
-— see the notice-content-redesign section below for why it deliberately
-doesn't log) vs. the real `*entity.Client`. Reads (`SearchProjects`, `GetAccount`,
+`sweep.DryRunProjectUpdater` (silently no-ops, writes neither CSM nor
+Salesforce — see the notice-content-redesign section below for why it
+deliberately doesn't log) vs. the real `*sweep.Writer`. Reads (`SearchProjects`, `GetAccount`,
 `SearchProjectContacts`, `SearchAccountContacts`) are never dry-run-gated —
 fetching and deciding has no write effect to protect against.
 

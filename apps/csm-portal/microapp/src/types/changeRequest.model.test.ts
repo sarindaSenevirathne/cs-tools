@@ -16,7 +16,11 @@
 
 import { describe, expect, it } from "vitest";
 import type { ChangeRequestDetailDto, ChangeRequestState } from "./changeRequest.dto";
-import { isProposedTimeAccepted, toChangeRequestDetail } from "./changeRequest.model";
+import {
+  changeRequestApprovedReadOnlyReason,
+  isProposedTimeAccepted,
+  toChangeRequestDetail,
+} from "./changeRequest.model";
 
 const AFTER_CUSTOMER_APPROVAL: ChangeRequestState[] = [
   "scheduled",
@@ -28,6 +32,21 @@ const AFTER_CUSTOMER_APPROVAL: ChangeRequestState[] = [
   "canceled",
 ];
 const BEFORE_OR_AT_CUSTOMER_APPROVAL: ChangeRequestState[] = ["new", "assess", "authorize", "customer_approval"];
+
+describe("changeRequestApprovedReadOnlyReason", () => {
+  it("locks every state reached only through an approval", () => {
+    for (const state of [...AFTER_CUSTOMER_APPROVAL.filter((s) => s !== "canceled"), "customer_approval" as const]) {
+      expect(changeRequestApprovedReadOnlyReason(state), state).toMatch(/read-only/);
+    }
+  });
+
+  it("leaves the change editable before its approval, when canceled, and with no state", () => {
+    for (const state of ["new", "assess", "authorize", "canceled"] as const) {
+      expect(changeRequestApprovedReadOnlyReason(state), state).toBeNull();
+    }
+    expect(changeRequestApprovedReadOnlyReason(null)).toBeNull();
+  });
+});
 
 describe("isProposedTimeAccepted", () => {
   it("is true when WSO2 agreed and the change request has moved on from Customer Approval, in every state after it", () => {

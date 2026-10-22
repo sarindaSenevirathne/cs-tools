@@ -46,6 +46,12 @@ import (
 //	the CRE head or CS head;
 //	a portal admin.
 //
+// Who may place a test call (POST .../{userId}/test): a portal admin, or the
+// rota admin of a family one of the person's teams is in. A test call rings
+// the number Case Alerts dials from CSM -- the one on the person's profile
+// when it can be called, else the paging-only number -- and its result is kept
+// on paging_test_call (migration 0242) or paging_contact respectively.
+//
 // Reading the stored numbers (GET /team-schedule/paging-contacts) is for
 // the service that pages, and internal staff.
 
@@ -78,6 +84,32 @@ func (a pagingAuthority) canEditPhone(teams []repository.PagingTeamRef) bool {
 		if a.leadOf[strings.ToLower(t.TeamKey)] {
 			return true
 		}
+		switch t.Family {
+		case familyCRE:
+			if a.creRotaAdmin {
+				return true
+			}
+		case familySRE:
+			if a.sreRotaAdmin {
+				return true
+			}
+		case familySME:
+			if a.smeRotaAdmin {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// canTestCall reports whether the caller may place a test call to a person
+// on teams: a portal admin, or the rota admin of one of the teams' families.
+// Narrower than canEditPhone: leads and heads may set a number but not ring it.
+func (a pagingAuthority) canTestCall(teams []repository.PagingTeamRef) bool {
+	if a.portalAdmin {
+		return true
+	}
+	for _, t := range teams {
 		switch t.Family {
 		case familyCRE:
 			if a.creRotaAdmin {
@@ -144,15 +176,36 @@ func pagingPhoneView(c repository.PagingContactRow, withNumber bool) *domain.Pag
 	return p
 }
 
-// testCallRefusal is why a test call cannot be asked for now: no number
-// (409), or one asked for less than pagingTestCooldown ago (429).
-func testCallRefusal(c *repository.PagingContactRow, now time.Time) error {
-	if c == nil {
-		return &apierror.ConflictError{Msg: "this person has no alert number to test"}
+// testCallCooldown refuses a test call (429) when any test of the person's,
+// of either number, was asked for less than pagingTestCooldown before now.
+func testCallCooldown(now time.Time, lastTests ...*time.Time) error {
+	for _, at := range lastTests {
+		if at != nil && now.Sub(*at) < pagingTestCooldown {
+			wait := pagingTestCooldown - now.Sub(*at)
+			return &apierror.TooManyRequestsError{Msg: fmt.Sprintf("a test call was asked for less than two minutes ago; try again in %d seconds", int(wait.Seconds())+1)}
+		}
 	}
-	if c.LastTestAt != nil && now.Sub(*c.LastTestAt) < pagingTestCooldown {
-		wait := pagingTestCooldown - now.Sub(*c.LastTestAt)
-		return &apierror.TooManyRequestsError{Msg: fmt.Sprintf("a test call was asked for less than two minutes ago; try again in %d seconds", int(wait.Seconds())+1)}
+	return nil
+}
+
+// errNoNumberToTest is a test call for a person CSM holds no number for.
+var errNoNumberToTest = &apierror.ConflictError{Msg: "this person has no alert number to test: add a mobile number to their CSM profile"}
+
+// testCallView is the number a test call would ring for the person -- their
+// profile number when callable, else their paging-only number -- with its
+// last test. A test of a profile number that has since changed is not shown.
+func testCallView(profile string, c *repository.PagingContactRow, t *repository.PagingTestRow) *domain.PagingTestCall {
+	switch {
+	case profile != "":
+		v := &domain.PagingTestCall{Masked: maskPhone(profile), Source: dialSourceProfile}
+		if t != nil && t.Phone == profile {
+			at, status := t.LastTestAt.UTC().Format(time.RFC3339), t.LastTestStatus
+			v.LastTestAt, v.LastTestStatus = &at, &status
+		}
+		return v
+	case c != nil:
+		p := pagingPhoneView(*c, false)
+		return &domain.PagingTestCall{Masked: p.Masked, Source: dialSourcePaging, LastTestAt: p.LastTestAt, LastTestStatus: p.LastTestStatus}
 	}
 	return nil
 }
@@ -162,6 +215,22 @@ func testCallRefusal(c *repository.PagingContactRow, now time.Time) error {
 // right to edit that user's number. It returns the caller's email and the
 // user.
 func (s *pagingChainService) phoneEditor(ctx context.Context, userID string) (string, repository.PagingUser, error) {
+	return s.phoneActor(ctx, userID, pagingAuthority.canEditPhone,
+		"only a lead of this person's team, a rota admin of its family, the CRE or CS head, or a portal admin can change their alert number")
+}
+
+// phoneTester is phoneEditor's checks with the right to place a test call
+// (canTestCall) in place of the right to edit.
+func (s *pagingChainService) phoneTester(ctx context.Context, userID string) (string, repository.PagingUser, error) {
+	return s.phoneActor(ctx, userID, pagingAuthority.canTestCall,
+		"only a rota admin of this person's family or a portal admin can place a test call to them")
+}
+
+// phoneActor is the checks shared by phoneEditor and phoneTester; allowed
+// decides the caller's right over the user's teams, refused is the message
+// when it says no.
+func (s *pagingChainService) phoneActor(ctx context.Context, userID string,
+	allowed func(pagingAuthority, []repository.PagingTeamRef) bool, refused string) (string, repository.PagingUser, error) {
 	if err := RequireInternalCaller(ctx, s.access, "alert numbers are only available to internal staff"); err != nil {
 		return "", repository.PagingUser{}, err
 	}
@@ -187,8 +256,8 @@ func (s *pagingChainService) phoneEditor(ctx context.Context, userID string) (st
 	if err != nil {
 		return "", repository.PagingUser{}, err
 	}
-	if !authorityOf(caller).canEditPhone(teams[userID]) {
-		return "", repository.PagingUser{}, &apierror.ForbiddenError{Msg: "only a lead of this person's team, a rota admin of its family, the CRE or CS head, or a portal admin can change their alert number"}
+	if !allowed(authorityOf(caller), teams[userID]) {
+		return "", repository.PagingUser{}, &apierror.ForbiddenError{Msg: refused}
 	}
 	return email, user, nil
 }
@@ -220,12 +289,14 @@ func (s *pagingChainService) DeletePagingPhone(ctx context.Context, userID strin
 	return s.contacts.Delete(ctx, email, user.ID)
 }
 
-// RequestTestCall implements PagingChainService: it marks the test pending
-// and publishes paging.test_call_requested on the main topic. A publish that
-// fails is recorded as a failed test, so the cooldown does not hold the next
-// try back for a call that was never placed.
+// RequestTestCall implements PagingChainService: it marks a test of the
+// number Case Alerts dials from CSM pending -- the profile number when it can
+// be called, else the paging-only one -- and publishes
+// paging.test_call_requested on the main topic. A publish that fails is
+// recorded as a failed test, so the cooldown does not hold the next try back
+// for a call that was never placed.
 func (s *pagingChainService) RequestTestCall(ctx context.Context, userID string) (domain.PagingTestCallResponse, error) {
-	email, user, err := s.phoneEditor(ctx, userID)
+	email, user, err := s.phoneTester(ctx, userID)
 	if err != nil {
 		return domain.PagingTestCallResponse{}, err
 	}
@@ -233,32 +304,60 @@ func (s *pagingChainService) RequestTestCall(ctx context.Context, userID string)
 		return domain.PagingTestCallResponse{}, &apierror.ServiceUnavailableError{Msg: "test calls are not available: event publishing is not configured"}
 	}
 	now := s.now().UTC().Truncate(time.Second)
+	notBefore := now.Add(-pagingTestCooldown)
+	profiles, err := s.contacts.ProfilePhones(ctx, []string{user.ID})
+	if err != nil {
+		return domain.PagingTestCallResponse{}, err
+	}
 	current, err := s.contacts.Get(ctx, user.ID)
 	if err != nil {
 		return domain.PagingTestCallResponse{}, err
 	}
-	if err := testCallRefusal(current, now); err != nil {
+	tests, err := s.contacts.ProfileTests(ctx, []string{user.ID})
+	if err != nil {
 		return domain.PagingTestCallResponse{}, err
 	}
-	row, marked, err := s.contacts.MarkTestPending(ctx, email, user.ID, now, now.Add(-pagingTestCooldown))
+	profile := profiles[user.ID]
+	if profile == "" && current == nil {
+		return domain.PagingTestCallResponse{}, errNoNumberToTest
+	}
+	var lastProfileTest, lastPagingTest *time.Time
+	if t, ok := tests[user.ID]; ok {
+		lastProfileTest = &t.LastTestAt
+	}
+	if current != nil {
+		lastPagingTest = current.LastTestAt
+	}
+	if err := testCallCooldown(now, lastProfileTest, lastPagingTest); err != nil {
+		return domain.PagingTestCallResponse{}, err
+	}
+
+	phone, marked := profile, false
+	if profile != "" {
+		marked, err = s.contacts.MarkProfileTestPending(ctx, email, user.ID, profile, now, notBefore)
+	} else {
+		var row repository.PagingContactRow
+		row, marked, err = s.contacts.MarkTestPending(ctx, email, user.ID, now, notBefore)
+		phone = row.Phone
+	}
 	if err != nil {
 		return domain.PagingTestCallResponse{}, err
 	}
 	if !marked {
-		// Something changed between the read and the write: the number was
-		// removed, or another test was asked for. Say which.
-		again, gerr := s.contacts.Get(ctx, user.ID)
-		if gerr != nil {
-			return domain.PagingTestCallResponse{}, gerr
-		}
-		if err := testCallRefusal(again, now); err != nil {
-			return domain.PagingTestCallResponse{}, err
+		// Something changed between the read and the write: another test was
+		// asked for, or the paging-only number was removed.
+		if profile == "" {
+			if again, gerr := s.contacts.Get(ctx, user.ID); gerr != nil {
+				return domain.PagingTestCallResponse{}, gerr
+			} else if again == nil {
+				return domain.PagingTestCallResponse{}, errNoNumberToTest
+			}
 		}
 		return domain.PagingTestCallResponse{}, &apierror.TooManyRequestsError{Msg: "a test call was asked for less than two minutes ago"}
 	}
 
 	payload, err := json.Marshal(events.PagingTestCallRequestedPayload{
-		UserID: user.ID, Email: user.Email, Name: user.Name, Phone: row.Phone,
+		UserID: user.ID, Email: user.Email, Name: user.Name, Phone: phone,
 		RequestedBy: email, RequestedAt: now.Format(time.RFC3339),
 	})
 	if err == nil {
@@ -359,14 +458,15 @@ func (s *pagingChainService) RecordTestResult(ctx context.Context, req domain.Pa
 		return err
 	}
 	if !found {
-		return &apierror.NotFoundError{Msg: "this person has no alert number"}
+		return &apierror.NotFoundError{Msg: "this person has no test call waiting for a result"}
 	}
 	return nil
 }
 
-// withPhones fills each member's canEditPhone and pagingPhone. a is the
-// caller's authority, nil for a service credential, which may edit nothing
-// and is shown masked numbers only.
+// withPhones fills each member's canEditPhone, pagingPhone, hasProfilePhone,
+// canTestCall and testCall. a is the caller's authority, nil for a service
+// credential, which may edit and test nothing and is shown masked numbers
+// only.
 func (s *pagingChainService) withPhones(ctx context.Context, a *pagingAuthority, members []domain.PagingChainMember) error {
 	if s.contacts == nil || len(members) == 0 {
 		return nil
@@ -389,18 +489,43 @@ func (s *pagingChainService) withPhones(ctx context.Context, a *pagingAuthority,
 			return err
 		}
 	}
-	profiles, err := s.contacts.ProfilePhoneUserIDs(ctx, ids)
+	profiles, err := s.contacts.ProfilePhones(ctx, ids)
+	if err != nil {
+		return err
+	}
+	anyTester := false
+	for i := range members {
+		m := &members[i]
+		m.CanEditPhone = a != nil && a.canEditPhone(teams[m.UserID])
+		m.CanTestCall = a != nil && a.canTestCall(teams[m.UserID])
+		anyTester = anyTester || m.CanTestCall
+		if c, ok := contacts[m.UserID]; ok {
+			m.PagingPhone = pagingPhoneView(c, m.CanEditPhone)
+		}
+		has := profiles[m.UserID] != ""
+		m.HasProfilePhone = &has
+	}
+	if !anyTester {
+		return nil
+	}
+	tests, err := s.contacts.ProfileTests(ctx, ids)
 	if err != nil {
 		return err
 	}
 	for i := range members {
 		m := &members[i]
-		m.CanEditPhone = a != nil && a.canEditPhone(teams[m.UserID])
-		if c, ok := contacts[m.UserID]; ok {
-			m.PagingPhone = pagingPhoneView(c, m.CanEditPhone)
+		if !m.CanTestCall {
+			continue
 		}
-		has := profiles[m.UserID]
-		m.HasProfilePhone = &has
+		var c *repository.PagingContactRow
+		if row, ok := contacts[m.UserID]; ok {
+			c = &row
+		}
+		var t *repository.PagingTestRow
+		if row, ok := tests[m.UserID]; ok {
+			t = &row
+		}
+		m.TestCall = testCallView(profiles[m.UserID], c, t)
 	}
 	return nil
 }

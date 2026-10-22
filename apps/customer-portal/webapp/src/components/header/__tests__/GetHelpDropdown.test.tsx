@@ -15,7 +15,7 @@
 // under the License.
 
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import GetHelpDropdown from "@components/header/GetHelpDropdown";
 
 vi.mock("react-router", () => ({
@@ -52,6 +52,15 @@ vi.mock("@utils/permission", () => ({
   isProjectSuspended: () => mockIsProjectSuspended(),
 }));
 
+const useCustomerPermissionsMock = vi.fn(() => ({
+  canCreateCase: true,
+  isLoading: false,
+}));
+
+vi.mock("@hooks/useCustomerPermissions", () => ({
+  useCustomerPermissions: () => useCustomerPermissionsMock(),
+}));
+
 vi.mock("@wso2/oxygen-ui-icons-react", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("@wso2/oxygen-ui-icons-react")>();
@@ -59,6 +68,14 @@ vi.mock("@wso2/oxygen-ui-icons-react", async (importOriginal) => {
 });
 
 describe("GetHelpDropdown", () => {
+  beforeEach(() => {
+    useCustomerPermissionsMock.mockReset();
+    useCustomerPermissionsMock.mockReturnValue({
+      canCreateCase: true,
+      isLoading: false,
+    });
+  });
+
   it("should render an accessible Get Help control with responsive label", () => {
     mockIsProjectRestricted.mockReturnValue(false);
     mockIsProjectSuspended.mockReturnValue(false);
@@ -83,6 +100,26 @@ describe("GetHelpDropdown", () => {
   it("should not render when the project is suspended or expired", () => {
     mockIsProjectRestricted.mockReturnValue(false);
     mockIsProjectSuspended.mockReturnValue(true);
+
+    const { container } = render(<GetHelpDropdown />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("should not render for a read-only (isReadOnly INTERNAL) caller", () => {
+    useCustomerPermissionsMock.mockReturnValue({
+      canCreateCase: false,
+      isLoading: false,
+    });
+
+    const { container } = render(<GetHelpDropdown />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("should not render while permissions are still loading", () => {
+    useCustomerPermissionsMock.mockReturnValue({
+      canCreateCase: true,
+      isLoading: true,
+    });
 
     const { container } = render(<GetHelpDropdown />);
     expect(container).toBeEmptyDOMElement();

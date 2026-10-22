@@ -45,6 +45,7 @@ func testAccessConfig() AccessConfig {
 		WorknoteCreator:      []string{"test-worknote-creator"},
 		AnnouncementCreator:  []string{"test-announcement-creator"},
 		CommentUpdater:       []string{"test-comment-updater"},
+		OnboardingLead:       []string{"test-onboarding-lead"},
 		SecurityTeam:         []string{"test-security-team"},
 	}
 }
@@ -594,7 +595,7 @@ func TestAccessGuard_SecurityReportCasesAlsoAllowsViewer(t *testing.T) {
 
 func TestAccessGuard_UnconfiguredRolesAreHeldByNobody(t *testing.T) {
 	g := NewAccessGuard(AccessConfig{})
-	for _, perm := range []Permission{PermView, PermViewOperations, PermTimeCardsAndUpdates, PermEscalate, PermDownloadAttachment, PermWrite, PermAdmin, PermViewSecurityCenter, PermViewSecurityReportCases, PermApproveTimeCard, PermUsePlg, PermManagePlaybooks, PermCreateWorkNote, PermCreateAnnouncement, PermUpdateDeleteComment} {
+	for _, perm := range []Permission{PermView, PermViewOperations, PermTimeCardsAndUpdates, PermEscalate, PermDownloadAttachment, PermWrite, PermAdmin, PermViewSecurityCenter, PermViewSecurityReportCases, PermApproveTimeCard, PermUsePlg, PermManagePlaybooks, PermCreateWorkNote, PermCreateAnnouncement, PermUpdateDeleteComment, PermManageOnboarding, PermUpdateProject} {
 		if status, _ := serveWithRoles(g, perm, []string{"test-admin", "test-viewer", ""}); status != http.StatusForbidden {
 			t.Errorf("permission %d with no roles configured: status = %d, want 403", perm, status)
 		}
@@ -820,6 +821,44 @@ func TestAccessGuard_UpdateDeleteCommentIsForCommentUpdatersCsEngineersAndAdmins
 	// other write action needs.
 	if status, _ := serveWithRoles(g, PermWrite, []string{"test-comment-updater"}); status != http.StatusForbidden {
 		t.Errorf("comment_updater must not hold PermWrite: status = %d, want 403", status)
+	}
+}
+
+// TestAccessGuard_OnboardingPermissions pins who holds PermManageOnboarding
+// (onboarding_lead and admin only -- never cs_engineer) and the wider
+// PermUpdateProject route floor (which adds cs_engineer), and that
+// onboarding_lead grants neither read nor write access.
+func TestAccessGuard_OnboardingPermissions(t *testing.T) {
+	g := NewAccessGuard(testAccessConfig())
+	for _, role := range []string{"test-onboarding-lead", "test-admin"} {
+		if status, _ := serveWithRoles(g, PermManageOnboarding, []string{role}); status != http.StatusNoContent {
+			t.Errorf("%s PermManageOnboarding: status = %d, want 204", role, status)
+		}
+	}
+	for _, role := range []string{
+		"test-cs-engineer", "test-viewer", "test-escalator", "test-attachment-downloader",
+		"test-usage-metrics-viewer", "test-timecard-approver", "test-dashboard-designer",
+		"test-comment-updater", "test-announcement-creator", "test-security-team",
+	} {
+		if status, _ := serveWithRoles(g, PermManageOnboarding, []string{role}); status != http.StatusForbidden {
+			t.Errorf("%s must not hold PermManageOnboarding: status = %d, want 403", role, status)
+		}
+	}
+	for _, role := range []string{"test-onboarding-lead", "test-cs-engineer", "test-admin"} {
+		if status, _ := serveWithRoles(g, PermUpdateProject, []string{role}); status != http.StatusNoContent {
+			t.Errorf("%s PermUpdateProject: status = %d, want 204", role, status)
+		}
+	}
+	if status, _ := serveWithRoles(g, PermUpdateProject, []string{"test-viewer"}); status != http.StatusForbidden {
+		t.Errorf("viewer PermUpdateProject: status = %d, want 403", status)
+	}
+	for _, perm := range []Permission{PermView, PermViewSharedEntity, PermWrite, PermAdmin} {
+		if status, _ := serveWithRoles(g, perm, []string{"test-onboarding-lead"}); status != http.StatusForbidden {
+			t.Errorf("onboarding_lead must not hold permission %d: status = %d, want 403", perm, status)
+		}
+	}
+	if got := g.RolesFor([]string{"test-onboarding-lead"}); len(got) != 1 || got[0] != "onboarding_lead" {
+		t.Errorf("RolesFor = %v, want [onboarding_lead]", got)
 	}
 }
 

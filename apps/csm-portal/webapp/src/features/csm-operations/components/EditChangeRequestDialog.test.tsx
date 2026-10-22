@@ -14,7 +14,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { clearUserPreferredTimeZone, setUserPreferredTimeZone } from "@utils/dateTime";
@@ -34,6 +34,16 @@ vi.mock("@api/useSearchGroups", () => ({
 const useSearchUsersByNameMock = vi.fn(() => ({ data: [], isFetching: false, isError: false }));
 vi.mock("@api/useSearchUsersByName", () => ({
   useSearchInternalUsersByName: (...args: unknown[]) => useSearchUsersByNameMock(...(args as [])),
+}));
+
+// The "Originating service request" picker searches service requests through
+// the backend client — stub it with one result.
+vi.mock("@features/csm-operations/api/useSearchServiceRequestsForSelect", () => ({
+  useSearchServiceRequestsForSelect: () => ({
+    data: [{ id: "case-2", number: "CS0002", subject: "Rotate the certificates" }],
+    isFetching: false,
+    isError: false,
+  }),
 }));
 
 // Customer Project picker: a plain labelled input that reports the typed id and
@@ -205,8 +215,8 @@ function renderDialog(
   return { onSave, onClose };
 }
 
-/** The dialog's Save button. */
-const saveButton = (): HTMLElement => screen.getByRole("button", { name: /save/i });
+/** The dialog's Save button ("Add work note" once the change request has been approved). */
+const saveButton = (): HTMLElement => screen.getByRole("button", { name: /^(save|add work note)$/i });
 
 // "Customer approved"/"Customer reviewed" are deliberately not rendered as
 // switches in this dialog — see EditChangeRequestDialog.tsx's doc comment for
@@ -395,6 +405,31 @@ describe("EditChangeRequestDialog — assigned engineer", () => {
   it("leaves Save disabled when nothing changed, even with an existing assignee", () => {
     renderDialog({ assignedEngineer: { id: "user-1", name: "Jane Doe" } });
     expect(saveButton()).toBeDisabled();
+  });
+});
+
+describe("EditChangeRequestDialog — originating service request", () => {
+  const picker = (): HTMLElement => screen.getByLabelText(/^originating service request$/i);
+  const pick = (): void => {
+    fireEvent.change(picker(), { target: { value: "CS0002" } });
+    fireEvent.click(screen.getByRole("option", { name: "CS0002 — Rotate the certificates" }));
+  };
+
+  it("links a change request raised without one", () => {
+    const { onSave } = renderDialog();
+    expect(picker()).toHaveValue("");
+    pick();
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith({ caseId: "case-2" });
+  });
+
+  it("shows the current link and replaces it", () => {
+    const { onSave } = renderDialog({ case: { id: "case-1", name: "CS0001" } });
+    expect(picker()).toHaveValue("CS0001");
+    expect(saveButton()).toBeDisabled();
+    pick();
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith({ caseId: "case-2" });
   });
 });
 
@@ -716,7 +751,7 @@ describe("EditChangeRequestDialog — Customer Approval / Customer Review checkb
       expect(onSave).toHaveBeenCalledWith({ customerApprovalRequired: true });
     });
 
-    it.each(["assess", "authorize", "customer_approval", "scheduled", "implement", "review"])(
+    it.each(["assess", "authorize"])(
       "Customer Review stays tickable in %s, and sends only that",
       (state) => {
         const { onSave } = renderDialog({ state, project: ACME, customerReviewRequired: false });
@@ -760,18 +795,19 @@ describe("EditChangeRequestDialog — Customer Approval / Customer Review checkb
       );
     });
 
-    it("Customer Review can still be added while Customer Approval is past its gate, and sends only that", () => {
-      const { onSave } = renderDialog({
-        state: "scheduled",
-        project: ACME,
-        customerApprovalRequired: true,
-        customerReviewRequired: false,
-      });
-      expect(approvalBox()).toBeDisabled();
-      fireEvent.click(reviewBox());
-      fireEvent.click(saveButton());
-      expect(onSave).toHaveBeenCalledWith({ customerReviewRequired: true });
-    });
+    // Once approved every field is read-only, the review box included (it used to stay
+    // tickable until the customer review step).
+    it.each(["customer_approval", "scheduled", "implement", "review"])(
+      "Customer Review can no longer be added once the change request has been approved (%s)",
+      (state) => {
+        renderDialog({ state, project: ACME, customerApprovalRequired: true, customerReviewRequired: false });
+        expect(approvalBox()).toBeDisabled();
+        expect(reviewBox()).toBeDisabled();
+        expect(screen.getByText(/CAB approval has been received/)).toBeInTheDocument();
+        // Nothing can be saved: the box does not promise an edit the form no longer offers.
+        expect(reviewBox()).not.toHaveAccessibleDescription(/Once saved this can't be removed/);
+      },
+    );
   });
 
   describe("after New an unticked box cannot be added without a Customer Project, and none can be set any more", () => {
@@ -835,8 +871,10 @@ describe("EditChangeRequestDialog — Customer Approval / Customer Review checkb
 // Customer Project / Deployments / Deployment products / Customer Group / Category
 // ---------------------------------------------------------------------------
 
+// Authorize: after New (the project is frozen) and before the approval (the
+// deployments are still editable).
 const SCOPED_CR: Partial<BeChangeRequestDetail> = {
-  state: "scheduled",
+  state: "authorize",
   project: { id: "proj-a", name: "Acme Project" },
   deployments: [{ id: "dep-prod", name: "Acme Production" }],
   deploymentProducts: [
@@ -976,11 +1014,17 @@ describe("EditChangeRequestDialog — customer project, deployments, deployment 
     expect(screen.getByLabelText("Customer Project")).toHaveAttribute("data-disable-clearable", "false");
   });
 
-  it.each(["implement", "review", "customer_review", "closed", "canceled"])(
+  it.each(["customer_approval", "scheduled", "implement", "review", "customer_review", "closed", "canceled"])(
     "locks the deployments as well, with their reason, once the change request is in %s",
     (state) => {
       const { onSave } = renderDialog({ ...SCOPED_CR, state });
-      expect(screen.getByText(/deployments can't be changed once implementation has started/i)).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          state === "canceled"
+            ? /deployments can't be changed once the change request has been cancelled/i
+            : /deployments can't be changed once the change request has been approved/i,
+        ),
+      ).toBeInTheDocument();
       expect(screen.getByLabelText("Customer Project")).toBeDisabled();
       expect(screen.getByRole("combobox", { name: "Deployments" })).toBeDisabled();
       expect(saveButton()).toBeDisabled();
@@ -988,9 +1032,9 @@ describe("EditChangeRequestDialog — customer project, deployments, deployment 
     },
   );
 
-  it("keeps the deployments editable up to and including scheduled", () => {
-    renderDialog({ ...SCOPED_CR, state: "scheduled" });
-    expect(screen.queryByText(/can't be changed once implementation/i)).not.toBeInTheDocument();
+  it("keeps the deployments editable up to and including authorize", () => {
+    renderDialog({ ...SCOPED_CR, state: "authorize" });
+    expect(screen.queryByText(/can't be changed once the change request has been approved/i)).not.toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "Deployments" })).toBeEnabled();
   });
 });
@@ -1006,7 +1050,7 @@ describe("EditChangeRequestDialog — the Customer Project is fixed once approva
     expect(screen.getByRole("combobox", { name: "Deployments" })).toBeEnabled();
   });
 
-  it.each(["assess", "authorize", "customer_approval", "scheduled"])(
+  it.each(["assess", "authorize"])(
     "is read-only in %s with the reason, while the deployments stay editable",
     (state) => {
       renderDialog({ ...SCOPED_CR, state });
@@ -1017,18 +1061,18 @@ describe("EditChangeRequestDialog — the Customer Project is fixed once approva
     },
   );
 
-  it.each(["implement", "review", "customer_review", "closed", "rollback", "canceled"])(
+  it.each(["customer_approval", "scheduled", "implement", "review", "customer_review", "closed", "rollback", "canceled"])(
     "is read-only in %s too, with its reason beside the deployments'",
     (state) => {
       renderDialog({ ...SCOPED_CR, state });
       expect(project()).toBeDisabled();
       expect(screen.getByText(FROZEN)).toBeInTheDocument();
-      expect(screen.getByText(/deployments can't be changed once implementation has started/i)).toBeInTheDocument();
+      expect(screen.getByText(/deployments can't be changed once the change request has been (approved|cancelled)/i)).toBeInTheDocument();
     },
   );
 
   it("sends the stored project along with changed deployments, which is an accepted no-op, never a changed project", () => {
-    const { onSave } = renderDialog({ ...SCOPED_CR, state: "scheduled" });
+    const { onSave } = renderDialog({ ...SCOPED_CR, state: "authorize" });
     pickOptions("Deployments", ["Acme Staging"]);
     fireEvent.click(saveButton());
     expect(onSave).toHaveBeenCalledWith({
@@ -1149,5 +1193,212 @@ describe("EditChangeRequestDialog — Category", () => {
     fireEvent.mouseDown(screen.getByRole("combobox", { name: "Category" }));
     fireEvent.click(screen.getByRole("option", { name: "-- Select --" }));
     expect(saveButton()).toBeDisabled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Every field the create form sets can be edited here too (the description used
+// not to be, nor the subject, type, impact, priority, justification and risk).
+// ---------------------------------------------------------------------------
+
+describe("EditChangeRequestDialog — the fields the create form sets", () => {
+  const approvalBox = (): HTMLElement => screen.getByRole("checkbox", { name: "Customer Approval" });
+  const reviewBox = (): HTMLElement => screen.getByRole("checkbox", { name: "Customer Review" });
+  const subject = (): HTMLElement => screen.getByRole("textbox", { name: /^subject/i });
+  const select = (name: string): HTMLElement => screen.getByRole("combobox", { name });
+  const choose = (name: string, option: string): void => {
+    fireEvent.mouseDown(select(name));
+    fireEvent.click(screen.getByRole("option", { name: option }));
+  };
+
+  it("seeds each from the record and sends nothing until one changes", () => {
+    renderDialog({
+      state: "new",
+      description: "<p>Move the gateway to the new cluster.</p>",
+      justification: "<p>The old cluster is end of life.</p>",
+      impactDescription: "<p>Ten minutes of read-only traffic.</p>",
+      impact: "medium",
+      priority: "moderate" as unknown as BeChangeRequestDetail["priority"],
+    });
+    expect(subject()).toHaveValue("Upgrade the gateway cluster");
+    expect(planEditor(/^description/i)).toHaveValue(normalizeLikeEditor("<p>Move the gateway to the new cluster.</p>"));
+    expect(planEditor(/^justification/i)).toHaveValue(normalizeLikeEditor("<p>The old cluster is end of life.</p>"));
+    expect(planEditor(/risk and impact analysis/i)).toHaveValue(normalizeLikeEditor("<p>Ten minutes of read-only traffic.</p>"));
+    expect(select("Type")).toHaveTextContent("Normal");
+    expect(select("Impact")).toHaveTextContent("Medium");
+    expect(select("Priority")).toHaveTextContent("Moderate");
+    expect(saveButton()).toBeDisabled();
+  });
+
+  it("reads a priority sent as an { id, label } ref too", () => {
+    renderDialog({ priority: { id: 2, label: "2 - High" } });
+    expect(select("Priority")).toHaveTextContent("High");
+  });
+
+  it.each([
+    ["description", /^description/i],
+    ["justification", /^justification/i],
+    ["impactDescription", /risk and impact analysis/i],
+  ] as const)("sends only %s when only it was edited", (key, label) => {
+    const { onSave } = renderDialog();
+    fireEvent.change(planEditor(label), { target: { value: "<p>Revised.</p>" } });
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith({ [key]: "<p>Revised.</p>" });
+  });
+
+  it("sends the subject trimmed, and refuses an empty one", () => {
+    const { onSave } = renderDialog();
+    fireEvent.change(subject(), { target: { value: "   " } });
+    expect(screen.getByText("A change request needs a subject.")).toBeInTheDocument();
+    expect(saveButton()).toBeDisabled();
+    fireEvent.change(subject(), { target: { value: "  Upgrade the gateway cluster to 4.3  " } });
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith({ title: "Upgrade the gateway cluster to 4.3" });
+  });
+
+  it("sends only the impact, or only the priority, when that is what changed", () => {
+    const first = renderDialog({ impact: "low" });
+    choose("Impact", "High");
+    fireEvent.click(saveButton());
+    expect(first.onSave).toHaveBeenCalledWith({ impact: "high" });
+    cleanup();
+    const second = renderDialog();
+    choose("Priority", "Critical");
+    fireEvent.click(saveButton());
+    expect(second.onSave).toHaveBeenCalledWith({ priority: "critical" });
+  });
+
+  it("changes the type in New, and sends only that", () => {
+    const { onSave } = renderDialog({ state: "new" });
+    expect(select("Type")).not.toHaveAttribute("aria-disabled", "true");
+    choose("Type", "Standard");
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith({ type: "standard" });
+  });
+
+  it("turns both customer boxes off when the type becomes Emergency in New, in the same request", () => {
+    const { onSave } = renderDialog({ state: "new", customerApprovalRequired: true, customerReviewRequired: true });
+    choose("Type", "Emergency");
+    expect(approvalBox()).not.toBeChecked();
+    expect(reviewBox()).not.toBeChecked();
+    expect(approvalBox()).toBeDisabled();
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith({
+      type: "emergency",
+      customerApprovalRequired: false,
+      customerReviewRequired: false,
+    });
+  });
+
+  it.each(["assess", "authorize"])("keeps the type read-only after New (%s), with the reason", (state) => {
+    renderDialog({ state });
+    expect(select("Type")).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByText(/The type decides the approval flow, so it is fixed once approval has been requested/)).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Once the change request has been approved every field is read-only and only a
+// work note can be added; before, a work note can ride with any save.
+// ---------------------------------------------------------------------------
+
+describe("EditChangeRequestDialog — read-only once approved, work notes only", () => {
+  const ACME = { id: "proj-a", name: "Acme Project" };
+  const workNote = (): HTMLElement => screen.getByRole("textbox", { name: /work note/i });
+  const APPROVED = ["customer_approval", "scheduled", "implement", "review", "customer_review", "closed", "rollback"];
+
+  it.each(APPROVED)("renders every field read-only in %s, with the reason, and saves only a work note", (state) => {
+    const { onSave } = renderDialog({
+      state,
+      project: ACME,
+      implementationPlan: "<p>Run the upgrade playbook.</p>",
+      category: "devops",
+    });
+    expect(screen.getByText(/CAB approval has been received, so this change request's fields are read-only/)).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: /^subject/i })).toBeDisabled();
+    for (const name of [/^description/i, /^justification/i, /risk and impact analysis/i, /implementation plan/i, /rollback plan/i, /test plan/i]) {
+      expect(planEditor(name)).toBeDisabled();
+    }
+    for (const name of ["Type", "Impact", "Priority", "Category"]) {
+      expect(screen.getByRole("combobox", { name })).toHaveAttribute("aria-disabled", "true");
+    }
+    expect(screen.getByLabelText(/^assignment group$/i)).toBeDisabled();
+    expect(screen.getByLabelText(/^assigned to$/i)).toBeDisabled();
+    expect(screen.getByLabelText(/^requested by$/i)).toBeDisabled();
+    expect(screen.getByLabelText(/^originating service request$/i)).toBeDisabled();
+    expect(screen.getByRole("textbox", { name: /rollback duration/i })).toBeDisabled();
+    expect(screen.getByLabelText("Implementation Plan visible to customers")).toBeDisabled();
+    for (const section of within(screen.getByRole("group", { name: /planned start/i })).getAllByRole("spinbutton")) {
+      expect(section).toHaveAttribute("aria-disabled", "true");
+    }
+
+    expect(workNote()).toBeEnabled();
+    expect(saveButton()).toHaveTextContent("Add work note");
+    expect(saveButton()).toBeDisabled();
+    fireEvent.change(workNote(), { target: { value: "  Implementation started on the primary cluster.  " } });
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith({ workNote: "Implementation started on the primary cluster." });
+  });
+
+  it.each(["new", "assess", "authorize", "canceled"])("leaves the fields editable in %s (not approved), with no notice", (state) => {
+    renderDialog({ state });
+    expect(screen.queryByText(/CAB approval has been received/)).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: /^subject/i })).toBeEnabled();
+    expect(planEditor(/implementation plan/i)).toBeEnabled();
+    expect(saveButton()).toHaveTextContent("Save");
+  });
+
+  it("sends a work note together with an edit before the approval", () => {
+    const { onSave } = renderDialog({ state: "authorize" });
+    fireEvent.change(planEditor(/implementation plan/i), { target: { value: "<p>Step 1.</p>" } });
+    fireEvent.change(workNote(), { target: { value: "Added the first step." } });
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith({ implementationPlan: "<p>Step 1.</p>", workNote: "Added the first step." });
+  });
+
+  it("does not send a blank work note", () => {
+    renderDialog({ state: "scheduled" });
+    fireEvent.change(workNote(), { target: { value: "   " } });
+    expect(saveButton()).toBeDisabled();
+  });
+});
+
+describe("EditChangeRequestDialog — inline variant", () => {
+  it("renders the same form in the page, not a modal, and saves only what changed", () => {
+    const onSave = vi.fn<(patch: BePatchChangeRequestPayload) => void>();
+    render(
+      <EditChangeRequestDialog
+        variant="inline"
+        cr={BASE_CR}
+        isSaving={false}
+        onClose={vi.fn()}
+        onSave={onSave}
+      />,
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    const region = screen.getByRole("region", { name: "Edit change request" });
+    const save = within(region).getByRole("button", { name: /save/i });
+    expect(save).toBeDisabled();
+
+    fireEvent.change(within(region).getByLabelText("Rollback duration"), { target: { value: "30 mins" } });
+    fireEvent.click(save);
+    expect(onSave).toHaveBeenCalledWith({ rollbackDurationText: "30 mins" });
+  });
+
+  it("keeps the edit rules: the Customer Project is read-only once approval was requested", () => {
+    render(
+      <EditChangeRequestDialog
+        variant="inline"
+        cr={{ ...BASE_CR, state: "assess", project: { id: "proj-a", name: "Acme Project" } }}
+        isSaving={false}
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />,
+    );
+    expect(
+      within(screen.getByRole("region", { name: "Edit change request" })).getByText(
+        "Fixed when approval was requested. Cancel and clone to change it.",
+      ),
+    ).toBeInTheDocument();
   });
 });

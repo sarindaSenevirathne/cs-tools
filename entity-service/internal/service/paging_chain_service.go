@@ -108,6 +108,7 @@ type pagingAuthority struct {
 	sreRotaAdmin bool
 	smeRotaAdmin bool
 	head         bool            // holds cre_head or cs_head somewhere
+	csHead       bool            // holds cs_head somewhere: above CRE, SRE and SME
 	leadOf       map[string]bool // a Team lead or the America lead of the team
 	headOf       map[string]bool // the America lead of the team
 }
@@ -134,8 +135,11 @@ func authorityOf(c repository.PagingCaller) pagingAuthority {
 		case memberRoleAmerica:
 			a.leadOf[key] = true
 			a.headOf[key] = true
-		case memberRoleCREHead, memberRoleCSHead:
+		case memberRoleCREHead:
 			a.head = true
+		case memberRoleCSHead:
+			a.head = true
+			a.csHead = true
 		}
 	}
 	return a

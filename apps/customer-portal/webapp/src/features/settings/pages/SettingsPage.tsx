@@ -66,12 +66,8 @@ export default function SettingsPage(): JSX.Element {
 
   // The AI Assistant settings save through PATCH /projects/{id}, which the
   // backend gates on projects:update. Deriving the UI from the same permission
-  // keeps the two from disagreeing. projects:update only ever gates this one
-  // route, and that route only ever touches hasAgent/hasKbReferences (see
-  // entity.UpdateProjectRequest) -- not general project data -- so
-  // customer_admin holding it only grants control over their own project's
-  // AI Assistant settings, nothing broader. If that scope ever changes
-  // (projects:update starts gating something else), re-check this grant.
+  // keeps the two from disagreeing. Only customer_admin holds it; WSO2-side
+  // roles are intentionally excluded (mirrors rbac.go in backend-v2).
   const { can } = useCustomerPermissions();
   const canUpdateProject = can("projects", "update");
 

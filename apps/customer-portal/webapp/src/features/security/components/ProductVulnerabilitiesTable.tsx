@@ -24,24 +24,24 @@ import ProductVulnerabilitiesFilters from "@features/security/components/Product
 import ProductVulnerabilitiesList from "@features/security/components/ProductVulnerabilitiesList";
 import {
   PRODUCT_VULNERABILITIES_DEFAULT_ROWS_PER_PAGE,
-  PRODUCT_VULNERABILITIES_FETCH_ALL_REQUEST,
   PRODUCT_VULNERABILITIES_SEARCH_DEBOUNCE_MS,
 } from "@features/security/constants/securityConstants";
-import type {
-  ProductVulnerabilitiesTableProps,
-  ProductVulnerability,
-} from "@features/security/types/security";
-import { countProductVulnerabilityTableActiveFilters } from "@features/security/utils/productVulnerabilitiesTable";
+import type { ProductVulnerabilitiesTableProps } from "@features/security/types/security";
+import {
+  buildProductVulnerabilitiesSearchRequest,
+  countProductVulnerabilityTableActiveFilters,
+} from "@features/security/utils/productVulnerabilitiesTable";
 
 /**
  * Product Vulnerabilities table.
  *
  * Architecture note:
- * - All ~1500 records are fetched once via a single "fetch all" request, using
- *   the shared PRODUCT_VULNERABILITIES_FETCH_ALL_REQUEST so the vulnerability
- *   details page resolves to the same React Query cache entry.
- * - The BFF handles batching to the entity service (which is capped at 50/request).
- * - All filtering, sorting, and pagination are performed client-side for instant response.
+ * - Search, filters and pagination are all server-side: every change issues a
+ *   search request for one page (at most 50 rows, the endpoint maximum).
+ * - The pager and the reported total use the server's `totalRecords`.
+ * - The previous page stays on screen while the next one loads.
+ * - Product and version dropdown options come from the metadata request. If it
+ *   fails the dropdowns are simply empty; the table itself is unaffected.
  */
 const ProductVulnerabilitiesTable = ({
   onTotalRecordsChange,
@@ -60,107 +60,53 @@ const ProductVulnerabilitiesTable = ({
     PRODUCT_VULNERABILITIES_DEFAULT_ROWS_PER_PAGE,
   );
 
-  // ── Severity dropdown metadata ──────────────────────────────────────────────
+  // ── Dropdown metadata (severities, products and their versions) ─────────────
   const { data: metaData } = useGetVulnerabilitiesMetaData();
   const severityOptions = useMemo(
     () =>
       metaData?.severities?.map((s) => ({ value: s.id, label: s.label })) ?? [],
     [metaData?.severities],
   );
-
-  // ── Full dataset (fetched once, all filtering/pagination done client-side) ───
-  const {
-    data: allData,
-    isLoading,
-    isError,
-  } = usePostProductVulnerabilitiesSearch(PRODUCT_VULNERABILITIES_FETCH_ALL_REQUEST);
-
-  const allVulnerabilities = useMemo(
-    (): ProductVulnerability[] => allData?.productVulnerabilities ?? [],
-    [allData],
+  const productOptions = useMemo(
+    () =>
+      metaData?.products?.map((p) => ({ value: p.name, label: p.name })) ?? [],
+    [metaData?.products],
   );
-
-  // ── Dropdown options ─────────────────────────────────────────────────────────
-  const productOptions = useMemo(() => {
-    const names = new Set<string>();
-    allVulnerabilities.forEach((v) => {
-      if (v.productName) names.add(v.productName);
-    });
-    return Array.from(names)
-      .sort()
-      .map((name) => ({ value: name, label: name }));
-  }, [allVulnerabilities]);
-
   const productVersionOptions = useMemo(() => {
     if (!filters.productName) return [];
-    const versions = new Set<string>();
-    allVulnerabilities
-      .filter((v) => v.productName === filters.productName)
-      .forEach((v) => {
-        if (v.productVersion) versions.add(v.productVersion);
-      });
-    return Array.from(versions)
-      .sort()
-      .map((v) => ({ value: v, label: v }));
-  }, [allVulnerabilities, filters.productName]);
-
-  // ── Client-side filtering ────────────────────────────────────────────────────
-  const filteredVulnerabilities = useMemo((): ProductVulnerability[] => {
-    let items = allVulnerabilities;
-
-    if (filters.severityId) {
-      items = items.filter(
-        (v) => String(v.severity?.id) === String(filters.severityId),
-      );
-    }
-    if (filters.productName) {
-      items = items.filter(
-        (v) => v.productName === (filters.productName as string),
-      );
-    }
-    if (filters.productVersion) {
-      items = items.filter(
-        (v) => v.productVersion === (filters.productVersion as string),
-      );
-    }
-    if (debouncedSearch?.trim()) {
-      const q = debouncedSearch.trim().toLowerCase();
-      items = items.filter(
-        (v) =>
-          v.cveId?.toLowerCase().includes(q) ||
-          v.componentName?.toLowerCase().includes(q) ||
-          v.vulnerabilityId?.toLowerCase().includes(q),
-      );
-    }
-
-    return items;
-  }, [allVulnerabilities, filters, debouncedSearch]);
-
-  // ── Client-side pagination ───────────────────────────────────────────────────
-  const paginatedData = useMemo(() => {
-    const total = filteredVulnerabilities.length;
-    const offset = page * rowsPerPage;
-    return {
-      vulnerabilities: filteredVulnerabilities.slice(offset, offset + rowsPerPage),
-      totalRecords: total,
-    };
-  }, [filteredVulnerabilities, page, rowsPerPage]);
-
-  // Clamp the current page when the filtered dataset shrinks (e.g. after a
-  // filter change) so the table never shows an empty page while valid rows exist.
-  useEffect(() => {
-    const maxPage = Math.max(
-      Math.ceil(filteredVulnerabilities.length / rowsPerPage) - 1,
-      0,
+    const product = metaData?.products?.find(
+      (p) => p.name === filters.productName,
     );
-    if (page > maxPage) {
-      setPage(maxPage);
-    }
-  }, [filteredVulnerabilities.length, rowsPerPage, page]);
+    return (product?.versions ?? []).map((v) => ({ value: v, label: v }));
+  }, [metaData?.products, filters.productName]);
+
+  // ── Current page, fetched from the server ───────────────────────────────────
+  const request = useMemo(
+    () =>
+      buildProductVulnerabilitiesSearchRequest(
+        debouncedSearch,
+        filters,
+        page,
+        rowsPerPage,
+      ),
+    [debouncedSearch, filters, page, rowsPerPage],
+  );
+  const { data, isLoading, isError } = usePostProductVulnerabilitiesSearch(
+    request,
+    { keepPreviousData: true },
+  );
+
+  const listData = useMemo(
+    () => ({
+      vulnerabilities: data?.productVulnerabilities ?? [],
+      totalRecords: data?.totalRecords ?? 0,
+    }),
+    [data],
+  );
 
   useEffect(() => {
-    onTotalRecordsChange?.(paginatedData.totalRecords);
-  }, [paginatedData.totalRecords, onTotalRecordsChange]);
+    onTotalRecordsChange?.(listData.totalRecords);
+  }, [listData.totalRecords, onTotalRecordsChange]);
 
   useEffect(() => {
     onError?.(isError);
@@ -176,6 +122,7 @@ const ProductVulnerabilitiesTable = ({
     setPage(0);
   };
 
+  // Clears the filters only; the search text is kept.
   const handleClearFilters = () => {
     setFilters({});
     setPage(0);
@@ -236,7 +183,7 @@ const ProductVulnerabilitiesTable = ({
       <ProductVulnerabilitiesList
         isLoading={isLoading}
         isError={isError}
-        data={paginatedData}
+        data={listData}
         page={page}
         rowsPerPage={rowsPerPage}
         onPageChange={handleChangePage}

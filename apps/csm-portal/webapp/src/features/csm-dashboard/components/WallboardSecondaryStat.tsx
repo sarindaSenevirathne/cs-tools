@@ -17,7 +17,7 @@
 import { Box, Skeleton, Typography } from "@wso2/oxygen-ui";
 import type { JSX } from "react";
 import { Link as RouterLink } from "react-router";
-import type { BeWidgetResourceType } from "@api/backend/types";
+import type { BeDashboardDistinctByConfig, BeWidgetResourceType } from "@api/backend/types";
 import { useWallboardTileData } from "@features/csm-dashboard/api/useWallboardTileData";
 
 export interface WallboardSecondaryStatProps {
@@ -25,6 +25,8 @@ export interface WallboardSecondaryStatProps {
   displayName: string;
   resourceType: BeWidgetResourceType;
   filters: Record<string, unknown>;
+  /** See `UseWidgetDataOptions.distinctBy`. */
+  distinctBy?: BeDashboardDistinctByConfig;
   selectedTeamCreGroupId?: string | string[];
   selectedTeamSreGroupId?: string | string[];
   selectedTeamLabel?: string;
@@ -48,6 +50,7 @@ export default function WallboardSecondaryStat({
   displayName,
   resourceType,
   filters,
+  distinctBy,
   selectedTeamCreGroupId,
   selectedTeamSreGroupId,
   selectedTeamLabel,
@@ -57,6 +60,7 @@ export default function WallboardSecondaryStat({
     displayName,
     resourceType,
     filters,
+    distinctBy,
     selectedTeamCreGroupId,
     selectedTeamSreGroupId,
     selectedTeamLabel,

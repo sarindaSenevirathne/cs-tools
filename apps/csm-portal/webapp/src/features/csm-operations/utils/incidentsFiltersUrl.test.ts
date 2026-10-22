@@ -42,6 +42,13 @@ describe("readIncidentFiltersFromUrl", () => {
       createdEndDate: "2026-05-31",
       products: ["Choreo", "Asgardeo"],
       sreTeamIds: ["team-apollo", "team-atlas"],
+      states: [],
+      categories: [],
+      serviceIds: [],
+      assigneeIds: [],
+      updatedStartDate: "",
+      updatedEndDate: "",
+      anyOf: [],
     });
   });
 
@@ -136,6 +143,16 @@ describe("writeIncidentFiltersToUrl", () => {
       createdEndDate: "2026-05-31",
       products: ["Choreo", "Asgardeo"],
       sreTeamIds: ["team-apollo", "team-atlas"],
+      states: ["NEW", "RESOLVED"],
+      categories: ["SOFTWARE"],
+      serviceIds: ["svc-1"],
+      assigneeIds: ["user-1"],
+      updatedStartDate: "2026-02-01",
+      updatedEndDate: "2026-02-10",
+      anyOf: [
+        { conditions: [{ field: "state", values: ["NEW"] }, { field: "priority", values: ["CRITICAL"] }] },
+        { conditions: [{ field: "assignmentGroupId", values: ["g-1"] }] },
+      ],
     };
     const round = readIncidentFiltersFromUrl(writeIncidentFiltersToUrl(filters));
     expect(round).toEqual(filters);

@@ -314,6 +314,7 @@ describe("CasePagingTab", () => {
       },
     };
     window.localStorage.setItem(VIEW_KEY, "settings");
+    window.localStorage.setItem("csm-ts.alert-settings.open", JSON.stringify(["SRE.where"]));
     render(
       <CasePagingTab
         onOpenRota={vi.fn()}
@@ -321,7 +322,7 @@ describe("CasePagingTab", () => {
         moveTargetKeys={["saas-night-cover"]}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "+ Add team chat routing" }));
+    fireEvent.click(screen.getByRole("button", { name: "+ Add chat space" }));
     const team = within(screen.getByRole("dialog")).getByLabelText("Team");
     expect(within(team).getAllByRole("option").map((o) => o.textContent)).toEqual([
       "All SRE teams (shared space)",
@@ -339,7 +340,7 @@ describe("CasePagingTab", () => {
         teams: [{ key: "atlas", name: "Atlas", family: "CRE" }],
       },
     };
-    window.localStorage.setItem("csm-ts.alert-settings.open", JSON.stringify(["CRE.redirects"]));
+    window.localStorage.setItem("csm-ts.alert-settings.open", JSON.stringify(["CRE.where"]));
     window.localStorage.setItem(VIEW_KEY, "settings");
     render(<CasePagingTab onOpenRota={vi.fn()} />);
     fireEvent.change(screen.getByLabelText("When a case is assigned to"), { target: { value: "Atlas" } });

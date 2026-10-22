@@ -606,24 +606,9 @@ func ParseCaseFieldFilters(filters []domain.CaseFieldFilter, callerEmail string,
 			internalID := f.Values[0]
 			p.InternalID = &internalID
 
-		case "taskSLABusinessElapsedPercent":
-			if err := requireCaseFilterValues(f); err != nil {
+		case slaFilterFieldPercent, slaFilterFieldBreached:
+			if err := parseSLAFilter(f.Field, f.Op, f.Values, &p.TaskSLAFilter, &p.HasBreachedSLA); err != nil {
 				return domain.ParsedCaseFilters{}, err
-			}
-			pct, err := parseCaseFilterPercent(f, f.Values[0])
-			if err != nil {
-				return domain.ParsedCaseFilters{}, err
-			}
-			if p.TaskSLAFilter == nil {
-				p.TaskSLAFilter = &domain.TaskSLAFilter{}
-			}
-			switch f.Op {
-			case "gte":
-				p.TaskSLAFilter.MinBusinessElapsedPercent = &pct
-			case "lte":
-				p.TaskSLAFilter.MaxBusinessElapsedPercent = &pct
-			default:
-				return domain.ParsedCaseFilters{}, badCaseFilterCombo(f)
 			}
 
 		case "escalationLevel":
@@ -646,22 +631,6 @@ func ParseCaseFieldFilters(filters []domain.CaseFieldFilter, callerEmail string,
 			default:
 				return domain.ParsedCaseFilters{}, badCaseFilterCombo(f)
 			}
-
-		case "slaBreached":
-			if f.Op != "eq" {
-				return domain.ParsedCaseFilters{}, badCaseFilterCombo(f)
-			}
-			if err := requireCaseFilterValues(f); err != nil {
-				return domain.ParsedCaseFilters{}, err
-			}
-			if len(f.Values) != 1 {
-				return domain.ParsedCaseFilters{}, &apierror.ValidationError{Msg: "filters: slaBreached eq requires exactly one value"}
-			}
-			b, err := parseCaseFilterBool(f, f.Values[0])
-			if err != nil {
-				return domain.ParsedCaseFilters{}, err
-			}
-			p.HasBreachedSLA = &b
 
 		case "accountEscalationActive":
 			if f.Op != "eq" {
@@ -830,36 +799,11 @@ func rejectUnsupportedOrGroupFields(parsed domain.ParsedCaseFilters) error {
 	return nil
 }
 
-// parseCaseFilterPercent parses a single filter value into a non-negative
-// integer percentage, for fields like taskSLABusinessElapsedPercent. No upper
-// bound: confirmed live against wso2sndev that a long-overdue, never-resolved
-// SLA's businessElapsedPercent keeps climbing well past 100 (observed up to
-// 45950) rather than capping there -- a value like 100 correctly means
-// "breached", not "the maximum possible value".
-func parseCaseFilterPercent(f domain.CaseFieldFilter, value string) (int, error) {
-	n, err := strconv.Atoi(value)
-	if err != nil || n < 0 {
-		return 0, &apierror.ValidationError{Msg: fmt.Sprintf("filters: field %q op %q value %q must be a non-negative integer", f.Field, f.Op, value)}
-	}
-	return n, nil
-}
-
-// parseCaseFilterBool mirrors incident_filters.go's parseIncidentFilterBool
-// for case search's own plain-boolean eq fields (slaBreached,
-// accountEscalationActive) -- unlike "escalation" (a reference-field
-// isEmpty/isNotEmpty presence check), these are true booleans with an
-// explicit true/false value on the wire, the same shape as the incident
-// side's slaViolated. Only the exact lowercase "true"/"false" the OpenAPI
-// contract documents are accepted.
+// parseCaseFilterBool parses case search's plain-boolean eq field
+// accountEscalationActive (a true boolean with an explicit true/false value on
+// the wire) via the shared parseBoolFilterValue.
 func parseCaseFilterBool(f domain.CaseFieldFilter, value string) (bool, error) {
-	switch value {
-	case "true":
-		return true, nil
-	case "false":
-		return false, nil
-	default:
-		return false, &apierror.ValidationError{Msg: fmt.Sprintf("filters: field %q op %q value %q must be a boolean", f.Field, f.Op, value)}
-	}
+	return parseBoolFilterValue(f.Field, f.Op, value)
 }
 
 // resolveCaseFilterCallerEmail resolves the authenticated caller's email from

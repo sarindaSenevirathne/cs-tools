@@ -465,8 +465,10 @@ func TestChangeRequestNobodyToAskIntegration_TickingAfterNewInTheLaterStates(t *
 	f.wantValidationError("approval ticked in Scheduled", err, "customerApprovalRequired can no longer be changed")
 	for _, st := range []string{"SCHEDULED", "IMPLEMENT", "REVIEW"} {
 		f.setState(id, st)
+		// Past the approval every field is read-only, so no contact would make the tick
+		// possible: the approved-content lock answers before the nobody-to-ask check.
 		_, err = f.patch(id, domain.PatchChangeRequestRequest{CustomerReviewRequired: boolp(true)})
-		f.wantExact("review ticked in "+st, err, nobodyMsgReview)
+		f.wantValidationError("review ticked in "+st, err, "customerReviewRequired can no longer be changed: the change request has been approved")
 		// Both at once, the approval box past its gate: the approval box's message first.
 		_, err = f.patch(id, domain.PatchChangeRequestRequest{CustomerApprovalRequired: boolp(true), CustomerReviewRequired: boolp(true)})
 		f.wantValidationError("both ticked in "+st, err, "customerApprovalRequired can no longer be changed")
@@ -483,19 +485,19 @@ func TestChangeRequestNobodyToAskIntegration_TickingAfterNewInTheLaterStates(t *
 	if _, err := f.patch(id, domain.PatchChangeRequestRequest{CustomerApprovalRequired: boolp(true)}); err != nil {
 		t.Fatalf("approval ticked in Authorize with somebody to ask: %v", err)
 	}
-	f.setState(id, "REVIEW")
 	if _, err := f.patch(id, domain.PatchChangeRequestRequest{CustomerReviewRequired: boolp(true)}); err != nil {
-		t.Fatalf("review ticked in Review with somebody to ask: %v", err)
+		t.Fatalf("review ticked in Authorize with somebody to ask: %v", err)
 	}
+	f.setState(id, "REVIEW")
 
 	// A box that is already ticked is never re-judged: its project's contacts left
 	// after it was ticked (the residual edge), and resending it, or any other
-	// edit, is accepted.
+	// edit the change still takes, is accepted.
 	f.execSQL(`UPDATE project_contact SET state = 'DEACTIVATED'::project_contact_state_enum WHERE project_id = $1`, crScopeProjectA)
-	if _, err := f.patch(id, domain.PatchChangeRequestRequest{CustomerApprovalRequired: boolp(true), CustomerReviewRequired: boolp(true), Title: sp("renamed")}); err != nil {
+	if _, err := f.patch(id, domain.PatchChangeRequestRequest{CustomerApprovalRequired: boolp(true), CustomerReviewRequired: boolp(true), OnHoldReason: sp("noted")}); err != nil {
 		t.Fatalf("resending the ticked boxes after the contacts left: %v", err)
 	}
-	if got := f.subjectOf(id); got != "renamed" {
+	if got := f.holdReasonOf(id); got != "noted" {
 		t.Fatalf("the resend did not write the rest of the PATCH: %q", got)
 	}
 	// Unticking is the lock's refusal, not this one.
@@ -585,8 +587,9 @@ func TestChangeRequestNobodyToAskIntegration_ResidualEdgeContactsLeaveAfterReque
 			t.Fatalf("a customer stage was provisioned with every contact deactivated: %+v", f.customerStages(id))
 		}
 		f.wantRefusedAndUnchanged("manual scheduled with nobody asked", id, domain.PatchChangeRequestRequest{State: ptrCRState("scheduled")}, bypassApprovalMsg)
-		// Nothing else about the change is judged by the refusal: other edits go through.
-		if _, err := f.patch(id, domain.PatchChangeRequestRequest{Title: sp("renamed"), CustomerApprovalRequired: boolp(true)}); err != nil {
+		// Nothing else about the change is judged by the refusal: what an approved change
+		// still takes (its stored box resent, a work note, the hold) goes through.
+		if _, err := f.patch(id, domain.PatchChangeRequestRequest{WorkNote: sp("a note"), OnHoldReason: sp("noted"), CustomerApprovalRequired: boolp(true)}); err != nil {
 			t.Fatalf("an edit of a change beyond New whose contacts left: %v", err)
 		}
 		f.step(id, domain.ChangeRequestStateCanceled, "CANCELED")
@@ -624,16 +627,17 @@ func TestChangeRequestNobodyToAskIntegration_ALegacyDeadEndRowIsNotRejudged(t *t
 	f.expect(review, "legacy, Customer Review", "CUSTOMER_REVIEW", "rollback", "canceled")
 
 	for _, id := range []string{approval, review} {
-		if _, err := f.patch(id, domain.PatchChangeRequestRequest{Title: sp("renamed"), WorkNote: sp("a note")}); err != nil {
+		if _, err := f.patch(id, domain.PatchChangeRequestRequest{OnHoldReason: sp("noted"), WorkNote: sp("a note")}); err != nil {
 			t.Fatalf("an edit of a legacy dead-end row: %v", err)
 		}
 		if _, err := f.patch(id, domain.PatchChangeRequestRequest{ProjectID: sp(crScopeProjectC), DeploymentIDs: &[]string{}}); err != nil {
 			t.Fatalf("restating the project of a legacy dead-end row: %v", err)
 		}
 	}
-	// A box that is turned on is judged, wherever the row is.
+	// A box that is turned on is refused: in Customer Approval the change has been
+	// approved, so it is read-only (the approved-content lock answers first).
 	_, err := f.patch(approval, domain.PatchChangeRequestRequest{CustomerReviewRequired: boolp(true)})
-	f.wantExact("turning the review box on of a legacy row in Customer Approval", err, nobodyMsgReview)
+	f.wantValidationError("turning the review box on of a legacy row in Customer Approval", err, "customerReviewRequired can no longer be changed: the change request has been approved")
 	// Re-schedule asks the customers again: with nobody to ask it is refused, atomically.
 	f.setPlanned(approval, rsStart1, rsEnd1)
 	before := f.snap(approval)

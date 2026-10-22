@@ -88,8 +88,8 @@ func TestServerRBACRouteGating(t *testing.T) {
 			wantHTTPCode: http.StatusForbidden,
 		},
 		// Projects. PATCH /projects/{id} is gated on projects:update, which
-		// the specification restricts to the WSO2-side roles; every external
-		// role is read-only on Projects.
+		// only a customer's own admin holds (the AI assistant settings);
+		// WSO2-side roles and every other external role are denied.
 	}
 
 	for _, tt := range tests {

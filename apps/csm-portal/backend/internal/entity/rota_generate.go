@@ -20,6 +20,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strconv"
 )
 
 // GenerateRotaMonth calls POST /team-schedule/rotas/{code}/generate on the
@@ -37,4 +38,11 @@ func (c *CustomerEntityClient) GetRotaNightCrew(ctx context.Context, code, from,
 	q.Set("from", from)
 	q.Set("to", to)
 	return c.do(ctx, http.MethodGet, "/team-schedule/rotas/"+url.PathEscape(code)+"/night-crew?"+q.Encode(), nil)
+}
+
+// ImportRota calls entity-service's POST /team-schedule/rotas/{code}/import: a whole rota from one file, or with dryRun what it would do.
+func (c *CustomerEntityClient) ImportRota(ctx context.Context, code string, dryRun bool, body []byte) ([]byte, error) {
+	q := url.Values{}
+	q.Set("dryRun", strconv.FormatBool(dryRun))
+	return c.do(ctx, http.MethodPost, "/team-schedule/rotas/"+url.PathEscape(code)+"/import?"+q.Encode(), body)
 }

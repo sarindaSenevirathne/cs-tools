@@ -102,19 +102,24 @@ export const PRODUCT_VULNERABILITIES_ALL_PRODUCTS_LABEL = "All Products";
 
 export const PRODUCT_VULNERABILITIES_ALL_VERSIONS_LABEL = "All Versions";
 
+/** Largest page the search endpoint accepts; the Component Analysis table pages server-side within it. */
+export const PRODUCT_VULNERABILITIES_MAX_PAGE_SIZE = 50;
+
+export const PRODUCT_VULNERABILITIES_NO_VERSIONS_LABEL = "No versions available";
+
 export const PRODUCT_VULNERABILITIES_ALL_FETCH_LIMIT = 5000;
 
 /**
- * Shared "fetch everything" search request. The Component Analysis list and the
- * vulnerability details page both use this exact object so they resolve to the
- * same React Query cache entry and the ~1500 rows are downloaded once.
+ * Search request used only by the vulnerability details page's affected-products
+ * lookup, which still reads the list in one request (so it sees at most the
+ * first ALL_FETCH_LIMIT records). The Component Analysis table does not use it.
  */
 export const PRODUCT_VULNERABILITIES_FETCH_ALL_REQUEST = {
   filters: {},
   pagination: { offset: 0, limit: PRODUCT_VULNERABILITIES_ALL_FETCH_LIMIT },
 };
 
-/** How long the details page trusts the cached fetch-all result before refetching. */
+/** How long the details page trusts its cached affected-products result before refetching. */
 export const PRODUCT_VULNERABILITIES_AFFECTED_STALE_TIME_MS = 5 * 60 * 1000;
 
 export const SECURITY_REPORT_ANALYSIS_PAGE_SIZE = 10;

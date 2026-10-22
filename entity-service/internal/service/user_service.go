@@ -341,11 +341,13 @@ func (s *userService) SearchUsers(ctx context.Context, req domain.SearchUsersReq
 //
 // Postgres has role/user_role tables (migrations 0008/0010 -- see
 // SearchUsers' roleIds filter, which does query them) and no group-membership
-// table at all. GetMe doesn't resolve either here: Roles is left empty rather
-// than queried, since no caller has asked for it on this path yet, and Groups
-// is always empty because there is genuinely nothing to resolve it from —
-// the frontend's team/role resolution is simply a no-op for this data source
-// today.
+// table at all. GetMe doesn't resolve groups here: Groups is always empty
+// because there is genuinely nothing to resolve it from — the frontend's
+// team resolution is simply a no-op for this data source today. UserType IS
+// populated (straight from GetUserByEmail's own already-resolved value) --
+// a caller (apps/customer-portal/backend-v2's internal-write-group gate, for
+// one) relies on it to tell an INTERNAL-classified caller apart from a
+// genuine customer/partner.
 func (s *userService) GetMe(ctx context.Context) (domain.GetUserMeResponse, error) {
 	token := middleware.UserIDTokenFromContext(ctx)
 	if token == "" {
@@ -387,6 +389,7 @@ func (s *userService) GetMe(ctx context.Context) (domain.GetUserMeResponse, erro
 		LastName:  user.LastName,
 		TimeZone:  user.Timezone,
 		Phone:     user.Phone,
+		UserType:  user.UserType,
 		Roles:     roles,
 		Groups:    groups,
 	}, nil

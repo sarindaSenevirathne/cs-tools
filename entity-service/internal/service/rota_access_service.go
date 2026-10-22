@@ -224,7 +224,7 @@ func (s *rotaAccessService) requireMarkerManager(ctx context.Context, teamKey st
 	}
 	if !c.csmAdmin && !containsFold(c.markerFamilies, family) {
 		return c, &apierror.ForbiddenError{
-			Msg: fmt.Sprintf("a rota marker for %s is granted by a CSM admin or the %s rota admin", teamKey, family),
+			Msg: fmt.Sprintf("a rota manager for %s is granted by a CSM admin or the %s rota admin", teamKey, family),
 		}
 	}
 	return c, nil
@@ -251,7 +251,7 @@ func (s *rotaAccessService) GrantRotaMarker(ctx context.Context, teamKey, userID
 		return err
 	}
 	if !member {
-		return &apierror.ValidationError{Msg: fmt.Sprintf("a rota marker marks their own team, and that person is not on %s", teamKey)}
+		return &apierror.ValidationError{Msg: fmt.Sprintf("a rota manager marks their own team, and that person is not on %s", teamKey)}
 	}
 	_, err = s.repo.GrantRotaMarker(ctx, userID, teamKey, c.email)
 	return err

@@ -79,6 +79,32 @@ func TestUserService_GetMe_ResolvesCallerFromToken(t *testing.T) {
 	}
 }
 
+// TestUserService_GetMe_PopulatesUserType proves GetMe carries through
+// GetUserByEmail's own already-resolved UserType -- a real, reported bug
+// had this field always left at its zero value on the Postgres data source
+// regardless of the caller's actual classification, which meant a caller
+// like apps/customer-portal/backend-v2's internal-write-group gate (keyed
+// on this exact field) could never recognize an INTERNAL-type user at all.
+func TestUserService_GetMe_PopulatesUserType(t *testing.T) {
+	for _, userType := range []domain.UserType{domain.UserTypeInternal, domain.UserTypeCustomer, ""} {
+		t.Run(string(userType), func(t *testing.T) {
+			repo := stubUserRepo{
+				getUserByEmail: func(_ context.Context, email string) (domain.User, error) {
+					return domain.User{ID: "11111111-1111-1111-1111-111111111111", Email: email, UserType: userType}, nil
+				},
+			}
+			svc := NewUserService(repo, nil)
+			resp, err := svc.GetMe(contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com")))
+			if err != nil {
+				t.Fatalf("GetMe returned error: %v", err)
+			}
+			if resp.UserType != userType {
+				t.Errorf("UserType = %q, want %q", resp.UserType, userType)
+			}
+		})
+	}
+}
+
 // TestUserService_GetMe_Phone proves the user's phone is passed through to the
 // response and serialised as "phone", and that a NULL phone is omitted.
 func TestUserService_GetMe_Phone(t *testing.T) {

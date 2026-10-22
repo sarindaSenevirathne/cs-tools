@@ -49,7 +49,9 @@ type stubContacts struct {
 	teams map[string][]repository.PagingTeamRef
 	rows  map[string]repository.PagingContactRow
 	// profiles is "user".phone, by user id.
-	profiles  map[string]string
+	profiles map[string]string
+	// tests is paging_test_call, by user id.
+	tests     map[string]repository.PagingTestRow
 	lastActor string
 }
 
@@ -64,6 +66,7 @@ func newStubContacts() *stubContacts {
 		},
 		rows:     map[string]repository.PagingContactRow{},
 		profiles: map[string]string{},
+		tests:    map[string]repository.PagingTestRow{},
 	}
 	for id, name := range map[string]string{uidVega: "Vic", uidApollo: "Abe", uidAsgardeo: "Ama", uidAmericas: "Ana", uidNoTeam: "Nia"} {
 		c.users[id] = repository.PagingUser{ID: id, Email: strings.ToLower(name) + "@wso2.com", Name: name}
@@ -126,14 +129,36 @@ func (c *stubContacts) DialNumbersByEmails(_ context.Context, emails []string) (
 	return out, nil
 }
 
-func (c *stubContacts) ProfilePhoneUserIDs(_ context.Context, ids []string) (map[string]bool, error) {
-	out := map[string]bool{}
+func (c *stubContacts) ProfilePhones(_ context.Context, ids []string) (map[string]string, error) {
+	out := map[string]string{}
 	for _, id := range ids {
-		if e164.MatchString(strings.TrimSpace(c.profiles[id])) {
-			out[id] = true
+		if p := strings.TrimSpace(c.profiles[id]); e164.MatchString(p) {
+			out[id] = p
 		}
 	}
 	return out, nil
+}
+
+func (c *stubContacts) ProfileTests(_ context.Context, ids []string) (map[string]repository.PagingTestRow, error) {
+	out := map[string]repository.PagingTestRow{}
+	for _, id := range ids {
+		if t, ok := c.tests[id]; ok {
+			out[id] = t
+		}
+	}
+	return out, nil
+}
+
+func (c *stubContacts) MarkProfileTestPending(_ context.Context, actor, id, phone string, at, notBefore time.Time) (bool, error) {
+	if t, ok := c.tests[id]; ok && t.LastTestAt.After(notBefore) {
+		return false, nil
+	}
+	if r, ok := c.rows[id]; ok && r.LastTestAt != nil && r.LastTestAt.After(notBefore) {
+		return false, nil
+	}
+	c.lastActor = actor
+	c.tests[id] = repository.PagingTestRow{UserID: id, Phone: phone, LastTestAt: at, LastTestStatus: "pending"}
+	return true, nil
 }
 
 func (c *stubContacts) Upsert(_ context.Context, actor, id, phone string) (repository.PagingContactRow, error) {
@@ -158,6 +183,9 @@ func (c *stubContacts) MarkTestPending(_ context.Context, actor, id string, at, 
 	if !ok || (r.LastTestAt != nil && r.LastTestAt.After(notBefore)) {
 		return repository.PagingContactRow{}, false, nil
 	}
+	if t, ok := c.tests[id]; ok && t.LastTestAt.After(notBefore) {
+		return repository.PagingContactRow{}, false, nil
+	}
 	c.lastActor = actor
 	pending := "pending"
 	r.LastTestAt, r.LastTestStatus = &at, &pending
@@ -166,8 +194,18 @@ func (c *stubContacts) MarkTestPending(_ context.Context, actor, id string, at, 
 }
 
 func (c *stubContacts) RecordTestResult(_ context.Context, actor, id, status string, at time.Time) (bool, error) {
+	if t, ok := c.tests[id]; ok && t.LastTestStatus == "pending" {
+		r, rok := c.rows[id]
+		newerPaging := rok && r.LastTestStatus != nil && *r.LastTestStatus == "pending" && r.LastTestAt.After(t.LastTestAt)
+		if !newerPaging {
+			c.lastActor = actor
+			t.LastTestAt, t.LastTestStatus = at, status
+			c.tests[id] = t
+			return true, nil
+		}
+	}
 	r, ok := c.rows[id]
-	if !ok {
+	if !ok || r.LastTestStatus == nil || *r.LastTestStatus != "pending" {
 		return false, nil
 	}
 	c.lastActor = actor
@@ -295,22 +333,22 @@ func TestMaskPhone(t *testing.T) {
 	}
 }
 
-func TestTestCallRefusal(t *testing.T) {
+func TestTestCallCooldown(t *testing.T) {
 	now := time.Date(2026, 10, 8, 10, 0, 0, 0, time.UTC)
 	at := func(d time.Duration) *time.Time { v := now.Add(-d); return &v }
-	var conflict *apierror.ConflictError
-	if err := testCallRefusal(nil, now); !errors.As(err, &conflict) {
-		t.Errorf("no number: %v, want 409", err)
-	}
 	var tooMany *apierror.TooManyRequestsError
 	for _, d := range []time.Duration{0, time.Minute, 119 * time.Second} {
-		if err := testCallRefusal(&repository.PagingContactRow{LastTestAt: at(d)}, now); !errors.As(err, &tooMany) {
+		if err := testCallCooldown(now, at(d)); !errors.As(err, &tooMany) {
 			t.Errorf("last test %v ago: %v, want 429", d, err)
 		}
+		// Either number's test counts.
+		if err := testCallCooldown(now, at(time.Hour), at(d)); !errors.As(err, &tooMany) {
+			t.Errorf("paging test %v ago: %v, want 429", d, err)
+		}
 	}
-	for _, c := range []*repository.PagingContactRow{{}, {LastTestAt: at(2 * time.Minute)}, {LastTestAt: at(time.Hour)}} {
-		if err := testCallRefusal(c, now); err != nil {
-			t.Errorf("%+v: %v, want allowed", c.LastTestAt, err)
+	for _, tests := range [][]*time.Time{nil, {nil}, {nil, nil}, {at(2 * time.Minute)}, {at(time.Hour), nil}} {
+		if err := testCallCooldown(now, tests...); err != nil {
+			t.Errorf("%v: %v, want allowed", tests, err)
 		}
 	}
 }
@@ -322,16 +360,18 @@ func TestRequestTestCall(t *testing.T) {
 	svc := phoneService(repo, contacts, pub, now)
 
 	var conflict *apierror.ConflictError
-	if _, err := svc.RequestTestCall(pagingCaller("vegalead@wso2.com"), uidVega); !errors.As(err, &conflict) || len(pub.calls) != 0 {
+	if _, err := svc.RequestTestCall(pagingCaller("rota@wso2.com"), uidVega); !errors.As(err, &conflict) || len(pub.calls) != 0 {
 		t.Fatalf("no number: %v", err)
 	}
 	_, _ = contacts.Upsert(context.Background(), "x", uidVega, "+94771234123")
 	var forbidden *apierror.ForbiddenError
-	if _, err := svc.RequestTestCall(pagingCaller("eng@wso2.com"), uidVega); !errors.As(err, &forbidden) {
-		t.Fatalf("engineer: %v", err)
+	for _, caller := range []string{"eng@wso2.com", "vegalead@wso2.com", "crehead@wso2.com"} {
+		if _, err := svc.RequestTestCall(pagingCaller(caller), uidVega); !errors.As(err, &forbidden) {
+			t.Fatalf("%s: %v, want 403", caller, err)
+		}
 	}
 
-	resp, err := svc.RequestTestCall(pagingCaller("vegalead@wso2.com"), uidVega)
+	resp, err := svc.RequestTestCall(pagingCaller("rota@wso2.com"), uidVega)
 	if err != nil || resp.LastTestStatus != "pending" {
 		t.Fatalf("test call: %+v %v", resp, err)
 	}
@@ -351,7 +391,7 @@ func TestRequestTestCall(t *testing.T) {
 	}
 	want := events.PagingTestCallRequestedPayload{
 		UserID: uidVega, Email: "vic@wso2.com", Name: "Vic", Phone: "+94771234123",
-		RequestedBy: "vegalead@wso2.com", RequestedAt: "2026-10-08T10:00:00Z",
+		RequestedBy: "rota@wso2.com", RequestedAt: "2026-10-08T10:00:00Z",
 	}
 	if p != want {
 		t.Errorf("payload\n got %+v\nwant %+v", p, want)
@@ -360,11 +400,11 @@ func TestRequestTestCall(t *testing.T) {
 	// Again within two minutes: 429, nothing published.
 	svc.now = func() time.Time { return now.Add(90 * time.Second) }
 	var tooMany *apierror.TooManyRequestsError
-	if _, err := svc.RequestTestCall(pagingCaller("vegalead@wso2.com"), uidVega); !errors.As(err, &tooMany) || len(pub.calls) != 1 {
+	if _, err := svc.RequestTestCall(pagingCaller("rota@wso2.com"), uidVega); !errors.As(err, &tooMany) || len(pub.calls) != 1 {
 		t.Fatalf("within the cooldown: %v, %d published", err, len(pub.calls))
 	}
 	svc.now = func() time.Time { return now.Add(2 * time.Minute) }
-	if _, err := svc.RequestTestCall(pagingCaller("vegalead@wso2.com"), uidVega); err != nil || len(pub.calls) != 2 {
+	if _, err := svc.RequestTestCall(pagingCaller("rota@wso2.com"), uidVega); err != nil || len(pub.calls) != 2 {
 		t.Fatalf("after the cooldown: %v, %d published", err, len(pub.calls))
 	}
 }
@@ -375,7 +415,7 @@ func TestRequestTestCall_PublishProblems(t *testing.T) {
 	_, _ = contacts.Upsert(context.Background(), "x", uidVega, "+94771234123")
 
 	var unavailable *apierror.ServiceUnavailableError
-	if _, err := phoneService(repo, contacts, nil, now).RequestTestCall(pagingCaller("vegalead@wso2.com"), uidVega); !errors.As(err, &unavailable) {
+	if _, err := phoneService(repo, contacts, nil, now).RequestTestCall(pagingCaller("rota@wso2.com"), uidVega); !errors.As(err, &unavailable) {
 		t.Fatalf("no publisher: %v", err)
 	}
 	if contacts.rows[uidVega].LastTestStatus != nil {
@@ -383,7 +423,7 @@ func TestRequestTestCall_PublishProblems(t *testing.T) {
 	}
 
 	failing := &mockEventPublisher{err: errors.New("event hub down")}
-	if _, err := phoneService(repo, contacts, failing, now).RequestTestCall(pagingCaller("vegalead@wso2.com"), uidVega); !errors.As(err, &unavailable) {
+	if _, err := phoneService(repo, contacts, failing, now).RequestTestCall(pagingCaller("rota@wso2.com"), uidVega); !errors.As(err, &unavailable) {
 		t.Fatalf("publish failed: %v", err)
 	}
 	if s := contacts.rows[uidVega].LastTestStatus; s == nil || *s != "failed" {
@@ -473,6 +513,7 @@ func TestListPagingContacts_DialNumber(t *testing.T) {
 func TestRecordTestResult(t *testing.T) {
 	repo, contacts := phoneFixture()
 	_, _ = contacts.Upsert(context.Background(), "x", uidVega, "+94771234123")
+	_, _, _ = contacts.MarkTestPending(context.Background(), "x", uidVega, time.Date(2026, 10, 8, 10, 0, 0, 0, time.UTC), time.Date(2026, 10, 8, 9, 58, 0, 0, time.UTC))
 	svc := phoneService(repo, contacts, nil, time.Now())
 	service := auth.WithIdentity(context.Background(), auth.Identity{Validated: true, ClientID: "csm-notification-service"})
 	ok := domain.PagingTestResultRequest{UserID: uidVega, Status: "no-answer", TestedAt: "2026-10-08T10:01:30Z"}
@@ -502,6 +543,14 @@ func TestRecordTestResult(t *testing.T) {
 	row := contacts.rows[uidVega]
 	if *row.LastTestStatus != "no-answer" || row.LastTestAt.Format(time.RFC3339) != ok.TestedAt || contacts.lastActor != "service:csm-notification-service" {
 		t.Errorf("stored %v at %v by %q", *row.LastTestStatus, row.LastTestAt, contacts.lastActor)
+	}
+	// A repeated result finds no pending test and changes nothing.
+	again := domain.PagingTestResultRequest{UserID: uidVega, Status: "completed", TestedAt: "2026-10-08T10:05:00Z"}
+	if err := svc.RecordTestResult(service, again); !errors.As(err, &notFound) {
+		t.Errorf("repeated result: %v, want NotFoundError", err)
+	}
+	if row := contacts.rows[uidVega]; *row.LastTestStatus != "no-answer" {
+		t.Errorf("a repeated result overwrote the last one: %v", *row.LastTestStatus)
 	}
 }
 
@@ -560,5 +609,159 @@ func TestGetPagingChain_PagingPhones(t *testing.T) {
 		if m := got[id]; m.HasProfilePhone == nil || *m.HasProfilePhone != want {
 			t.Errorf("%s hasProfilePhone = %v, want %v", id, m.HasProfilePhone, want)
 		}
+	}
+}
+
+// Who may place a test call: a portal admin, or the rota admin of a family
+// one of the person's teams is in. Leads and heads may set a number, not ring it.
+func TestRequestTestCall_PermissionTable(t *testing.T) {
+	for _, tc := range []struct {
+		caller, target string
+		allow          bool
+	}{
+		{"admin@wso2.com", uidVega, true},
+		{"admin@wso2.com", uidApollo, true},
+		{"admin@wso2.com", uidNoTeam, true},
+		{"rota@wso2.com", uidVega, true}, // cre_rota_admin, CRE team
+		{"rota@wso2.com", uidAmericas, true},
+		{"rota@wso2.com", uidApollo, false},
+		{"rota@wso2.com", uidNoTeam, false},
+		{"sreadmin@wso2.com", uidApollo, true},
+		{"sreadmin@wso2.com", uidVega, false},
+		{"smeadmin@wso2.com", uidAsgardeo, true},
+		{"smeadmin@wso2.com", uidVega, false},
+		{"vegalead@wso2.com", uidVega, false},
+		{"apollolead@wso2.com", uidApollo, false},
+		{"amhead@wso2.com", uidAmericas, false},
+		{"crehead@wso2.com", uidVega, false},
+		{"eng@wso2.com", uidVega, false},
+	} {
+		t.Run(tc.caller+"->"+tc.target, func(t *testing.T) {
+			repo, contacts := phoneFixture()
+			contacts.profiles[tc.target] = "+94770000009"
+			pub := &mockEventPublisher{}
+			_, err := phoneService(repo, contacts, pub, time.Now()).RequestTestCall(pagingCaller(tc.caller), tc.target)
+			var forbidden *apierror.ForbiddenError
+			switch {
+			case tc.allow && (err != nil || len(pub.calls) != 1):
+				t.Fatalf("want allowed, got %v (%d published)", err, len(pub.calls))
+			case !tc.allow && (!errors.As(err, &forbidden) || len(pub.calls) != 0 || len(contacts.tests) != 0):
+				t.Fatalf("want ForbiddenError and nothing written, got %v (%d published)", err, len(pub.calls))
+			}
+		})
+	}
+}
+
+// A person with a callable profile number is rung on it -- the number Case
+// Alerts dials first -- and the test is kept apart from the paging-only one.
+func TestRequestTestCall_ProfileNumber(t *testing.T) {
+	now := time.Date(2026, 10, 8, 10, 0, 0, 0, time.UTC)
+	repo, contacts := phoneFixture()
+	pub := &mockEventPublisher{}
+	svc := phoneService(repo, contacts, pub, now)
+	service := auth.WithIdentity(context.Background(), auth.Identity{Validated: true, ClientID: "csm-notification-service"})
+
+	contacts.profiles[uidVega] = " +94770000001 "
+	_, _ = contacts.Upsert(context.Background(), "x", uidVega, "+94771234123")
+	if _, err := svc.RequestTestCall(pagingCaller("rota@wso2.com"), uidVega); err != nil {
+		t.Fatal(err)
+	}
+	call, ok := findPublishCall(pub.calls, events.TypePagingTestCallRequested)
+	var p events.PagingTestCallRequestedPayload
+	if !ok || json.Unmarshal(call.payload, &p) != nil || p.Phone != "+94770000001" {
+		t.Fatalf("rang %q, want the profile number", p.Phone)
+	}
+	if tr := contacts.tests[uidVega]; tr.Phone != "+94770000001" || tr.LastTestStatus != "pending" || !tr.LastTestAt.Equal(now) || contacts.lastActor != "rota@wso2.com" {
+		t.Errorf("profile test %+v by %q", tr, contacts.lastActor)
+	}
+	if contacts.rows[uidVega].LastTestStatus != nil {
+		t.Error("a profile test was recorded on the paging-only number")
+	}
+
+	// The cooldown spans both numbers.
+	svc.now = func() time.Time { return now.Add(time.Minute) }
+	var tooMany *apierror.TooManyRequestsError
+	if _, err := svc.RequestTestCall(pagingCaller("rota@wso2.com"), uidVega); !errors.As(err, &tooMany) {
+		t.Fatalf("within the cooldown: %v", err)
+	}
+
+	// The outcome lands on the pending profile test.
+	if err := svc.RecordTestResult(service, domain.PagingTestResultRequest{UserID: uidVega, Status: "completed", TestedAt: "2026-10-08T10:01:10Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if tr := contacts.tests[uidVega]; tr.LastTestStatus != "completed" || tr.LastTestAt.Format(time.RFC3339) != "2026-10-08T10:01:10Z" {
+		t.Errorf("profile test after the result %+v", tr)
+	}
+	if contacts.rows[uidVega].LastTestStatus != nil {
+		t.Error("the result was recorded on the paging-only number")
+	}
+
+	// No number anywhere: 409, even for an admin.
+	var conflict *apierror.ConflictError
+	if _, err := svc.RequestTestCall(pagingCaller("admin@wso2.com"), uidApollo); !errors.As(err, &conflict) {
+		t.Errorf("no number: %v, want 409", err)
+	}
+	// A profile number only: rung without a paging_contact row.
+	contacts.profiles[uidAsgardeo] = "+94770000003"
+	if _, err := svc.RequestTestCall(pagingCaller("smeadmin@wso2.com"), uidAsgardeo); err != nil {
+		t.Errorf("profile only: %v", err)
+	}
+}
+
+// The chain says who may test, and what a test would ring, only to them.
+func TestGetPagingChain_TestCall(t *testing.T) {
+	now := time.Date(2026, 10, 8, 10, 0, 0, 0, time.UTC)
+	repo, contacts := phoneFixture()
+	vega := repo.members[idVegaEng]
+	vega.UserID = uidVega
+	repo.members[idVegaEng] = vega
+	am := repo.members[idAmEng]
+	am.UserID = uidAmericas
+	repo.members[idAmEng] = am
+	contacts.profiles[uidVega] = "+94770000001"
+	_, _ = contacts.Upsert(context.Background(), "x", uidAmericas, "+14155550123")
+	contacts.tests[uidVega] = repository.PagingTestRow{UserID: uidVega, Phone: "+94770000001", LastTestAt: now, LastTestStatus: "no-answer"}
+	svc := phoneService(repo, contacts, nil, now)
+
+	view := func(caller string) map[string]domain.PagingChainMember {
+		resp, err := svc.GetPagingChain(pagingCaller(caller), "CRE")
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]domain.PagingChainMember{}
+		for _, m := range resp.Members {
+			out[m.MembershipID] = m
+		}
+		return out
+	}
+
+	got := view("rota@wso2.com")
+	if m := got[idVegaEng]; !m.CanTestCall || m.TestCall == nil || m.TestCall.Source != "profile" || m.TestCall.Masked != "+94•••••001" ||
+		m.TestCall.LastTestStatus == nil || *m.TestCall.LastTestStatus != "no-answer" || *m.TestCall.LastTestAt != "2026-10-08T10:00:00Z" {
+		t.Errorf("profile number: %+v %+v", m, m.TestCall)
+	}
+	if m := got[idAmEng]; !m.CanTestCall || m.TestCall == nil || m.TestCall.Source != "paging" || m.TestCall.Masked != "+1•••••123" || m.TestCall.LastTestStatus != nil {
+		t.Errorf("paging-only number: %+v %+v", m, m.TestCall)
+	}
+	// A portal admin may test anyone; a person with no number has no testCall.
+	if m := view("admin@wso2.com")[idVegaLead]; !m.CanTestCall || m.TestCall != nil {
+		t.Errorf("no number: canTestCall %v, testCall %+v", m.CanTestCall, m.TestCall)
+	}
+
+	// A team lead may edit a paging number but neither test it nor see testCall.
+	for id, m := range view("vegalead@wso2.com") {
+		if m.CanTestCall || m.TestCall != nil {
+			t.Errorf("lead sees %s: canTestCall %v, testCall %+v", id, m.CanTestCall, m.TestCall)
+		}
+	}
+	raw, _ := json.Marshal(view("vegalead@wso2.com")[idVegaEng])
+	if !strings.Contains(string(raw), `"canTestCall":false`) || strings.Contains(string(raw), `"testCall"`) {
+		t.Errorf("wire shape %s", raw)
+	}
+
+	// A test of a profile number that has since changed is not shown.
+	contacts.profiles[uidVega] = "+94770000002"
+	if m := view("rota@wso2.com")[idVegaEng]; m.TestCall == nil || m.TestCall.Masked != "+94•••••002" || m.TestCall.LastTestStatus != nil {
+		t.Errorf("after the number changed: %+v", m.TestCall)
 	}
 }

@@ -122,6 +122,23 @@ type Config struct {
 	// uses — it is the system zone, NOT the commitment's recorded one.
 	AvailabilityTimezone string
 
+	// WorklogReportTeamTypes scopes the CS Worklogs reports: the
+	// team.type values whose teams get a section. Defaults to the CRE
+	// delivery teams, which is what the delivered mails cover -- the
+	// SME and SRE teams appear in neither.
+	WorklogReportTeamTypes []string
+	// WorklogReportExcludedTeamKeys drops individual teams from that
+	// scope by key. A type filter is broad by nature and catches teams
+	// nobody wants in the report; this takes them out without
+	// narrowing the type list to the point of brittleness.
+	WorklogReportExcludedTeamKeys []string
+	// QueryHourInternalEmailDomain restricts the query-hour report's
+	// derived audience to internal addresses. ServiceNow checks
+	// `includes("@wso2.com")` before adding an account owner, so a
+	// customer contact mistakenly recorded as an owner is not mailed an
+	// internal report.
+	QueryHourInternalEmailDomain string
+
 	DBUser     string
 	DBPassword string
 	DBName     string
@@ -431,6 +448,19 @@ type Config struct {
 	// recipients is not swept at all, so its decisions are not used up.
 	OutageNotificationRecipients  []string
 	OutageCommunicationRecipients []string
+	// MigrationCaseReportHoldTag and MigrationCaseReportAccountsTag are the
+	// tag names (matched ignoring case) that place a long-running migration
+	// in the weekly scan's "customer asked to hold" and "waiting on the
+	// accounts team" tables. MigrationCaseReportTeamKeys are the teams whose
+	// mail groups (team.group_email) receive the scan; empty means the scan
+	// derives no recipients and the scheduled task must configure its own.
+	// ProductRegressionReportTag is the tag name (matched ignoring case)
+	// that marks a case as a regression for the monthly product regression
+	// reports (GET /reports/product-regressions).
+	ProductRegressionReportTag     string
+	MigrationCaseReportHoldTag     string
+	MigrationCaseReportAccountsTag string
+	MigrationCaseReportTeamKeys    []string
 	// CustomerRoles is a comma-separated list of ServiceNow role names
 	// (organisation-specific vocabulary, the same reasoning
 	// apps/csm-portal/backend's own CSM_TEAM_REGISTRY uses for not shipping
@@ -689,6 +719,12 @@ type Config struct {
 	// this is the backstop for a missed invalidation, not the main freshness
 	// mechanism.
 	UserCacheTTL time.Duration
+	// VulnerabilityMetaCacheTTL bounds how long the cached distinct
+	// product/version options of GET /products/vulnerabilities/meta survive
+	// (PRODUCT_VULNERABILITY_META_CACHE_TTL, default 24h). A successful
+	// POST /products/vulnerabilities/sync deletes the entry; this is the
+	// backstop for changes made to the table by anything else.
+	VulnerabilityMetaCacheTTL time.Duration
 	// ServerReadTimeout and ServerWriteTimeout are the main API server's
 	// http.Server ReadTimeout/WriteTimeout (SERVER_READ_TIMEOUT,
 	// SERVER_WRITE_TIMEOUT). The health server keeps its own fixed timeouts.
@@ -727,9 +763,12 @@ func Load() *Config {
 		return n
 	}
 	cfg := &Config{
-		DBHost:                                   getEnvOrDefault("DB_HOST", "localhost"),
-		DBPort:                                   getEnvOrDefault("DB_PORT", "5432"),
-		AvailabilityTimezone:                     os.Getenv("AVAILABILITY_TIMEZONE"),
+		DBHost:               getEnvOrDefault("DB_HOST", "localhost"),
+		DBPort:               getEnvOrDefault("DB_PORT", "5432"),
+		AvailabilityTimezone: os.Getenv("AVAILABILITY_TIMEZONE"),
+		WorklogReportTeamTypes: splitCommaOrDefault(
+			os.Getenv("WORKLOG_REPORT_TEAM_TYPES"), []string{"cre-abt", "cre"}),
+		WorklogReportExcludedTeamKeys:            splitComma(os.Getenv("WORKLOG_REPORT_EXCLUDED_TEAM_KEYS")),
 		DBUser:                                   os.Getenv("DB_USER"),
 		DBPassword:                               os.Getenv("DB_PASSWORD"),
 		DBName:                                   os.Getenv("DB_NAME"),
@@ -784,6 +823,10 @@ func Load() *Config {
 		OutageNoticePollInterval:                      envDuration("OUTAGE_NOTICE_POLL_INTERVAL", 60*time.Second),
 		OutageNotificationRecipients:                  splitComma(os.Getenv("OUTAGE_NOTIFICATION_RECIPIENTS")),
 		OutageCommunicationRecipients:                 splitComma(os.Getenv("OUTAGE_COMMUNICATION_RECIPIENTS")),
+		ProductRegressionReportTag:                    getEnvOrDefault("PRODUCT_REGRESSION_REPORT_TAG", "s_rg"),
+		MigrationCaseReportHoldTag:                    getEnvOrDefault("MIGRATION_CASE_REPORT_HOLD_TAG", "s_mig_hold"),
+		MigrationCaseReportAccountsTag:                getEnvOrDefault("MIGRATION_CASE_REPORT_ACCOUNTS_TAG", "s_acc"),
+		MigrationCaseReportTeamKeys:                   splitComma(os.Getenv("MIGRATION_CASE_REPORT_TEAM_KEYS")),
 		AuthIssuer:                                    os.Getenv("AUTH_ISSUER"),
 		AuthJWKSURL:                                   os.Getenv("AUTH_JWKS_URL"),
 		AuthUserTokenAudiences:                        splitComma(os.Getenv("AUTH_USER_TOKEN_AUDIENCES")),
@@ -842,6 +885,7 @@ func Load() *Config {
 	cfg.RedisAddr = strings.TrimSpace(os.Getenv("REDIS_ADDR"))
 	cfg.RedisPassword = os.Getenv("REDIS_PASSWORD")
 	cfg.UserCacheTTL = envDuration("USER_CACHE_TTL", 10*time.Minute)
+	cfg.VulnerabilityMetaCacheTTL = envDuration("PRODUCT_VULNERABILITY_META_CACHE_TTL", 24*time.Hour)
 	cfg.applySREEventHubTopic()
 	return cfg
 }
@@ -950,6 +994,17 @@ func splitComma(s string) []string {
 		}
 	}
 	return result
+}
+
+// splitCommaOrDefault is splitComma with a fallback, for a list whose
+// empty value would mean something materially different from its
+// intended default -- an unset team-type scope would widen a report to
+// every team rather than narrow it to none.
+func splitCommaOrDefault(s string, def []string) []string {
+	if v := splitComma(s); len(v) > 0 {
+		return v
+	}
+	return def
 }
 
 // HasDatabase reports whether a Postgres connection is configured. It is the

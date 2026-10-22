@@ -4757,3 +4757,34 @@ func TestCaseCreateTargetsAnnouncement(t *testing.T) {
 		}
 	}
 }
+
+func TestCreateCallRequest_StartsPendingOnCustomer(t *testing.T) {
+	const caseID = "11111111-1111-1111-1111-111111111111"
+
+	var captured []byte
+	client := &mockEntityCaseClient{
+		createCallRequestFn: func(_ context.Context, body []byte) ([]byte, error) {
+			captured = body
+			return []byte(`{"message":"created","callRequest":{"id":"cr-1","state":{"id":"pending_on_customer","label":"Pending on Customer"}}}`), nil
+		},
+	}
+	h := NewCaseHandler(client)
+	r := withUser(httptest.NewRequest(http.MethodPost, "/cases/"+caseID+"/call-requests", strings.NewReader(
+		`{"reason":"walkthrough","utcTimes":["2026-12-31T10:00:00Z"],"durationInMinutes":30,"state":"pending_on_wso2"}`,
+	)))
+	r.SetPathValue("id", caseID)
+	w := httptest.NewRecorder()
+	h.CreateCallRequest(w, r)
+
+	assertStatus(t, w, http.StatusCreated)
+	var sent map[string]any
+	if err := json.Unmarshal(captured, &sent); err != nil {
+		t.Fatalf("upstream body: %v", err)
+	}
+	if sent["caseId"] != caseID {
+		t.Errorf("caseId = %v, want %s", sent["caseId"], caseID)
+	}
+	if sent["state"] != "pending_on_customer" {
+		t.Errorf("state = %v, want pending_on_customer (client-supplied state must not win)", sent["state"])
+	}
+}

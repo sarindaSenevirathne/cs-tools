@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strconv"
 
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
@@ -37,6 +38,7 @@ var rotaMonthRe = regexp.MustCompile(`^\d{4}-(0[1-9]|1[0-2])$`)
 type entityRotaGenerateClient interface {
 	GenerateRotaMonth(ctx context.Context, code string, body []byte) ([]byte, error)
 	GetRotaNightCrew(ctx context.Context, code, from, to string) ([]byte, error)
+	ImportRota(ctx context.Context, code string, dryRun bool, body []byte) ([]byte, error)
 }
 
 // RotaGenerateHandler proxies the Team Schedule's "Generate month" action.
@@ -83,6 +85,44 @@ func (h *RotaGenerateHandler) GenerateRotaMonth(w http.ResponseWriter, r *http.R
 
 	status := http.StatusCreated
 	if req.DryRun {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, result)
+}
+
+// ImportRota handles POST /team-schedule/rotas/{code}/import; entity-service decides who may, and its refusals name the entry at fault.
+func (h *RotaGenerateHandler) ImportRota(w http.ResponseWriter, r *http.Request) {
+	dryRun := false
+	if raw := r.URL.Query().Get("dryRun"); raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "dryRun must be true or false.")
+			return
+		}
+		dryRun = v
+	}
+	body, userID, ok := readScheduleBody(w, r)
+	if !ok {
+		return
+	}
+
+	result, err := h.entity.ImportRota(r.Context(), r.PathValue("code"), dryRun, body)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "entity ImportRota failed", "userID", userID, "err", err)
+		var apiErr *apierror.Error
+		if errors.As(err, &apiErr) {
+			switch apiErr.StatusCode {
+			case http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound, http.StatusConflict:
+				writeError(w, apiErr.StatusCode, upstreamErrorMessageStrict(apiErr.Body, "Failed to import the rota."))
+				return
+			}
+		}
+		mapUpstreamErrorGeneric(w, err, "Failed to import the rota.")
+		return
+	}
+
+	status := http.StatusCreated
+	if dryRun {
 		status = http.StatusOK
 	}
 	writeJSON(w, status, result)

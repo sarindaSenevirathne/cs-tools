@@ -164,7 +164,7 @@ func (s *changeRequestService) SearchChangeRequests(ctx context.Context, req dom
 	// Reuses validChangeRequestSortField/validChangeRequestSortOrder (defined
 	// in sn_change_request_service.go) so an invalid sortBy is a 400 on both
 	// data sources instead of silently falling back to created_on DESC here.
-	if req.SortBy.Field != "" && !validChangeRequestSortField[req.SortBy.Field] {
+	if req.SortBy.Field != "" && !validChangeRequestSortField[req.SortBy.Field] && !postgresOnlyChangeRequestSortField[req.SortBy.Field] {
 		return domain.SearchChangeRequestsResponse{}, &apierror.ValidationError{Msg: "sortBy.field contains invalid value: " + string(req.SortBy.Field)}
 	}
 	if req.SortBy.Order != "" && !validChangeRequestSortOrder[req.SortBy.Order] {
@@ -176,6 +176,10 @@ func (s *changeRequestService) SearchChangeRequests(ctx context.Context, req dom
 	}
 	if parsed.CreatedStartDate != nil && parsed.CreatedEndDate != nil && parsed.CreatedEndDate.Before(*parsed.CreatedStartDate) {
 		return domain.SearchChangeRequestsResponse{}, &apierror.ValidationError{Msg: "filters: createdOn lte bound must not be before its gte bound"}
+	}
+
+	if err := applyChangeRequestListFilters(ctx, &req.Filters, parsed); err != nil {
+		return domain.SearchChangeRequestsResponse{}, err
 	}
 
 	views, total, err := s.repo.SearchChangeRequests(ctx, req, parsed.CreatedStartDate, parsed.CreatedEndDate, parsed.Approval, parsed.AssignmentGroupIDs)
@@ -193,6 +197,64 @@ func (s *changeRequestService) SearchChangeRequests(ctx context.Context, req dom
 
 const defaultChangeRequestMaxGroups = 10
 
+// postgresOnlyChangeRequestSortField: sort fields this data source accepts
+// beyond the ServiceNow-backed service's validChangeRequestSortField.
+var postgresOnlyChangeRequestSortField = map[domain.ChangeRequestSortField]bool{
+	domain.ChangeRequestSortFieldPlannedStartOn: true,
+	domain.ChangeRequestSortFieldPlannedEndOn:   true,
+}
+
+// applyChangeRequestTagFilter hands the parsed "tag" filter to the repository
+// (through the request's internal Tags / ExcludeTags). Tags are staff
+// bookkeeping a customer never sees (GetChangeRequestByID leaves them null for a
+// restricted caller), so filtering by them is refused for anyone but an
+// Unrestricted caller: a customer's result would otherwise tell them which tags
+// their change requests carry.
+func applyChangeRequestTagFilter(ctx context.Context, f *domain.SearchChangeRequestsFilters, parsed parsedChangeRequestFilters) error {
+	if len(parsed.Tags) == 0 && len(parsed.ExcludeTags) == 0 {
+		return nil
+	}
+	if scope, ok := repository.CallerIdentityFromContext(ctx); !ok || !scope.Unrestricted {
+		return &apierror.ForbiddenError{Msg: "filters: field \"tag\" is only available to internal callers"}
+	}
+	f.Tags = parsed.Tags
+	f.ExcludeTags = parsed.ExcludeTags
+	return nil
+}
+
+// applyChangeRequestListFilters hands every parsed filter the PostgreSQL search
+// applies to the repository, through the request's internal fields. The tag
+// filter is internal callers only (applyChangeRequestTagFilter).
+func applyChangeRequestListFilters(ctx context.Context, f *domain.SearchChangeRequestsFilters, parsed parsedChangeRequestFilters) error {
+	if err := applyChangeRequestTagFilter(ctx, f, parsed); err != nil {
+		return err
+	}
+	if err := parseChangeRequestAnyOfPostgres(ctx, f); err != nil {
+		return err
+	}
+	for _, t := range parsed.Types {
+		if !repository.IsFilterableChangeRequestType(t) {
+			return &apierror.ValidationError{Msg: "filters: type contains a value with no equivalent on this data source: " + string(t)}
+		}
+	}
+	for _, b := range [][2]*time.Time{
+		{parsed.UpdatedStart, parsed.UpdatedEnd},
+		{parsed.PlannedStartFrom, parsed.PlannedStartTo},
+		{parsed.PlannedEndFrom, parsed.PlannedEndTo},
+	} {
+		if b[0] != nil && b[1] != nil && b[1].Before(*b[0]) {
+			return &apierror.ValidationError{Msg: "filters: a lte bound must not be before its gte bound"}
+		}
+	}
+	f.AssignmentGroupIDs = parsed.AssignmentGroupIDs
+	f.AssignedUserIDs = parsed.AssignedUserIDs
+	f.UpdatedStart, f.UpdatedEnd = parsed.UpdatedStart, parsed.UpdatedEnd
+	f.PlannedStartFrom, f.PlannedStartTo = parsed.PlannedStartFrom, parsed.PlannedStartTo
+	f.PlannedEndFrom, f.PlannedEndTo = parsed.PlannedEndFrom, parsed.PlannedEndTo
+	f.Types = parsed.Types
+	return nil
+}
+
 // AggregateChangeRequests implements ChangeRequestService.
 func (s *changeRequestService) AggregateChangeRequests(ctx context.Context, req domain.AggregateChangeRequestsRequest) (domain.AggregateResponse, error) {
 	if err := validateChangeRequestFilters(req.Filters); err != nil {
@@ -207,6 +269,10 @@ func (s *changeRequestService) AggregateChangeRequests(ctx context.Context, req 
 	}
 	parsed, err := ParseChangeRequestFieldFilters(req.Filters.Filters, time.Now().UTC())
 	if err != nil {
+		return domain.AggregateResponse{}, err
+	}
+
+	if err := applyChangeRequestListFilters(ctx, &req.Filters, parsed); err != nil {
 		return domain.AggregateResponse{}, err
 	}
 

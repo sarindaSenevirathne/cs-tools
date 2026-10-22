@@ -89,9 +89,9 @@ export class SecurityCenterPage {
   //
   // Component Analysis tab (ProductVulnerabilitiesTable).
   //
-  // Everything below narrows a dataset that was fetched once, in the browser.
-  // No method here waits on a network response, and none should be given one:
-  // typing in the search box or changing a filter issues no request at all.
+  // Search, filters and paging are server-side: each change issues a search
+  // request, so the methods below that change one wait for its response and
+  // read the total from it (`totalRecords`), not from a page of rendered rows.
   //
 
   /**
@@ -147,8 +147,8 @@ export class SecurityCenterPage {
    * Switches to Component Analysis and waits for its data to land.
    *
    * Waits for a row rather than the search box: the box renders while the
-   * fetch is still in flight, so a caller that searched on seeing it would be
-   * filtering an empty table. Returns the row count so a caller can assert the
+   * first page is still in flight, so a caller that searched on seeing it
+   * would be searching an empty table. Returns the row count so a caller can assert the
    * narrowing actually narrowed.
    *
    * @returns Total matching records, from the pagination footer.
@@ -187,13 +187,42 @@ export class SecurityCenterPage {
   }
 
   /**
-   * The size of the current result set, read from the pagination footer.
+   * Runs an action that changes the table's search, filters or page and waits
+   * for the search request it triggers.
    *
-   * NOT the number of rendered rows. The table paginates client-side at ten a
-   * page, so on this tenant `componentRows()` returns 10 whether the filter
-   * matched 10 records or 1265 — which makes any narrowing assertion built on
-   * rendered rows quietly vacuous. The footer's "1–10 of 1265" is the only
-   * place the real total appears.
+   * The wait is registered before the action, so a response that lands quickly
+   * is not missed. Only use it for an action that really changes the request:
+   * one that leaves it identical (typing the text already in the box) issues
+   * nothing and this would time out.
+   *
+   * @returns The response's `totalRecords`, once the footer shows it too.
+   */
+  async waitForComponentSearch(action: () => Promise<unknown>): Promise<number> {
+    const [response] = await Promise.all([
+      this.page.waitForResponse(
+        (r) =>
+          SECURITY_CENTER.componentAnalysis.searchPathPattern.test(
+            new URL(r.url()).pathname,
+          ) && r.request().method() === "POST",
+        { timeout: LOAD_TIMEOUT_MS },
+      ),
+      action(),
+    ]);
+    expect(response.ok(), "the search request should succeed").toBe(true);
+
+    const { totalRecords } = (await response.json()) as { totalRecords: number };
+
+    // The response arriving is not the render having happened.
+    await expect(async () => {
+      expect(await this.componentTotal()).toBe(totalRecords);
+    }).toPass({ timeout: LOAD_TIMEOUT_MS });
+    return totalRecords;
+  }
+
+  /**
+   * The size of the current result set, read from the pagination footer, which
+   * shows the server's `totalRecords` (not the number of rendered rows, which
+   * is at most one page).
    *
    * @returns Total matching records, or 0 when the empty state is showing.
    */
@@ -215,41 +244,43 @@ export class SecurityCenterPage {
   }
 
   /**
-   * Types into the Component Analysis search and waits for the table to settle.
-   *
-   * The input is debounced and filters in-process, so there is no response to
-   * await.
+   * Types into the Component Analysis search and waits for the (debounced)
+   * search request it issues. The text must differ from what is in the box.
    *
    * @param query - CVE, component name or vulnerability id fragment.
-   * @returns Number of matching records — the result-set total, not the page.
+   * @returns Number of matching records, as reported by the server.
    */
   async searchComponents(query: string): Promise<number> {
-    await this.componentSearchInput().fill(query);
-
-    // The debounce must elapse before ANY count is meaningful. Polling for a
-    // "stable" count without this waits zero time: the first two reads agree
-    // because neither has seen the filter apply yet, which presents as a search
-    // that matched every row.
-    await this.page.waitForTimeout(
-      SECURITY_CENTER.componentAnalysis.searchDebounceMs * 2,
+    return this.waitForComponentSearch(() =>
+      this.componentSearchInput().fill(query),
     );
-
-    // Only now is stability meaningful: require two consecutive identical reads
-    // so a count is never taken mid-render.
-    let previous = -1;
-    await expect(async () => {
-      const count = await this.componentTotal();
-      const settled = count === previous;
-      previous = count;
-      expect(settled).toBe(true);
-    }).toPass({ timeout: LOAD_TIMEOUT_MS });
-
-    return this.componentTotal();
   }
 
-  /** Clears the search box. */
-  async clearComponentSearch(): Promise<void> {
-    await this.componentSearchInput().fill("");
+  /**
+   * Clears the search box and waits for the unfiltered request.
+   *
+   * @returns Number of records after clearing.
+   */
+  async clearComponentSearch(): Promise<number> {
+    return this.waitForComponentSearch(() =>
+      this.componentSearchInput().fill(""),
+    );
+  }
+
+  /**
+   * Clicks Clear Filters (which keeps the search text) and waits for the
+   * resulting request.
+   *
+   * @returns Number of records after clearing the filters.
+   */
+  async clearComponentFilters(): Promise<number> {
+    return this.waitForComponentSearch(() =>
+      this.page
+        .getByRole("button", {
+          name: SECURITY_CENTER.componentAnalysis.clearFiltersButton,
+        })
+        .click(),
+    );
   }
 
   /** The Filters toggle, which reveals the severity/product/version selects. */
@@ -284,7 +315,8 @@ export class SecurityCenterPage {
    *
    * @param label - The select's label.
    * @param allOptionLabel - That select's no-filter option, to skip over.
-   * @returns The chosen value and how many real values were on offer, or null
+   * @returns The chosen value, how many real values were on offer and the
+   *   server's total after applying it, or null
    *   when the select offers nothing to filter by. The count matters to the
    *   caller: a filter can only be expected to NARROW a list when more than one
    *   value exists — with a single value, matching everything is correct.
@@ -292,7 +324,7 @@ export class SecurityCenterPage {
   async selectFilterValue(
     label: string,
     allOptionLabel: string,
-  ): Promise<{ value: string; optionCount: number } | null> {
+  ): Promise<{ value: string; optionCount: number; total: number } | null> {
     await this.filterSelect(label).click();
 
     const options = this.page.getByRole("option");
@@ -308,7 +340,9 @@ export class SecurityCenterPage {
     }
 
     const chosen = labels[0];
-    await options.filter({ hasText: chosen }).first().click();
-    return { value: chosen, optionCount: labels.length };
+    const total = await this.waitForComponentSearch(() =>
+      options.filter({ hasText: chosen }).first().click(),
+    );
+    return { value: chosen, optionCount: labels.length, total };
   }
 }

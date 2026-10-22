@@ -38,6 +38,13 @@ type Pagination struct {
 
 // --- users/me ---
 
+// UserTypeInternal is the GetUserMeResponse.UserType value entity-service
+// reports for a WSO2-internal-classified user -- derived there from role
+// membership, not a plain settable column (see that service's own CLAUDE.md,
+// "recompute_user_type"). Every other value ("customer", "external",
+// "system") is a genuine non-internal user.
+const UserTypeInternal = "internal"
+
 // GetUserMeResponse is entity-service's response for GET /users/me.
 type GetUserMeResponse struct {
 	ID        string   `json:"id"`
@@ -45,7 +52,13 @@ type GetUserMeResponse struct {
 	FirstName *string  `json:"firstName,omitempty"`
 	LastName  string   `json:"lastName"`
 	TimeZone  *string  `json:"timeZone,omitempty"`
-	Roles     []string `json:"roles"`
+	// UserType is entity-service's own internal/customer/external/system
+	// classification (see UserTypeInternal). Used by
+	// middleware.CachedRoleResolver.IsInternalWriteBlocked and by
+	// UserHandler.GetMe to compute isReadOnly -- never shown to the frontend
+	// directly.
+	UserType string   `json:"userType,omitempty"`
+	Roles    []string `json:"roles"`
 }
 
 // SearchUsersFilters mirrors entity-service's own filter struct field-for-field,
@@ -251,7 +264,7 @@ type ProjectFeatures struct {
 // accepts a closureState field -- a direct, admin-only override of a
 // project's overall closure status (see entity-service's own CLAUDE.md) --
 // and this route's RBAC entry (middleware.ModuleProjects/ActionUpdate) grants
-// RoleCustomerAdmin, an external role, specifically because this struct is
+// only RoleCustomerAdmin, an external role, specifically because this struct is
 // narrowly scoped to these two fields. Adding closureState here would hand
 // that override to a customer admin.
 type UpdateProjectRequest struct {
@@ -2398,7 +2411,15 @@ type GlobalSearchResponse struct {
 
 // VulnerabilityMetaResponse is entity-service's response for GET /products/vulnerabilities/meta.
 type VulnerabilityMetaResponse struct {
-	Severities []ChoiceListItem `json:"severities"`
+	Severities []ChoiceListItem             `json:"severities"`
+	Products   []VulnerabilityProductOption `json:"products"`
+}
+
+// VulnerabilityProductOption is one product name with the distinct versions the
+// vulnerability data carries for it.
+type VulnerabilityProductOption struct {
+	Name     string   `json:"name"`
+	Versions []string `json:"versions"`
 }
 
 // --- conversations CRUD ---

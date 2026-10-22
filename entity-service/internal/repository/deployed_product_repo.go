@@ -505,7 +505,7 @@ func (r *deployedProductRepo) SearchDeployedProducts(ctx context.Context, req do
 		`SELECT dp.id, dp.created_on, dp.updated_on,
 		        dp.core_count, dp.tps_count, dp.product_category::TEXT,
 		        dp.description, dp.update_level_info, pr.sf_id, COALESCE(dp.active, TRUE),
-		        d.id, d.name,
+		        d.id, d.name, d.type::TEXT,
 		        p.id, p.name, p.code,
 		        pv.id, pv.version, pv.release_date, pv.support_eol_date
 		 FROM deployed_product dp
@@ -548,15 +548,22 @@ func (r *deployedProductRepo) SearchDeployedProducts(ctx context.Context, req do
 			// update_level_info is nullable JSONB; decoded below into
 			// dp.Updates once the row is scanned.
 			var updateLevelInfo []byte
+			// deployment.type is nullable (see SearchDeployments).
+			var deploymentType *string
 			if err := rows.Scan(
 				&dp.ID, &dp.CreatedOn, &dp.UpdatedOn,
 				&dp.Cores, &dp.TPS, &dp.Category,
 				&dp.Description, &updateLevelInfo, &dp.ProjectSfID, &dp.Active,
-				&dp.Deployment.ID, &dp.Deployment.Name,
+				&dp.Deployment.ID, &dp.Deployment.Name, &deploymentType,
 				&dp.Product.ID, &dp.Product.Name, &dp.Product.Abbreviation,
 				&pvID, &pvName, &pvReleaseDate, &pvEoLDate,
 			); err != nil {
 				return fmt.Errorf("scan deployed product: %w", err)
+			}
+			if deploymentType != nil {
+				// Lower case, the same canonical form SearchDeployments returns.
+				t := domain.DeploymentType(strings.ToLower(*deploymentType))
+				dp.DeploymentType = &t
 			}
 			if pvID != nil {
 				dp.Version = &domain.DeployedProductVersionRef{

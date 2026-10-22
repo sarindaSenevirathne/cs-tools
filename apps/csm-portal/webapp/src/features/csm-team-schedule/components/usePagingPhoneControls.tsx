@@ -22,7 +22,7 @@ import { BackendApiError } from "@api/backend/client";
 import { useErrorBanner } from "@context/error-banner/ErrorBannerContext";
 import { useDeletePagingContact, usePutPagingContact, useTestPagingContact } from "../api/usePagingChain";
 import type { PagingChainMember } from "../types";
-import { testCallAwaited } from "../utils/pagingPhone";
+import { lastTestOf, testCallAwaited } from "../utils/pagingPhone";
 import PagingPhoneDialog from "./PagingPhoneDialog";
 import type { PagingPhoneControls } from "./PhoneChip";
 
@@ -66,7 +66,7 @@ export function usePagingPhoneControls(
 
   // A test call's result changes readiness too; the chain polls for it, the
   // strip does not, so it is redrawn when the last awaited call settles.
-  const anyPending = members.some((m) => m.pagingPhone?.lastTestStatus === "pending");
+  const anyPending = members.some((m) => lastTestOf(m).status === "pending");
   const wasPending = useRef(anyPending);
   useEffect(() => {
     if (wasPending.current && !anyPending) {

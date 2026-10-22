@@ -46,9 +46,18 @@ type fakeChat struct {
 	// noRoom lists audiences GOOGLE_CHAT_SPACES has no space for. Empty means
 	// every audience has one, which is what the older tests assume.
 	noRoom map[string]bool
+	// sharedSRERoom says the Alert Settings mapping registered the shared SRE
+	// room (notifications.IncidentFallbackAudience). Off by default, as in a
+	// deployment with no sre.chat, so the older tests keep their meaning.
+	sharedSRERoom bool
 }
 
-func (f *fakeChat) HasAudienceSpace(audience string) bool { return !f.noRoom[audience] }
+func (f *fakeChat) HasAudienceSpace(audience string) bool {
+	if audience == notifications.IncidentFallbackAudience {
+		return f.sharedSRERoom
+	}
+	return !f.noRoom[audience]
+}
 
 func (f *fakeChat) SendEscalationHandoff(_ context.Context, h notifications.EscalationHandoff) error {
 	if f.err != nil {

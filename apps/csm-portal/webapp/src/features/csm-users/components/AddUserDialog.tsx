@@ -73,11 +73,9 @@ function isWso2Email(email: string): boolean {
   return email.toLowerCase().endsWith(WSO2_EMAIL_DOMAIN);
 }
 
-const EMPTY_FORM: { firstName: string; lastName: string; email: string; userType: NewUserType | "" } = {
-  firstName: "",
-  lastName: "",
+const EMPTY_FORM: { email: string; userType: NewUserType | "" } = {
   email: "",
-  userType: "",
+  userType: "internal",
 };
 
 /**
@@ -101,6 +99,13 @@ const EMPTY_FORM: { firstName: string; lastName: string; email: string; userType
  * this as the real constraint (a non-wso2.com address must never resolve to
  * `user_type = INTERNAL`); this form blocks the same case up front so the
  * admin sees it immediately rather than after a round trip.
+ *
+ * This form only ever collects an email -- there are no first/last name
+ * fields. The backend (`apps/csm-portal/backend`'s own `CLAUDE.md`, "Creating
+ * a user") looks the email up in SCIM and fills firstName/lastName/phone from
+ * that record instead; a 400 from SCIM having no matching user (or no name on
+ * file) surfaces in the error banner like any other create failure. User type
+ * defaults to Internal -- "External" stays disabled below until that's lifted.
  */
 export default function AddUserDialog({ open, onClose, onCreated }: AddUserDialogProps): JSX.Element {
   const [form, setForm] = useState(EMPTY_FORM);
@@ -126,10 +131,9 @@ export default function AddUserDialog({ open, onClose, onCreated }: AddUserDialo
   };
 
   const trimmedEmail = form.email.trim();
-  const hasName = form.firstName.trim() !== "" || form.lastName.trim() !== "";
   const emailValid = isPlausibleEmail(trimmedEmail);
   const internalEmailViolation = form.userType === "internal" && emailValid && !isWso2Email(trimmedEmail);
-  const canSubmit = hasName && emailValid && form.userType !== "" && !internalEmailViolation;
+  const canSubmit = emailValid && form.userType !== "" && !internalEmailViolation;
 
   const handleSubmit = (e: FormEvent<HTMLFormElement>): void => {
     e.preventDefault();
@@ -137,8 +141,6 @@ export default function AddUserDialog({ open, onClose, onCreated }: AddUserDialo
     const selected = USER_TYPE_OPTIONS.find((o) => o.value === form.userType);
     mutate(
       {
-        firstName: form.firstName.trim() || undefined,
-        lastName: form.lastName.trim() || undefined,
         email: trimmedEmail,
         roles: selected ? [selected.role] : undefined,
         grantRoles: selectedGrantRoles.length > 0 ? selectedGrantRoles : undefined,
@@ -166,21 +168,6 @@ export default function AddUserDialog({ open, onClose, onCreated }: AddUserDialo
               </Typography>
             )}
             <TextField
-              label="First name"
-              value={form.firstName}
-              onChange={(e) => setForm({ ...form, firstName: e.target.value })}
-              fullWidth
-              disabled={isPending}
-              autoFocus
-            />
-            <TextField
-              label="Last name"
-              value={form.lastName}
-              onChange={(e) => setForm({ ...form, lastName: e.target.value })}
-              fullWidth
-              disabled={isPending}
-            />
-            <TextField
               label="Email"
               type="email"
               value={form.email}
@@ -188,13 +175,14 @@ export default function AddUserDialog({ open, onClose, onCreated }: AddUserDialo
               fullWidth
               disabled={isPending}
               required
+              autoFocus
               error={(form.email.trim() !== "" && !emailValid) || internalEmailViolation}
               helperText={
                 form.email.trim() !== "" && !emailValid
                   ? "Enter a valid email address."
                   : internalEmailViolation
                     ? `An internal user must have a ${WSO2_EMAIL_DOMAIN} email address.`
-                    : undefined
+                    : "Name and phone number are filled in automatically from this email."
               }
             />
             <TextField
@@ -212,11 +200,6 @@ export default function AddUserDialog({ open, onClose, onCreated }: AddUserDialo
                 </MenuItem>
               ))}
             </TextField>
-            {!hasName && (
-              <Typography variant="caption" color="text.secondary">
-                At least a first or last name is required.
-              </Typography>
-            )}
             {grantableRolesLoading && (
               <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
                 <CircularProgress size={16} />

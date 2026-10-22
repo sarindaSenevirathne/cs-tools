@@ -26,6 +26,7 @@ Go HTTP server (`net/http`, Go 1.26+) that acts as a backend-for-frontend (BFF) 
 - **`PermCreateAnnouncement` narrows `PermWrite`, it does not replace it.** Creating and sending a customer announcement needs the `announcement_creator` role (`AUTH_ANNOUNCEMENT_CREATOR_ROLES`) or `admin`, **in addition to** the caller's own `PermWrite`: a `cs_engineer` without the role keeps every other write and loses this one, and a holder of the role who cannot write still cannot send anything. The role implies nothing else, not even view (same shape as `worknote_creator`). Two mechanisms, because the feature is not backed by routes of its own: (1) every write on `/announcement-requests` (create, edit, dry run, submit, schedule, publish, add an update, record deliveries) is registered with `routeAll(pattern, handler, handler.PermWrite, handler.PermCreateAnnouncement)`, which goes through `AccessGuard.RequireAll` (every permission must be held, an empty list denies); the request LIST (`POST /announcement-requests/search`, the webapp's Requests tab: drafts and requests awaiting approval) is the creators' workspace and is registered the same way, while reading ONE request and its updates and deliveries stays `PermView` because a published announcement in the main list opens the same request dialog; (2) `POST /cases` is the one generic create route and makes an announcement (the dry-run case and every per-project case of a publish) as readily as a support case, so `CaseHandler.CreateCase` additionally requires `PermCreateAnnouncement` when the body asks for `type: announcement` (`caseCreateTargetsAnnouncement`, a token scan of the top-level keys so every spelling and every repeat of `type` is judged; a nil guard fails closed, like the Security Center check). **Approving a request ("Mark as approved") is deliberately not gated**: it only records a decision taken over email and may be recorded by someone other than the creator. An unset `AUTH_ANNOUNCEMENT_CREATOR_ROLES` means only `admin` can create announcements, so startup warns about it and it must be set (to the Asgardeo role the announcement creators hold) before this ships to an environment. `cmd/server/announcement_routes_test.go` pins how each `/announcement-requests` route is registered, and `openapi_routes_test.go` reads `routeAll` registrations too. Not covered here: posting an update as ordinary case comments (`POST /cases/{id}/comments`) is the normal comment route and unchanged.
 - **`PermUpdateDeleteComment` widens the `PATCH`/`DELETE /comments/{id}` route floor, it does not narrow it.** Unlike `PermCreateAnnouncement`, which removes an ability from `cs_engineer` by requiring a second permission alongside `PermWrite`, this is the same shape as `PermCreateWorkNote`: `comment_updater` (`AUTH_COMMENT_UPDATER_ROLES`) is a new, additional way to reach the handler, on top of `cs_engineer`/`admin`'s existing access — a `cs_engineer` keeps editing/deleting comments exactly as before. This permission only decides who may reach the handler at all; it says nothing about which specific comment they may act on — that finer-grained decision is `PermUpdateDeleteAnyComment`, below. An unset `AUTH_COMMENT_UPDATER_ROLES` is a normal, supported state (same as `AUTH_WORKNOTE_CREATOR_ROLES`): `cs_engineer`/`admin` already hold this permission regardless, so leaving it empty just means the role isn't provisioned yet, never a lockout.
 - **`PermUpdateDeleteAnyComment` is the in-handler check that decides whether THIS caller may act on a comment they did not author — entirely inside this backend, nothing forwarded to or re-checked by entity-service.** Held by `admin` and `comment_updater` ONLY — deliberately NOT `cs_engineer`, unlike `PermUpdateDeleteComment` above. `CommentHandler.authorizeCommentActor` (called from both `UpdateComment` and `DeleteComment`) calls `entityCommentClient.GetComment` first, purely to learn the comment's author, then allows the request through when either the caller's own email matches that author (case-insensitively) or `h.access.Permits(PermUpdateDeleteAnyComment, user.Roles)` is true — otherwise it writes a 403 itself and never calls entity-service's `UpdateComment`/`DeleteComment` at all. entity-service's `comment_service.go` performs **no author or role check of its own** on `GetComment`/`UpdateComment`/`DeleteComment`/`GetCommentEditHistory` any more — not even its own former Postgres `admin`-role lookup, dropped as redundant with (and a source of confusion against) this backend's own Asgardeo roles, which is the only caller of this path. Net effect: a `cs_engineer` can still only successfully edit/delete a comment they themselves authored; `comment_updater`/`admin` can act on any comment, decided once, here.
+- **`PermManageOnboarding` is checked in-handler on `PATCH /projects/{id}`, behind a wider route floor, `PermUpdateProject`.** Held by `onboarding_lead` (`AUTH_ONBOARDING_LEAD_ROLES`) and `admin` ONLY, not `cs_engineer`. `PermUpdateProject` (`cs_engineer` ∪ `admin` ∪ `onboarding_lead`) only lets an `onboarding_lead` reach the handler; `ProjectHandler.UpdateProject` then reads the body's keys (case-insensitively, like the `closureState` check) and requires `PermManageOnboarding` for `onboardingStatus`/`onboardingOwner` and `PermWrite` for any other field, so an `onboarding_lead` alone can never edit anything else and a `cs_engineer` alone can never set the onboarding fields. `closureState` stays `PermAdmin`-only. The role is config-only and grants no read permission. A nil guard fails closed. An unset variable is a normal state (admin still holds the permission), so startup does not warn.
 - **PLG's routes go through this guard too, and through a second one of their own.** `internal/plg/plg.go` registers all 24 as `accessGuard.Require(perm, identity(fn))` — the guard OUTSIDE PLG's `identity` middleware, deliberately, because the guard is a set lookup while `identity` is an entity-service round trip, so a denied caller costs nothing upstream. Two permissions: `PermUsePlg` (CS engineer and admin) for 20 routes, and `PermManagePlaybooks` (admin only) for the four that author a playbook template. `PermUsePlg` is narrower than `PermView` on purpose — every portal role holds `PermView`, but PLG is a worklist staff act on, and a view-only role that could open it would meet a 403 on every control. Reading a playbook (`GET /plg/playbooks`, `GET /plg/playbooks/{id}`) and assigning one to a pairing (`POST .../playbook-runs`) are `PermUsePlg`, NOT `PermManagePlaybooks`: running a template and writing one are different jobs, so gating on the `/plg/playbooks` path prefix would be wrong. `PermManagePlaybooks` is kept separate from `PermAdmin`, which it currently matches exactly, so granting playbook authoring to a future PLG-admin role does not also hand out platform-user creation. `identity` still runs and is not redundant: it resolves the `"user".id` every PLG write records as `actorId`, and refuses anyone who is not ACTIVE INTERNAL staff — a roles claim cannot tell you somebody was offboarded this morning. `internal/plg/routes_access_test.go` pins every route's permission and the middleware ordering.
 - **`GET /users/me` reports `roles`** (from `AccessGuard.RolesFor`): the stable keys of the portal roles the token roles grant — several possible, fixed order — and is **not** the entity service's role data, which the response no longer carries. The frontend decides what to show or hide from these roles (there is deliberately no derived `permissions` list); the backend's `403` is the real gate. Dashboard-designer access is only the `AUTH_DASHBOARD_DESIGNER_ROLES` role (the old `DASHBOARD_DESIGNER_EMAILS` email allow-list is gone).
 - **`GET /users/{id}` reports a target's CSM portal-role vocabulary alongside entity-service's own, via SCIM instead of a JWT -- and matches by role ID, not by display name.** `GetUser`'s own `withPortalRoles` (`internal/handler/user_portal_roles.go`) reaches the same vocabulary for the profile being *viewed* in two SCIM calls: `scim.SearchUser` by the target's email to resolve their own Asgardeo user ID (there is no other lookup key available here -- entity-service stores no SCIM id), then `scim.GetUserByID` by that ID for the target's full, canonical role assignment list. The result lands in a separate `csmPlatformRoles` field -- this used to overwrite the response's own `roles` outright for an internal target, but that read as though the Customer Portal's own role vocabulary (`admin`/`commenter`/`customer`/`customer_admin`/`partner`/`partner_admin`/`external`/`internal`/`timecard_approver`/`agent`, the `CSM_USER_ROLES` set -- a genuinely different, unrelated vocabulary from the CSM-portal-access one, not something SCIM has any equivalent for) had disappeared for that person, and left the whole section looking empty for a target holding no configured Asgardeo role at all. Both vocabularies describe real, different things about the same person, so neither hides the other. Things worth knowing:
@@ -38,6 +39,17 @@ Go HTTP server (`net/http`, Go 1.26+) that acts as a backend-for-frontend (BFF) 
 - The role check is separate from resource-level guards inside handlers (e.g. the assigned-engineer check on public case comments) — both must pass.
 - **`PermViewAllDashboards` (CS engineer and admin) is the one permission with no route.** A `dashboard.Dashboard` may set `"restricted": true`; `DashboardHandler` calls the newly-exported `AccessGuard.Permits(perm, roles)` itself to filter it out of `GET /dashboards` and 403 a direct `GET /dashboards/{id}` for anyone else, while both routes stay `PermView` so the list route still runs for every viewer. `Permits` exists specifically for this — a handler that must gate one specific resource against a caller's roles from inside its own logic, not a whole route via `Require`.
 - Handler tests call handlers directly and bypass the guard; test the guard in `access_test.go`. `dashboards_test.go`'s `withRestrictedDashboard` temporarily swaps the package-level `dashboard.Active()` registry for one that adds a `Restricted` dashboard, restored via `t.Cleanup` — every other test in that file depends on the shared two-dashboard fixture's exact count, so never add a permanent third dashboard to it.
+
+## The user's phone (`/users/me`)
+
+`phoneNumber` is read from and written to the platform user record only (the entity
+service's `"user".phone`), never the identity provider. `GET /users/me` returns the
+record's `phone` as `phoneNumber` (omitted when the record has none), and `PATCH /users/me`
+with `phoneNumber` writes it to the record through the entity service, in the same call as a
+`timeZone` change when the request carries both. The phone is trimmed first; an empty or blank
+one clears it. The identity provider is neither read nor
+written for the phone. A user whose record has no phone shows none until they set one.
+Tests: `TestGetMe`, `TestPatchMe`.
 
 ## Creating a user (POST /users)
 
@@ -57,6 +69,21 @@ A separate, unrelated field on the same request, `grantRoles`, is the Asgardeo-b
 the new user into one or more portal-permission roles (`cs_engineer`, `escalator`, ...) at creation
 time — see "Granting portal roles on user creation" below for the full mechanism. It is validated and
 acted on independently of `roles`/`CSM_USER_ROLES` and never reaches entity-service at all.
+
+**`firstName`/`lastName`/phone are sourced from SCIM when the Add User form sends neither name field.**
+The webapp's Add User dialog only collects an email (plus the type/portal-role selectors) — no name
+fields at all. When `CreateUser` sees a request with both `firstName` and `lastName` blank, it runs a
+SCIM search by `email` (`scim.Client.SearchUser`, the same call `provisionCsEngineerUser` above uses)
+and fills `req.FirstName`/`req.LastName` from the result before building the entity-service request; if
+SCIM has no matching user, or has one but no name on file either, the request is rejected with a 400
+naming the problem (`please verify the email address` / `please provide a first or last name`) rather
+than forwarding a name-less create upstream. A caller that DOES send a name (any other API consumer) is
+untouched — this only fires for the email-only case, so it never overrides a caller-supplied name.
+Phone is handled the same way `provisionCsEngineerUser` handles it: entity-service's `POST /users` has
+no phone field, so a SCIM-sourced phone number is set with a second, best-effort `PATCH /users/{id}`
+call once the create has returned the new user's id — a failed phone patch does not undo the create.
+Unlike `provisionCsEngineerUser`, the created `lastName` here is **not** marked with `" Ⓦ"` — that
+marker is specific to the on-demand `cs_engineer` auto-provisioning path, not the admin Add User flow.
 
 **Constraint: an internal-type user must have a `@wso2.com` email.** Found live: the Add User form sent
 no `roles` at all, so every user it created resolved to `user_type = NOT_AVAILABLE` (the trigger's
@@ -257,6 +284,35 @@ pays no extra `GetUserMe` round trip. `CreateCaseEscalation` has no equivalent s
 comment), so every caller who reaches that handler is, by construction, exactly the
 audience this exists for.
 
+**`GET /users/me` has its own, separate on-demand provisioning path for `cs_engineer`,
+sourced from the token, not SCIM** (`UsersHandler.provisionCsEngineerUser`, `users.go`,
+called from `GetMe`'s existing 404 branch, right where it already checks
+`len(resp.Roles) == 0`). A `cs_engineer` caller with no `"user"` row yet — the same
+provisioning gap `ensureUserProvisioned` closes for worknote/escalation authors — gets
+one created on the first `GET /users/me` after the role is granted, rather than only on
+their next case comment or escalation.
+
+**`firstName`/`lastName`/`phone` come straight off the caller's own validated token**
+(`middleware.UserInfo`'s `given_name`/`family_name`/`phone_number` claims — the last of
+these a new field this feature added, same posture `ensureUserProvisioned` already takes
+for name, extended here to phone too since the token carries it). No SCIM call is made at
+all: unlike the admin Add User flow below, which has no token for the person it's creating
+and so has to look them up in SCIM by email, this caller IS the person being provisioned,
+so their own token already has everything needed. The created `lastName` has `" Ⓦ"`
+appended (`withCsEngineerLastNameMarker`), so a row created this way is identifiable later
+as distinct from one entered by hand or via the admin Add User flow. Unlike
+`ensureUserProvisioned`, this path does not fall back to the email's local part when both
+name claims are blank — it creates the user with whatever the token has (possibly just the
+marker alone as `lastName`).
+
+`POST /users` has no `phone` field (see "Creating a user" above), so a non-blank token
+phone is set with a second call, `PATCH /users/{id}` (`entityUserClient.UpdateUser`), once
+the create has returned the new user's id — best-effort, same as everything else in this
+path: a failed phone patch does not undo the create. A token with no `phone_number` claim
+simply creates the user without a phone. Any failure anywhere in this path (create, phone
+patch) is logged and falls through to `GetMe`'s existing token-only answer rather than
+failing the request.
+
 ## Security Center access (PermViewSecurityCenter / PermViewSecurityReportCases)
 
 Security Center (the webapp's Security reports + Vulnerabilities tabs) is restricted to `cs_engineer`,
@@ -308,13 +364,15 @@ two different mechanisms, because the feature isn't backed by its own exclusive 
   still fetch it directly by `GET /cases/{id}`. Closing either gap fully needs entity-service itself to
   resolve and enforce it (it has reliable type data on either data source), not this BFF layer.
 
-## PATCH /projects/{id}: closureState requires PermAdmin, every other field stays at PermWrite
+## PATCH /projects/{id}: closureState requires PermAdmin, the onboarding fields PermManageOnboarding, every other field PermWrite
 
 Same mechanism as `caseSearchTargetsSecurityReports` above, applied to a write instead of a search:
-`PATCH /projects/{id}` is registered at `PermWrite` (held by both `cs_engineer` and `admin`) and stays
-that way, since every other field on this endpoint (`hasAgent`, `hasKbReferences`, the three closure
-sub-state fields, `suspensionProcessState`) is ordinary `cs_engineer` territory — re-gating the whole
-route to `PermAdmin` would lock `cs_engineer` out of fields nobody asked to restrict. `closureState`
+`PATCH /projects/{id}` is registered at the `PermUpdateProject` route floor (`cs_engineer` ∪ `admin` ∪
+`onboarding_lead`, see the `PermManageOnboarding` entry above), and `ProjectHandler.UpdateProject` then
+checks each field group itself: every other field on this endpoint (`hasAgent`, `hasKbReferences`, the
+three closure sub-state fields, `suspensionProcessState`) needs `PermWrite`, which is ordinary
+`cs_engineer` territory — re-gating the whole route to `PermAdmin` would lock `cs_engineer` out of
+fields nobody asked to restrict. `closureState`
 (entity-service's direct, Postgres-only override of a project's overall closure status — see that
 repo's own `CLAUDE.md`, "PATCH /projects/{id}: closureState is a direct admin override") is the one
 field that needs the narrower bar: an admin can set a project to OPEN/READ_ONLY/CLOSED/RESTRICTED/
@@ -329,8 +387,9 @@ around by a body that spells the key differently) and, if `closureState` is pres
 explicit `null` — additionally requires `PermAdmin` via `ProjectHandler.access` (wired with
 `WithAccessGuard`, the same pattern `CaseHandler`/`UsersHandler` already use). A caller holding
 `PermWrite` but not `PermAdmin` (a plain `cs_engineer`) gets 403 and the entity service is never
-called; every other field on the same PATCH is unaffected and keeps reaching the entity service at the
-route's existing `PermWrite` floor. A nil `access` (no guard wired) fails closed, same as every other
+called; every other field on the same PATCH is unaffected and keeps reaching the entity service for a
+caller holding `PermWrite` (the onboarding fields are checked the same way against
+`PermManageOnboarding`). A nil `access` (no guard wired) fails closed, same as every other
 in-handler permission check in this codebase.
 
 ## Redacting raw base64 inline images (`internal/handler/inline_image_redact.go`)

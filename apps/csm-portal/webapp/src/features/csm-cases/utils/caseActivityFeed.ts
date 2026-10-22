@@ -21,6 +21,7 @@ import type { Severity } from "@features/csm-dashboard/types/abtDashboard";
 import type {
   CaseAttachment,
   CaseAuditEntry,
+  CaseAuditFieldChange,
   CaseFeedbackEntry,
   CsmCaseComment,
 } from "@features/csm-cases/types/csmCases";
@@ -140,6 +141,13 @@ function formatAuditChangeValue(value: string, field?: string): string {
   return value;
 }
 
+/** "Impact Low → High · Urgency Low → Medium": the changes shown beneath another one. */
+export function describeChangeDetails(details: CaseAuditFieldChange[]): string {
+  return details
+    .map((d) => `${d.fieldLabel} ${d.previousValue?.trim() || "none"} → ${d.newValue?.trim() || "none"}`)
+    .join(" · ");
+}
+
 /**
  * Single-line plain-text description of an audit/field-change entry — e.g.
  * "State: New → Work in Progress; Assignee: cleared → Jane Doe" — mirroring
@@ -155,9 +163,10 @@ export function describeAuditEntry(entry: CaseAuditEntry): string {
         const previous = c.previousValue?.trim();
         const next = c.newValue?.trim();
         const to = next ? formatAuditChangeValue(next, c.field) : "cleared";
-        return previous
+        const line = previous
           ? `${c.fieldLabel}: ${formatAuditChangeValue(previous, c.field)} → ${to}`
           : `${c.fieldLabel}: ${to}`;
+        return c.details && c.details.length > 0 ? `${line} (${describeChangeDetails(c.details)})` : line;
       })
       .join("; ");
   }

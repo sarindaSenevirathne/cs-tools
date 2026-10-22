@@ -42,14 +42,17 @@ const LOCAL_ZONE_NAMES: Record<string, string> = {
   "Asia/Colombo": "IST",
   "Asia/Kolkata": "IST",
   "America/Sao_Paulo": "BRT",
+  // Americas regular hours: 08:00-18:00 on a fixed UTC-7 clock, the PDT offset
+  // kept all year (Intl would print "GMT-7").
+  "Etc/GMT+7": "PDT",
 };
 
-export function zoneAbbreviation(tz: string): string {
+export function zoneAbbreviation(tz: string, at: Date = new Date()): string {
   const known = LOCAL_ZONE_NAMES[tz];
   if (known) return known;
   try {
     const name = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "short" })
-      .formatToParts(new Date())
+      .formatToParts(at)
       .find((p) => p.type === "timeZoneName")?.value;
     return name ?? tz;
   } catch {
@@ -84,6 +87,53 @@ export function partsInZone(iso: string, tz: string): { date: string; minutes: n
     date: `${p.year}-${p.month}-${p.day}`,
     // Intl renders midnight as 24 in some locales; fold it back to 0.
     minutes: (Number(p.hour) % 24) * 60 + Number(p.minute),
+  };
+}
+
+/** Minutes a zone's clock is ahead of UTC at an instant (IST +330, PDT -420). */
+export function utcOffsetMinutes(tz: string, at: Date): number {
+  const local = partsInZone(at.toISOString(), tz);
+  const [y, m, d] = local.date.split("-").map(Number);
+  const wall = Date.UTC(y, m - 1, d, 0, local.minutes);
+  const utc = Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate(), at.getUTCHours(), at.getUTCMinutes());
+  return Math.round((wall - utc) / 60_000);
+}
+
+/** The clocks Today can always be read on: the Sri Lankan day's and the
+ *  Americas day's. Americas regular hours are 08:00-18:00 on this PDT clock,
+ *  all year. */
+export const TODAY_FIXED_CLOCKS: readonly { value: string; label: string }[] = [
+  { value: "Asia/Colombo", label: "IST" },
+  { value: "Etc/GMT+7", label: "PDT" },
+];
+
+/**
+ * Today's clock picker, and the clock it opens on, for a reader whose CSM
+ * profile names a time zone.
+ *
+ * A profile zone on the same clock as IST or PDT right now (Asia/Kolkata;
+ * America/Los_Angeles while the US is on summer time) opens on that option,
+ * rather than adding a second entry that reads the same. Any other zone, or a
+ * Pacific one once the US is on winter time (PST), keeps its real local clock
+ * as an option of its own, first and selected.
+ */
+export function todayClockOptions(
+  profileTz: string,
+  at: Date,
+): { options: readonly { value: string; label: string }[]; initial: string } {
+  let offset: number | undefined;
+  try {
+    offset = utcOffsetMinutes(profileTz, at);
+  } catch {
+    offset = undefined;
+  }
+  const same = TODAY_FIXED_CLOCKS.find(
+    (o) => o.value === profileTz || (offset !== undefined && utcOffsetMinutes(o.value, at) === offset),
+  );
+  if (same) return { options: TODAY_FIXED_CLOCKS, initial: same.value };
+  return {
+    options: [{ value: profileTz, label: `${zoneAbbreviation(profileTz, at)} (your profile)` }, ...TODAY_FIXED_CLOCKS],
+    initial: profileTz,
   };
 }
 

@@ -16,8 +16,9 @@
  * under the License.
  */
 
-import type { ScheduleAbsence, ScheduleAssignment, ScheduleShift, ScheduleTeam } from "../types";
-import { partsInZone } from "./rota";
+import type { ScheduleAbsence, ScheduleAbsenceKind, ScheduleAssignment, ScheduleShift, ScheduleTeam } from "../types";
+import { coverSideOf } from "./handover";
+import { HALF_DAY_LEAVE_CODES, partsInZone } from "./rota";
 
 /** The window a team's ordinary weekday is when the team names none. */
 export const REGULAR_HOURS_CODE = "CRE_REGULAR";
@@ -81,6 +82,11 @@ function covers(ab: ScheduleAbsence, iso: string): boolean {
  * somebody on another team was put on Americas cover by hand. Turns (morning,
  * evening, weekend, on-call, escalation) are not touched. Until the server
  * says which teams are ABTs, the regular-hours rule is not applied.
+ *
+ * A standing window on the Americas side that is no team's ordinary day any
+ * more -- Americas cover, once the Americas team's day moved to Americas
+ * regular hours on Pacific time -- still belongs to the team whose day is on
+ * that side, so its stored rows keep listing the Americas team only.
  */
 export function onItsStandingCard(
   row: ScheduleAssignment,
@@ -91,6 +97,13 @@ export function onItsStandingCard(
   if (!window || window.isRotation) return true;
   const team = teams.find((t) => t.key.toLowerCase() === row.teamKey.toLowerCase());
   if (teams.some((t) => t.defaultShiftCode === row.shiftCode)) return team?.defaultShiftCode === row.shiftCode;
+  if (coverSideOf(window) === "americas") {
+    const americasDay = (t: ScheduleTeam | undefined): boolean => {
+      const own = t?.defaultShiftCode ? shifts.get(t.defaultShiftCode) : undefined;
+      return own !== undefined && coverSideOf(own) === "americas";
+    };
+    if (teams.some(americasDay)) return americasDay(team);
+  }
   const abtKnown = teams.some((t) => t.isAbt !== undefined);
   return !abtKnown || team?.isAbt === true;
 }
@@ -141,7 +154,13 @@ export function standingDayRows({
     if (!isWeekdayIso(iso)) continue;
     const rowsToday = assignments.filter((a) => a.rotaDate === iso);
     const withRow = new Set(rowsToday.map((a) => a.engineer.userId));
-    const away = new Set(absences.filter((ab) => covers(ab, iso)).map((ab) => ab.engineer.userId));
+    // Someone on half-day leave still works part of the day and stays listed;
+    // the Leave card says which half they are away.
+    const away = new Set(
+      absences
+        .filter((ab) => covers(ab, iso) && !HALF_DAY_LEAVE_CODES.has(ab.kindCode))
+        .map((ab) => ab.engineer.userId),
+    );
     const listed = new Set<string>();
 
     const add = (team: ScheduleTeam, window: ScheduleShift, engineer: ScheduleAssignment["engineer"]): void => {
@@ -187,4 +206,156 @@ export function standingDayRows({
     }
   }
   return out;
+}
+
+/**
+ * Stored Americas-side standing rows, drawn at the team's own ordinary hours.
+ *
+ * The Americas team's weekdays are mostly stored rows on Americas cover
+ * (21:00-06:00 on the Colombo clock), written by the roster import and by
+ * hand, while the team actually works its ordinary day, Americas regular hours
+ * on the Pacific clock. Drawn as stored, the day view never shows where that
+ * day meets the Sri Lankan one. So, for the day view only, a row on a standing
+ * Americas-side window that is not its team's own ordinary day -- on a weekday,
+ * for a team whose ordinary day is itself on the Americas side -- is moved onto
+ * that ordinary day's hours for the same rota date.
+ *
+ * The Americas weekend turn (and its on-call) is stored 21:00-06:00 on the
+ * Colombo clock, back to back with the Sri Lankan weekend rotation, so from
+ * Saturday evening to Monday morning the two days never overlapped on screen.
+ * Its rows are drawn at the same Americas ordinary hours for their rota date,
+ * keeping their own window (title, on-call) and team, so the weekend reads
+ * like every other day.
+ *
+ * Display only: nothing is saved, and paging reads the stored rota, never
+ * these rows. Other turns and every Sri Lankan row are left as they are.
+ */
+export function atTeamOrdinaryHours(
+  rows: readonly ScheduleAssignment[],
+  shifts: ReadonlyMap<string, ScheduleShift>,
+  teams: readonly ScheduleTeam[],
+): ScheduleAssignment[] {
+  const teamByKey = new Map(teams.map((t) => [t.key.toLowerCase(), t]));
+  const at = (row: ScheduleAssignment, own: ScheduleShift, shiftCode: string): ScheduleAssignment => {
+    const end = own.endMinute > own.startMinute ? own.endMinute : own.endMinute + 1440;
+    return {
+      ...row,
+      shiftCode,
+      startsAt: instantInZone(row.rotaDate, own.startMinute, own.authoringTimeZone),
+      endsAt: instantInZone(row.rotaDate, end, own.authoringTimeZone),
+    };
+  };
+  // The Americas ordinary day, when exactly one is set as a team's own.
+  const americasDays = new Set(
+    teams
+      .map((t) => (t.defaultShiftCode ? shifts.get(t.defaultShiftCode) : undefined))
+      .filter((s): s is ScheduleShift => !!s && !s.isRotation && coverSideOf(s) === "americas")
+      .map((s) => s.code),
+  );
+  const americasDay = americasDays.size === 1 ? shifts.get([...americasDays][0]) : undefined;
+  return rows.map((row) => {
+    const stored = shifts.get(row.shiftCode);
+    if (!stored) return row;
+    if (stored.isRotation) {
+      const weekendTurn = stored.dayScope === "WEEKEND" && !stored.isEscalation && coverSideOf(stored) === "americas";
+      return weekendTurn && americasDay ? at(row, americasDay, stored.code) : row;
+    }
+    if (coverSideOf(stored) !== "americas") return row;
+    if (!isWeekdayIso(row.rotaDate)) return row;
+    const team = teamByKey.get(row.teamKey.toLowerCase());
+    const own = team?.defaultShiftCode ? shifts.get(team.defaultShiftCode) : undefined;
+    if (!own || own.code === stored.code || own.isRotation || coverSideOf(own) !== "americas") return row;
+    return at(row, own, own.code);
+  });
+}
+
+/**
+ * Stored rows of people who are not at work that day, left out of the day
+ * view's cards.
+ *
+ * A row on the rota survives the leave or allocation granted against it
+ * afterwards -- the two are stored apart -- so a card read straight from the
+ * rota counted someone on annual leave in Regular hours and listed them under
+ * Leave in the off-rota column as well. A row is dropped when its person has a
+ * full-day leave or allocation covering its rota date. Kept:
+ *  - half-day leave: they still work part of the day, and the Leave card says
+ *    which half;
+ *  - a stint worked on another team's rota (the Brazil rotation on the
+ *    Americas rota) -- its rows on that team are the stint itself;
+ *  - a retired kind, which no longer marks anybody away (the off-rota column
+ *    leaves it out too), and Excluded from rota, which is not a day's absence.
+ *
+ * Display only, as Case Alerts already leaves out whoever is away when it
+ * reads who is on duty.
+ */
+export function atWorkOnTheDay(
+  rows: readonly ScheduleAssignment[],
+  absences: readonly ScheduleAbsence[],
+  kinds: readonly ScheduleAbsenceKind[],
+): ScheduleAssignment[] {
+  const kindByCode = new Map(kinds.map((k) => [k.code, k]));
+  const awayAll = absences.filter((ab) => {
+    const kind = kindByCode.get(ab.kindCode);
+    if (!kind || kind.retired || HALF_DAY_LEAVE_CODES.has(ab.kindCode)) return false;
+    return kind.bucket === "LEAVE" || kind.bucket === "ALLOCATION";
+  });
+  if (awayAll.length === 0) return [...rows];
+  const byPerson = new Map<string, ScheduleAbsence[]>();
+  for (const ab of awayAll) byPerson.set(ab.engineer.userId, [...(byPerson.get(ab.engineer.userId) ?? []), ab]);
+  return rows.filter((row) => {
+    const spans = byPerson.get(row.engineer.userId)?.filter((ab) => covers(ab, row.rotaDate)) ?? [];
+    return spans.every(
+      (ab) => kindByCode.get(ab.kindCode)?.worksRotaThere && ab.teamKey.toLowerCase() === row.teamKey.toLowerCase(),
+    );
+  });
+}
+
+/**
+ * Who is at work on CRE's rota days, as the day view and the week view both
+ * show it.
+ *
+ * Everyone the month roster shows at work, not only those with a row: a blank
+ * weekday is the team's ordinary day, and the morning and evening crews work
+ * the ordinary day around their turn (standingDayRows). Stored Americas-side
+ * standing days are drawn at the team's own hours (atTeamOrdinaryHours), a
+ * stored row of somebody on full-day leave or an allocation that day is left
+ * out (atWorkOnTheDay), and each standing window lists only the teams whose
+ * ordinary day it is (onItsStandingCard).
+ *
+ * One function for both views: This week used to count the stored rows alone,
+ * so its Regular hours numbers disagreed with Today's for the same day --
+ * blank weekdays missing, people on an allocation still counted.
+ *
+ * Display only: nothing here is saved, and paging reads the stored rota.
+ */
+export function creRowsAtWork({
+  rotaDates,
+  teams,
+  teamKeysInView,
+  shifts,
+  assignments,
+  absences,
+  absenceKinds,
+}: {
+  rotaDates: readonly string[];
+  /** The whole catalogue's teams: which team a window is the ordinary day
+   *  of does not depend on the team picked. */
+  teams: readonly ScheduleTeam[];
+  /** The teams in view; empty for the whole family. */
+  teamKeysInView: readonly string[];
+  shifts: ReadonlyMap<string, ScheduleShift>;
+  assignments: readonly ScheduleAssignment[];
+  absences: readonly ScheduleAbsence[];
+  absenceKinds: readonly ScheduleAbsenceKind[];
+}): ScheduleAssignment[] {
+  const inScope = new Set(teamKeysInView.map((k) => k.toLowerCase()));
+  const allCreTeams = teams.filter((t) => t.family === "CRE");
+  const creTeams = allCreTeams
+    .filter((t) => inScope.size === 0 || inScope.has(t.key.toLowerCase()))
+    .sort((a, b) => a.sortOrder - b.sortOrder);
+  const standing = standingDayRows({ rotaDates, teams: creTeams, shifts, assignments, absences });
+  return [
+    ...atTeamOrdinaryHours(atWorkOnTheDay(assignments, absences, absenceKinds), shifts, allCreTeams),
+    ...standing,
+  ].filter((a) => onItsStandingCard(a, shifts, allCreTeams));
 }

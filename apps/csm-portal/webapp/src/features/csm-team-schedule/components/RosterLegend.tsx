@@ -56,10 +56,11 @@ function writeOpen(open: boolean): void {
 /**
  * What the codes on the roster mean.
  *
- * Only the codes actually on screen, so it stays short and never explains a
- * chip the reader cannot see. Open by default -- the codes are the rota
- * sheet's shorthand, which a new lead or a manager does not know -- and a
- * reader who knows them can fold it away; the choice is remembered.
+ * The codes on screen, plus every leave, allocation and move tag a rota
+ * marker can add, so a lead finds what can be marked without opening a cell.
+ * Open by default -- the codes are the rota sheet's shorthand, which a new
+ * lead or a manager does not know -- and a reader who knows them can fold it
+ * away; the choice is remembered.
  */
 export default function RosterLegend({ items }: { items: LegendItem[] }): JSX.Element | null {
   const [open, setOpen] = useState(readOpen);
@@ -78,7 +79,7 @@ export default function RosterLegend({ items }: { items: LegendItem[] }): JSX.El
       }}
     >
       <summary>
-        Legend <small>what the codes on screen mean</small>
+        Legend <small>what the codes mean, and every tag that can be marked</small>
       </summary>
       <div className="rl-groups">
         {groups.map((g) => (

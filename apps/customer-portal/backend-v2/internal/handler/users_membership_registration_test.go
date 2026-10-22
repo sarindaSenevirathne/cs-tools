@@ -81,7 +81,7 @@ func getMeRequest() *http.Request {
 // onboarding route.
 func TestGetMe_FirstAccessDisabledMakesNoCall(t *testing.T) {
 	client := &fakeFirstAccessUserClient{called: make(chan struct{})}
-	h := NewUserHandler(client, noopSCIMUserClient{}, false)
+	h := NewUserHandler(client, noopSCIMUserClient{}, false, nil)
 
 	rec := httptest.NewRecorder()
 	h.GetMe(rec, getMeRequest())
@@ -101,7 +101,7 @@ func TestGetMe_FirstAccessDisabledMakesNoCall(t *testing.T) {
 func TestGetMe_FirstAccessEnabledCallsBeforeResponding(t *testing.T) {
 	rec := httptest.NewRecorder()
 	client := &fakeFirstAccessUserClient{called: make(chan struct{}), rec: rec}
-	h := NewUserHandler(client, noopSCIMUserClient{}, true)
+	h := NewUserHandler(client, noopSCIMUserClient{}, true, nil)
 
 	h.GetMe(rec, getMeRequest())
 
@@ -132,7 +132,7 @@ func TestGetMe_FirstAccessEnabledCallsBeforeResponding(t *testing.T) {
 // cutover flag is on), must be invisible to the signed-in user.
 func TestGetMe_FirstAccessFailureDoesNotAffectTheResponse(t *testing.T) {
 	client := &fakeFirstAccessUserClient{called: make(chan struct{}), err: errors.New("entity-service unavailable")}
-	h := NewUserHandler(client, noopSCIMUserClient{}, true)
+	h := NewUserHandler(client, noopSCIMUserClient{}, true, nil)
 
 	rec := httptest.NewRecorder()
 	h.GetMe(rec, getMeRequest())

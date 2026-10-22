@@ -115,7 +115,7 @@ function reschedule(): void {
  * recomputes whatever it derives from "now" — exactly when its own tracked
  * timestamp's displayed text would change (not on a fixed cadence shared
  * with every other timestamp on the page). Used by {@link RelativeTime}
- * itself, and by the two "Last refreshed …" labels (`CaseSlaTable`,
+ * itself, and by the two "Last refreshed …" labels (`WorkItemSlaTable`,
  * `RefreshButton`) that format a relative string outside this component.
  *
  * `trackedMs` is the epoch-ms of the timestamp this caller displays —

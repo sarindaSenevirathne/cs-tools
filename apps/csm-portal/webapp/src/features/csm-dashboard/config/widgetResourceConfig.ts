@@ -60,6 +60,7 @@ import {
 } from "@features/csm-operations/utils/changeRequests";
 import { writeChangeRequestFiltersToUrl } from "@features/csm-operations/utils/changeRequestsFiltersUrl";
 import { taskStateLabel } from "@features/csm-cases/utils/taskState";
+import { callRequestStateLabel } from "@features/csm-cases/utils/callRequestState";
 import type { BeTaskState } from "@api/backend/types";
 import {
   appendWidgetTitleParam,
@@ -1146,8 +1147,10 @@ export const WIDGET_RESOURCE_CONFIG: Record<
       return [number, reason].filter(Boolean).join(" — ") || "—";
     },
     secondaryLabel: (item) => {
-      const state = item.state as { label?: string } | undefined;
-      return state?.label;
+      const state = item.state as { id?: number | string; label?: string } | undefined;
+      if (!state || (state.id == null && !state.label)) return undefined;
+      if (state.id == null) return state.label;
+      return callRequestStateLabel({ id: state.id, label: state.label });
     },
     // No widget filters a call request by anything the cases list can render as a
     // filtered view (state keys differ entirely from case state), so the tile-level

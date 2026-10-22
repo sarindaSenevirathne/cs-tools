@@ -136,4 +136,45 @@ describe("usePostProductVulnerabilitiesSearch", () => {
     renderHook(() => usePostProductVulnerabilitiesSearch(request), { wrapper });
     await waitFor(() => expect(mockAuthFetch).toHaveBeenCalledTimes(2));
   });
+
+  it("shows the previous result while the next request loads only when keepPreviousData is requested", async () => {
+    const first = { productVulnerabilities: [{ id: "a" }], totalRecords: 2, offset: 0, limit: 1 };
+    const second = { productVulnerabilities: [{ id: "b" }], totalRecords: 2, offset: 1, limit: 1 };
+    const pending: { release?: () => void } = {};
+    const releasePending = () => pending.release?.();
+    mockAuthFetch.mockImplementation(
+      (_url: string, init: { body: string }) =>
+        new Promise((resolve) => {
+          const payload = JSON.parse(init.body).pagination.offset === 0 ? first : second;
+          const respond = () => resolve({ ok: true, status: 200, json: () => Promise.resolve(payload) });
+          if (payload === first) respond();
+          else pending.release = respond;
+        }),
+    );
+    const page = (offset: number) => ({ filters: {}, pagination: { offset, limit: 1 } });
+
+    const kept = renderHook(
+      ({ offset }) => usePostProductVulnerabilitiesSearch(page(offset), { keepPreviousData: true }),
+      { wrapper, initialProps: { offset: 0 } },
+    );
+    await waitFor(() => expect(kept.result.current.data).toEqual(first));
+    kept.rerender({ offset: 1 });
+    expect(kept.result.current.data).toEqual(first);
+    expect(kept.result.current.isPlaceholderData).toBe(true);
+    releasePending();
+    await waitFor(() => expect(kept.result.current.data).toEqual(second));
+    kept.unmount();
+
+    queryClient.clear();
+    pending.release = undefined;
+    const plain = renderHook(
+      ({ offset }) => usePostProductVulnerabilitiesSearch(page(offset)),
+      { wrapper, initialProps: { offset: 0 } },
+    );
+    await waitFor(() => expect(plain.result.current.data).toEqual(first));
+    plain.rerender({ offset: 1 });
+    expect(plain.result.current.data).toBeUndefined();
+    expect(plain.result.current.isPlaceholderData).toBe(false);
+    releasePending();
+  });
 });

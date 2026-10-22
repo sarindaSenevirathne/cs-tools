@@ -108,6 +108,21 @@ func callerEmail(ctx context.Context) (string, error) {
 	return email, nil
 }
 
+// resolveCreateCallRequestState picks the row's starting state.
+// A nil state means the field was omitted: the customer raised the request, so
+// it waits on WSO2. A supplied value is checked before any repository call.
+// Only pending_on_customer is accepted (an agent-raised request). An empty
+// string and every other state are refused.
+func resolveCreateCallRequestState(state *domain.CallRequestStateType) (domain.CallRequestStateType, error) {
+	if state == nil {
+		return domain.CallRequestStatePendingOnWSO2, nil
+	}
+	if *state == domain.CallRequestStatePendingOnCustomer {
+		return domain.CallRequestStatePendingOnCustomer, nil
+	}
+	return "", &apierror.ValidationError{Msg: "state on create must be omitted or pending_on_customer"}
+}
+
 // CreateCallRequest implements CallRequestService.
 func (s *callRequestService) CreateCallRequest(ctx context.Context, req domain.CreateCallRequestRequest) (domain.CreateCallRequestResponse, error) {
 	if req.CaseID == "" {
@@ -125,6 +140,11 @@ func (s *callRequestService) CreateCallRequest(ctx context.Context, req domain.C
 	if req.DurationMinutes <= 0 {
 		return domain.CreateCallRequestResponse{}, &apierror.ValidationError{Msg: "durationInMinutes must be positive"}
 	}
+	state, err := resolveCreateCallRequestState(req.State)
+	if err != nil {
+		return domain.CreateCallRequestResponse{}, err
+	}
+	req.State = &state
 
 	email, err := callerEmail(ctx)
 	if err != nil {

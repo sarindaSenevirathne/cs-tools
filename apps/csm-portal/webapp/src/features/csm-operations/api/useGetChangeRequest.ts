@@ -30,12 +30,28 @@ export function useGetChangeRequest(
   const api = useBackendApi();
 
   return useQuery<BeChangeRequestDetail | null, Error>({
-    queryKey: [ApiQueryKeys.CHANGE_REQUEST_DETAILS, id ?? ""],
-    queryFn: (): Promise<BeChangeRequestDetail | null> =>
-      api.get<BeChangeRequestDetail>(
-        `/change-requests/${encodeURIComponent(id as string)}`,
-      ),
+    ...changeRequestDetailQuery(api, id ?? ""),
     enabled: !!id,
-    staleTime: 30_000,
   });
+}
+
+/**
+ * The detail query of one change request, shared by the detail page and by
+ * anything that needs several at once (the list's bulk edit reads each selected
+ * change request's `legalNextStates`), so they share one cache entry.
+ */
+export function changeRequestDetailQuery(
+  api: Pick<ReturnType<typeof useBackendApi>, "get">,
+  id: string,
+): {
+  queryKey: readonly [string, string];
+  queryFn: () => Promise<BeChangeRequestDetail | null>;
+  staleTime: number;
+} {
+  return {
+    queryKey: [ApiQueryKeys.CHANGE_REQUEST_DETAILS, id] as const,
+    queryFn: (): Promise<BeChangeRequestDetail | null> =>
+      api.get<BeChangeRequestDetail>(`/change-requests/${encodeURIComponent(id)}`),
+    staleTime: 30_000,
+  };
 }

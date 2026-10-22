@@ -24,6 +24,7 @@ import (
 	"os"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/dashboard"
@@ -825,3 +826,28 @@ func TestGetDashboardDetail(t *testing.T) {
 // to the frontend — see DashboardHandler's doc comment in dashboards.go and
 // the "my-open-cases"/"Mine" assertions above in TestGetDashboardDetail,
 // which now assert the placeholder reaches the response unresolved instead.
+
+// distinctBy must survive the template -> wire view mapping (the view is a
+// hand-copied struct, so a new template field is dropped unless added), and a
+// widget without it must not emit the key at all.
+func TestWidgetViews_ForwardsDistinctBy(t *testing.T) {
+	views := widgetViews([]dashboard.WidgetTemplate{
+		{ID: "a", DisplayName: "A", ResourceType: dashboard.ResourceCase, Shape: dashboard.ShapeCount, GridWidth: 3,
+			DistinctBy: &dashboard.DistinctByConfig{Field: "account", MaxGroups: 1000}},
+		{ID: "b", DisplayName: "B", ResourceType: dashboard.ResourceCase, Shape: dashboard.ShapeCount, GridWidth: 3},
+	})
+	withJSON, err := json.Marshal(views[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(withJSON), `"distinctBy":{"field":"account","maxGroups":1000}`) {
+		t.Errorf("distinctBy not forwarded: %s", withJSON)
+	}
+	withoutJSON, err := json.Marshal(views[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(withoutJSON), "distinctBy") {
+		t.Errorf("distinctBy emitted for a widget without it: %s", withoutJSON)
+	}
+}

@@ -131,7 +131,8 @@ export default function CaseDetailsActionRow({
   const theme = useTheme();
   const { data: filterMetadata } = useGetProjectFilters(projectId);
   const caseStates = filterMetadata?.caseStates;
-  const { isExternalUser } = useCustomerPermissions();
+  const { isExternalUser, canCreateCase, canUpdateCase } =
+    useCustomerPermissions();
 
   const { showSuccess } = useSuccessBanner();
   const { showError } = useErrorBanner();
@@ -152,13 +153,19 @@ export default function CaseDetailsActionRow({
   const resolvedEscalationLevelId = escalationLevelId != null ? String(escalationLevelId) : null;
   const escalationLevelInfo = resolvedEscalationLevelId != null ? ESCALATION_NEXT_LEVEL[resolvedEscalationLevelId ?? "0"] : null;
   const needsLead = resolvedEscalationLevelId != null && ESCALATION_LEAD_REQUIRED_FROM_LEVEL.has(resolvedEscalationLevelId);
+  // Every write action below ends in PATCH /cases/{id} (create+update of a
+  // state) or POST /cases/{caseId}/escalations (create) -- the matrix grants
+  // cases.create and cases.update to the identical role set today, so
+  // combining them is both correct and conservative if that ever changes.
+  const canManageCase = canCreateCase && canUpdateCase;
   const showEscalateButton =
+    canManageCase &&
     resolvedEscalationLevelId != null &&
     statusLabel !== "Closed" &&
     resolvedEscalationLevelId !== ESCALATION_MAX_LEVEL_ID &&
     !!escalationLevelInfo &&
     (!needsLead || isCurrentUserLead === true);
-  const showDeescalateButton = isEscalated === true;
+  const showDeescalateButton = canManageCase && isEscalated === true;
   const canDeescalateCase = canDeescalate === true;
 
   // Reject Solution requires a customer comment before the case flips back to
@@ -242,7 +249,7 @@ export default function CaseDetailsActionRow({
         justifyContent: "flex-end",
       }}
     >
-      {CASE_STATUS_ACTIONS.filter((action) =>
+      {(canManageCase ? CASE_STATUS_ACTIONS : []).filter((action) =>
         availableActions.includes(action.label),
       ).map(({ label, Icon, paletteIntent }) => {
         const stateKey = getStateKeyForAction(label, caseStates);

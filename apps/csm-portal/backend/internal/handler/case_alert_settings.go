@@ -189,19 +189,27 @@ func (h *CaseAlertSettingsHandler) PutCaseAlertRoute(w http.ResponseWriter, r *h
 	var req struct {
 		Ladder    string `json:"ladder"`
 		GroupName string `json:"groupName"`
-		TeamKey   string `json:"teamKey"`
-		RotaCode  string `json:"rotaCode"`
-		Enabled   *bool  `json:"enabled"`
+		// GroupID is the assignment group picked from the tab's list; sent
+		// on only when present, since an entity-service from before it
+		// refuses the field.
+		GroupID  string `json:"groupId"`
+		TeamKey  string `json:"teamKey"`
+		RotaCode string `json:"rotaCode"`
+		Enabled  *bool  `json:"enabled"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil || !caseAlertLadderRe.MatchString(req.Ladder) ||
 		strings.TrimSpace(req.GroupName) == "" || len(req.GroupName) > maxCaseAlertTextLen ||
 		(req.TeamKey == "") == (req.RotaCode == "") ||
+		(req.GroupID != "" && !uuidRe.MatchString(req.GroupID)) ||
 		(req.TeamKey != "" && !rotaTeamKeyRe.MatchString(req.TeamKey)) ||
 		(req.RotaCode != "" && !rotaTeamKeyRe.MatchString(req.RotaCode)) {
 		writeError(w, http.StatusBadRequest, "Send a ladder, a group name, and either a team or a rota.")
 		return
 	}
 	fwd := map[string]any{"ladder": req.Ladder, "groupName": req.GroupName}
+	if req.GroupID != "" {
+		fwd["groupId"] = req.GroupID
+	}
 	if req.TeamKey != "" {
 		fwd["teamKey"] = req.TeamKey
 	} else {

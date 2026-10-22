@@ -439,4 +439,3 @@ func TestSNCaseService_CreateCase_ServiceRequest_DerivesTitleAndDescriptionFromC
 		t.Fatalf("payload description: got %v, want %q", gotBody["description"], wantDesc)
 	}
 }
-

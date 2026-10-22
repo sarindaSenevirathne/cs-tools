@@ -100,6 +100,8 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	// *cache.UserCache inside a non-nil one -- so the writers below can test
 	// it against nil.
 	var userCacheInvalidator service.UserCacheInvalidator
+	// productVulnerabilityOptionsCache is likewise a nil interface without Redis.
+	var productVulnerabilityOptionsCache service.ProductVulnerabilityOptionsCache
 	closeRedis := func() {}
 	if db != nil && cfg.HasRedis() {
 		rdb, err := cache.NewRedisClient(cfg)
@@ -109,6 +111,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		userCache := cache.NewUserCache(rdb, cfg.UserCacheTTL)
 		userSvc = service.NewCachedUserService(userSvc, userCache)
 		userCacheInvalidator = userCache
+		productVulnerabilityOptionsCache = cache.NewProductVulnerabilityOptionsCache(rdb, cfg.VulnerabilityMetaCacheTTL)
 		closeRedis = func() {
 			if err := rdb.Close(); err != nil {
 				log.Printf("redis: close client: %v", err)
@@ -234,8 +237,28 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		githubSync service.GithubSyncService
 	)
 	var scheduledTaskRunHandler *handler.ScheduledTaskRunHandler
+	var worklogReportHandler *handler.WorklogReportHandler
+	var queryHourHandler *handler.QueryHourHandler
 	if db != nil {
+		// Query-hour utilisation. No table of its own: the entitlement
+		// comes from the Salesforce mirror, the consumption from time
+		// cards, and the result is written back to columns that already
+		// exist -- sf_opportunity.query_hour_state and project's three
+		// duration fields.
+		queryHourHandler = handler.NewQueryHourHandler(
+			service.NewQueryHourService(
+				repository.NewQueryHourRepository(repository.NewScoped(db)),
+				cfg.QueryHourInternalEmailDomain))
 		scheduledTaskRunHandler = handler.NewScheduledTaskRunHandler(service.NewScheduledTaskRunService(repository.NewScheduledTaskRunRepository(db)))
+		// Which teams the CS Worklogs reports cover is deployment
+		// configuration, not a constant: the default is the CRE
+		// delivery teams, which is what the delivered mails show, but
+		// type 'cre' also catches approval and review teams nobody
+		// wants in a report, and teams come and go.
+		worklogReportHandler = handler.NewWorklogReportHandler(
+			service.NewWorklogReportService(
+				repository.NewWorklogReportRepository(repository.NewScoped(db)),
+				cfg.WorklogReportTeamTypes, cfg.WorklogReportExcludedTeamKeys))
 		if cfg.HasGithubIntegration() {
 			githubLabels, labelErr := service.NewGithubLabels(service.GithubLabelOverrides{
 				TypeIncident:       cfg.GithubLabelTypeIncident,
@@ -314,10 +337,15 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	// rest of the Team Schedule.
 	var rotaGenerateHandler *handler.RotaGenerateHandler
 	var rotaAccessHandler *handler.RotaAccessHandler
+	var scheduleReminderHandler *handler.ScheduleReminderHandler
+	var rotaReminderSettingsHandler *handler.RotaReminderSettingsHandler
+	var rotaReminderRequestHandler *handler.RotaReminderRequestHandler
 	var teamMemberHandler *handler.TeamMemberHandler
 	var pagingChainHandler *handler.PagingChainHandler
 	var caseAlertSettingsHandler *handler.CaseAlertSettingsHandler
 	var runbookHandler *handler.RunbookHandler
+	var migrationCaseReportHandler *handler.MigrationCaseReportHandler
+	var productRegressionReportHandler *handler.ProductRegressionReportHandler
 	// runbookRepo stays a nil interface without a pool, so no incident service gets a catalog.
 	var runbookRepo repository.RunbookRepository
 
@@ -1094,6 +1122,22 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		rotaAccessHandler = handler.NewRotaAccessHandler(
 			service.NewRotaAccessService(repository.NewRotaAccessRepository(db), repository.NewScheduleRepository(db), accessSvc, cfg.AuthAdminRoles),
 		)
+		// The rota reminders' bookkeeping, for csm-scheduled-tasks' service
+		// credential only: what a reminder last sent, and the rota admins to
+		// ask when a rota is not complete.
+		scheduleReminderHandler = handler.NewScheduleReminderHandler(
+			service.NewScheduleReminderService(repository.NewScheduleReminderRepository(db), repository.NewRotaAccessRepository(db), accessSvc),
+		)
+		// The rota reminders' settings: read by csm-scheduled-tasks and the Rota
+		// Access tab, changed there by a CSM admin or the family's rota admin.
+		rotaReminderSettingsHandler = handler.NewRotaReminderSettingsHandler(
+			service.NewRotaReminderSettingsService(repository.NewRotaReminderSettingsRepository(db), repository.NewScheduleRepository(db), accessSvc, cfg.AuthAdminRoles),
+		)
+		// "Send now" on the same card: asked for by a CSM admin or the family's
+		// rota admin, claimed and reported by csm-scheduled-tasks.
+		rotaReminderRequestHandler = handler.NewRotaReminderRequestHandler(
+			service.NewRotaReminderRequestService(repository.NewRotaReminderRequestRepository(db), repository.NewScheduleRepository(db), accessSvc, cfg.AuthAdminRoles),
+		)
 		// Postgres-only, and internal-staff-only like every other read in this
 		// module: it returns staff names, addresses and rank.
 		teamMemberHandler = handler.NewTeamMemberHandler(
@@ -1318,27 +1362,25 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	}
 	feedbackHandler := handler.NewFeedbackHandler(activeFeedbackSvc)
 
-	// Product vulnerabilities: read queries (SearchProductVulnerabilities,
-	// GetProductVulnerability, GetVulnerabilityMeta) are served from Postgres
-	// whenever the database connection pool is available (db != nil), avoiding
-	// downstream ServiceNow integration dependency and user-level ACL issues
-	// on static metadata. SyncProductVulnerabilities delegates to the ServiceNow
-	// data source when configured. When no database pool is available (db == nil),
-	// falls back to the ServiceNow service.
-	var activeProductVulnerabilitySvc service.ProductVulnerabilityService
+	// Product vulnerabilities: the service follows cfg.DataSource (selection
+	// and the defensive no-database fallback live in
+	// newProductVulnerabilityService). In dual-write mode reads
+	// (SearchProductVulnerabilities, GetProductVulnerability,
+	// GetVulnerabilityMeta) are served from Postgres, avoiding the downstream
+	// ServiceNow integration dependency and user-level ACL issues on static
+	// metadata; SyncProductVulnerabilities writes to Postgres too.
+	// The ServiceNow client may exist for SLA/attachment reads alone, so its
+	// presence says nothing about this service's data source.
+	var productVulnerabilityRepo repository.ProductVulnerabilityRepository
 	if db != nil {
-		productVulnerabilityRepo := repository.NewProductVulnerabilityRepository(db)
-		var snSvc service.ProductVulnerabilityService
-		if serviceNowIntegrationServiceClient != nil {
-			snSvc = service.NewServiceNowProductVulnerabilityService(serviceNowIntegrationServiceClient)
-		}
-		activeProductVulnerabilitySvc = service.NewProductVulnerabilityServiceWithSNSync(productVulnerabilityRepo, snSvc)
-	} else if serviceNowIntegrationServiceClient != nil {
-		activeProductVulnerabilitySvc = service.NewServiceNowProductVulnerabilityService(serviceNowIntegrationServiceClient)
-	} else {
-		activeProductVulnerabilitySvc = service.NewProductVulnerabilityService(repository.NewProductVulnerabilityRepository(nil))
+		productVulnerabilityRepo = repository.NewProductVulnerabilityRepository(db)
 	}
-	productVulnerabilityHandler := handler.NewProductVulnerabilityHandler(activeProductVulnerabilitySvc)
+	var snProductVulnerabilitySvc service.ProductVulnerabilityService
+	if serviceNowIntegrationServiceClient != nil {
+		snProductVulnerabilitySvc = service.NewServiceNowProductVulnerabilityService(serviceNowIntegrationServiceClient)
+	}
+	activeProductVulnerabilitySvc := newProductVulnerabilityService(cfg.DataSource, productVulnerabilityRepo, snProductVulnerabilitySvc, productVulnerabilityOptionsCache)
+	productVulnerabilityHandler := handler.NewProductVulnerabilityHandler(activeProductVulnerabilitySvc, cfg.M2MClientIDs)
 
 	// incident/problem/incident_task/conversation (migrations 000057-000060,
 	// 000066) -- see incident_repo.go/problem_repo.go's own doc comments for
@@ -1382,6 +1424,14 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		// (what the call-escalation ladders start from) and takes work notes, with no ServiceNow behind it.
 		activeIncidentSvc = service.NewIncidentServiceWithPublisher(incidentRepo, userRepo, incidentEventPublisher)
 	}
+	// SLA_DATA_SOURCE=servicenow: SLA-filtered incident search/aggregate is
+	// answered by a read-only ServiceNow-backed incident service instead of the
+	// Postgres sla_live query, the same routing the case service gets via
+	// snSLASearchDelegate. Not DataSourceServiceNow, where the whole incident
+	// service is already ServiceNow-backed.
+	if cfg.SLADataSource == config.SLADataSourceServiceNow && cfg.DataSource != config.DataSourceServiceNow {
+		activeIncidentSvc = service.WithSLASearchDelegate(activeIncidentSvc, service.NewServiceNowIncidentMirrorService(serviceNowIntegrationServiceClient))
+	}
 	// Which Special Ops team a handoff goes to, and which GitHub repository
 	// its internal issue goes to, is configuration. A value that does not
 	// parse would silently offer no handoff anywhere; refuse to start instead.
@@ -1419,6 +1469,24 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		// Runbooks: the alert-name to runbook catalog, matched against every new incident's subject.
 		runbookRepo = repository.NewRunbookRepository(db)
 		runbookHandler = handler.NewRunbookHandler(service.NewRunbookService(runbookRepo))
+		// Weekly migration case scan: the long-running migration engagements,
+		// bucketed by the tags the CS team keeps on them, for the scheduled
+		// task that mails the scan to the teams' mail groups.
+		migrationCaseReportHandler = handler.NewMigrationCaseReportHandler(
+			service.NewMigrationCaseReportService(
+				repository.NewMigrationCaseReportRepository(repository.NewScoped(db)),
+				service.MigrationCaseReportConfig{
+					HoldTag:           cfg.MigrationCaseReportHoldTag,
+					AccountsTag:       cfg.MigrationCaseReportAccountsTag,
+					RecipientTeamKeys: cfg.MigrationCaseReportTeamKeys,
+				}))
+		// Monthly product regression reports: one business unit's regression
+		// cases whose fix ETA was shared last month, for the scheduled task
+		// that mails one report per unit.
+		productRegressionReportHandler = handler.NewProductRegressionReportHandler(
+			service.NewProductRegressionReportService(
+				repository.NewProductRegressionReportRepository(repository.NewScoped(db)),
+				service.ProductRegressionReportConfig{Tag: cfg.ProductRegressionReportTag}))
 		caseAlertSettingsHandler = handler.NewCaseAlertSettingsHandler(
 			service.NewCaseAlertSettingsService(repository.NewCaseAlertSettingsRepository(db), repository.NewPagingChainRepository(db), accessSvc,
 				service.CaseAlertSettingsConfig{
@@ -1452,9 +1520,6 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	// groupless default is logged, never fatal -- the create still works, it
 	// just leaves such incidents unassigned.
 	activeIncidentSvc = service.WithIncidentDefaultService(activeIncidentSvc, cfg.IncidentDefaultServiceID)
-	if runbookRepo != nil {
-		activeIncidentSvc = service.WithRunbookCatalog(activeIncidentSvc, runbookRepo)
-	}
 	if cfg.IncidentDefaultServiceID != "" && (db != nil || cfg.DataSource == config.DataSourceServiceNow) {
 		go service.CheckIncidentDefaultService(context.Background(), activeIncidentSvc, cfg.IncidentDefaultServiceID)
 	}
@@ -1798,6 +1863,18 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		mux.HandleFunc("POST /github/service-requests", githubServiceRequestHandler.Create)
 	}
 
+	if worklogReportHandler != nil {
+		// internalOnly, not merely authenticated. The report names every
+		// engineer, what they worked on and how long it took; a customer
+		// token must never reach it.
+		mux.HandleFunc("GET /reports/worklogs", internalOnly(accessSvc, worklogReportHandler.GetWorklogReport))
+	}
+	if queryHourHandler != nil {
+		// internalOnly: the report names accounts, their owners and
+		// what each has spent. A customer token must never reach it.
+		mux.HandleFunc("GET /reports/query-hours", internalOnly(accessSvc, queryHourHandler.GetWeeklyReport))
+		mux.HandleFunc("POST /query-hours/recompute", internalOnly(accessSvc, queryHourHandler.RecomputeQueryHours))
+	}
 	if scheduledTaskRunHandler != nil {
 		mux.HandleFunc("POST /scheduled-tasks/attempts", scheduledTaskRunHandler.AttemptScheduledTaskRun)
 		mux.HandleFunc("PATCH /scheduled-tasks/attempts/{id}", scheduledTaskRunHandler.UpdateScheduledTaskRunAttempt)
@@ -1834,6 +1911,16 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		mux.HandleFunc("DELETE /team-schedule/paging-contacts/{userId}", pagingChainHandler.DeletePagingPhone)
 		mux.HandleFunc("POST /team-schedule/paging-contacts/{userId}/test", pagingChainHandler.RequestTestCall)
 		mux.HandleFunc("PUT /team-schedule/paging-contacts/{userId}/test-result", pagingChainHandler.RecordTestResult)
+	}
+	if migrationCaseReportHandler != nil {
+		// internalOnly: the scan names accounts, their owners and who is
+		// assigned to each migration; a customer token must never reach it.
+		mux.HandleFunc("GET /reports/migration-cases", internalOnly(accessSvc, migrationCaseReportHandler.GetMigrationCaseReport))
+	}
+	if productRegressionReportHandler != nil {
+		// internalOnly: the report names customers' cases and deployments; a
+		// customer token must never reach it.
+		mux.HandleFunc("GET /reports/product-regressions", internalOnly(accessSvc, productRegressionReportHandler.GetProductRegressionReport))
 	}
 	if runbookHandler != nil {
 		// Runbooks (Operations > Runbooks): internal callers only.
@@ -1873,6 +1960,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		mux.HandleFunc("GET /team-schedule/my-lead-teams", scheduleHandler.GetMyLeadTeams)
 		mux.HandleFunc("POST /team-schedule/assignments/apply", scheduleHandler.ApplyScheduleRange)
 		mux.HandleFunc("POST /team-schedule/absences/apply", scheduleHandler.ApplyScheduleAbsence)
+		mux.HandleFunc("POST /team-schedule/rotas/{code}/import", scheduleHandler.ImportRota)
 		mux.HandleFunc("DELETE /team-schedule/absences/{id}", scheduleHandler.DeleteScheduleAbsence)
 		mux.HandleFunc("POST /team-schedule/absence-kinds", scheduleHandler.CreateScheduleAbsenceKind)
 		mux.HandleFunc("DELETE /team-schedule/absence-kinds/{code}", scheduleHandler.DeleteScheduleAbsenceKind)
@@ -1886,6 +1974,21 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		mux.HandleFunc("DELETE /team-schedule/rota-access/admins/{family}/{userId}", rotaAccessHandler.RevokeRotaAdmin)
 		mux.HandleFunc("PUT /team-schedule/rota-access/markers/{teamKey}/{userId}", rotaAccessHandler.GrantRotaMarker)
 		mux.HandleFunc("DELETE /team-schedule/rota-access/markers/{teamKey}/{userId}", rotaAccessHandler.RevokeRotaMarker)
+	}
+	if scheduleReminderHandler != nil {
+		mux.HandleFunc("GET /team-schedule/reminders/{family}/{kind}/{periodStart}", scheduleReminderHandler.GetReminder)
+		mux.HandleFunc("PUT /team-schedule/reminders/{family}/{kind}/{periodStart}", scheduleReminderHandler.RecordReminder)
+		mux.HandleFunc("GET /team-schedule/rota-admins/{family}", scheduleReminderHandler.GetRotaAdmins)
+	}
+	if rotaReminderSettingsHandler != nil {
+		mux.HandleFunc("GET /team-schedule/reminder-settings/{family}", rotaReminderSettingsHandler.Get)
+		mux.HandleFunc("PUT /team-schedule/reminder-settings/{family}", rotaReminderSettingsHandler.Save)
+	}
+	if rotaReminderRequestHandler != nil {
+		mux.HandleFunc("POST /team-schedule/reminder-requests/{family}", rotaReminderRequestHandler.Create)
+		mux.HandleFunc("GET /team-schedule/reminder-requests/{family}", rotaReminderRequestHandler.List)
+		mux.HandleFunc("POST /team-schedule/reminder-requests/{family}/claim", rotaReminderRequestHandler.Claim)
+		mux.HandleFunc("PUT /team-schedule/reminder-requests/{family}/{id}/result", rotaReminderRequestHandler.Report)
 	}
 	if rotaGenerateHandler != nil {
 		// A lead of the rota (or its admin) works out a month from the

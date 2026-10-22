@@ -168,6 +168,150 @@ query run) if empty. Shares `internal/entitycases.Client` and the row-rendering 
 (`internal/notify/templates/open_cases_report.html`) per this component's own "Per-task report
 emails" below.
 
+## Rota reminders
+
+`internal/rotareminder`, registered as **`rota_weekday_reminder`**, **`rota_weekend_notice`**,
+**`rota_weekend_reminder`** and **`rota_manual_reminder`** (the Rota Access card's "Send now" and
+"Send a test to me"), emails the people rostered on a rotation shift in the Team Schedule, with a
+calendar invitation for their window. **Registered only when `ROTA_REMINDERS_ENABLED=true`**
+(default false): they email real staff from the real rota.
+
+| Task | Default schedule | Announces |
+|---|---|---|
+| `rota_weekday_reminder` | `30 9 * * 1-5` (15:00 Colombo, Mon–Fri) | the next working day's weekday rotations (`CRE_MORNING`, `CRE_MORNING_OC`, `CRE_EVENING`): tomorrow from Monday to Thursday, **Monday from Friday** |
+| `rota_weekend_notice` | `30 14 * * 0-4` (20:00 Colombo, Sun–Thu) | the coming weekend (`CRE_WEEKEND`, `CRE_WEEKEND_NIGHT`, `CRE_WEEKEND_NIGHT_OC`), **once it is fully marked**: the summary and the invitations, sent once; until then the rota admins are asked every evening |
+| `rota_weekend_reminder` | `30 9 * * 5` (15:00 Colombo, Fri) | this weekend again: the summary, the invitations as updates, cancellations, gaps listed |
+| `rota_manual_reminder` | `*/5 * * * *` (finer than the driver, so due at every run) | whatever was asked for on the Rota Access card since the last run: a weekday or weekend "Send now", or a test sent only to the person who asked (see "Send now" below) |
+
+The schedule decides only *when* a task runs. Which days it announces comes from the day it runs
+(`NextWorkingDay`, `ComingWeekend`), counted in `ROTA_REMINDER_TIME_ZONE` (default
+`Asia/Colombo`), so a schedule moved by `SUB_CRON_SCHEDULES` still announces sensible days. The
+schedules assume `TZ=UTC` like every other here.
+
+- **The rota comes from entity-service** (`internal/teamschedule`): `GET /team-schedule/catalogue`
+  for labels, windows and team names, and `POST /team-schedule/assignments/search` with
+  `excludeAbsent: true`, so **people on leave are left out by entity-service**, by the same rule
+  the pager uses. An entity-service that predates `excludeAbsent` answers 400 (unknown field) and
+  the task fails and alerts rather than reminding somebody on leave: deploy entity-service first.
+  The Team Schedule is internal-only, so this client's id must be in entity-service's
+  `M2M_CLIENT_IDS`.
+- **Weekday: one email per shift window**, sent to the people on that window only. A window is
+  a shift and its on-call variant (`<CODE>_OC`), which share hours: Morning (with its on-call
+  person) and Evening. The email lists its window's people.
+- **Weekend: one summary email plus one invitation email per team per day.** The summary goes
+  to everybody on the weekend, LK and Americas (with the LK on-call person) alike, in the layout the
+  CRE weekend emails already had: "Hello team,", a Saturday Team and a Sunday Team list
+  ("Name (Rotation)"), a Rotation Definitions table (Rotation with its member count | Local time on
+  the rotation's own clock | UTC window | Role: "IST/PDT General support" or "On-call"), the zone
+  legend and a daylight saving note, then the Handover paragraphs (`notify.RenderWeekendRota`).
+  The Americas Weekend's hours, and the LK On-call's that cover it, are 08:00-18:00
+  America/Los_Angeles (`ROTA_REMINDER_WINDOWS`), not the Team Schedule's 21:00-06:00 IST; the
+  invitations use the same hours. Then each window (LK
+  Saturday, Americas Saturday, LK Sunday, Americas Sunday) gets its own email to its own people,
+  carrying its invitation with all of them as guests, so they can start a group chat from the
+  event. One recipient is greeted by full name, several with "Dear all,".
+- **Settings saved on the Rota Access tab win.** Every run first reads
+  `GET /team-schedule/reminder-settings/{family}` (entity-service, migration 0242; the
+  "CRE rota reminders" card, editable by a CSM admin or the CRE rota admin). When something
+  is saved: `weekdayEnabled` / `weekendEnabled` turn that task off (the run succeeds and
+  sends nothing), `invitesEnabled` can turn invitations off but never on where the deployment
+  has them off (`ROTA_REMINDER_INVITES_ENABLED`, or no organizer), `weekendRequired` and
+  `windows` override `ROTA_REMINDER_WEEKEND_REQUIRED` / `ROTA_REMINDER_WINDOWS` code by code
+  (a code the saved settings do not name keeps the configured value; the card saves a code
+  only once somebody changes it there), and `copyTo` is copied on top of the configured copy
+  list. So saving one field never replaces a deployment setting nobody changed. Nothing saved (a 404, also from an entity-service without the
+  route) keeps the environment's values. A failed read fails the run, so it is retried
+  rather than sent with settings somebody turned off. Not on the card, on purpose: the
+  send times, `ROTA_REMINDER_REDIRECT_TO`, the family, the shift codes and names, and the
+  email service settings.
+- **"Send now" (`rota_manual_reminder`, every run).** The card's Send now button queues a
+  request in entity-service (`team_schedule_reminder_request`, migration 0242; asked for by a
+  CSM admin or the family's rota admin, refused while one of the same kind is waiting and within
+  10 minutes of the last that did not fail). This task has no address to call, so at every run it claims the
+  waiting requests (`POST .../reminder-requests/{family}/claim`, up to 5 a run) and sends each
+  with the code above: `weekday` is the next working day's windows, `weekend` the coming weekend
+  (this one from a Saturday or a Sunday), sent even when not fully marked, as on Friday, and
+  recorded like Friday's, so invitations update and cancellations follow. The saved on/off
+  switches do not stop it; the saved minimums, hours, invitations switch and copy list apply.
+  Each request is reported `SENT` ("Sent N emails.", counted where each reminder is sent: a
+  weekday window's email by its final outcome, the weekend summary and each invitation, never the
+  rota admins' email, cancellations or alerts; or "Nothing was sent: <why>.", the reason each
+  window was skipped) or `FAILED` with the reason
+  (`PUT .../{id}/result`); only a failed claim or report fails the run. A request claimed but
+  never reported (the run died) is claimed again after 2 hours, so in that rare case its
+  emails go out twice. How soon it is sent is the driver's cadence (`DRIVER_INTERVAL`, an hour by
+  default); its schedule (`*/5 * * * *`) is finer than the driver, so it is due at every tick.
+- **"Send a test to me".** The same queue with `test: true` (its own queue per person, 2 minutes
+  apart, never held up by a real request). The run sends exactly what Send now would, but every
+  email -- admins' and failure alerts included -- goes only to the person who asked, with
+  "[Test]" in the subject and the "[Test copy] Not sent to the rota. ... would have been sent
+  to: ..." line; nothing is copied; invitations carry test event ids (`...-test@csm-team-schedule`),
+  so a test event never stands in for or blocks the real one; and the weekend's send record is
+  neither read nor written, so the real reminders are unaffected. Works in every environment,
+  production included, and needs no `ROTA_REMINDER_REDIRECT_TO`.
+- **Only a fully marked weekend is announced.** `ROTA_REMINDER_WEEKEND_REQUIRED` (default
+  `CRE_WEEKEND=3,CRE_WEEKEND_NIGHT=1`) is how many people each shift needs on each day; the on-call
+  variant does not count. Until that holds, `rota_weekend_notice` emails the family's rota admins
+  (entity-service `GET /team-schedule/rota-admins/{family}`; the task's alert audience when there
+  are none) a table of what is missing, every evening, and sends nothing to the rota. Friday's
+  `rota_weekend_reminder` sends anyway, listing the gaps, and tells the admins.
+- **The weekend send is recorded in entity-service** (`team_schedule_reminder_sent`, migration
+  0241, `GET`/`PUT /team-schedule/reminders/{family}/weekend_notice/{saturday}`): an evening that
+  finds the record sends nothing, and Friday compares its invitations with the recorded ones and
+  sends a cancellation (`METHOD:CANCEL`) to anybody taken off a window, or to everybody on a window
+  that is gone. A failure to record is reported in the partial-failure alert; the emails are not
+  re-sent for it.
+- **Calendar invitations** (`ROTA_REMINDER_INVITES_ENABLED`, default true; needs
+  `EMAIL_FROM_ADDRESS`, the organizer) are `text/calendar; method=REQUEST` attachments built in
+  `ics.go`. Through the email service Gmail shows them as invitation cards and adds the event (an
+  `.ics` attached by hand in Gmail compose does not). Each event's identity is the rota day and
+  shift (`inviteUID`), and its sequence the minute it was sent, so a re-send updates it. The
+  email service binds an attachment to `byte[]`, so `notify.Attachment` sends it as an array of
+  byte values, not base64. Weekday emails carry their window's invitation in the same email. If the email service rejects a weekday email's invitation (HTTP 400), the email is sent again
+  without it, so the reminder still arrives; a weekend invitation email has no such fallback.
+  Nothing from the rota or the configuration can add a line to an invitation: names and notes
+  are escaped and stripped of control characters, an attendee whose address is not a plain
+  address is left out (`ValidInviteAddress`), and the event's URL is written only when it is
+  http(s) (`ValidScheduleURL`). At startup an `EMAIL_FROM_ADDRESS` that is not a plain address
+  turns invitations off, and a `ROTA_REMINDER_SCHEDULE_URL` that is not http(s) is dropped from
+  every email, both with a warning.
+- **The task's `SUB_CRON_RECIPIENTS` are not copied** unless
+  `ROTA_REMINDER_COPY_TASK_RECIPIENTS=true`; they still get its failure alerts, as everywhere
+  here. Nobody is ever both a recipient and copied, or copied twice (case-insensitive).
+- **A plain, formal message, not a branded template** (by request). A weekday email, an invitation
+  email and the rota admins' email (`notify.RenderRotaReminder`): a greeting, one line about the
+  window -- its date and hours on the rotation's own clock (`clockOf`: IST, except a rotation in
+  `ROTA_REMINDER_WINDOWS`, e.g. the Americas Weekend in PDT/PST) -- a Name | Rotation table, the
+  swap instruction with the Team Schedule link written out, and a sign-off. The weekend summary
+  (`notify.RenderWeekendRota`, described above): "Hello team,", the day team lists, the Rotation
+  Definitions table, the zone note and the handover paragraphs. Rotation names come from config
+  (`CODE=Name`). Names are escaped.
+- **A retry announces what its scheduled run would have.** The engine retries a failed run every
+  tick until the next period, which for `rota_weekend_notice` is days later. So the rota days are
+  counted from the run's period key (`Config.Anchor`, from `schedule.PeriodKey`), not the clock:
+  Thursday's run retried after midnight still announces Friday, not Monday, and Friday's weekend
+  notice retried on Saturday announces this weekend, not the next. "Tomorrow" / "today" in the text
+  are from the clock, as the reader sees them.
+- **A window that has started is not sent** (a late retry); it is logged. A weekend email
+  retried on Saturday goes to the people on the windows still to come.
+- **The run fails only when no email went out.** The handler keeps no record of what it sent, so
+  a retry re-sends every window. When some windows went out and some failed, the run succeeds and
+  the handler itself emails the task's alert audience (its `SUB_CRON_RECIPIENTS` and
+  `ALERT_RECIPIENTS`, as the engine would) a "PARTLY FAILED" alert listing each failed window and
+  its people, to be told by hand. When nothing went out, the run fails and is retried as usual,
+  which repeats nothing.
+- **Nobody to email is a success**: an empty rota, or a shift whose people have no address (logged).
+- **`ROTA_REMINDER_REDIRECT_TO`** sends every reminder to a test inbox instead, naming the intended
+  recipients in its first line. Use it in any environment that holds the real rota but must not mail
+  people. `ALERTS_ENABLED=false` silences these like every other email here.
+- Turning the tasks on with `EMAIL_BASE_URL` unset refuses to start.
+- **Not built**: a "your shift changed" email when a lead edits the rota after the reminder went
+  out (Friday's reminder is the only re-send; it needs entity-service to announce rota changes,
+  see "Future: events"), SRE and SME rotas (set
+  `ROTA_REMINDER_FAMILY` and the shift lists; the date rules assume CRE's weekday and weekend
+  split), and cancelling a weekday invitation (weekday sends are not recorded). Unlike the report
+  tasks, these own no template file.
+
 ## Availability recalculation
 
 Recomputes every committed service offering's uptime and rewrites
@@ -303,10 +447,22 @@ report emails" below for why that's not a generic engine feature.
 | `EMAIL_FROM_ADDRESS` | No | Fixed "From" address for every email this component sends |
 | `ALERTS_ENABLED` | No (default `true`) | Global kill switch for every email this component sends — failure alerts and report-style tasks' own success emails alike — see "Alerting" above |
 | `ALERT_RECIPIENTS` | No | Comma-separated email addresses alerted on every failed sub-cron attempt, for every task — see "Alerting" above |
+| `TRYOUT_TASK` | No | Runs the named task's handler once, now, outside the schedule and the ledger, then exits (`runTryout` in `cmd/server/main.go`). Refuses unless that task has a `debug` list in `SUB_CRON_RECIPIENTS` |
 | `DRIVER_INTERVAL` | No (default `1h`) | This component's own expected invocation cadence — must match the cron trigger configured on the Choreo Scheduled Task component itself |
 | `SUB_CRON_SCHEDULES` | No | JSON object `{"<task.Name>": "<cron expression>"}` overriding any registered task's schedule by name — see "Adding a sub-cron" above. A task not mentioned keeps its own hardcoded default |
-| `SUB_CRON_RECIPIENTS` | No | JSON object `{"<task.Name>": {"to": [...], "cc": [...]}}` giving a registered task its own extra failure-alert audience, on top of `ALERT_RECIPIENTS` — or, for a report-style task, its report's actual recipients (see "Alerting" above for which tasks work which way). A task not mentioned gets no per-task recipients |
+| `SUB_CRON_RECIPIENTS` | No | JSON object `{"<task.Name>": {"to": [...], "cc": [...], "debug": [...]}}` giving a registered task its own extra failure-alert audience, on top of `ALERT_RECIPIENTS` — or, for a report-style task, its report's actual recipients (see "Alerting" above for which tasks work which way). `debug` on a report task is debug mail mode for that report alone (`notify.ForReport`): it goes to that list only, `[Test copy]`-prefixed, with the intended To/Cc named in the body; startup warns naming every such task. A task not mentioned gets no per-task recipients |
+| `ROTA_REMINDERS_ENABLED` | No (default `false`) | Registers the two rota reminder tasks — see "Rota reminders" above |
+| `ROTA_REMINDER_REDIRECT_TO` | No | Comma-separated test inbox(es) that receive every rota reminder instead of the people on the shift |
+| `ROTA_REMINDER_SCHEDULE_URL` | No | Link to the CSM portal's Team Schedule page, shown in every reminder |
+| `ROTA_REMINDER_COPY_TASK_RECIPIENTS` | No (default `false`) | Also copies each task's `SUB_CRON_RECIPIENTS` on every reminder |
+| `ROTA_REMINDER_INVITES_ENABLED` | No (default `true`) | Attaches each window's calendar invitation; off when `EMAIL_FROM_ADDRESS` is unset |
+| `ROTA_REMINDER_WEEKEND_REQUIRED` | No (default `CRE_WEEKEND=3,CRE_WEEKEND_NIGHT=1`) | `CODE=N` pairs: how many people each weekend shift needs on each day before the weekend is announced |
+| `ROTA_REMINDER_FAMILY` / `ROTA_REMINDER_WEEKDAY_SHIFTS` / `ROTA_REMINDER_WEEKEND_SHIFTS` | No (defaults `CRE` and the codes in "Rota reminders") | Which rota, and which shifts each task announces as `CODE=Name` pairs (the name the email shows) |
+| `ROTA_REMINDER_WINDOWS` | No (default `CRE_WEEKEND_NIGHT=08:00-18:00 America/Los_Angeles,CRE_WEEKEND_NIGHT_OC=08:00-18:00 America/Los_Angeles`) | A rotation's hours on its own clock, used in the emails and invitations instead of the Team Schedule's (`CODE=HH:MM-HH:MM Zone`, comma-separated). The Americas Weekend and the LK On-call that covers it are 08:00-18:00 Pacific time, so it moves an hour in UTC and IST when US daylight saving changes; the weekend summary says so when a change is within five weeks. A malformed value stops startup |
+| `ROTA_REMINDER_TIME_ZONE` | No (default `Asia/Colombo`) | The calendar "tomorrow" and "the coming weekend" are counted in |
 | `HOUSEKEEPING_RETENTION_DAYS` | No (default `30`) | Plain integer number of days of resolved history the `housekeeping_cleanup` sub-cron keeps — see "Housekeeping" above |
+| `MIGRATION_CASE_REPORT_OLDER_THAN_DAYS` | No (default `180`) | Plain integer number of days a migration must have been open before the `migration_case_report` sub-cron lists it — see "Per-task report emails" below |
+| `MIGRATION_CASE_REPORT_LINK_BASE_URL` | No | The support portal's case page prefix (https), for the links in the migration case scan (`<prefix>/<case number>`). Unset renders plain text |
 
 No app-level execution timeout is configured here — Choreo's own Scheduled Task execution-time
 limit already bounds how long one invocation can run. `cmd/server/main.go` instead cancels its
@@ -317,6 +473,40 @@ instead of being cut off mid-request with no chance to react.
 `.env` is auto-loaded from the working directory at startup if present (silently ignored if
 absent), matching `integrations/csm-notification-service`'s own convention.
 
+## Monthly product regression reports
+
+`internal/regressionscan.SendReport`, registered three times -- `"product_regression_report_apim"`,
+`"product_regression_report_iam"` and `"product_regression_report_integration"` -- is the port of
+ServiceNow's three *Monthly Product Regression Report* scheduled reports. Each one was a plain list
+report on cases filtered by the regression tag, "Fix ETA shared on last month", and that business
+unit's product list, mailed as a PDF on the 1st at 09:00 India Standard Time to a fixed address
+list. Here entity-service builds the list (`GET /reports/product-regressions?products=...`, client in
+`internal/regressionreport`; the tag and the month window live there) and this task mails it as an
+inline table grouped by product, with the introduction the ServiceNow mail carried, through its own
+template (`internal/notify/templates/product_regression_report.html`,
+`notify.RenderProductRegressionReport`).
+
+The three reports are one handler constructor over a `regressionscan.Variant` (key, label, product
+list): `regressionscan.DefaultVariants` holds the three product lists ServiceNow filtered on, and
+`PRODUCT_REGRESSION_REPORT_PRODUCTS` (a JSON object of key to names) replaces any of them without a
+code change -- an unknown key or an empty list refuses to start rather than mailing an empty report
+every month. Three registry entries rather than one task sending three mails so that each report
+keeps its own `SUB_CRON_SCHEDULES` and `SUB_CRON_RECIPIENTS` entry by exact task name, the way
+every other task here is configured. Default schedule `30 3 1 * *`: 09:00 IST on the 1st, the hour
+the reports have always arrived, in UTC (same `TZ=UTC` caveat as "Housekeeping" above). The month
+reported is decided by entity-service in Asia/Colombo (the same +05:30), so a retry later in the
+month still reports the same month.
+
+Two behaviours are ServiceNow's, reproduced on purpose: a report whose month has no regression
+cases is **not sent** (the scheduled reports had "Omit if no records" ticked), and the audience is
+**only** the task's own `SUB_CRON_RECIPIENTS` entry, as the address lists were fixed per report
+there. With no `to`, the task skips its query and succeeds, like the stale and open case reports.
+Each `registry.Task` leaves `To`/`Cc` nil, as `migration_case_report` does: the audience is business
+unit mail groups, and a failed period is retried on every tick, so failure alerts go to
+`ALERT_RECIPIENTS` only.
+`PRODUCT_REGRESSION_REPORT_LINK_BASE_URL` optionally turns each case id into a link
+(`<prefix>/<case number>`); unset keeps the plain text the PDF had.
+
 ## Per-task report emails
 
 `engine.recordSuccess` still only ever updates the ledger — it never sends anything, and
@@ -325,8 +515,15 @@ succeeded" template was tried and dropped early on: different sub-crons want gen
 report content (a usage report reads nothing like a billing summary), so one shared shape would
 either stay generic to the point of being useless or grow special cases per task.
 
-`stale_cases_report` and `open_cases_report` (see "Stale cases report"/"Open cases report" above)
-are the two real instances of the shape that replaced it. Each sub-cron's own package
+`stale_cases_report`, `open_cases_report` (see "Stale cases report"/"Open cases report" above),
+`migration_case_report` and the three `product_regression_report_*` tasks (see "Monthly product regression
+reports" above) are the real instances of the shape that replaced it. `migration_case_report` differs in
+two ways worth knowing: entity-service builds the whole report (`GET /reports/migration-cases`,
+client in `internal/migrationreport`) and derives part of the audience from the team table, so the
+task merges those mail groups with its own `SUB_CRON_RECIPIENTS` entry (`migrationscan.Audience`)
+and **fails the run when the merged audience is empty** rather than quietly skipping — a scan nobody
+receives looks exactly like a quiet week. Its `registry.Task` leaves `To`/`Cc` nil so failure
+alerts reach `ALERT_RECIPIENTS` only, never the team mail groups. Each sub-cron's own package
 (`internal/stalecases`, `internal/opencases`) owns its own template
 (`internal/notify/templates/{stale,open}_cases_report.html`, following `alert.html`'s pattern) and
 its own recipients (its own `SUB_CRON_RECIPIENTS` entry, passed in as plain `to`/`cc` slices) — the

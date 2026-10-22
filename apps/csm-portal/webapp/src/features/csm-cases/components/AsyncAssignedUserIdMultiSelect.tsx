@@ -40,6 +40,10 @@ interface AsyncAssignedUserIdMultiSelectProps {
   roleIds?: string[];
   /** See {@link roleIds}; restrict to active accounts only. */
   active?: boolean;
+  /** Field label; the Advanced builder's row keeps the default. */
+  label?: string;
+  /** Autocomplete id; the Advanced builder's row keeps the default. */
+  id?: string;
 }
 
 /**
@@ -57,6 +61,8 @@ export default function AsyncAssignedUserIdMultiSelect({
   onChange,
   roleIds,
   active,
+  label = "Value(s)",
+  id = "any-of-filter-assigned-user",
 }: AsyncAssignedUserIdMultiSelectProps): JSX.Element {
   const [input, setInput] = useState("");
   const [open, setOpen] = useState(false);
@@ -110,7 +116,7 @@ export default function AsyncAssignedUserIdMultiSelect({
     <Autocomplete<AssignedUserOption, true>
       multiple
       size="small"
-      id="any-of-filter-assigned-user"
+      id={id}
       options={options}
       value={selectedOptions}
       open={open}
@@ -172,7 +178,7 @@ export default function AsyncAssignedUserIdMultiSelect({
       renderInput={(params) => (
         <TextField
           {...params}
-          label="Value(s)"
+          label={label}
           placeholder={values.length ? undefined : "Search engineers…"}
         />
       )}

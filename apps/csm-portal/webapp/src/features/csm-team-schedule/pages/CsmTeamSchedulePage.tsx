@@ -55,6 +55,8 @@ import { canManageRotaAccess, useRotaAccess } from "../api/useRotaAccess";
 import { canViewCaseAlertSettings, useCaseAlertSettings } from "../api/useCaseAlertSettings";
 import { useGetPagingChain } from "../api/usePagingChain";
 import GenerateRotaDialog from "../components/GenerateRotaDialog";
+import ImportRotaDialog from "../components/ImportRotaDialog";
+import { rotaImportOffered } from "../utils/rotaImport";
 import { GENERATED_ROTA } from "../api/useGenerateRota";
 import type {
   PagingChainCode,
@@ -84,13 +86,14 @@ import {
   mondayOf,
   shiftsByCode,
   toIsoDate,
+  todayClockOptions,
   zoneAbbreviation,
   zoneLabelOn,
   zoneColumnOf,
 } from "../utils/rota";
 import { isSettled, sitsAboveTeamLeads } from "../utils/myWeek";
 import { zoneColour } from "../utils/rotaHues";
-import { onItsStandingCard, standingDayRows } from "../utils/standingDay";
+import { creRowsAtWork } from "../utils/standingDay";
 import { SCHEDULE_THEME_VARS } from "../utils/useScheduleTheme";
 import ScheduleSkeleton, { TabStripSkeleton } from "../components/ScheduleSkeleton";
 import { rotaIsLoading } from "../utils/rotaLoading";
@@ -223,14 +226,28 @@ export default function CsmTeamSchedulePage(): JSX.Element {
   const [weekFromPaging, setWeekFromPaging] = useState(false);
 
   const { user } = useCurrentUser();
-  // The clock this reader is on, and the only source of it: their CSM profile
-  // timezone, through the portal's own resolver. Set it there once and every
-  // view follows, including after a move from Colombo to San Francisco.
+  // The clock this reader is on: their CSM profile timezone, through the
+  // portal's own resolver. Set it there once and every view follows,
+  // including after a move from Colombo to San Francisco.
   //
-  // There is deliberately no picker on this page. A second control could
-  // disagree with the profile, and then two people comparing the same rota
-  // over a call have no way of knowing whose clock they are each reading.
+  // Today alone can be read on another clock (IST or PDT), since the Sri Lankan
+  // day and the Americas day meet on it and each side reads it on its own
+  // clock. The choice starts on the profile's every time the page opens and is
+  // not remembered, so two people comparing the rota over a call are on their
+  // profile clocks unless one of them has just switched -- and the axis says
+  // which clock it is.
+  //
+  // A profile zone on the same clock as IST or PDT when the page opens opens
+  // Today on that option (todayClockOptions); any other zone, or a Pacific one
+  // on winter time, keeps its own clock.
   const tz = resolveDisplayTimeZone(user?.timeZone);
+  const [openedAt] = useState(() => new Date());
+  const { options: clockOptions, initial: profileClock } = useMemo(
+    () => todayClockOptions(tz, openedAt),
+    [tz, openedAt],
+  );
+  const [todayClock, setTodayClock] = useState<string | null>(null);
+  const dayTz = todayClock ?? profileClock;
   const catalogue = useScheduleCatalogue();
 
   /** The teams of the group on screen, in the order the catalogue gives them.
@@ -649,6 +666,11 @@ export default function CsmTeamSchedulePage(): JSX.Element {
     (catalogue.data?.teams ?? []).some(
       (t) => t.rotaCode === GENERATED_ROTA && fullTeams.includes(t.key),
     );
+  // An SRE rota's "Import rota", on its roster, to a reader who may edit one of its teams; the server checks every entry again.
+  const [importOpen, setImportOpen] = useState(false);
+  const canImportRota =
+    view === "roster" &&
+    rotaImportOffered(scopeRota, catalogue.data?.rotas ?? [], catalogue.data?.teams ?? [], leadTeams.data ?? []);
   // A family running more than one rota reads only the scoped rota's teams;
   // otherwise the family alone, as before.
   // A reader whose team runs no rota yet (PaaS) reads their own team alone,
@@ -1153,13 +1175,15 @@ export default function CsmTeamSchedulePage(): JSX.Element {
     // A zone with a crew on during the reader's day keeps its lane whatever
     // the day is called where its rota is written: a Sunday evening in
     // Chicago is Monday morning in the office, and that weekday crew is on.
+    // Read on the clock the day is drawn on (Today's IST / PDT choice), so a
+    // lane is kept for exactly the crews the ladder places.
     for (const a of rows) {
       const zone = a.zoneCode ?? shifts.get(a.shiftCode)?.zoneCode;
-      if (zone && placeOnDay(a, anchor, tz)) staffed.add(zone);
+      if (zone && placeOnDay(a, anchor, dayTz)) staffed.add(zone);
     }
     const kept = own.filter((z) => staffed.has(z.code));
     return kept.length > 0 ? kept : own;
-  }, [anchor, shifts, zones, family, rota, rows, tz]);
+  }, [anchor, shifts, zones, family, rota, rows, dayTz]);
 
   /** Leave and allocations over the day being viewed, for the off-rota column.
    *  The day view reads the rota days either side as well; those are only for
@@ -1172,36 +1196,47 @@ export default function CsmTeamSchedulePage(): JSX.Element {
     [absences.data?.absences, dayView, anchorIso],
   );
 
-  const lanes: LadderLane[] = useMemo(() => {
-    if (family === "CRE") {
-      // Everyone the month roster shows at work, not only those with a row:
-      // a blank weekday is the team's ordinary day, and the morning and
-      // evening crews work the ordinary day around their turn.
+  /** Who is at work on CRE's rota days, the same on Today and This week --
+   *  see creRowsAtWork. */
+  const creAtWork = useCallback(
+    (rotaDates: readonly string[]): ScheduleAssignment[] => {
       // The same teams as the rota read (teamKeys), worked out here because
       // teamKeys is a fresh array every render. None means the whole family.
-      const scoped = shownTeamKey ? [shownTeamKey] : rotaScoped && scopeRota ? teamsOf(family, scopeRota) : [];
-      const inScope = new Set(scoped.map((k) => k.toLowerCase()));
-      // Every CRE team, whatever is in view: which team a window is the
-      // ordinary day of does not depend on the team picked.
-      const allCreTeams = (catalogue.data?.teams ?? []).filter((t) => t.family === "CRE");
-      const creTeams = allCreTeams
-        .filter((t) => inScope.size === 0 || inScope.has(t.key.toLowerCase()))
-        .sort((a, b) => a.sortOrder - b.sortOrder);
-      const standing = standingDayRows({
-        rotaDates: [readFrom, anchorIso, readTo],
-        teams: creTeams,
+      const scoped = shownTeamKey ? [shownTeamKey] : rotaScoped && scopeRota ? teamsOf("CRE", scopeRota) : [];
+      return creRowsAtWork({
+        rotaDates,
+        teams: catalogue.data?.teams ?? [],
+        teamKeysInView: scoped,
         shifts,
         assignments: rows,
         absences: absences.data?.absences ?? [],
+        absenceKinds: catalogue.data?.absenceKinds ?? [],
       });
+    },
+    [shownTeamKey, rotaScoped, scopeRota, teamsOf, catalogue.data?.teams, catalogue.data?.absenceKinds, shifts, rows, absences.data?.absences],
+  );
+
+  /** This week's rows: on CRE, who is at work each day of the week, as Today
+   *  reads it; on SRE the stored rota as it is. */
+  const weekRows = useMemo(
+    () =>
+      view === "week" && family === "CRE"
+        ? creAtWork(Array.from({ length: 7 }, (_, i) => toIsoDate(addDays(weekStart, i))))
+        : rows,
+    [view, family, creAtWork, weekStart, rows],
+  );
+
+  const lanes: LadderLane[] = useMemo(() => {
+    if (family === "CRE") {
       return [
         {
           name: "Rotations",
           sub: "on-call, the night and regular hours",
           colour: "var(--muted)",
-          // Each standing window's card lists only the teams whose ordinary
-          // day it is: Americas cover the Americas team, regular hours the ABTs.
-          assignments: [...rows, ...standing].filter((a) => onItsStandingCard(a, shifts, allCreTeams)),
+          assignments: creAtWork([readFrom, anchorIso, readTo]),
+          // The Sri Lankan day and the Americas day meet twice a day; where
+          // they overlap each keeps a column of its own.
+          regions: true,
         },
       ];
     }
@@ -1226,7 +1261,7 @@ export default function CsmTeamSchedulePage(): JSX.Element {
         layout: "zone" as const,
       };
     });
-  }, [anchor, family, rows, shifts, zonesOnDay, shownTeamKey, rotaScoped, scopeRota, teamsOf, catalogue.data?.teams, readFrom, anchorIso, readTo, absences.data?.absences]);
+  }, [anchor, family, rows, shifts, zonesOnDay, creAtWork, readFrom, anchorIso, readTo]);
 
   /** The teams the edit bar says this reader can change, by name and in the
    *  catalogue's order. A rota admin can change every team of the group, and
@@ -1539,6 +1574,12 @@ export default function CsmTeamSchedulePage(): JSX.Element {
                 <span>Generate month</span>
               </button>
             ) : null}
+
+            {canImportRota ? (
+              <button className="btn sm" onClick={() => setImportOpen(true)}>
+                <span>Import rota</span>
+              </button>
+            ) : null}
           </div>
         </div>
 
@@ -1622,8 +1663,10 @@ export default function CsmTeamSchedulePage(): JSX.Element {
           ) : view === "today" ? (
             <DayLadder
               day={anchor}
-              tz={tz}
-              zoneLabel={zoneAbbreviation(tz)}
+              tz={dayTz}
+              zoneLabel={zoneAbbreviation(dayTz)}
+              clockOptions={clockOptions}
+              onClockChange={setTodayClock}
               lanes={lanes}
               shifts={shifts}
               zones={zones}
@@ -1641,7 +1684,7 @@ export default function CsmTeamSchedulePage(): JSX.Element {
           ) : view === "week" ? (
             <WeekTable
               weekStart={weekStart}
-              assignments={rows}
+              assignments={weekRows}
               shifts={shifts}
               absences={absences.data?.absences ?? []}
               absenceKinds={catalogue.data?.absenceKinds ?? []}
@@ -1765,6 +1808,9 @@ export default function CsmTeamSchedulePage(): JSX.Element {
           );
         }}
       />
+      {canImportRota && scopeRota ? (
+        <ImportRotaDialog open={importOpen} onClose={() => setImportOpen(false)} rotaCode={scopeRota} />
+      ) : null}
       {canGenerateRota ? (
         <GenerateRotaDialog
           open={generateOpen}

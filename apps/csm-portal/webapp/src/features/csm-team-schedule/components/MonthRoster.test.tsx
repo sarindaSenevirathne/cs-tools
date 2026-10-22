@@ -947,7 +947,8 @@ describe("MonthRoster: the SaaS Night cover is a team people are moved to", () =
     expect(nia?.textContent).toContain("L1");
     // Being on the Night cover is the whole of it: no tag drawn on the days.
     expect(nia?.textContent).not.toContain("NC");
-    expect(container.querySelector(".rlegend")?.textContent ?? "").not.toContain("SaaS Night cover");
+    // The legend still names it: it is a move an SRE rota marker can add.
+    expect(container.querySelector(".rlegend")?.textContent ?? "").toContain("SaaS Night cover");
     expect(screen.getAllByText("Nia")).toHaveLength(1);
     // Somebody holding a night without being moved stays on their own team.
     expect(rowOf(container, "Tom")?.querySelector(".team")?.textContent).toBe("Delta");
@@ -1052,6 +1053,56 @@ describe("MonthRoster: reading the codes", () => {
     expect(within(legend).getByText(HD_AM.label)).toBeInTheDocument();
     // Retired, it is no longer something to mark, so not explained either.
     expect(within(legend).queryByText(HD_PM.label)).not.toBeInTheDocument();
+  });
+
+  it("lists every tag a rota marker can add on this rota, in catalogue order, on screen or not", () => {
+    const ALLO_INT = { ...ANNUAL_LEAVE, id: "k-int", code: "ALLO_INT", shortCode: "Allo-INT", label: "Allocated — internal", bucket: "ALLOCATION" as const, colourToken: "INT", sortOrder: 30 };
+    const LIEU = { ...ANNUAL_LEAVE, id: "k-ll", code: "LIEU_LEAVE", shortCode: "LL", label: "Lieu leave", colourToken: "LL", sortOrder: 20 };
+    const MIG = { ...ALLO_INT, id: "k-mig", code: "MIGRATION", shortCode: "Mig", label: "Migration", colourToken: "MIG", sortOrder: 90, family: "CRE" as const, movesToTeamKey: "bravo" };
+    const RETIRED = { ...ALLO_INT, id: "k-cus", code: "CUSTOMER", shortCode: "CUS", label: "Customer allocation", sortOrder: 43, retired: true };
+    const EXCLUDED_KIND = { ...ALLO_INT, id: "k-exc", code: "EXCLUDED", shortCode: "EXC", label: "Excluded from rota", bucket: "EXCLUDED" as const, sortOrder: 110 };
+    const SRE_RND = { ...RND, family: "SRE" as const };
+    const { container } = renderRoster({
+      family: "CRE",
+      // Lieu leave is on screen; nothing else is.
+      absences: [absence({ name: "Asela", startsOn: "2026-09-22", endsOn: "2026-09-22", kindCode: LIEU.code })],
+      absenceKinds: [MIG, SRE_RND, ALLO_INT, RETIRED, EXCLUDED_KIND, LIEU, ANNUAL_LEAVE],
+    });
+    const legend = container.querySelector(".rlegend") as HTMLElement;
+    const labels = [...legend.querySelectorAll(".chip")].map((c) => c.textContent);
+    expect(labels).toEqual(expect.arrayContaining(["AL", "LL", "Allo-INT", "Mig"]));
+    expect(labels.indexOf("AL")).toBeLessThan(labels.indexOf("LL"));
+    expect(labels.indexOf("Allo-INT")).toBeLessThan(labels.indexOf("Mig"));
+    // Not this rota's (RnD is SRE's), retired, or not a lead's to set.
+    expect(within(legend).queryByText(SRE_RND.label)).not.toBeInTheDocument();
+    expect(within(legend).queryByText(RETIRED.label)).not.toBeInTheDocument();
+    expect(within(legend).queryByText(EXCLUDED_KIND.label)).not.toBeInTheDocument();
+  });
+
+  it("lists a move worked as another team's hours as those hours", () => {
+    const AMERICAS = shift({ code: "CRE_AMERICAS", shortCode: "NLK", label: "Americas cover", colourToken: "NLK", isRotation: false });
+    const BR = { ...ANNUAL_LEAVE, id: "k-br", code: "ALLO_BR", shortCode: "BR", label: "Brazil rotation", bucket: "ALLOCATION" as const, sortOrder: 70, movesToTeamKey: "americas", worksRotaThere: true, showsAsShiftCode: AMERICAS.code };
+    const { container } = renderRoster({
+      family: "CRE",
+      shifts: shiftMap(REGULAR, EVENING, AMERICAS),
+      absenceKinds: [ANNUAL_LEAVE, BR],
+    });
+    const legend = container.querySelector(".rlegend") as HTMLElement;
+    expect(within(legend).getByText("Americas cover")).toBeInTheDocument();
+    expect(within(legend).queryByText(BR.label)).not.toBeInTheDocument();
+  });
+
+  it("does not list another rota's hours for such a move", () => {
+    const AMERICAS = shift({ code: "CRE_AMERICAS", shortCode: "NLK", label: "Americas cover", colourToken: "NLK", isRotation: false });
+    const BR = { ...ANNUAL_LEAVE, id: "k-br", code: "ALLO_BR", shortCode: "BR", label: "Brazil rotation", bucket: "ALLOCATION" as const, sortOrder: 70, movesToTeamKey: "americas", worksRotaThere: true, showsAsShiftCode: AMERICAS.code };
+    const { container } = renderRoster({
+      family: "SRE",
+      assignments: [],
+      shifts: shiftMap(TZ1, TZ2, AMERICAS),
+      absenceKinds: [ANNUAL_LEAVE, BR],
+    });
+    const legend = container.querySelector(".rlegend") as HTMLElement;
+    expect(within(legend).queryByText("Americas cover")).not.toBeInTheDocument();
   });
 
   it("lists labels only, not the grid's own marks", () => {

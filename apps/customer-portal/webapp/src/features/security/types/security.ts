@@ -173,8 +173,15 @@ export type VulnerabilityAffectedProductsProps = {
 };
 
 // Response type for product vulnerabilities metadata.
+// One product with the versions it has vulnerability records for (exact stored strings).
+export type VulnerabilitiesMetaProduct = {
+  name: string;
+  versions: string[];
+};
+
 export type VulnerabilitiesMetaResponse = {
   severities: IdLabelRef[];
+  products: VulnerabilitiesMetaProduct[];
 };
 
 // Response type for product vulnerabilities search results.

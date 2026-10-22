@@ -55,12 +55,17 @@ import {
   type SettingsFamily,
 } from "../utils/caseAlertDrafts";
 import {
+  ADVANCED_GROUPS,
   channelWords,
+  ladderKeysFor,
+  runningLine,
+  savedInGroups,
   teamChannelsUnder,
   valuesToCopy,
+  type LadderKeyGroup,
 } from "../utils/caseAlertLadderKeys";
 import CaseAlertDraftsProvider from "./CaseAlertDraftsProvider";
-import CaseAlertLadderSettings from "./CaseAlertLadderSettings";
+import { LadderAdvanced, LadderValueGroup } from "./CaseAlertLadderSettings";
 import CaseAlertModal from "./CaseAlertModal";
 import CaseAlertSection from "./CaseAlertSection";
 
@@ -90,10 +95,20 @@ function when(iso: string | undefined): string {
   return iso ? new Date(iso).toLocaleString() : "";
 }
 
-/** What the alert service is doing with these settings, in one line. It is
- *  what the service last reported at start-up: switched back off, it no
- *  longer asks or reports, so the time is part of the answer. */
-function statusLine(s: Settings): { tone: "info" | "warn"; text: string } {
+interface Status {
+  tone: "ok" | "info" | "warn";
+  /** The chip's words. */
+  short: string;
+  /** The whole answer, with when it was reported. */
+  text: string;
+  /** Not in use for a reason worth a line of its own, not just the chip. */
+  loud: boolean;
+}
+
+/** What the alert service is doing with these settings. It is what the
+ *  service last reported at start-up: switched back off, it no longer asks or
+ *  reports, so the time is part of the answer. */
+function statusLine(s: Settings): Status {
   const r = s.revision;
   const asOf = r.appliedAt
     ? ` (as the alert service reported at ${when(r.appliedAt)})`
@@ -101,29 +116,58 @@ function statusLine(s: Settings): { tone: "info" | "warn"; text: string } {
   switch (r.appliedMode) {
     case "db":
       return r.applied === r.saved
-        ? { tone: "info", text: `In use by the alert service${asOf}.` }
+        ? { tone: "ok", short: "In use", text: `In use by the alert service${asOf}.`, loud: false }
         : {
             tone: "warn",
+            short: "Saved · applies after a restart",
             text: `Saved. Changes apply the next time the alert service restarts${asOf}.`,
+            loud: false,
           };
     case "shadow":
       return {
         tone: "warn",
+        short: "Not in use: shadow mode",
         text: `Saved, not in use yet. The alert service is comparing these with its own settings, but still uses its own${asOf}.`,
+        loud: true,
       };
     case "off":
       // Reported "off": the saved settings were read but refused by the
       // file's own checks, so the alert service runs on its file.
       return {
         tone: "warn",
+        short: "Not in use: runs on its file",
         text: `Saved, not in use: at its last start the alert service could not use these and runs on its own file${asOf}.`,
+        loud: true,
       };
     default:
       return {
-        tone: "warn",
+        tone: "info",
+        short: "Applies from the next restart",
         text: "The alert service uses the settings saved here from its next restart.",
+        loud: false,
       };
   }
+}
+
+/** A section's one-line summary: its name, then what's inside, if anything. */
+function summaryOf(title: string, ...parts: (string | false | undefined)[]): string {
+  return [title, ...parts.filter(Boolean)].join(" · ");
+}
+
+function plural(n: number, one: string, many = `${one}s`): string {
+  return `${n} ${n === 1 ? one : many}`;
+}
+
+/** A ladder's switch and channel as running, in a few words: "SRE on, calls
+ *  and chat". */
+function switchWords(s: Settings, ladder: CaseAlertRoomLadder): string | undefined {
+  const c = s.running?.channels?.[ladder];
+  if (c) return `${ladder} ${c.enabled ? `on, ${(channelWords(c.channel) ?? c.channel).toLowerCase()}` : "off"}`;
+  const f = s.running?.fileOnly?.[ladder];
+  if (f && typeof f.enabled === "boolean") {
+    return `${ladder} ${f.enabled ? `on, ${(channelWords(f.channel) ?? String(f.channel ?? "")).toLowerCase()}` : "off"}`;
+  }
+  return undefined;
 }
 
 interface Props {
@@ -140,12 +184,13 @@ interface Props {
 }
 
 /**
- * The Case Alerts settings of one family, under the tab's Settings: a header
- * saying what the alert service does with them, each team's Google Chat space,
- * which team other CSM Portal teams' alerts go to, and the rest of each
- * ladder's paging file (CaseAlertLadderSettings). Every change waits in the
- * tab's list until its Submit, which saves them together. Shown only to those
- * the server lets change the family's settings (canManage), and each row only
+ * The Case Alerts settings of one family, under the tab's Settings: a chip
+ * saying what the alert service does with them, then four sections -- each
+ * ladder's on/off and channel (open), where alerts go (each assignment group's
+ * team and each team's Google Chat space), who gets alerts, and the rest of
+ * each ladder's paging file under Advanced. Every change waits in the tab's
+ * list until its Submit, which saves them together. Shown only to those the
+ * server lets change the family's settings (canManage), and each row only
  * changeable by those who may change its ladder.
  *
  * A webhook URL is pasted once and never shown again: the page only ever
@@ -207,6 +252,13 @@ function SettingsPanel({
   // The ladder's own channel is the file's; a team can only do less.
   const ladderChannel = s.running?.fileOnly?.[family === "CRE" ? "CRE" : "SRE"]?.channel;
   const pending = drafts.changes.filter((c) => c.family === family);
+  const routeLadders = editable.filter((l): l is CaseAlertLadder => l !== "SME");
+  const routes = s.routes.filter((r) => routeLadders.includes(r.ladder));
+  const unmapped = routeLadders.includes("SRE") ? (s.unmappedGroups ?? []) : [];
+  const several = editable.length > 1;
+  const savedIn = (groups: readonly LadderKeyGroup[]) =>
+    editable.reduce((n, l) => n + savedInGroups(s, l, groups), 0);
+  const savedWords = (n: number) => (n > 0 ? `${n} saved here` : undefined);
   /** A change was made: say it waits for Submit, in place of the last line. */
   const onSaved = (what: string) => {
     setError(null);
@@ -227,11 +279,18 @@ function SettingsPanel({
       <div className="cas-head">
         <h3 id={`cas-h-${family}`}>{family} settings</h3>
         {family === "SRE" ? <span className="cas-sub">SaaS, IaaS and SME</span> : null}
+        <span
+          className={`cas-state ${status.tone}`}
+          title={s.running ? `${status.text} It runs in ${s.running.mode} mode.` : `${status.text} ${runningLine(s)}`}
+          aria-label={`Status: ${status.text}`}
+        >
+          {status.short}
+        </span>
         {s.environment ? (
           <span className="cas-env">Environment: {s.environment}</span>
         ) : null}
       </div>
-      <p className={`cas-status ${status.tone}`}>{status.text}</p>
+      {status.loud ? <p className="cas-status warn">{status.text}</p> : null}
       <div className="cas-live" aria-live="polite">
         {notice ? (
           <p className="cas-status ok cas-done">
@@ -252,39 +311,125 @@ function SettingsPanel({
           {error}
         </div>
       ) : null}
-      {editable.map((l) => (
-        <SetupStep key={l} settings={s} ladder={l} onError={setError} onSaved={onSaved} />
-      ))}
 
-      <TeamChatRouting
-        ladders={ladders}
-        editable={editable}
-        rooms={rooms}
-        options={roomOptions}
-        ladderChannel={ladderChannel}
-        roomsOnly
-        webhooksEnabled={s.webhooksEnabled}
-        appliedNote={whenUsed(s)}
-        onError={setError}
-        onSaved={onSaved}
-      />
+      <CaseAlertSection
+        id={`${family}.switches`}
+        label="On/off and channel"
+        defaultOpen
+        summary={summaryOf(
+          "On/off and channel",
+          ...editable.map((l) => switchWords(s, l)),
+          savedWords(savedIn(["On/off and channel"])),
+        )}
+      >
+        <p className="cas-sub">
+          Whether each ladder alerts, by calls, chat or both, and its safety holds.
+        </p>
+        {editable.map((l) => (
+          <div key={l}>
+            {l === "SRE" ? (
+              <p className="cas-sub">One SRE ladder: these apply to both the SaaS and IaaS chains.</p>
+            ) : null}
+            <LadderValueGroup
+              ladder={l}
+              settings={s}
+              group="On/off and channel"
+              heading={several ? `${l} ladder` : undefined}
+              onSaved={onSaved}
+            />
+          </div>
+        ))}
+      </CaseAlertSection>
 
-      {editable
-        .filter((l): l is CaseAlertLadder => l !== "SME")
-        .map((l) => (
-          <Redirects
-            key={l}
-            ladder={l}
+      <CaseAlertSection
+        id={`${family}.where`}
+        label="Where alerts go"
+        summary={summaryOf(
+          "Where alerts go",
+          unmapped.length > 0 && `${unmapped.length} unmapped`,
+          routes.length > 0 && plural(routes.length, "redirect"),
+          rooms.length > 0 && plural(rooms.length, "chat space") + " saved here",
+        )}
+      >
+        {routeLadders.includes("SRE") ? (
+          <AssignmentGroups
             settings={{ ...s, routeOptions }}
-            rooms={rooms.filter((r) => r.ladder === l)}
+            rooms={rooms.filter((r) => r.ladder === "SRE")}
             ladderChannel={ladderChannel}
             onError={setError}
             onSaved={onSaved}
           />
+        ) : null}
+        <TeamChatRouting
+          ladders={ladders}
+          editable={editable}
+          rooms={rooms}
+          options={roomOptions}
+          ladderChannel={ladderChannel}
+          roomsOnly
+          webhooksEnabled={s.webhooksEnabled}
+          onError={setError}
+          onSaved={onSaved}
+        />
+        {routeLadders.includes("CRE") ? (
+          <Redirects
+            ladder="CRE"
+            settings={{ ...s, routeOptions }}
+            rooms={rooms.filter((r) => r.ladder === "CRE")}
+            ladderChannel={ladderChannel}
+            onError={setError}
+            onSaved={onSaved}
+          />
+        ) : null}
+      </CaseAlertSection>
+
+      <CaseAlertSection
+        id={`${family}.who`}
+        label="Who gets alerts"
+        summary={summaryOf("Who gets alerts", savedWords(savedIn(["Who gets alerts"])))}
+      >
+        {editable.map((l) => (
+          <LadderValueGroup
+            key={l}
+            ladder={l}
+            settings={s}
+            group="Who gets alerts"
+            heading={several ? `${l} ladder` : undefined}
+            onSaved={onSaved}
+          />
         ))}
-      {editable.map((l) => (
-        <CaseAlertLadderSettings key={l} ladder={l} settings={s} onSaved={onSaved} />
-      ))}
+      </CaseAlertSection>
+
+      <CaseAlertSection
+        id={`${family}.advanced`}
+        label="Advanced"
+        summary={summaryOf(
+          "Advanced",
+          "timing, escalation, heads, chat messages and the file's own settings",
+          savedWords(
+            savedIn(ADVANCED_GROUPS) +
+              editable.reduce(
+                (n, l) =>
+                  n +
+                  s.values.filter(
+                    (v) => v.ladder === l && !ladderKeysFor(l).some((k) => k.key === v.key),
+                  ).length,
+                0,
+              ),
+          ),
+        )}
+      >
+        <p className="cas-sub cas-running">{runningLine(s)}</p>
+        {editable.map((l) => (
+          <LadderAdvanced
+            key={l}
+            ladder={l}
+            settings={s}
+            setup={<SetupStep settings={s} ladder={l} onError={setError} onSaved={onSaved} />}
+            onSaved={onSaved}
+          />
+        ))}
+      </CaseAlertSection>
 
       <SubmitBar
         family={family}
@@ -376,8 +521,7 @@ interface RedirectsProps {
   onSaved: (what: string) => void;
 }
 
-/** A ladder's redirects: which team a CSM Portal team's cases (CRE) or
- *  incidents (SRE) go to. */
+/** A ladder's redirects: which team a CSM Portal team's cases go to (CRE). */
 function Redirects({
   ladder,
   settings: s,
@@ -389,34 +533,272 @@ function Redirects({
   const canRoutes = s.canManage.routeLadders.includes(ladder);
   const routes = s.routes.filter((r) => r.ladder === ladder);
   return (
-    <>
-      <CaseAlertSection
-        id={`${ladder}.redirects`}
-        label={ROUTE_WORDS[ladder].title}
-        summary={`${ROUTE_WORDS[ladder].title} · ${
-          routes.length === 0
-            ? "none"
-            : `${routes.length} redirect${routes.length === 1 ? "" : "s"}`
-        }`}
-      >
-        <p className="cas-sub">{ROUTE_WORDS[ladder].help}</p>
-        <RouteTable
-          ladder={ladder}
-          routes={routes}
-          options={s.routeOptions}
-          rooms={rooms}
-          ladderChannel={ladderChannel}
-          canEdit={canRoutes}
-          appliedNote={whenUsed(s)}
-          onError={onError}
-          onSaved={onSaved}
-        />
-      </CaseAlertSection>
-    </>
+    <div className="cas-block" role="group" aria-label={ROUTE_WORDS[ladder].title}>
+      <h4>{ROUTE_WORDS[ladder].title}</h4>
+      <p className="cas-sub">{ROUTE_WORDS[ladder].help}</p>
+      <RouteTable
+        ladder={ladder}
+        routes={routes}
+        options={s.routeOptions}
+        rooms={rooms}
+        ladderChannel={ladderChannel}
+        canEdit={canRoutes}
+        onError={onError}
+        onSaved={onSaved}
+      />
+    </div>
   );
 }
 
-/** whenUsed's usual answer, for a dialog not told the mode. */
+/** How many unmapped groups the warning names before "and N more". */
+const UNMAPPED_SHOWN = 5;
+
+/** The SRE assignment groups nothing routes: no redirect, no team named after
+ *  them, nothing in the alert service's file. Their incident cards go to the
+ *  shared SRE room. */
+function UnmappedGroups({ groups }: { groups: { id: string; name: string }[] }): JSX.Element {
+  const shown = groups.slice(0, UNMAPPED_SHOWN).map((g) => g.name);
+  const more = groups.length - shown.length;
+  return (
+    <p className="cas-status warn" role="status">
+      {groups.length === 1
+        ? "1 assignment group has no SRE team"
+        : `${groups.length} assignment groups have no SRE team`}
+      {groups.length === 1 ? ": its" : ": their"} incident cards go to the shared SRE room
+      and nobody is called. Redirect {groups.length === 1 ? "it" : "them"} below:{" "}
+      {shown.join(", ")}
+      {more > 0 ? ` and ${more} more` : ""}.
+    </p>
+  );
+}
+
+/** Where an assignment group's incidents go, and why. */
+interface GroupDestination {
+  /** "team:<key>", "rota:<code>", or "" for the shared room. */
+  target: string;
+  /** The destination, for people. */
+  name: string;
+  /** Why: a redirect saved here, the file, the team's name, or nothing. */
+  why: string;
+  /** Not mapped: the shared room only. */
+  unmapped?: boolean;
+  route?: CaseAlertGroupRoute;
+}
+
+interface AssignmentGroupsProps {
+  settings: Settings;
+  /** The SRE ladder's saved rooms, to say where a team's alerts end up. */
+  rooms: CaseAlertChatRoom[];
+  ladderChannel?: string;
+  onError: (msg: string | null) => void;
+  onSaved: (what: string) => void;
+}
+
+/**
+ * Where an SRE incident's alerts go, by the assignment group it carries: one
+ * row per support group (and per redirect saved for any other name), the team
+ * or rota it reaches and why -- a redirect saved here, the alert service's
+ * file, or a team named after it -- or the shared SRE room when nothing routes
+ * it. Change prefills the form below with the row's group; a redirect saved
+ * for the same group replaces the old one.
+ */
+function AssignmentGroups({
+  settings: s,
+  rooms,
+  ladderChannel,
+  onError,
+  onSaved,
+}: AssignmentGroupsProps): JSX.Element {
+  const drafts = useCaseAlertDrafts();
+  const busy = drafts.submitting === "SRE";
+  const canEdit = s.canManage.routeLadders.includes("SRE");
+  const options = s.routeOptions;
+  const routes = s.routes.filter((r) => r.ladder === "SRE");
+  const routing = s.running?.groups?.SRE;
+  const form = useRouteForm();
+  const targetRef = useRef<HTMLSelectElement>(null);
+  const [confirmId, setConfirmId] = useState<string | null>(null);
+  const lower = (x: string) => x.trim().toLowerCase();
+  const teams = (options?.teams ?? []).filter((t) => t.family === "SRE");
+  const named = [...(options?.groups ?? []), ...(options?.teams ?? [])];
+  const teamName = (key: string) => teams.find((t) => t.key === key)?.name ?? key;
+  const rotaName = (code: string) => {
+    const r = (options?.rotas ?? []).find((x) => x.code === code);
+    return r && r.label !== code ? r.label : code;
+  };
+  const outcome = teamOutcomeFor(rooms, ladderChannel);
+
+  const destination = (name: string, route?: CaseAlertGroupRoute): GroupDestination => {
+    if (route && route.enabled) {
+      // The alert service matches a team by its key, so a redirect from a
+      // name that already is the key changes nothing.
+      const needless = !!route.teamKey && lower(route.groupName) === route.teamKey.toLowerCase();
+      return route.teamKey
+        ? {
+            target: `team:${route.teamKey}`,
+            name: teamName(route.teamKey),
+            why: needless ? "Same team, not needed: it is alerted as itself anyway" : "Redirect saved here",
+            route,
+          }
+        : {
+            target: `rota:${route.rotaCode ?? ""}`,
+            name: `Every team on the ${rotaName(route.rotaCode ?? "")} rota`,
+            why: "Redirect saved here",
+            route,
+          };
+    }
+    const alias = routing?.aliases?.[lower(name)];
+    if (alias) return { target: `team:${alias}`, name: teamName(alias), why: "From the alert service's file", route };
+    if ((routing?.defaultGroups ?? []).some((g) => lower(g) === lower(name))) {
+      return { target: "", name: "The default SRE rota", why: "From the alert service's file", route };
+    }
+    const team = named.find((t) => lower(t.key) === lower(name) || lower(t.name) === lower(name));
+    if (team) return { target: `team:${team.key}`, name: team.name, why: "A team has this name", route };
+    return { target: "", name: "The shared SRE room", why: "Not mapped: nobody is called", unmapped: true, route };
+  };
+
+  const groupRows = (options?.assignmentGroups ?? []).map((g) => {
+    const route = routes.find((r) => (r.groupId && r.groupId === g.id) || lower(r.groupName) === lower(g.name));
+    return { key: `ag:${g.id}`, name: g.name, groupId: g.id, route, dest: destination(g.name, route) };
+  });
+  // A redirect for a name that is no support group (an SME team, a typed name).
+  const extraRows = routes
+    .filter((r) => !groupRows.some((g) => g.route?.id === r.id))
+    .map((r) => {
+      const label = named.find((t) => lower(t.name) === lower(r.groupName))?.name ?? r.groupName;
+      return { key: `r:${r.id}`, name: label, groupId: undefined, route: r, dest: destination(r.groupName, r) };
+    });
+  const rows = [...groupRows, ...extraRows];
+  // The shared room's groups first, then by name.
+  rows.sort((a, b) =>
+    a.dest.unmapped === b.dest.unmapped ? a.name.localeCompare(b.name) : a.dest.unmapped ? -1 : 1,
+  );
+  const unmapped = s.unmappedGroups ?? [];
+
+  /** Puts the row's group, and where it goes now, in the form below. */
+  const change = (name: string, groupId: string | undefined, dest: GroupDestination) => {
+    const v = routeGroupValue("SRE", options, name, groupId);
+    form.pick(v.group, v.other);
+    form.setTarget(dest.route ? dest.target : "");
+    targetRef.current?.focus();
+  };
+
+  return (
+    <div className="cas-block" role="group" aria-label="Assignment groups">
+      <h4>Assignment groups</h4>
+      <p className="cas-sub">
+        An incident is alerted by the assignment group it carries. Most groups reach their SRE team
+        through the alert service&apos;s file or a team named after them; redirect one to send its
+        alerts to another SRE team or a whole rota.
+      </p>
+      {unmapped.length ? <UnmappedGroups groups={unmapped} /> : null}
+      {rows.length === 0 ? (
+        <p className="cas-sub cas-empty">{ROUTE_WORDS.SRE.empty}</p>
+      ) : (
+        <table className="ra-tbl cas-routes cas-groups" aria-label="Where each assignment group's alerts go">
+          <thead>
+            <tr>
+              <th>Assignment group</th>
+              <th>Alerts go to</th>
+              {canEdit ? <th aria-label="Actions" /> : null}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.key} className={r.dest.unmapped ? "cas-unmapped" : undefined}>
+                <td>{r.name}</td>
+                <td>
+                  <b>{r.dest.name}</b>
+                  <div className="cas-sub">{r.dest.why}</div>
+                  {r.dest.target.startsWith("team:") ? (
+                    <div className="cas-sub">{outcome(r.dest.target.slice(5))}</div>
+                  ) : null}
+                </td>
+                {canEdit ? (
+                  <td>
+                    <div className="cas-acts">
+                      {confirmId === r.route?.id && r.route ? (
+                        <>
+                          <button
+                            type="button"
+                            className="btn sm danger"
+                            disabled={busy}
+                            onClick={() => {
+                              onError(null);
+                              setConfirmId(null);
+                              const what = `redirect from ${r.name} removed`;
+                              drafts.add({ family: "SRE", what, kind: "deleteRoute", routeId: r.route!.id });
+                              onSaved(what);
+                            }}
+                          >
+                            Remove
+                          </button>
+                          <button type="button" className="btn sm" onClick={() => setConfirmId(null)}>
+                            Cancel
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            className="btn sm"
+                            disabled={busy}
+                            aria-label={`${r.route ? "Change" : "Redirect"} ${r.name}`}
+                            onClick={() => change(r.name, r.groupId, r.dest)}
+                          >
+                            {r.route ? "Change" : "Redirect"}
+                          </button>
+                          {r.route ? (
+                            <button
+                              type="button"
+                              className="btn sm"
+                              disabled={busy}
+                              aria-label={`Remove the redirect from ${r.name}`}
+                              onClick={() => setConfirmId(r.route!.id)}
+                            >
+                              Remove
+                            </button>
+                          ) : null}
+                        </>
+                      )}
+                    </div>
+                  </td>
+                ) : null}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {canEdit ? (
+        <RouteForm
+          ladder="SRE"
+          options={options}
+          form={form}
+          targetRef={targetRef}
+          busy={busy}
+          onError={onError}
+          onSaved={onSaved}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/** Where a team's alerts end up, from its chat space: the space and how they
+ *  go out. */
+function teamOutcomeFor(rooms: CaseAlertChatRoom[], ladderChannel?: string) {
+  return (key: string): string => {
+    const room = rooms.find((r) => r.teamKey === key);
+    const channel = room?.channel || ladderChannel;
+    const by = channelWords(channel) ?? "As the ladder";
+    // Where the card goes only matters when the team gets chat cards.
+    if (channel === "call" || channel === "log") return by;
+    const space = room?.hasWebhook ? `in the ${room.label} space` : "in its own chat space";
+    return `${by} · ${space}`;
+  };
+}
+
+/** whenUsed's usual answer. */
 const DEFAULT_APPLIED_NOTE = "The alert service uses it after its next restart.";
 
 /** When the alert service starts using a saved change. */
@@ -444,9 +826,9 @@ function roomTeamName(
   return options?.teams.find((t) => t.key === teamKey)?.name ?? fallback;
 }
 
-/** What a team's chat routing is called in the confirmation line. */
+/** What a team's chat space is called in the confirmation line. */
 function routingWhat(teamName: string): string {
-  return `${teamName.replace(/ \(shared space\)$/, "")} chat routing`;
+  return `${teamName.replace(/ \(shared space\)$/, "")} chat space`;
 }
 
 /** A team (or a ladder's shared space) the Add dialog offers: every one of
@@ -473,14 +855,12 @@ interface TeamChatRoutingProps {
   /** Only the chat space is set here: how a team is alerted stays the file's. */
   roomsOnly: boolean;
   webhooksEnabled: boolean;
-  /** When the alert service starts using a saved change (whenUsed). */
-  appliedNote: string;
   onError: (msg: string | null) => void;
   onSaved: (what: string) => void;
 }
 
 /**
- * Team chat routing: which Google Chat space each team's alerts go to. Only
+ * Chat space for each team: which Google Chat space each team's alerts go to. Only
  * routings saved here are listed; every other team uses the alert service's
  * file. Each row can be changed by those who may change its ladder (SRE rows
  * by the SRE rota admin, SME rows by the SME rota admin). Adding and changing
@@ -494,7 +874,6 @@ function TeamChatRouting({
   ladderChannel,
   roomsOnly,
   webhooksEnabled,
-  appliedNote,
   onError,
   onSaved,
 }: TeamChatRoutingProps): JSX.Element {
@@ -542,7 +921,7 @@ function TeamChatRouting({
   return (
     <>
       <div className="cas-h4row">
-        <h4>Team chat routing</h4>
+        <h4>Chat space for each team</h4>
         {canAdd ? (
           <button
             ref={addRef}
@@ -552,7 +931,7 @@ function TeamChatRouting({
             title={addBlocked}
             onClick={() => setAdding(true)}
           >
-            + Add team chat routing
+            + Add chat space
           </button>
         ) : null}
       </div>
@@ -571,11 +950,11 @@ function TeamChatRouting({
       ) : null}
       {sorted.length === 0 ? (
         <p className="cas-sub cas-empty">
-          No team chat routing saved here yet. Alerts go to the chat spaces in
-          the alert service&apos;s file.
+          No chat space saved here yet. Alerts go to the chat spaces in the
+          alert service&apos;s file.
         </p>
       ) : (
-        <table className="ra-tbl cas-rooms" aria-label="Team chat routing">
+        <table className="ra-tbl cas-rooms" aria-label="Chat space for each team">
           <thead>
             <tr>
               <th>Team</th>
@@ -596,7 +975,6 @@ function TeamChatRouting({
                 showActions={canAdd}
                 roomsOnly={roomsOnly}
                 webhooksEnabled={webhooksEnabled}
-                appliedNote={appliedNote}
                 onError={onError}
                 onSaved={onSaved}
               />
@@ -612,7 +990,6 @@ function TeamChatRouting({
           ladderChannel={ladderChannel}
           roomsOnly={roomsOnly}
           webhooksEnabled={webhooksEnabled}
-          appliedNote={appliedNote}
           returnFocus={addRef}
           onClose={() => setAdding(false)}
           onSaved={onSaved}
@@ -632,12 +1009,11 @@ interface ChatRowProps {
   showActions?: boolean;
   roomsOnly: boolean;
   webhooksEnabled: boolean;
-  appliedNote?: string;
   onError: (msg: string | null) => void;
   onSaved: (what: string) => void;
 }
 
-/** One saved chat routing, read-only: changes go through Edit and its Save. */
+/** One saved chat space, read-only: changes go through Edit and its Save. */
 function ChatRow({
   ladder,
   room,
@@ -647,7 +1023,6 @@ function ChatRow({
   showActions = canEdit,
   roomsOnly,
   webhooksEnabled,
-  appliedNote,
   onError,
   onSaved,
 }: ChatRowProps): JSX.Element {
@@ -822,7 +1197,6 @@ function ChatRow({
               ladderChannel={ladderChannel}
               roomsOnly={roomsOnly}
               webhooksEnabled={webhooksEnabled}
-              appliedNote={appliedNote}
               returnFocus={editRef}
               onClose={() => setEditing(false)}
               onSaved={onSaved}
@@ -849,15 +1223,13 @@ interface RoomDialogProps {
   /** Only the space is set: a team's channel is kept as it is. */
   roomsOnly: boolean;
   webhooksEnabled: boolean;
-  /** When the alert service starts using a saved change (whenUsed). */
-  appliedNote?: string;
   returnFocus: RefObject<HTMLButtonElement | null>;
   onClose: () => void;
   onSaved: (what: string) => void;
 }
 
 /**
- * Add a team chat routing, or change one: the team, its space's webhook URL,
+ * Add a team's chat space, or change one: the team, its space's webhook URL,
  * how it is alerted and whether it also gets incidents with no SRE team.
  * Save sends the room with every field, then the URL when one was typed.
  * Errors stay in the dialog.
@@ -871,7 +1243,6 @@ function RoomDialog({
   ladderChannel,
   roomsOnly,
   webhooksEnabled,
-  appliedNote = DEFAULT_APPLIED_NOTE,
   returnFocus,
   onClose,
   onSaved,
@@ -956,8 +1327,8 @@ function RoomDialog({
       <form className="cas-edit" noValidate onSubmit={submit}>
         <h3 id={titleId}>
           {room
-            ? `Edit ${name.replace(/ \(shared space\)$/, "")} chat routing`
-            : "Add team chat routing"}
+            ? `Edit ${name.replace(/ \(shared space\)$/, "")} chat space`
+            : "Add a team's chat space"}
         </h3>
         {room ? (
           <p className="cp-help">
@@ -1041,9 +1412,6 @@ function RoomDialog({
             {error}
           </p>
         ) : null}
-        <p className="cas-sub cas-applied">
-          Saved with this tab&apos;s Submit. {appliedNote}
-        </p>
         <div className="cp-modal-actions">
           <button type="button" className="btn sm" onClick={onClose}>
             Cancel
@@ -1093,13 +1461,14 @@ function SetupStep({
   return (
     <div className="cas-status warn cas-setup">
       <span>
-        {count} {word} still {count === 1 ? "comes" : "come"} from the alert
-        service&apos;s file.
+        {count} {ladder} {word} still {count === 1 ? "comes" : "come"} from the
+        alert service&apos;s file. Copy {count === 1 ? "it" : "them"} here to
+        change {count === 1 ? "it" : "them"} on this page.
       </span>
       {confirm ? (
         <>
           <span>
-            Save {count} {word} here?
+            Copy {count} {word} here?
           </span>
           <button
             type="button"
@@ -1113,7 +1482,7 @@ function SetupStep({
               onSaved(what);
             }}
           >
-            Save {count} {word}
+            Copy {count} {word}
           </button>
           <button
             type="button"
@@ -1130,7 +1499,7 @@ function SetupStep({
           disabled={drafts.submitting !== null}
           onClick={() => setConfirm(true)}
         >
-          Save them here
+          Copy {count === 1 ? "it" : "them"} here
         </button>
       )}
     </div>
@@ -1220,21 +1589,6 @@ function MoreMenu({ disabled, items }: MoreMenuProps): JSX.Element {
   );
 }
 
-interface RouteTableProps {
-  ladder: CaseAlertLadder;
-  routes: CaseAlertGroupRoute[];
-  options?: CaseAlertRouteOptions;
-  /** The ladder's saved rooms, to say where a team's alerts end up. */
-  rooms: CaseAlertChatRoom[];
-  /** The ladder's own channel from the file, when reported. */
-  ladderChannel?: string;
-  canEdit: boolean;
-  /** When the alert service starts using a saved change (whenUsed). */
-  appliedNote?: string;
-  onError: (msg: string | null) => void;
-  onSaved: (what: string) => void;
-}
-
 /** How each ladder's redirects are put to the reader. An SRE incident and a
  *  CRE case both carry the CSM Portal team they are assigned to; a redirect
  *  sends its alerts to one of the ladder's own teams instead. */
@@ -1246,9 +1600,7 @@ const ROUTE_WORDS: Record<
     title: "Send an incident's alerts to another SRE team",
     help:
       "An incident is alerted to the SRE team it's assigned to in CSM Portal. If it's assigned to a different " +
-      "team, such as an SME team, choose which SRE team should get its alerts: that team's chat space gets the " +
-      "card, and its people on call get the calls, as set in Team chat routing above. An assignment group " +
-      "that isn't a CSM Portal team (such as WSO2 IaaS Team) can be typed in under \"Another assignment group\".",
+      "team, such as an SME team, choose which SRE team should get its alerts.",
     when: "When an incident is assigned to",
     empty:
       "No redirects. Each incident is alerted to the SRE team it's assigned to.",
@@ -1264,12 +1616,14 @@ const ROUTE_WORDS: Record<
   },
 };
 
-/** The CSM Portal teams a ladder's routes can be for: a CRE case's team, or
- *  an SRE incident's SRE or SME team. */
 /** The group list's "type a name" entry: an SRE incident's assignment group
  *  that no CSM Portal team has. Not a name any team can have. */
 const OTHER_GROUP = "\u0000other";
+/** Prefix of an assignment group picked from the list: then the id follows. */
+const ASSIGNMENT_GROUP = "\u0000ag:";
 
+/** The CSM Portal teams a ladder's routes can be for: a CRE case's team, or
+ *  an SRE incident's SRE or SME team. */
 const ROUTE_GROUP_FAMILIES: Record<
   CaseAlertLadder,
   CaseAlertTeamOption["family"][]
@@ -1278,65 +1632,121 @@ const ROUTE_GROUP_FAMILIES: Record<
   SRE: ["SRE", "SME"],
 };
 
-function RouteTable({
-  ladder,
-  routes,
-  options,
-  rooms,
-  ladderChannel,
-  canEdit,
-  appliedNote = DEFAULT_APPLIED_NOTE,
-  onError,
-  onSaved,
-}: RouteTableProps): JSX.Element {
+/** The redirect form's choices, kept by its owner so a row can fill them. */
+interface RouteFormState {
+  /** The group list's value: a team's name, ASSIGNMENT_GROUP + id, or
+   *  OTHER_GROUP with otherGroup typed. */
+  group: string;
+  otherGroup: string;
+  /** "team:<key>" or "rota:<code>". */
+  target: string;
+  pick: (group: string, otherGroup?: string) => void;
+  setOtherGroup: (v: string) => void;
+  setTarget: (v: string) => void;
+  reset: () => void;
+}
+
+function useRouteForm(): RouteFormState {
+  const [group, setGroup] = useState("");
+  const [otherGroup, setOtherGroup] = useState("");
+  const [target, setTarget] = useState("");
+  return {
+    group,
+    otherGroup,
+    target,
+    pick: (g, other = "") => {
+      setGroup(g);
+      setOtherGroup(other);
+    },
+    setOtherGroup,
+    setTarget,
+    reset: () => {
+      setGroup("");
+      setOtherGroup("");
+      setTarget("");
+    },
+  };
+}
+
+/** The form's group value for a name (and the assignment group's id, when
+ *  known): the team named so, else the listed group, else a typed name. */
+function routeGroupValue(
+  ladder: CaseAlertLadder,
+  options: CaseAlertRouteOptions | undefined,
+  name: string,
+  groupId?: string,
+): { group: string; other?: string } {
+  const lower = name.trim().toLowerCase();
+  const team = (options?.groups ?? []).find(
+    (g) => ROUTE_GROUP_FAMILIES[ladder].includes(g.family) && g.name.toLowerCase() === lower,
+  );
+  if (team) return { group: team.name };
+  const ag = (options?.assignmentGroups ?? []).find(
+    (a) => (groupId && a.id === groupId) || a.name.trim().toLowerCase() === lower,
+  );
+  if (ag) return { group: `${ASSIGNMENT_GROUP}${ag.id}` };
+  return { group: OTHER_GROUP, other: name };
+}
+
+interface RouteFormProps {
+  ladder: CaseAlertLadder;
+  options?: CaseAlertRouteOptions;
+  form: RouteFormState;
+  /** The "send its alerts to" list, for a row to focus. */
+  targetRef?: RefObject<HTMLSelectElement | null>;
+  busy: boolean;
+  onError: (msg: string | null) => void;
+  onSaved: (what: string) => void;
+}
+
+/** Add a redirect: a group (a CSM Portal team, an SRE assignment group, or a
+ *  typed name) and the team or rota its alerts go to. A redirect for a group
+ *  that has one replaces it. */
+function RouteForm({ ladder, options, form, targetRef, busy, onError, onSaved }: RouteFormProps): JSX.Element {
   const drafts = useCaseAlertDrafts();
   const family = familyOfLadder(ladder);
   const words = ROUTE_WORDS[ladder];
-  const [group, setGroup] = useState("");
-  // The typed name when group is OTHER_GROUP (SRE only).
-  const [otherGroup, setOtherGroup] = useState("");
-  const groupName = group === OTHER_GROUP ? otherGroup.trim() : group;
-  // "team:<key>" or "rota:<code>": one list, the ladder's teams first.
-  const [target, setTarget] = useState("");
-  const [confirmId, setConfirmId] = useState<string | null>(null);
-  const busy = drafts.submitting === family;
+  const { group, otherGroup, target } = form;
   const families = ROUTE_GROUP_FAMILIES[ladder];
-  const groups = (options?.groups ?? []).filter((g) =>
-    families.includes(g.family),
-  );
+  const groups = (options?.groups ?? []).filter((g) => families.includes(g.family));
+  // SRE incidents carry their ServiceNow assignment group: list those, less
+  // the ones a team above is already named after.
+  const assignmentGroups =
+    ladder === "SRE"
+      ? (options?.assignmentGroups ?? []).filter(
+          (a) => !groups.some((g) => g.name.toLowerCase() === a.name.toLowerCase()),
+        )
+      : [];
+  const pickedGroup = group.startsWith(ASSIGNMENT_GROUP)
+    ? (options?.assignmentGroups ?? []).find((a) => a.id === group.slice(ASSIGNMENT_GROUP.length))
+    : undefined;
+  const groupName =
+    group === OTHER_GROUP
+      ? otherGroup.trim()
+      : pickedGroup
+        ? pickedGroup.name
+        : group.startsWith(ASSIGNMENT_GROUP)
+          ? ""
+          : group;
+  /** The assignment group a name is, when exactly one has it (SRE only), so
+   *  the redirect follows a rename in ServiceNow. */
+  const groupIdFor = (name: string): string | undefined => {
+    if (pickedGroup) return pickedGroup.id;
+    if (ladder !== "SRE") return undefined;
+    const same = (options?.assignmentGroups ?? []).filter(
+      (a) => a.name.trim().toLowerCase() === name.trim().toLowerCase(),
+    );
+    return same.length === 1 ? same[0].id : undefined;
+  };
   const teams = (options?.teams ?? []).filter((t) => t.family === ladder);
   const rotas = options?.rotas ?? [];
-  // A saved route holds the team's name in lower case; show it as the team
-  // is named, and a target by its name too.
   const groupLabel = (name: string) =>
-    groups.find((g) => g.name.toLowerCase() === name.toLowerCase())?.name ??
-    name;
-  const teamLabel = (key: string) =>
-    teams.find((t) => t.key === key)?.name ?? key;
+    groups.find((g) => g.name.toLowerCase() === name.toLowerCase())?.name ?? name;
+  const teamLabel = (key: string) => teams.find((t) => t.key === key)?.name ?? key;
   const rotaLabel = (code: string) => {
     const r = rotas.find((x) => x.code === code);
     return r && r.label !== code ? r.label : code;
   };
-  /** Where a team's alerts end up, from Team chat routing: its chat space and
-   *  how they go out. */
-  const teamOutcome = (key: string) => {
-    const room = rooms.find((r) => r.teamKey === key);
-    const channel = room?.channel || ladderChannel;
-    const by = channelWords(channel) ?? "As the ladder";
-    // Where the card goes only matters when the team gets chat cards.
-    if (channel === "call" || channel === "log") return by;
-    const space = room?.hasWebhook
-      ? `in the ${room.label} space`
-      : "in its own chat space";
-    return `${by} · ${space}`;
-  };
-  /** A redirect from a team to itself: it changes nothing. */
-  // The alert service matches an incident's team by name against the Team
-  // Schedule's key, so a redirect is only needless when the name already is
-  // the key (a team named "Apollo" with key apollo). A team named "Apollo SRE
-  // Group" with key apollo does need it, though both read "Apollo...".
-  const sameTeam = (r: CaseAlertGroupRoute) =>
-    !!r.teamKey && r.groupName.trim().toLowerCase() === r.teamKey.toLowerCase();
 
   const add = (e: FormEvent) => {
     e.preventDefault();
@@ -1350,6 +1760,7 @@ function RouteTable({
     const what = `redirect from ${groupLabel(groupName)} to ${
       kind === "team" ? teamLabel(value) : `every team on ${rotaLabel(value)}`
     }`;
+    const id = groupIdFor(groupName);
     drafts.add({
       family,
       what,
@@ -1357,14 +1768,136 @@ function RouteTable({
       input: {
         ladder,
         groupName,
+        ...(id ? { groupId: id } : {}),
         ...(kind === "team" ? { teamKey: value } : { rotaCode: value }),
       },
     });
     onSaved(what);
-    setGroup("");
-    setOtherGroup("");
-    setTarget("");
+    form.reset();
   };
+
+  return (
+    <form className="cas-add cas-route-add" aria-label={`Add a ${ladder} redirect`} onSubmit={add}>
+      <label>
+        {words.when}
+        <select value={group} onChange={(e) => form.pick(e.target.value, otherGroup)}>
+          <option value="">Choose a team</option>
+          {families.map((f) => {
+            const inFamily = groups.filter((g) => g.family === f);
+            return inFamily.length ? (
+              <optgroup key={f} label={`${f} teams`}>
+                {inFamily.map((g) => (
+                  <option key={g.key} value={g.name}>
+                    {g.name}
+                  </option>
+                ))}
+              </optgroup>
+            ) : null;
+          })}
+          {ladder === "SRE" ? (
+            <optgroup label="Not a CSM Portal team">
+              {assignmentGroups.map((a) => (
+                <option key={a.id} value={`${ASSIGNMENT_GROUP}${a.id}`}>
+                  {a.name}
+                </option>
+              ))}
+              <option value={OTHER_GROUP}>Another assignment group…</option>
+            </optgroup>
+          ) : null}
+        </select>
+      </label>
+      {group === OTHER_GROUP ? (
+        <label>
+          Assignment group name
+          <input
+            type="text"
+            value={otherGroup}
+            maxLength={255}
+            placeholder="As the incident carries it"
+            onChange={(e) => form.setOtherGroup(e.target.value)}
+          />
+        </label>
+      ) : null}
+      <label>
+        send its alerts to
+        <select ref={targetRef} value={target} onChange={(e) => form.setTarget(e.target.value)}>
+          <option value="">{ladder === "SRE" ? "Choose an SRE team" : "Choose a CRE team"}</option>
+          <optgroup label={`${ladder} teams`}>
+            {teams.map((t) => (
+              <option key={t.key} value={`team:${t.key}`}>
+                {t.name}
+              </option>
+            ))}
+          </optgroup>
+          {ladder === "SRE" && rotas.length ? (
+            <optgroup label="A whole rota">
+              {rotas.map((r) => (
+                <option key={r.code} value={`rota:${r.code}`}>
+                  Every team on {rotaLabel(r.code)}
+                </option>
+              ))}
+            </optgroup>
+          ) : null}
+        </select>
+      </label>
+      <button type="submit" className="btn sm" disabled={busy || !groupName || !target}>
+        Add
+      </button>
+    </form>
+  );
+}
+
+interface RouteTableProps {
+  ladder: CaseAlertLadder;
+  routes: CaseAlertGroupRoute[];
+  options?: CaseAlertRouteOptions;
+  /** The ladder's saved rooms, to say where a team's alerts end up. */
+  rooms: CaseAlertChatRoom[];
+  /** The ladder's own channel from the file, when reported. */
+  ladderChannel?: string;
+  canEdit: boolean;
+  onError: (msg: string | null) => void;
+  onSaved: (what: string) => void;
+}
+
+/** A ladder's saved redirects, and the form to add one. */
+function RouteTable({
+  ladder,
+  routes,
+  options,
+  rooms,
+  ladderChannel,
+  canEdit,
+  onError,
+  onSaved,
+}: RouteTableProps): JSX.Element {
+  const drafts = useCaseAlertDrafts();
+  const family = familyOfLadder(ladder);
+  const words = ROUTE_WORDS[ladder];
+  const form = useRouteForm();
+  const [confirmId, setConfirmId] = useState<string | null>(null);
+  const busy = drafts.submitting === family;
+  const families = ROUTE_GROUP_FAMILIES[ladder];
+  const groups = (options?.groups ?? []).filter((g) => families.includes(g.family));
+  const teams = (options?.teams ?? []).filter((t) => t.family === ladder);
+  const rotas = options?.rotas ?? [];
+  // A saved route holds the team's name in lower case; show it as the team
+  // is named, and a target by its name too.
+  const groupLabel = (name: string) =>
+    groups.find((g) => g.name.toLowerCase() === name.toLowerCase())?.name ?? name;
+  const teamLabel = (key: string) => teams.find((t) => t.key === key)?.name ?? key;
+  const rotaLabel = (code: string) => {
+    const r = rotas.find((x) => x.code === code);
+    return r && r.label !== code ? r.label : code;
+  };
+  const teamOutcome = teamOutcomeFor(rooms, ladderChannel);
+  /** A redirect from a team to itself: it changes nothing. */
+  // The alert service matches an incident's team by name against the Team
+  // Schedule's key, so a redirect is only needless when the name already is
+  // the key (a team named "Apollo" with key apollo). A team named "Apollo SRE
+  // Group" with key apollo does need it, though both read "Apollo...".
+  const sameTeam = (r: CaseAlertGroupRoute) =>
+    !!r.teamKey && r.groupName.trim().toLowerCase() === r.teamKey.toLowerCase();
 
   return (
     <>
@@ -1395,12 +1928,8 @@ function RouteTable({
                     </>
                   ) : (
                     <>
-                      <b>
-                        Every team on the {rotaLabel(r.rotaCode ?? "")} rota
-                      </b>
-                      <div className="cas-sub">
-                        Whoever is on call there gets the alerts
-                      </div>
+                      <b>Every team on the {rotaLabel(r.rotaCode ?? "")} rota</b>
+                      <div className="cas-sub">Whoever is on call there gets the alerts</div>
                     </>
                   )}
                 </td>
@@ -1423,11 +1952,7 @@ function RouteTable({
                           >
                             Remove
                           </button>
-                          <button
-                            type="button"
-                            className="btn sm"
-                            onClick={() => setConfirmId(null)}
-                          >
+                          <button type="button" className="btn sm" onClick={() => setConfirmId(null)}>
                             Cancel
                           </button>
                         </>
@@ -1450,79 +1975,7 @@ function RouteTable({
         </table>
       )}
       {canEdit ? (
-        <form className="cas-add cas-route-add" onSubmit={add}>
-          <label>
-            {words.when}
-            <select value={group} onChange={(e) => setGroup(e.target.value)}>
-              <option value="">Choose a team</option>
-              {families.map((family) => {
-                const inFamily = groups.filter((g) => g.family === family);
-                return inFamily.length ? (
-                  <optgroup key={family} label={`${family} teams`}>
-                    {inFamily.map((g) => (
-                      <option key={g.key} value={g.name}>
-                        {g.name}
-                      </option>
-                    ))}
-                  </optgroup>
-                ) : null;
-              })}
-              {ladder === "SRE" ? (
-                <optgroup label="Not a CSM Portal team">
-                  <option value={OTHER_GROUP}>Another assignment group…</option>
-                </optgroup>
-              ) : null}
-            </select>
-          </label>
-          {group === OTHER_GROUP ? (
-            <label>
-              Assignment group name
-              <input
-                type="text"
-                value={otherGroup}
-                maxLength={255}
-                placeholder="As the incident carries it, e.g. WSO2 IaaS Team"
-                onChange={(e) => setOtherGroup(e.target.value)}
-              />
-            </label>
-          ) : null}
-          <label>
-            send its alerts to
-            <select value={target} onChange={(e) => setTarget(e.target.value)}>
-              <option value="">
-                {ladder === "SRE" ? "Choose an SRE team" : "Choose a CRE team"}
-              </option>
-              <optgroup label={`${ladder} teams`}>
-                {teams.map((t) => (
-                  <option key={t.key} value={`team:${t.key}`}>
-                    {t.name}
-                  </option>
-                ))}
-              </optgroup>
-              {ladder === "SRE" && rotas.length ? (
-                <optgroup label="A whole rota">
-                  {rotas.map((r) => (
-                    <option key={r.code} value={`rota:${r.code}`}>
-                      Every team on {rotaLabel(r.code)}
-                    </option>
-                  ))}
-                </optgroup>
-              ) : null}
-            </select>
-          </label>
-          <button
-            type="submit"
-            className="btn sm"
-            disabled={busy || !groupName || !target}
-          >
-            Add
-          </button>
-        </form>
-      ) : null}
-      {canEdit ? (
-        <p className="cas-sub cas-applied">
-          A redirect is saved with this tab&apos;s Submit. {appliedNote}
-        </p>
+        <RouteForm ladder={ladder} options={options} form={form} busy={busy} onError={onError} onSaved={onSaved} />
       ) : null}
     </>
   );

@@ -67,12 +67,17 @@ export default function CallRequestCard({
   onRejectClick,
 }: CallRequestCardProps): JSX.Element {
   const theme = useTheme();
-  const statusLabel = call.state?.label ?? "--";
+  const stateId = String(call.state?.id ?? "").trim().toLowerCase();
+  const isPendingOnCustomer =
+    stateId === "pending_on_customer" ||
+    stateId === "1" ||
+    call.state?.label === CallRequestStatus.PENDING_ON_CUSTOMER;
+  const statusLabel = isPendingOnCustomer
+    ? CallRequestStatus.PENDING_ON_CUSTOMER
+    : (call.state?.label ?? "--");
   const statusLower = statusLabel?.toLowerCase() ?? "";
   const isCancelled = statusLower === "cancelled" || statusLower === "canceled";
   const isTerminal = isCancelled || statusLabel === CallRequestStatus.COMPLETED;
-  const isPendingOnCustomer =
-    statusLabel === CallRequestStatus.PENDING_ON_CUSTOMER;
   const isScheduled = statusLabel === CallRequestStatus.SCHEDULED;
   const isNotesPending =
     call.state?.id === CALL_REQUEST_STATE_NOTES_PENDING_ID ||
@@ -89,6 +94,11 @@ export default function CallRequestCard({
     call.preferredTimes,
     userTimeZone,
   );
+  // The agreed meeting instant, set when an agent schedules or reschedules.
+  // Distinct from preferredTimes, which stay the customer's proposed options.
+  const scheduledTimeLine = call.scheduleTime
+    ? formatUtcToLocal(call.scheduleTime, "short", false, userTimeZone)
+    : null;
 
   return (
     <Card variant="outlined">
@@ -182,8 +192,8 @@ export default function CallRequestCard({
             {isPendingOnCustomer ? (
               <>
                 <Button
-                  variant="contained"
-                  color="primary"
+                  variant="outlined"
+                  color="success"
                   onClick={() => onApproveClick?.(call)}
                   sx={{
                     minWidth: "auto",
@@ -196,7 +206,7 @@ export default function CallRequestCard({
                   Approve
                 </Button>
                 <Button
-                  variant="contained"
+                  variant="outlined"
                   color="error"
                   onClick={() => onRejectClick?.(call)}
                   sx={{
@@ -213,7 +223,7 @@ export default function CallRequestCard({
             ) : hideCustomerActions ? null : (
               <>
                 <Button
-                  variant="contained"
+                  variant="outlined"
                   color="warning"
                   onClick={() => onEditClick?.(call)}
                   disabled={isTerminal}
@@ -228,7 +238,7 @@ export default function CallRequestCard({
                   Reschedule
                 </Button>
                 <Button
-                  variant="contained"
+                  variant="outlined"
                   color="error"
                   onClick={() => onDeleteClick?.(call)}
                   disabled={isTerminal}
@@ -281,6 +291,18 @@ export default function CallRequestCard({
               </Box>
             )}
           </Box>
+          {scheduledTimeLine && (
+            <Box>
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                display="block"
+              >
+                Scheduled Time
+              </Typography>
+              <Typography variant="body2">{scheduledTimeLine}</Typography>
+            </Box>
+          )}
           <Box>
             <Typography
               variant="caption"

@@ -115,11 +115,38 @@ func NewClient(cfg Config) (*Client, error) {
 
 // sendEmailRequest is the wire shape expected by POST /send-email.
 type sendEmailRequest struct {
-	To       []string `json:"to"`
-	CC       []string `json:"cc,omitempty"`
-	From     string   `json:"from"`
-	Subject  string   `json:"subject"`
-	Template []byte   `json:"template"`
+	To          []string     `json:"to"`
+	CC          []string     `json:"cc,omitempty"`
+	From        string       `json:"from"`
+	Subject     string       `json:"subject"`
+	Template    []byte       `json:"template"`
+	Attachments []Attachment `json:"attachments,omitempty"`
+}
+
+// Attachment is one file sent with an email: a calendar invitation, say.
+type Attachment struct {
+	// ContentName is the file name ("invite.ics").
+	ContentName string
+	// ContentType is the MIME type ("text/calendar; method=REQUEST; charset=UTF-8").
+	ContentType string
+	// Content is the raw file.
+	Content []byte
+}
+
+// MarshalJSON writes the content as a JSON array of byte values. The email
+// service binds it to a byte[] and refuses the base64 string encoding/json
+// writes for a []byte ("should be of type 'byte[]'"); the template field is
+// unaffected.
+func (a Attachment) MarshalJSON() ([]byte, error) {
+	values := make([]int, len(a.Content))
+	for i, c := range a.Content {
+		values[i] = int(c)
+	}
+	return json.Marshal(struct {
+		ContentName string `json:"contentName"`
+		ContentType string `json:"contentType"`
+		Attachment  []int  `json:"attachment"`
+	}{a.ContentName, a.ContentType, values})
 }
 
 // SendEmail sends a plain HTML email via the notification service. The
@@ -129,19 +156,24 @@ type sendEmailRequest struct {
 // error. cc may be nil; a nil/empty cc with a non-empty to still sends
 // normally, just with no one cc'd.
 func (c *Client) SendEmail(ctx context.Context, to, cc []string, subject, htmlBody string) error {
+	return c.SendEmailWithAttachments(ctx, to, cc, subject, htmlBody, nil)
+}
+
+// SendEmailWithAttachments is SendEmail with files attached.
+func (c *Client) SendEmailWithAttachments(ctx context.Context, to, cc []string, subject, htmlBody string, attachments []Attachment) error {
 	if len(to) == 0 {
 		return nil
 	}
 	if subject == "" {
 		return fmt.Errorf("notify: subject is required")
 	}
-
 	reqBody, err := json.Marshal(sendEmailRequest{
-		To:       to,
-		CC:       cc,
-		From:     c.fromAddress,
-		Subject:  subject,
-		Template: []byte(htmlBody),
+		To:          to,
+		CC:          cc,
+		From:        c.fromAddress,
+		Subject:     subject,
+		Template:    []byte(htmlBody),
+		Attachments: attachments,
 	})
 	if err != nil {
 		return fmt.Errorf("notify: encode send-email request: %w", err)

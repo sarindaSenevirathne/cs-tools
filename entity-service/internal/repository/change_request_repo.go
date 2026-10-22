@@ -309,6 +309,14 @@ const changeRequestFromJoins = `
 // not a missing-data one, so no create/patch write-path changes are needed
 // alongside this join.
 //
+// finitePlannedStart / finitePlannedEnd are the planned window as every read
+// shows it: a non-finite stored value is no date (NULL). The list's sort and
+// its planned-date filters use them, so they agree with what the rows display.
+const (
+	finitePlannedStart = "CASE WHEN isfinite(cr.start_on) THEN cr.start_on END"
+	finitePlannedEnd   = "CASE WHEN isfinite(cr.end_on) THEN cr.end_on END"
+)
+
 // start_on / end_on are read through isfinite(): a row holding Postgres'
 // 'infinity' / '-infinity' (nothing the API writes any more, see
 // change_request_window.go, but a row can get there by other doors) reads as no
@@ -684,13 +692,99 @@ func changeRequestWhereClause(f domain.SearchChangeRequestsFilters, createdStart
 	if approval != nil {
 		add("cr.approval = $%d::change_request_approval_enum", changeRequestApprovalEnum(*approval))
 	}
-	// The parsed filter array's assignmentGroupId has a real backing column
-	// now (work_item.assignment_group_id, read as AssignedTeam -- see this
-	// file's own package doc comment), but filtering search results by it is
-	// still not wired here; out of scope for the read-side fix that added
-	// the column's own join.
+	// tag: the case search's own predicate (case_field_predicates.go), on the
+	// change request's work item. in = carries any of the names, notIn = none.
+	if len(f.Tags) > 0 {
+		add("EXISTS (SELECT 1 FROM work_item_tag wit JOIN tag t ON t.id = wit.tag_id WHERE wit.work_item_id = wi.id AND LOWER(t.name) = ANY($%d::text[]))", lowerAll(f.Tags))
+	}
+	if len(f.ExcludeTags) > 0 {
+		add("NOT EXISTS (SELECT 1 FROM work_item_tag wit JOIN tag t ON t.id = wit.tag_id WHERE wit.work_item_id = wi.id AND LOWER(t.name) = ANY($%d::text[]))", lowerAll(f.ExcludeTags))
+	}
+	// The assigned team (SRE Team) and engineer, read as AssignedTeam /
+	// AssignedEngineer.
+	if len(f.AssignmentGroupIDs) > 0 {
+		add("wi.assignment_group_id = ANY($%d::uuid[])", f.AssignmentGroupIDs)
+	}
+	if len(f.AssignedUserIDs) > 0 {
+		add("wi.assigned_to_id = ANY($%d::uuid[])", f.AssignedUserIDs)
+	}
+	for _, b := range []struct {
+		col string
+		at  *time.Time
+		op  string
+	}{
+		{"wi.updated_on", f.UpdatedStart, ">="}, {"wi.updated_on", f.UpdatedEnd, "<="},
+		// The planned dates are compared as they read (changeRequestSelectColumns):
+		// a non-finite one is no date, so no range matches it.
+		{finitePlannedStart, f.PlannedStartFrom, ">="}, {finitePlannedStart, f.PlannedStartTo, "<="},
+		{finitePlannedEnd, f.PlannedEndFrom, ">="}, {finitePlannedEnd, f.PlannedEndTo, "<="},
+	} {
+		if b.at != nil {
+			add(b.col+" "+b.op+" $%d", *b.at)
+		}
+	}
+	if len(f.Types) > 0 {
+		models := make([]string, 0, len(f.Types))
+		for _, t := range f.Types {
+			models = append(models, changeRequestTypeToChangeModel[t])
+		}
+		add("cr.change_model::TEXT = ANY($%d::text[])", models)
+	}
+	// anyOf: each branch is the AND of its own conditions, the branches are
+	// OR'd, and the whole is ANDed with everything above (case search's shape).
+	if len(f.OrGroups) > 0 {
+		branches := make([]string, 0, len(f.OrGroups))
+		for _, g := range f.OrGroups {
+			var preds []string
+			bind := func(clause string, val any) {
+				preds = append(preds, fmt.Sprintf(clause, argIdx))
+				args = append(args, val)
+				argIdx++
+			}
+			if len(g.States) > 0 {
+				bind("cr.state::TEXT = ANY($%d::text[])", g.States)
+			}
+			if len(g.Impacts) > 0 {
+				bind("cr.impact::TEXT = ANY($%d::text[])", g.Impacts)
+			}
+			if len(g.ProjectIDs) > 0 {
+				bind("wi.project_id = ANY($%d::uuid[])", g.ProjectIDs)
+			}
+			if len(g.ChangeModels) > 0 {
+				bind("cr.change_model::TEXT = ANY($%d::text[])", g.ChangeModels)
+			}
+			if len(g.AssignmentGroupIDs) > 0 {
+				bind("wi.assignment_group_id = ANY($%d::uuid[])", g.AssignmentGroupIDs)
+			}
+			if len(g.AssignedUserIDs) > 0 {
+				bind("wi.assigned_to_id = ANY($%d::uuid[])", g.AssignedUserIDs)
+			}
+			if len(g.Tags) > 0 {
+				bind("EXISTS (SELECT 1 FROM work_item_tag wit JOIN tag t ON t.id = wit.tag_id WHERE wit.work_item_id = wi.id AND LOWER(t.name) = ANY($%d::text[]))", lowerAll(g.Tags))
+			}
+			if len(preds) == 0 {
+				branches = append(branches, "TRUE")
+				continue
+			}
+			branches = append(branches, "("+strings.Join(preds, " AND ")+")")
+		}
+		where += " AND (" + strings.Join(branches, " OR ") + ")"
+	}
 
 	return where, args
+}
+
+// IsFilterableChangeRequestType reports whether a change type has a
+// change_model on this data source (model / site_reliability_ops have none).
+func IsFilterableChangeRequestType(t domain.ChangeRequestType) bool {
+	_, ok := changeRequestTypeToChangeModel[t]
+	return ok
+}
+
+// ChangeModelForType returns a change type's change_model label.
+func ChangeModelForType(t domain.ChangeRequestType) (string, bool) {
+	m, ok := changeRequestTypeToChangeModel[t]
+	return m, ok
 }
 
 // changeRequestApprovalEnum maps ServiceNow's raw task.approval value
@@ -716,13 +810,23 @@ func (r *changeRequestRepo) SearchChangeRequests(ctx context.Context, req domain
 	where += visSQL
 
 	sortCol := "wi.created_on"
-	if req.SortBy.Field == domain.ChangeRequestSortFieldUpdatedOn {
+	switch req.SortBy.Field {
+	case domain.ChangeRequestSortFieldUpdatedOn:
 		sortCol = "wi.updated_on"
+	case domain.ChangeRequestSortFieldPlannedStartOn:
+		sortCol = finitePlannedStart
+	case domain.ChangeRequestSortFieldPlannedEndOn:
+		sortCol = finitePlannedEnd
 	}
 	sortDir := "DESC"
 	if req.SortBy.Order == domain.ChangeRequestSortOrderAsc {
 		sortDir = "ASC"
 	}
+	// The planned dates are nullable: a change request with none sorts last
+	// either way (created_on / updated_on are never NULL). They are sorted as
+	// they read, so a non-finite one (no date on screen) is NULL here too:
+	// 'infinity' would otherwise sort first descending, '-infinity' first ascending.
+	sortDir += " NULLS LAST"
 
 	countQuery := "SELECT COUNT(*) " + changeRequestFromJoins + " " + where
 	dataQuery := fmt.Sprintf("SELECT %s %s %s ORDER BY %s %s, wi.id LIMIT $%d OFFSET $%d",
@@ -862,9 +966,15 @@ func (r *changeRequestRepo) AggregateChangeRequests(ctx context.Context, req dom
 // nothing to select -- same "no real column" posture as ApprovedBy/
 // ApprovedOn/LegalNextStates already have (see this file's own package
 // doc comment).
+// impactDescription and rollbackPlan read impact_description / rollback_process,
+// falling back to risk_impact_analysis / backout_plan: the create form's "Risk and
+// impact analysis" and "Backout plan" were written only to the latter pair, so a
+// change request created before both creates wrote the pair the read uses showed
+// neither field. Plain COALESCE (not NULLIF ''), so a field cleared by a PATCH
+// stays cleared.
 const changeRequestDetailColumns = `
-	wi.created_by, cr.justification, cr.impact_description, cr.service_outage_downtime,
-	cr.communication_plan, cr.rollback_process, cr.test_plan,
+	wi.created_by, cr.justification, COALESCE(cr.impact_description, cr.risk_impact_analysis), cr.service_outage_downtime,
+	cr.communication_plan, COALESCE(cr.rollback_process, cr.backout_plan), cr.test_plan,
 	cr.is_customer_approval_required, cr.is_customer_review_required,
 	cr.implementation_plan, cr.priority::TEXT, cr.category::TEXT,
 	rb.id, COALESCE(rb.name, NULLIF(TRIM(CONCAT_WS(' ', rb.first_name, rb.last_name)), '')),
@@ -1307,6 +1417,15 @@ func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.
 			return "", err
 		}
 		if err := validateCreationPhaseEdits(gates, req); err != nil {
+			return "", err
+		}
+		// Once the change has been approved its fields are read-only (only work
+		// notes and the lifecycle move on): change_request_approved_lock.go. After
+		// the pure rules above, which keep their more specific words (a type that is
+		// frozen, a box that can never be unticked), and before the rules below that
+		// ask who could be asked: past the approval no contact would make an edit
+		// possible, so their words would mislead.
+		if err := checkApprovedContentLock(ctx, tx, id, gates, req, staffTimeResponse); err != nil {
 			return "", err
 		}
 		// A box turned on after Request Approval needs somebody who can be asked
@@ -2232,14 +2351,16 @@ const createChangeRequestPortalQuery = `
 			justification, implementation_plan, risk_impact_analysis, backout_plan, test_plan,
 			start_on, end_on, requested_by_user_id, customer_group_id,
 			is_planning_visible_to_customers, affected_services, affected_component, rollback_duration,
-			customer_approval_required, customer_review_required, category
+			customer_approval_required, customer_review_required, category,
+			impact_description, rollback_process
 		)
 		SELECT id, 'NEW'::change_request_state_enum, $5::uuid, $6::uuid, $7::change_request_impact_enum, $8::change_request_risk_enum,
 		       $9::change_request_priority_enum, $10::change_request_change_model_enum,
 		       $11, $12, $13, $14, $15,
 		       $16::text::timestamptz, $17::text::timestamptz, $18::uuid, $19::uuid,
 		       $20, $21, $22, $23, COALESCE($25::boolean, false), COALESCE($26::boolean, false),
-		       $30::change_request_category_enum
+		       $30::change_request_category_enum,
+		       $13, $14
 		FROM inserted_work_item
 		RETURNING id
 	)
@@ -2451,7 +2572,8 @@ const createChangeRequestFromServiceNowQuery = `
 			justification, implementation_plan, risk_impact_analysis, backout_plan, test_plan,
 			start_on, end_on, requested_by_user_id, customer_group_id,
 			is_planning_visible_to_customers, affected_services, affected_component, rollback_duration,
-			customer_approval_required, customer_review_required, category
+			customer_approval_required, customer_review_required, category,
+			impact_description, rollback_process
 		)
 		VALUES (
 			$1, 'NEW'::change_request_state_enum, $7::uuid, $8::uuid, $9::change_request_impact_enum, $10::change_request_risk_enum,
@@ -2459,7 +2581,8 @@ const createChangeRequestFromServiceNowQuery = `
 			$13, $14, $15, $16, $17,
 			$18::text::timestamptz, $19::text::timestamptz, $20::uuid, $21::uuid,
 			$22, $23, $24, $25, COALESCE($27::boolean, false), COALESCE($28::boolean, false),
-			$32::change_request_category_enum
+			$32::change_request_category_enum,
+			$15, $16
 		)
 		RETURNING id
 	)

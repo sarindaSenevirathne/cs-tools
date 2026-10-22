@@ -76,6 +76,15 @@ var (
 
 // caseAlertValueSpecs are the keys that can be saved, by the file's name.
 var caseAlertValueSpecs = map[string]caseAlertValueSpec{
+	// The ladder's own switches: whether it runs, how it reaches people and
+	// the safety holds. The file's top-level enabled and the alert service's
+	// INCIDENT_ESCALATION_ENABLED kill switch stay outside the tab.
+	"enabled":                           {allLadders, boolValue},
+	"channel":                           {allLadders, enumValue("call", "chat", "both", "log")},
+	"safety.maxCallsPerLadder":          {bothLadders, intValue(1, 50)},
+	"safety.callWithoutVerifiedLeads":   {bothLadders, boolValue},
+	"safety.callHeadsWithoutLowerTiers": {bothLadders, boolValue},
+
 	"trigger.priorities":       {bothLadders, stringListValue(5, priorityItem)},
 	"trigger.teams":            {bothLadders, stringListValue(100, groupNameItem)},
 	"trigger.excludeTeams":     {bothLadders, stringListValue(100, groupNameItem)},

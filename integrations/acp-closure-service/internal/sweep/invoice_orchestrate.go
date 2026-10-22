@@ -199,8 +199,10 @@ func suspendInvoice(ctx context.Context, updater projectUpdater, proj project) e
 		return fmt.Errorf("marshal update request: %w", err)
 	}
 
-	_, err = updater.UpdateProject(ctx, proj.ID, body)
-	return err
+	if _, err := updater.UpdateProject(ctx, proj.ID, body); err != nil {
+		return err
+	}
+	return suspendInSalesforce(ctx, updater, proj)
 }
 
 // listedInvoices turns the resolved due invoices into the lines the internal

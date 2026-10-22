@@ -336,6 +336,10 @@ type Dispatcher struct {
 	// space of its own -- a default group's cards to Apollo and Artemis.
 	incidentChatFanout map[string][]string
 
+	// incidentRoutes is the group fan-out from the Alert Settings mapping
+	// (WithIncidentRoutes), shared with the paging engine; nil holds none.
+	incidentRoutes *notifications.IncidentRoutes
+
 	// identityExisted (guarded by doneMu, like done) remembers, per baseKey,
 	// the Existed result of an identity step that already succeeded on an
 	// earlier attempt at the same record — so a retry caused by a later
@@ -604,6 +608,13 @@ func (d *Dispatcher) WithIncidentChatFanout(fanout map[string][]string) *Dispatc
 			d.incidentChatFanout[key] = targets
 		}
 	}
+	return d
+}
+
+// WithIncidentRoutes shares the Alert Settings group fan-out with the
+// dispatcher, so an incident's card goes to the rooms its paging replies do.
+func (d *Dispatcher) WithIncidentRoutes(routes *notifications.IncidentRoutes) *Dispatcher {
+	d.incidentRoutes = routes
 	return d
 }
 
@@ -2059,17 +2070,14 @@ func (d *Dispatcher) incidentAudiences(ctx context.Context, t events.Type, incid
 			"type", string(t), "incidentId", incidentID, "number", number)
 		return nil
 	}
-	var audiences []string
-	for _, target := range notifications.IncidentGroups(d.incidentChatFanout, team) {
-		audience := notifications.IncidentAudience(target)
-		if !d.googleChat.HasAudienceSpace(audience) {
-			slog.InfoContext(ctx, "dispatch: assignment group has no INCIDENT_CHAT_SPACES entry, no chat alert",
-				"type", string(t), "incidentId", incidentID, "number", number, "assignmentGroup", target)
-			continue
-		}
-		if !slices.Contains(audiences, audience) {
-			audiences = append(audiences, audience)
-		}
+	audiences, fallback := notifications.IncidentAudiences(d.incidentRoutes, d.incidentChatFanout, team, d.googleChat.HasAudienceSpace)
+	switch {
+	case fallback:
+		slog.InfoContext(ctx, "dispatch: assignment group maps to no SRE team room; card goes to the shared SRE room",
+			"type", string(t), "incidentId", incidentID, "number", number, "assignmentGroup", team)
+	case len(audiences) == 0:
+		slog.InfoContext(ctx, "dispatch: assignment group has no chat space (no mapped team room, no INCIDENT_CHAT_SPACES entry), no chat alert",
+			"type", string(t), "incidentId", incidentID, "number", number, "assignmentGroup", team)
 	}
 	return audiences
 }

@@ -30,7 +30,7 @@ describe("readChangeRequestFiltersFromUrl", () => {
 
   it("parses a fully-populated query string", () => {
     const params = new URLSearchParams(
-      "crQ=rollback&crStates=implement,review&crImpacts=high,low&crClosedFrom=2026-01-01&crClosedTo=2026-01-31&crSreTeams=team-apollo,team-atlas&crProjects=proj-1,proj-2",
+      "crQ=rollback&crStates=implement,review&crImpacts=high,low&crClosedFrom=2026-01-01&crClosedTo=2026-01-31&crSreTeams=team-apollo,team-atlas&crProjects=proj-1,proj-2&crTags=hotfix,db",
     );
     expect(readChangeRequestFiltersFromUrl(params)).toEqual({
       search: "rollback",
@@ -40,6 +40,18 @@ describe("readChangeRequestFiltersFromUrl", () => {
       closedEndDate: "2026-01-31",
       sreTeamIds: ["team-apollo", "team-atlas"],
       projectIds: ["proj-1", "proj-2"],
+      tags: ["hotfix", "db"],
+      assigneeIds: [],
+      types: [],
+      createdStartDate: "",
+      createdEndDate: "",
+      updatedStartDate: "",
+      updatedEndDate: "",
+      plannedStartFrom: "",
+      plannedStartTo: "",
+      plannedEndFrom: "",
+      plannedEndTo: "",
+      anyOf: [],
     });
   });
 
@@ -99,6 +111,21 @@ describe("writeChangeRequestFiltersToUrl", () => {
       closedEndDate: "2026-01-31",
       sreTeamIds: ["team-apollo"],
       projectIds: ["proj-1"],
+      tags: ["hotfix", "db"],
+      assigneeIds: ["user-1"],
+      types: ["normal"],
+      createdStartDate: "2026-01-01",
+      createdEndDate: "2026-01-15",
+      updatedStartDate: "2026-01-02",
+      updatedEndDate: "2026-01-16",
+      plannedStartFrom: "2026-02-01",
+      plannedStartTo: "2026-02-28",
+      plannedEndFrom: "",
+      plannedEndTo: "2026-03-31",
+      anyOf: [
+        { conditions: [{ field: "state", values: ["new"] }] },
+        { conditions: [{ field: "impact", values: ["high"] }, { field: "tag", values: ["hotfix"] }] },
+      ],
     };
     const round = readChangeRequestFiltersFromUrl(
       writeChangeRequestFiltersToUrl(filters),

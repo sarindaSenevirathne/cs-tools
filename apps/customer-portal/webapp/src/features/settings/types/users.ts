@@ -25,6 +25,11 @@ export type UserDetails = {
   avatar?: string | null;
   roles?: string[];
   lastPasswordUpdateTime?: string;
+  // True only for an INTERNAL-type user (entity-service's own user_type) who
+  // holds none of the deployment-configured write groups on their own token.
+  // Always false for a genuine customer/partner -- see
+  // useCustomerPermissions, which is where this actually gates write UI.
+  isReadOnly?: boolean;
 };
 
 // Response type for contact validation.

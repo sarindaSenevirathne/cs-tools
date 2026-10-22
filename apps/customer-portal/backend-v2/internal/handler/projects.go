@@ -134,7 +134,8 @@ func (h *ProjectHandler) GetProject(w http.ResponseWriter, r *http.Request) {
 }
 
 // PatchProject handles PATCH /projects/{id}: the AI chat assistant (Novera)
-// settings for a project.
+// settings for a project. The route is gated on projects:update, which only
+// customer_admin holds.
 //
 // EXACTLY ONE FIELD PER REQUEST. entity-service rejects anything else, and the
 // Ballerina backend this replaces checked the same thing before calling it

@@ -50,9 +50,12 @@ type dashboardWidgetView struct {
 	GridWidth    int                      `json:"gridWidth"`
 	Query        map[string]any           `json:"query"`
 	GroupBy      *dashboard.GroupByConfig `json:"groupBy,omitempty"`
-	ListLimit    int                      `json:"listLimit,omitempty"`
-	Slices       []dashboardPieSliceView  `json:"slices,omitempty"`
-	Section      string                   `json:"section,omitempty"`
+	// DistinctBy is only meaningful for Shape "count" — see
+	// dashboard.WidgetTemplate.DistinctBy. Forwarded verbatim.
+	DistinctBy *dashboard.DistinctByConfig `json:"distinctBy,omitempty"`
+	ListLimit  int                         `json:"listLimit,omitempty"`
+	Slices     []dashboardPieSliceView     `json:"slices,omitempty"`
+	Section    string                      `json:"section,omitempty"`
 	// Columns and SortBy are only meaningful for Shape "list" — see
 	// dashboard.WidgetTemplate.Columns/SortBy. Forwarded verbatim: Columns
 	// is display config the BE never resolves, and SortBy is opaque search
@@ -259,6 +262,7 @@ func widgetViews(templates []dashboard.WidgetTemplate) []dashboardWidgetView {
 			GridWidth:       tpl.GridWidth,
 			Query:           tpl.Query,
 			GroupBy:         tpl.GroupBy,
+			DistinctBy:      tpl.DistinctBy,
 			ListLimit:       tpl.ListLimit,
 			Slices:          slices,
 			Section:         tpl.Section,

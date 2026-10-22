@@ -18,7 +18,7 @@
 
 import type { JSX } from "react";
 import type { PagingChainMember } from "../types";
-import { ADD_TO_PROFILE_HINT, phoneChipState } from "../utils/pagingPhone";
+import { ADD_TO_PROFILE_HINT, phoneChipState, profileTestState } from "../utils/pagingPhone";
 
 /** What a reader may do about a person's alert number; the tab owns it. */
 export interface PagingPhoneControls {
@@ -44,10 +44,13 @@ function PhoneIcon(): JSX.Element {
  * The number Case Alerts would call for one person, shown only when there is
  * something to act on ("No number", an alert number that failed its test,
  * ...): a number on the person's own profile is the normal case and shows
- * nothing. The colour only repeats the words, and only the masked number is
- * ever shown. A number is added on the person's profile, not here, so a
- * missing one says where to add it. A paging-only number set before that rule
- * can still be test-called or removed by a reader who may.
+ * nothing, except to a reader who may test it. The colour only repeats the
+ * words, and only the masked number is ever shown. A number is added on the
+ * person's profile, not here, so a missing one says where to add it. A
+ * paging-only number set before that rule can still be removed by a reader
+ * who may edit it. "Test call" -- for a portal or rota admin -- rings the
+ * number Case Alerts dials: the profile number when there is one, else the
+ * paging-only number.
  */
 export default function PhoneChip({
   member,
@@ -59,12 +62,15 @@ export default function PhoneChip({
   const st = phoneChipState(member);
   const name = member.name || member.email;
   const can = Boolean(controls) && member.canEditPhone === true;
-  const calling = can && controls ? controls.calling(member) : false;
+  const testCall = controls && member.canTestCall === true ? member.testCall ?? null : null;
+  const calling = testCall && controls ? controls.calling(member) : false;
   const onProfile = member.hasProfilePhone === true;
+  const removable = can && Boolean(member.pagingPhone);
+  const tested = profileTestState(testCall);
 
   // A number on the profile needs nothing said about it; only an older
-  // paging-only number's actions are still offered beside it.
-  if (onProfile && !(can && member.pagingPhone)) return null;
+  // paging-only number's actions, and a test call, are still offered beside it.
+  if (onProfile && !removable && !testCall) return null;
 
   return (
     <span className="cp-phone">
@@ -77,33 +83,43 @@ export default function PhoneChip({
           </span>
         </span>
       )}
+      {tested ? (
+        <span className={`cp-ph ${tested.tone}`} aria-live="polite">
+          <PhoneIcon />
+          <span>{tested.label}</span>
+        </span>
+      ) : null}
       {!member.pagingPhone && member.hasProfilePhone === false ? (
         <span className="cp-fixnote">{ADD_TO_PROFILE_HINT}</span>
       ) : null}
-      {can && controls && member.pagingPhone ? (
+      {controls && (removable || testCall) ? (
         <span className="cp-phact">
-          {member.pagingPhone ? (
-            <>
-              <button
-                type="button"
-                className="btn ghost sm"
-                aria-label={`Remove ${name}'s alert number`}
-                onClick={() => controls.remove(member)}
-              >
-                Remove
-              </button>
-              <button
-                type="button"
-                className="btn ghost sm"
-                aria-label={calling ? `${CALLING_LABEL} (${name})` : `Test call ${name}'s alert number`}
-                aria-disabled={calling || undefined}
-                onClick={() => {
-                  if (!calling) controls.test(member);
-                }}
-              >
-                {calling ? CALLING_LABEL : "Test call"}
-              </button>
-            </>
+          {removable ? (
+            <button
+              type="button"
+              className="btn ghost sm"
+              aria-label={`Remove ${name}'s alert number`}
+              onClick={() => controls.remove(member)}
+            >
+              Remove
+            </button>
+          ) : null}
+          {testCall ? (
+            <button
+              type="button"
+              className="btn ghost sm"
+              aria-label={
+                calling
+                  ? `${CALLING_LABEL} (${name})`
+                  : `Test call ${name}'s ${testCall.source === "profile" ? "profile" : "alert"} number ${testCall.masked}`
+              }
+              aria-disabled={calling || undefined}
+              onClick={() => {
+                if (!calling) controls.test(member);
+              }}
+            >
+              {calling ? CALLING_LABEL : "Test call"}
+            </button>
           ) : null}
         </span>
       ) : null}

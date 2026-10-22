@@ -1148,12 +1148,12 @@ func TestChangeRequestLinkHelpers(t *testing.T) {
 	if firstOrNil(nil) != nil || *firstOrNil([]string{"x", "y"}) != "x" {
 		t.Error("firstOrNil")
 	}
-	for _, locked := range []string{"IMPLEMENT", "REVIEW", "CUSTOMER_REVIEW", "ROLLBACK", "CLOSED", "CANCELED"} {
+	for _, locked := range []string{"CUSTOMER_APPROVAL", "SCHEDULED", "IMPLEMENT", "REVIEW", "CUSTOMER_REVIEW", "ROLLBACK", "CLOSED", "CANCELED"} {
 		if !changeRequestLinksLockedStates[locked] {
 			t.Errorf("%s should close the edit window", locked)
 		}
 	}
-	for _, open := range []string{"NEW", "ASSESS", "AUTHORIZE", "CUSTOMER_APPROVAL", "SCHEDULED"} {
+	for _, open := range []string{"NEW", "ASSESS", "AUTHORIZE"} {
 		if changeRequestLinksLockedStates[open] {
 			t.Errorf("%s should be inside the edit window", open)
 		}

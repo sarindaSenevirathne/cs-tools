@@ -46,6 +46,11 @@ export interface Account {
   tier?: AccountTier;
   supportTier?: string | SupportTierRef | null;
   region?: string | null;
+  // The account's country (account.country), shown beside Region on the
+  // detail view — support uses it to pick a meeting time when a customer
+  // gives no time zone. Sent by entity-service on both the search and detail
+  // responses; null when the account has none on record.
+  country?: string | null;
   activationDate: string;
   deactivationDate?: string | null;
   // Postgres-backed accounts carry `ownerId`/`technicalOwnerId` as bare id

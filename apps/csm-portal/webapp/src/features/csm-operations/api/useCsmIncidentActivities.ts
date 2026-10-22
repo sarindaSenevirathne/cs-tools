@@ -24,6 +24,7 @@ import type {
   BeCaseActivityEntry,
 } from "@api/backend/types";
 import type { CaseAuditEntry } from "@features/csm-cases/types/csmCases";
+import { groupIncidentActivity } from "@features/csm-operations/utils/incidentActivity";
 
 /** Page size per request. Capped by the BE; see BE_MAX_PAGE_LIMIT. */
 const ACTIVITIES_PAGE_LIMIT = BE_MAX_PAGE_LIMIT;
@@ -74,9 +75,10 @@ export function useGetCsmIncidentActivities(
         allEntries.push(...rows);
         if (rows.length < ACTIVITIES_PAGE_LIMIT || !response.hasMore) break;
       }
-      return allEntries
-        .filter((a) => a.type === "field_change")
-        .map(auditEntryFromBeActivity);
+      // One feed entry per save, impact/urgency under the priority they moved.
+      return groupIncidentActivity(
+        allEntries.filter((a) => a.type === "field_change").map(auditEntryFromBeActivity),
+      );
     },
     enabled: !!incidentId,
     staleTime: 10_000,

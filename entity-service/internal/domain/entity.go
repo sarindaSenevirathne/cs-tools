@@ -779,6 +779,9 @@ const (
 	// sync's, which share the same table but never carry this value. See
 	// internal/service/sla_policy_resolver.go.
 	SLAEngineActor = "sla-engine"
+	// ProductVulnerabilitySyncActor is created_by/updated_by for every
+	// product_vulnerability row the full-replace sync writes.
+	ProductVulnerabilitySyncActor = "product-vulnerability-sync"
 )
 
 // SalesforceEntityLinkedOpportunity is the Linked_Opportunity__c custom
@@ -1529,6 +1532,17 @@ type ProjectUpdateRequest struct {
 	// and tolerant of spaces (normalized the same way the three sub-state
 	// fields above already are).
 	ClosureState *string `json:"closureState,omitempty"`
+	// OnboardingStatus sets the project's onboarding status (Postgres data
+	// sources only; rejected on the ServiceNow data source). Accepts the labels
+	// reads return ("Not-Started", "In-Progress", "On-Hold", "Completed",
+	// "Cancelled", "Expired", "Not-Applicable"), ignoring case, hyphens,
+	// underscores and spaces.
+	OnboardingStatus *string `json:"onboardingStatus,omitempty"`
+	// OnboardingOwner sets the project's onboarding owner to this user id
+	// (Postgres data sources only; rejected on the ServiceNow data source).
+	// Must be an active internal user. Clearing the owner is not supported:
+	// null and omitted both leave it unchanged.
+	OnboardingOwner *string `json:"onboardingOwner,omitempty"`
 }
 
 // ProjectUpdateResponse is the result of a project update operation
@@ -1550,6 +1564,10 @@ type ProjectUpdateResult struct {
 	ComplianceViolationClosureState *string         `json:"complianceViolationClosureState"`
 	SuspensionProcessState          json.RawMessage `json:"suspensionProcessState"`
 	VerificationEnabled             *bool           `json:"verificationEnabled,omitempty"`
+	// OnboardingStatus and OnboardingOwner are populated on Postgres data
+	// sources only.
+	OnboardingStatus *string    `json:"onboardingStatus,omitempty"`
+	OnboardingOwner  *PersonRef `json:"onboardingOwner,omitempty"`
 }
 
 // ProjectConsumptionStatus represents the product consumption state and keys for a project.
@@ -2346,6 +2364,31 @@ type DeployedProductView struct {
 	Updates   []ProductUpdateEntry `json:"updates"`
 	CreatedOn time.Time            `json:"createdOn"`
 	UpdatedOn time.Time            `json:"updatedOn"`
+	// DeploymentType is the type of the deployment this deployed product belongs
+	// to, nil when the deployment has none or the data source does not say. It
+	// is not a field of its own on the wire: MarshalJSON nests it in "deployment".
+	DeploymentType *DeploymentType `json:"-"`
+}
+
+// MarshalJSON writes the deployment as {id, name, type}: EntityRef alone has no
+// room for the deployment type, and widening that shared type would touch every
+// endpoint that uses it. type is null when DeploymentType is nil.
+func (v DeployedProductView) MarshalJSON() ([]byte, error) {
+	type plain DeployedProductView // no MarshalJSON, so this does not recurse
+	return json.Marshal(struct {
+		plain
+		// Deployment shadows plain.Deployment (same JSON name, shallower depth).
+		Deployment struct {
+			EntityRef
+			Type *DeploymentType `json:"type"`
+		} `json:"deployment"`
+	}{
+		plain: plain(v),
+		Deployment: struct {
+			EntityRef
+			Type *DeploymentType `json:"type"`
+		}{EntityRef: v.Deployment, Type: v.DeploymentType},
+	})
 }
 
 // ProductRef is a reference to a product, carrying the short key ServiceNow
@@ -4548,6 +4591,10 @@ type ChangeRequestSortField string
 const (
 	ChangeRequestSortFieldCreatedOn ChangeRequestSortField = "createdOn"
 	ChangeRequestSortFieldUpdatedOn ChangeRequestSortField = "updatedOn"
+	// PostgreSQL only: the planned window. A change request with no planned
+	// date sorts last in either direction.
+	ChangeRequestSortFieldPlannedStartOn ChangeRequestSortField = "plannedStartOn"
+	ChangeRequestSortFieldPlannedEndOn   ChangeRequestSortField = "plannedEndOn"
 )
 
 // ChangeRequestSortOrder controls the sort direction.
@@ -4600,8 +4647,60 @@ type SearchChangeRequestsFilters struct {
 	//     "rejected". Distinct from approvedBy/approvedOn on
 	//     ChangeRequestDetail, which are derived from a narrower
 	//     Customer-Approval-stage record, not this CR-wide field.
+	//   - "tag" (op in / notIn): tag names, matched case-insensitively; in =
+	//     carries any of them, notIn = carries none. PostgreSQL only, internal
+	//     callers only.
+	//   - "updatedOn" / "plannedStartOn" / "plannedEndOn" (op gte/lte): same
+	//     value syntax as "createdOn", on the last update / planned start /
+	//     planned end. PostgreSQL only.
+	//   - "type" (op in): change types (standard, normal, emergency, ...).
+	//     PostgreSQL only.
 	// See service.ParseChangeRequestFieldFilters.
 	Filters []ChangeRequestFieldFilter `json:"filters,omitempty"`
+
+	// Tags / ExcludeTags are the parsed "tag" filter, set by the service from
+	// Filters before the repository runs. Never read from the wire.
+	Tags        []string `json:"-"`
+	ExcludeTags []string `json:"-"`
+	// The other list filters the PostgreSQL search applies from Filters, set by
+	// the service the same way. Never read from the wire.
+	AssignmentGroupIDs               []string            `json:"-"`
+	AssignedUserIDs                  []string            `json:"-"`
+	UpdatedStart, UpdatedEnd         *time.Time          `json:"-"`
+	PlannedStartFrom, PlannedStartTo *time.Time          `json:"-"`
+	PlannedEndFrom, PlannedEndTo     *time.Time          `json:"-"`
+	Types                            []ChangeRequestType `json:"-"`
+
+	// AnyOf expresses cross-field OR, as on case search: each branch's Filters
+	// are ANDed, the branches are OR'd, and the result is ANDed with everything
+	// else. Branch fields (op in only): state, impact, projectId, type,
+	// assignmentGroupId, assignedUserId, tag (tag: internal callers only).
+	// PostgreSQL only.
+	AnyOf []ChangeRequestFilterBranch `json:"anyOf,omitempty"`
+	// OrGroups is AnyOf parsed by the PostgreSQL service. Never read from the wire.
+	OrGroups []ChangeRequestFilterGroup `json:"-"`
+}
+
+// ChangeRequestFilterBranch is one branch of SearchChangeRequestsFilters.AnyOf.
+type ChangeRequestFilterBranch struct {
+	Filters []ChangeRequestFieldFilter `json:"filters"`
+}
+
+// ChangeRequestFilterGroup is one parsed, ANDed branch of
+// SearchChangeRequestsFilters.AnyOf (enum values already in their column form).
+type ChangeRequestFilterGroup struct {
+	States, Impacts, ProjectIDs, ChangeModels, AssignmentGroupIDs, AssignedUserIDs, Tags []string
+}
+
+// IncidentFilterBranch is one branch of SearchIncidentsFilters.AnyOf.
+type IncidentFilterBranch struct {
+	Filters []IncidentFieldFilter `json:"filters"`
+}
+
+// IncidentFilterGroup is one parsed, ANDed branch of SearchIncidentsFilters.AnyOf
+// (enum values already in their column form).
+type IncidentFilterGroup struct {
+	States, Priorities, Categories, ServiceIDs, AssignmentGroupIDs, AssignedUserIDs []string
 }
 
 // SearchChangeRequestsRequest is the input for a change request search operation.
@@ -5008,9 +5107,9 @@ type PatchChangeRequestRequest struct {
 	// change touches (an explicitly empty array clears it, and with it the
 	// deployment products that follow from it). Together
 	// with ProjectID and DeploymentProductIDs it is editable
-	// only before implementation starts: once the change request has reached
-	// implement (or any later state) a change is refused with a
-	// ValidationError, while resending the stored value is accepted. The
+	// only until the change request is approved: once it has reached
+	// customer_approval or scheduled (or any later state) a change is refused
+	// with a ValidationError, while resending the stored value is accepted. The
 	// relationship rules are those of CreateChangeRequestRequest.ProjectID.
 	// Changing ProjectID while deployments are stored requires DeploymentIDs
 	// in the same request. Cannot be combined with the single DeploymentID /
@@ -5588,8 +5687,9 @@ type SearchProductVulnerabilitiesResponse struct {
 }
 
 // ProductVulnerabilitySyncItem is one entry submitted to a full-replace sync of product
-// vulnerabilities. WSO2ID is the join key the downstream data source uses to match this item
-// against an existing record.
+// vulnerabilities. WSO2ID is the join key used to match this item against an existing
+// record (the business_key column). ScannerName is accepted for wire compatibility but has
+// no column in product_vulnerability and is not stored by the Postgres data source.
 type ProductVulnerabilitySyncItem struct {
 	WSO2ID                 string `json:"wso2Id"`
 	ComponentName          string `json:"componentName"`
@@ -5903,11 +6003,16 @@ type SearchITServicesResponse struct {
 }
 
 // CreateCallRequestRequest is the input for POST /call-requests.
+// State is optional. A nil state means the field was omitted, so the request
+// starts pending_on_wso2 (the customer raised it). A supplied value, including
+// an empty string, is validated: only pending_on_customer is accepted, which
+// is what the CSM portal sends when an agent raises the request.
 type CreateCallRequestRequest struct {
-	CaseID          string   `json:"caseId"`
-	Reason          string   `json:"reason"`
-	UTCTimes        []string `json:"utcTimes"`
-	DurationMinutes int      `json:"durationInMinutes"`
+	CaseID          string                `json:"caseId"`
+	Reason          string                `json:"reason"`
+	UTCTimes        []string              `json:"utcTimes"`
+	DurationMinutes int                   `json:"durationInMinutes"`
+	State           *CallRequestStateType `json:"state,omitempty"`
 }
 
 // CreateCallRequestResponse is the output for POST /call-requests.
@@ -6357,6 +6462,10 @@ type SearchIncidentsFilters struct {
 	//     ServiceNow's raw incident_state numeric keys.
 	//   - "assignmentGroupId" (op in): sys_user_group UUIDs.
 	//   - "businessServiceId" (op in): business_service sys_id UUIDs.
+	//   - "category" (op in): incident category labels (e.g. "SOFTWARE"),
+	//     case-insensitive. PostgreSQL only.
+	//   - "updatedOn" (op gte/lte): same syntax as "createdOn", on the
+	//     incident's last update. PostgreSQL only.
 	//   - "createdOn" (op gte/lte): RFC3339 timestamp, YYYY-MM-DD date, or a
 	//     relative-date placeholder (e.g. "__daysAgo:90__"), same syntax as
 	//     case search's own "createdOn" filter.
@@ -6382,8 +6491,40 @@ type SearchIncidentsFilters struct {
 	//     column, so the keys (1 New, 2 In Progress, 3 On Hold, 6 Resolved,
 	//     7 Closed, 8 Canceled) are applied to `state`, ANDed with any "state"
 	//     filter; a key with no state is a 400.
+	//   - "slaBreached" (op eq): a single boolean value; identical in meaning
+	//     to "slaViolated" (restricts to incidents with, or without, a
+	//     currently-breached SLA record) under the name every work-item type
+	//     shares. Supplying both with different values is a 400.
+	//   - "taskSLABusinessElapsedPercent" (op gte/lte): a non-negative
+	//     integer; restricts to incidents having an SLA record whose
+	//     business-elapsed percentage is within the bound(s) (both bounds
+	//     apply to the same SLA record). Uncapped above. Not supported by the
+	//     ServiceNow-backed incident service: rejected with a 400 there, and
+	//     therefore also when SLA_DATA_SOURCE routes the search to it.
 	// See service.ParseIncidentFieldFilters.
 	Filters []IncidentFieldFilter `json:"filters,omitempty"`
+	// ParsedTaskSLA is populated by the service layer from the
+	// "taskSLABusinessElapsedPercent" filter before the request reaches the
+	// Postgres repository; it carries no wire representation of its own.
+	ParsedTaskSLA *TaskSLAFilter `json:"-"`
+
+	// AssignmentGroupIDs / Categories / UpdatedStart / UpdatedEnd are the parsed
+	// "assignmentGroupId", "category" and "updatedOn" filters, set by the
+	// Postgres incident service from Filters before the repository runs. Never
+	// read from the wire.
+	AssignmentGroupIDs []string   `json:"-"`
+	Categories         []string   `json:"-"`
+	UpdatedStart       *time.Time `json:"-"`
+	UpdatedEnd         *time.Time `json:"-"`
+
+	// AnyOf expresses cross-field OR, as on case search: each branch's Filters
+	// are ANDed, the branches are OR'd, and the result is ANDed with everything
+	// else. Branch fields (op in only): state, priority, category,
+	// businessServiceId, assignmentGroupId, assignedUserId. PostgreSQL only.
+	AnyOf []IncidentFilterBranch `json:"anyOf,omitempty"`
+	// OrGroups is AnyOf parsed by the PostgreSQL incident service. Never read
+	// from the wire.
+	OrGroups []IncidentFilterGroup `json:"-"`
 }
 
 // SearchIncidentsRequest is the input for POST /incidents/search.
@@ -6593,13 +6734,11 @@ type CreateIncidentRequest struct {
 	WatchList          []string `json:"watchList,omitempty"`
 	AdditionalComments *string  `json:"additionalComments,omitempty"`
 	WorkNotes          *string  `json:"workNotes,omitempty"`
-	// RunbookWorkNote is set by the service from the runbook catalog and written as a work note of its own, after WorkNotes; never read from the request body.
-	RunbookWorkNote  *string `json:"-"`
-	ParentID         *string `json:"parentId,omitempty"`
-	ParentIncidentID *string `json:"parentIncidentId,omitempty"`
-	ChangeRequestID  *string `json:"changeRequestId,omitempty"`
-	ProblemID        *string `json:"problemId,omitempty"`
-	CausedByID       *string `json:"causedById,omitempty"`
+	ParentID           *string  `json:"parentId,omitempty"`
+	ParentIncidentID   *string  `json:"parentIncidentId,omitempty"`
+	ChangeRequestID    *string  `json:"changeRequestId,omitempty"`
+	ProblemID          *string  `json:"problemId,omitempty"`
+	CausedByID         *string  `json:"causedById,omitempty"`
 	// CorrelationID is an optional caller-supplied external-system key, stored
 	// on ServiceNow's stock `correlation_id` field. Lets a monitoring
 	// integration find an incident it already created (SearchIncidentsFilters.
@@ -7756,6 +7895,19 @@ type GlobalSearchResponse struct {
 // VulnerabilityMetaResponse is the response for GET /products/vulnerabilities/meta.
 type VulnerabilityMetaResponse struct {
 	Severities []ChoiceListItem `json:"severities"`
+	// Products lists every distinct product name found in the vulnerability
+	// data, each with its distinct versions, both sorted ascending. The values
+	// are the exact strings the search filters match on, so any option is
+	// guaranteed to be selectable. Always a JSON array, empty when the backing
+	// data source has no such query.
+	Products []VulnerabilityProductOption `json:"products"`
+}
+
+// VulnerabilityProductOption is one product name with the distinct versions
+// the vulnerability data carries for it.
+type VulnerabilityProductOption struct {
+	Name     string   `json:"name"`
+	Versions []string `json:"versions"`
 }
 
 // --- case feedback (ServiceNow data source only) ---

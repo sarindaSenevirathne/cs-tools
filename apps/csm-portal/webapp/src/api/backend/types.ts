@@ -3384,6 +3384,29 @@ export interface BeConfigurationItemSearchResponse {
  * UI starts sending it, after checking it against the published contract.
  */
 export interface BePatchChangeRequestPayload {
+  /** The subject. */
+  title?: string;
+  /** Rich-text description; `""` clears it. */
+  description?: string;
+  /** Rich-text justification; `""` clears it. */
+  justification?: string;
+  /** Rich-text "Risk and impact analysis" (read back as `impactDescription`); `""` clears it. */
+  impactDescription?: string;
+  impact?: BeChangeRequestImpact;
+  priority?: BeChangeRequestPriority;
+  /**
+   * The change type. It decides the approval flow, so the backend accepts a
+   * change only while the change request is New (a resend of the stored type is
+   * accepted in every state). Re-typing into `emergency` must turn both customer
+   * boxes off in the same request.
+   */
+  type?: BeChangeRequestType;
+  /**
+   * An internal work note, appended to the journal (never blank). The one thing
+   * that can still be added once the change request has been approved: every
+   * field is read-only then (400 `change_request_approved_read_only`).
+   */
+  workNote?: string;
   plannedStartOn?: string;
   plannedEndOn?: string;
   assignedTeamId?: string;
@@ -3494,12 +3517,21 @@ export interface BePatchChangeRequestResponse {
 export type BeChangeRequestFieldFilterField =
   | "createdOn"
   | "assignmentGroupId"
-  | "approval";
+  | "approval"
+  | "assignedUserId"
+  /** Tag names, `in` (carries any) or `notIn` (carries none); staff only. */
+  | "tag"
+  /** PostgreSQL only, `gte`/`lte`. */
+  | "updatedOn"
+  | "plannedStartOn"
+  | "plannedEndOn"
+  /** PostgreSQL only, `in`: change types (standard, normal, ...). */
+  | "type";
 
 /** `op` enum accepted by a change-request search's generic `filters` array
  * — mirrors `changeRequestFilterOpSet` in `change_request_filters.go`.
  * Field/op compatibility is enforced only on the backend. */
-export type BeChangeRequestFieldFilterOp = "gte" | "lte" | "in" | "eq";
+export type BeChangeRequestFieldFilterOp = "gte" | "lte" | "in" | "eq" | "notIn";
 
 /** One entry in a change-request search's generic `filters` array. */
 export interface BeChangeRequestFieldFilter {
@@ -3529,9 +3561,12 @@ export interface BeChangeRequestSearchPayload {
      * populates this today.
      */
     filters?: BeChangeRequestFieldFilter[];
+    /** OR groups (PostgreSQL only): each branch's filters ANDed, branches OR'd. */
+    anyOf?: Array<{ filters: Array<{ field: string; op: "in"; values: string[] }> }>;
   };
   sortBy?: {
-    field?: "createdOn" | "updatedOn";
+    /** `plannedStartOn` / `plannedEndOn`: PostgreSQL only. */
+    field?: "createdOn" | "updatedOn" | "plannedStartOn" | "plannedEndOn";
     order?: "asc" | "desc";
   };
   pagination?: BePagination;
@@ -3806,6 +3841,8 @@ export interface BeUpdateIncidentPayload {
   problemId?: string | null;
   causedById?: string | null;
   environment?: string | null;
+  /** The incident report (HTML); replaces what is stored. Write-only: the detail does not read it back. */
+  incidentReport?: string;
 }
 
 /** `PATCH /incidents/{id}` response — the full updated incident. */
@@ -3817,10 +3854,8 @@ export interface BePatchIncidentResponse {
 /**
  * `field` enum accepted by an incident search's generic `filters` array —
  * mirrors the entity-service's `incidentFilterFieldSet` (see
- * `incident_filters.go`) exactly. This portal currently builds controls for
- * `assignmentGroupId` (SRE Team), `slaViolated`, `createdOn`, and
- * `productName` — the remaining values (`state`, `businessServiceId`,
- * `madeSla`) are included for completeness/future controls, not dead code.
+ * `incident_filters.go`) exactly. The Incidents filter bar builds controls for
+ * all of them except `madeSla`.
  */
 export type BeIncidentFieldFilterField =
   | "state"
@@ -3829,7 +3864,12 @@ export type BeIncidentFieldFilterField =
   | "createdOn"
   | "slaViolated"
   | "madeSla"
-  | "productName";
+  | "productName"
+  | "assignedUserId"
+  /** PostgreSQL only: incident category labels, `in`. */
+  | "category"
+  /** PostgreSQL only: last update, `gte`/`lte`. */
+  | "updatedOn";
 
 /**
  * `op` enum accepted by an incident search's generic `filters` array,
@@ -3871,6 +3911,8 @@ export interface BeIncidentSearchPayload {
      * above remain flat — only those four.
      */
     filters?: BeIncidentFieldFilter[];
+    /** OR groups (PostgreSQL only): each branch's filters ANDed, branches OR'd. */
+    anyOf?: Array<{ filters: Array<{ field: string; op: "in"; values: string[] }> }>;
   };
   sortBy?: {
     field?: "createdOn" | "updatedOn" | "openedOn";
@@ -4547,6 +4589,20 @@ export type BeCaseFeedbackBucket =
   | "reasons_satisfied"
   | "reasons_very_satisfied";
 
+/** Only for shape "count" on resourceType "case": show the number of distinct
+ * values of `field` among the widget's matching records instead of the record
+ * total. Resolved by `useWidgetData` via one `POST /cases/aggregate` call whose
+ * returned group count is the displayed number. Mutually exclusive with
+ * `groupBy`/`slices` (backend-enforced at config-load time). */
+export interface BeDashboardDistinctByConfig {
+  /** What to count distinct values of (`account`, `state`, `severity` or
+   * `type`) — forwarded as the aggregate request's `groupBy`. */
+  field: string;
+  /** Forwarded as the aggregate request's `maxGroups`. Always present on a
+   * dashboard response (the backend fills in its default at load time). */
+  maxGroups: number;
+}
+
 /** Alternative to {@link BeDashboardPieSlice}[] for shapes "pie"/"bar":
  * one server-side `POST /{resourceType}/aggregate` call instead of one
  * `search` per hand-authored slice. Mutually exclusive with `slices` —
@@ -4754,6 +4810,10 @@ export interface BeDashboardWidget {
    * slice. Mutually exclusive with `slices` — the backend enforces
    * exactly one of the two for those shapes (never both, never neither). */
   groupBy?: BeDashboardGroupByConfig;
+  /** Only meaningful for shape "count" (resourceType "case"): the widget
+   * shows the number of distinct values of `distinctBy.field` instead of the
+   * record total. Absent when unset — see {@link BeDashboardDistinctByConfig}. */
+  distinctBy?: BeDashboardDistinctByConfig;
   /** Only meaningful for shapes "pie"/"bar": one search per slice, each
    * read via its own `total`. Mutually exclusive with `groupBy`. */
   slices?: BeDashboardPieSlice[];

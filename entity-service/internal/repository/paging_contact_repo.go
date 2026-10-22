@@ -50,21 +50,32 @@ type PagingContactRepository interface {
 	// number on their own profile ("user".phone) and their stored paging-only
 	// number. A user with neither is left out.
 	DialNumbersByEmails(ctx context.Context, emails []string) ([]PagingDialRow, error)
-	// ProfilePhoneUserIDs is which of the given users have a callable number
-	// on their own profile ("user".phone matching CallablePhonePattern).
-	ProfilePhoneUserIDs(ctx context.Context, userIDs []string) (map[string]bool, error)
+	// ProfilePhones is the callable number on each of the given users' own
+	// profile ("user".phone, trimmed, matching CallablePhonePattern), by user
+	// id. A user without one has no entry.
+	ProfilePhones(ctx context.Context, userIDs []string) (map[string]string, error)
+	// ProfileTests is the last test call of each of the given users' profile
+	// number (paging_test_call, migration 0242), by user id.
+	ProfileTests(ctx context.Context, userIDs []string) (map[string]PagingTestRow, error)
 
 	// Upsert stores phone for the user. Changing the number clears the last
 	// test, which was of another number; restating it keeps it.
 	Upsert(ctx context.Context, actor, userID, phone string) (PagingContactRow, error)
 	// Delete removes the user's number; a no-op when there is none.
 	Delete(ctx context.Context, actor, userID string) error
-	// MarkTestPending records a test call as requested at at, only when the
-	// last one was at or before notBefore (or there was none). False means a test
-	// was requested since, or the number is gone.
+	// MarkTestPending records a test call of the paging-only number as
+	// requested at at, only when no test of the person's (of either number)
+	// was requested after notBefore. False means a test was requested since,
+	// or the number is gone.
 	MarkTestPending(ctx context.Context, actor, userID string, at, notBefore time.Time) (PagingContactRow, bool, error)
-	// RecordTestResult stores a test call's outcome. False when the user has
-	// no number any more.
+	// MarkProfileTestPending records a test call of phone, the person's
+	// profile number, as requested at at, with the same cooldown rule as
+	// MarkTestPending. False means a test was requested since.
+	MarkProfileTestPending(ctx context.Context, actor, userID, phone string, at, notBefore time.Time) (bool, error)
+	// RecordTestResult stores a test call's outcome: on the pending test of
+	// the profile number when that is the newest pending test, else on the
+	// pending test of the paging-only number. False when neither is pending
+	// (a late or repeated result is not recorded).
 	RecordTestResult(ctx context.Context, actor, userID, status string, testedAt time.Time) (bool, error)
 }
 
@@ -93,6 +104,15 @@ type PagingDialRow struct {
 	Email        string
 	ProfilePhone string
 	Paging       *PagingContactRow
+}
+
+// PagingTestRow is the last test call of a person's profile number
+// (paging_test_call). Phone is the number that was rung.
+type PagingTestRow struct {
+	UserID         string
+	Phone          string
+	LastTestAt     time.Time
+	LastTestStatus string
 }
 
 // PagingContactRow is one paging_contact row, with the user's email.
@@ -252,24 +272,46 @@ func (r *pagingContactRepository) DialNumbersByEmails(ctx context.Context, email
 	return out, rows.Err()
 }
 
-func (r *pagingContactRepository) ProfilePhoneUserIDs(ctx context.Context, userIDs []string) (map[string]bool, error) {
-	out := map[string]bool{}
+func (r *pagingContactRepository) ProfilePhones(ctx context.Context, userIDs []string) (map[string]string, error) {
+	out := map[string]string{}
 	if len(userIDs) == 0 {
 		return out, nil
 	}
 	rows, err := r.db.Query(ctx, `
-		SELECT id::text FROM "user"
+		SELECT id::text, btrim(phone) FROM "user"
 		 WHERE id = ANY($1::uuid[]) AND btrim(phone) ~ $2`, userIDs, CallablePhonePattern)
 	if err != nil {
 		return nil, fmt.Errorf("query profile phones: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var id, phone string
+		if err := rows.Scan(&id, &phone); err != nil {
 			return nil, fmt.Errorf("scan profile phone: %w", err)
 		}
-		out[id] = true
+		out[id] = phone
+	}
+	return out, rows.Err()
+}
+
+func (r *pagingContactRepository) ProfileTests(ctx context.Context, userIDs []string) (map[string]PagingTestRow, error) {
+	out := map[string]PagingTestRow{}
+	if len(userIDs) == 0 {
+		return out, nil
+	}
+	rows, err := r.db.Query(ctx, `
+		SELECT user_id::text, phone, last_test_on, last_test_status
+		  FROM paging_test_call WHERE user_id = ANY($1::uuid[])`, userIDs)
+	if err != nil {
+		return nil, fmt.Errorf("query profile test calls: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var t PagingTestRow
+		if err := rows.Scan(&t.UserID, &t.Phone, &t.LastTestAt, &t.LastTestStatus); err != nil {
+			return nil, fmt.Errorf("scan profile test call: %w", err)
+		}
+		out[t.UserID] = t
 	}
 	return out, rows.Err()
 }
@@ -336,7 +378,9 @@ func (r *pagingContactRepository) MarkTestPending(ctx context.Context, actor, us
 			UPDATE paging_contact
 			   SET last_test_status = 'pending', last_test_at = $3
 			 WHERE user_id = $1::uuid
-			   AND (last_test_at IS NULL OR last_test_at <= $2)`, userID, notBefore, at)
+			   AND (last_test_at IS NULL OR last_test_at <= $2)
+			   AND NOT EXISTS (SELECT 1 FROM paging_test_call t
+			                    WHERE t.user_id = $1::uuid AND t.last_test_on > $2)`, userID, notBefore, at)
 		if err != nil {
 			return fmt.Errorf("mark paging test pending: %w", err)
 		}
@@ -354,12 +398,53 @@ func (r *pagingContactRepository) MarkTestPending(ctx context.Context, actor, us
 	return c, marked, err
 }
 
+func (r *pagingContactRepository) MarkProfileTestPending(ctx context.Context, actor, userID, phone string, at, notBefore time.Time) (bool, error) {
+	marked := false
+	err := r.inTx(ctx, actor, func(tx pgx.Tx) error {
+		// One statement decides, so two requests at once cannot both pass
+		// the cooldown; a pending test of the paging-only number counts too.
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO paging_test_call AS t (user_id, phone, requested_by, last_test_on, last_test_status)
+			SELECT $1::uuid, $2::text, $3::text, $4::timestamptz, 'pending'
+			 WHERE NOT EXISTS (SELECT 1 FROM paging_contact pc
+			                    WHERE pc.user_id = $1::uuid AND pc.last_test_at > $5)
+			ON CONFLICT (user_id) DO UPDATE
+			   SET phone = EXCLUDED.phone, requested_by = EXCLUDED.requested_by,
+			       last_test_on = EXCLUDED.last_test_on, last_test_status = 'pending'
+			 WHERE t.last_test_on <= $5`, userID, phone, actor, at, notBefore)
+		if err != nil {
+			return fmt.Errorf("mark profile test pending: %w", err)
+		}
+		marked = tag.RowsAffected() > 0
+		return nil
+	})
+	return marked, err
+}
+
 func (r *pagingContactRepository) RecordTestResult(ctx context.Context, actor, userID, status string, testedAt time.Time) (bool, error) {
 	found := false
 	err := r.inTx(ctx, actor, func(tx pgx.Tx) error {
+		// The result is of the newest pending test: the profile number's when
+		// no pending test of the paging-only number is newer.
 		tag, err := tx.Exec(ctx, `
+			UPDATE paging_test_call t SET last_test_status = $2, last_test_on = $3
+			 WHERE t.user_id = $1::uuid AND t.last_test_status = 'pending'
+			   AND NOT EXISTS (SELECT 1 FROM paging_contact pc
+			                    WHERE pc.user_id = $1::uuid AND pc.last_test_status = 'pending'
+			                      AND pc.last_test_at > t.last_test_on)`, userID, status, testedAt)
+		if err != nil {
+			return fmt.Errorf("record profile test result: %w", err)
+		}
+		if tag.RowsAffected() > 0 {
+			found = true
+			return nil
+		}
+		// Only a pending test: a late or repeated result -- of a profile
+		// test already settled, or of this number's own -- must not
+		// overwrite the paging-only number's last result.
+		tag, err = tx.Exec(ctx, `
 			UPDATE paging_contact SET last_test_status = $2, last_test_at = $3
-			 WHERE user_id = $1::uuid`, userID, status, testedAt)
+			 WHERE user_id = $1::uuid AND last_test_status = 'pending'`, userID, status, testedAt)
 		if err != nil {
 			return fmt.Errorf("record paging test result: %w", err)
 		}

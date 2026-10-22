@@ -197,3 +197,31 @@ func TestNoIncidentSpace_SwitchesStillApply(t *testing.T) {
 		t.Errorf("handoffs = %+v; want none with sre.smeHandoffChat off", chat.handoffs)
 	}
 }
+
+// With the shared SRE room registered (the Alert Settings mapping, sre.chat),
+// an incident whose group maps to no team room replies under its card there,
+// the room the dispatcher posted the card to; a customer case still keeps the
+// ladder's own space.
+func TestIncidentRung_AnUnmappedGroupRepliesInTheSharedSRERoom(t *testing.T) {
+	chat := &fakeChat{sharedSRERoom: true, noRoom: map[string]bool{notifications.IncidentAudience("Unmapped Group"): true}}
+	deliverFirstRung(t, incidentSpaceEngine(chat), Trigger{IncidentID: "inc-3", Record: RecordIncident, Team: "Unmapped Group", At: time.Now()})
+	if len(chat.posted) != 1 || chat.posted[0].Audience != notifications.IncidentFallbackAudience || !chat.posted[0].Reply {
+		t.Fatalf("posted %+v; want one reply in the shared SRE room", chat.posted)
+	}
+
+	chat = &fakeChat{sharedSRERoom: true}
+	deliverFirstRung(t, incidentSpaceEngine(chat), Trigger{IncidentID: "case-2", Record: RecordCase, Team: "Unmapped Group", At: time.Now()})
+	if len(chat.posted) != 1 || chat.posted[0].Audience != "SRE Case Paging" || chat.posted[0].Reply {
+		t.Fatalf("case posted %+v; want the ladder's own full card", chat.posted)
+	}
+}
+
+// The CRE ladder never falls back to the SRE ladder's shared room.
+func TestIncidentRung_TheCRELadderDoesNotUseTheSharedSRERoom(t *testing.T) {
+	chat := &fakeChat{sharedSRERoom: true, noRoom: map[string]bool{notifications.IncidentAudience("Unmapped Group"): true}}
+	e := incidentSpaceEngine(chat)
+	e.cfg.Kind = LadderCRE
+	if rooms := e.incidentRooms(Trigger{IncidentID: "inc-4", Record: RecordIncident, Team: "Unmapped Group"}); len(rooms) != 0 {
+		t.Fatalf("rooms = %+v; want none", rooms)
+	}
+}

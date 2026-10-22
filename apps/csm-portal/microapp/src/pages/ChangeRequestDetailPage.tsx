@@ -30,6 +30,7 @@ import {
 } from "@components/operations/config";
 import { EditChangeRequestDialog } from "@components/operations/EditChangeRequestDialog";
 import { formatDate } from "@utils/dateTime";
+import { changeRequestApprovedReadOnlyReason } from "@src/types/changeRequest.model";
 
 export default function ChangeRequestDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -50,6 +51,7 @@ function ChangeRequestDetailContent({ id }: { id: string }) {
   const { data: cr } = useSuspenseQuery(changeRequests.get(id));
   const [editOpen, setEditOpen] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const readOnlyReason = changeRequestApprovedReadOnlyReason(cr.state);
   const [error, setError] = useState<string | null>(null);
 
   const handleSubmit: Parameters<typeof EditChangeRequestDialog>[0]["onSubmit"] = (fields) => {
@@ -83,10 +85,15 @@ function ChangeRequestDetailContent({ id }: { id: string }) {
           <Typography variant="subtitle2" color="text.secondary" noWrap>
             {cr.number}
           </Typography>
-          <Button size="small" variant="outlined" onClick={() => setEditOpen(true)}>
+          <Button size="small" variant="outlined" disabled={!!readOnlyReason} onClick={() => setEditOpen(true)}>
             Edit
           </Button>
         </Stack>
+        {readOnlyReason && (
+          <Typography variant="caption" color="text.secondary">
+            {readOnlyReason}
+          </Typography>
+        )}
 
         <Typography variant="h6">{cr.subject}</Typography>
 

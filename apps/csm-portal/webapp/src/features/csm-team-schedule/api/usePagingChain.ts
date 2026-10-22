@@ -32,7 +32,7 @@ import type {
   PagingPhone,
   PagingReadinessResponse,
 } from "../types";
-import { PAGING_TEST_POLL_MAX_MS, PAGING_TEST_POLL_MS } from "../utils/pagingPhone";
+import { lastTestOf, PAGING_TEST_POLL_MAX_MS, PAGING_TEST_POLL_MS } from "../utils/pagingPhone";
 
 /**
  * Case Paging: the system pages people about an incident tier by tier until
@@ -62,9 +62,10 @@ export function pagingPollInterval(
   let poll = false;
   const pendingIds = new Set<string>();
   for (const m of members) {
-    if (m.pagingPhone?.lastTestStatus !== "pending") continue;
+    const last = lastTestOf(m);
+    if (last.status !== "pending") continue;
     pendingIds.add(m.userId);
-    let started = m.pagingPhone.lastTestAt ? Date.parse(m.pagingPhone.lastTestAt) : NaN;
+    let started = last.at ? Date.parse(last.at) : NaN;
     if (Number.isNaN(started)) {
       started = firstSeen.get(m.userId) ?? now;
       firstSeen.set(m.userId, started);

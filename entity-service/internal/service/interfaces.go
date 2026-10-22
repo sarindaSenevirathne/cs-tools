@@ -130,7 +130,7 @@ type SavedFilterViewService interface {
 	Reorder(ctx context.Context, req domain.ReorderSavedFilterViewRequest) (domain.SavedFilterViewList, error)
 }
 
-// RunbookService manages the alert-name to runbook catalog (Operations > Runbooks).
+// RunbookService manages the runbook catalog (Operations > Runbooks): numbered, named runbook links and their alert names.
 type RunbookService interface {
 	List(ctx context.Context) (domain.RunbookList, error)
 	Create(ctx context.Context, req domain.SaveRunbookRequest) (domain.Runbook, error)
@@ -1192,14 +1192,12 @@ type ProductVulnerabilityService interface {
 	// GetVulnerabilityMeta returns the valid severity choices for product vulnerabilities.
 	GetVulnerabilityMeta(ctx context.Context) (domain.VulnerabilityMetaResponse, error)
 	// SyncProductVulnerabilities replaces the full set of product vulnerabilities with the
-	// given items. This is a full-replace sync: ServiceNow deletes any existing record whose
-	// WSO2ID is not present in items and upserts everything that is. Callers MUST submit the
-	// complete current set, never a partial delta, or downstream records will be deleted.
-	// Supported by the ServiceNow data source only: the full-replace semantics need a stable
-	// external join key with a database-enforced uniqueness guarantee to upsert against, and
-	// product_vulnerability has no UNIQUE constraint on any column other than its own
-	// generated id -- adding one is a schema change, out of scope here (see
-	// productVulnerabilityService.SyncProductVulnerabilities).
+	// given items. This is a full-replace sync: any existing record whose WSO2ID is not
+	// present in items is deleted and everything that is present is upserted. Callers MUST
+	// submit the complete current set, never a partial delta, or records will be deleted.
+	// An empty items list, an empty or duplicate WSO2ID, an over-length field or an
+	// unrecognised severity is a ValidationError and changes nothing. The Postgres data
+	// source applies the replace in one transaction; the ServiceNow data source delegates it.
 	SyncProductVulnerabilities(ctx context.Context, items []domain.ProductVulnerabilitySyncItem) (domain.ProductVulnerabilitySyncResult, error)
 }
 

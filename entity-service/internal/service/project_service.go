@@ -126,4 +126,3 @@ func (s *projectService) UpdateProjectConsumption(ctx context.Context, id string
 	}
 	return s.repo.UpdateProjectConsumption(ctx, id, req, updatedBy)
 }
-

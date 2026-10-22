@@ -55,7 +55,11 @@ vi.mock("@context/error-banner/ErrorBannerContext", () => ({
 
 // Defaults to an external (customer) caller, the normal customer portal user;
 // individual tests override this where internal behaviour matters.
-const useCustomerPermissionsMock = vi.fn(() => ({ isExternalUser: true }));
+const useCustomerPermissionsMock = vi.fn(() => ({
+  isExternalUser: true,
+  canCreateCase: true,
+  canUpdateCase: true,
+}));
 
 vi.mock("@hooks/useCustomerPermissions", () => ({
   useCustomerPermissions: () => useCustomerPermissionsMock(),
@@ -85,7 +89,11 @@ describe("CaseDetailsActionRow", () => {
     showSuccessMock.mockReset();
     showErrorMock.mockReset();
     useCustomerPermissionsMock.mockReset();
-    useCustomerPermissionsMock.mockReturnValue({ isExternalUser: true });
+    useCustomerPermissionsMock.mockReturnValue({
+      isExternalUser: true,
+      canCreateCase: true,
+      canUpdateCase: true,
+    });
   });
 
   it("should render Close action for open status when case can be patched", () => {
@@ -94,7 +102,11 @@ describe("CaseDetailsActionRow", () => {
   });
 
   it("closes with a plain confirm and sends no resolution fields for an external user", () => {
-    useCustomerPermissionsMock.mockReturnValue({ isExternalUser: true });
+    useCustomerPermissionsMock.mockReturnValue({
+      isExternalUser: true,
+      canCreateCase: true,
+      canUpdateCase: true,
+    });
     renderActionRow({ statusLabel: "Open" });
 
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
@@ -121,7 +133,11 @@ describe("CaseDetailsActionRow", () => {
 
   describe("internal users", () => {
     beforeEach(() => {
-      useCustomerPermissionsMock.mockReturnValue({ isExternalUser: false });
+      useCustomerPermissionsMock.mockReturnValue({
+        isExternalUser: false,
+        canCreateCase: true,
+        canUpdateCase: true,
+      });
     });
 
     it("disables Close and cannot open the confirm dialog", () => {
@@ -322,6 +338,41 @@ describe("CaseDetailsActionRow", () => {
       expect(
         screen.getByLabelText("Reason for rejecting the solution"),
       ).toBeInTheDocument();
+    });
+  });
+
+  describe("read-only (isReadOnly INTERNAL caller)", () => {
+    beforeEach(() => {
+      useCustomerPermissionsMock.mockReturnValue({
+        isExternalUser: false,
+        canCreateCase: false,
+        canUpdateCase: false,
+      });
+    });
+
+    it("renders no state-change actions", () => {
+      renderActionRow({ statusLabel: "Open" });
+      expect(
+        screen.queryByRole("button", { name: "Close" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("never shows the Escalate button even when otherwise eligible", () => {
+      renderActionRow({
+        statusLabel: "Open",
+        escalationLevelId: "0",
+        isCurrentUserLead: true,
+      });
+      expect(
+        screen.queryByRole("button", { name: "Escalate Case" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("never shows the De-escalate button even when escalated", () => {
+      renderActionRow({ statusLabel: "Open", isEscalated: true, canDeescalate: true });
+      expect(
+        screen.queryByRole("button", { name: "De-escalate Case" }),
+      ).not.toBeInTheDocument();
     });
   });
 });

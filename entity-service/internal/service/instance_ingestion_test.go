@@ -115,6 +115,21 @@ func TestInstanceIngestion_MetaIsTrimmedAndPassedOn(t *testing.T) {
 	}
 }
 
+// Products report a node id as a 64-character hash, not a dashed UUID, and the
+// column holds 128, so both must be accepted and only the 129th character refused.
+func TestInstanceIngestion_AcceptsHashSizedNodeIDs(t *testing.T) {
+	for _, n := range []int{64, 128} {
+		repo := &mockInstanceIngestionRepo{}
+		node := strings.Repeat("a", n)
+		if _, err := newTestIngestionService(repo).UpsertInstanceMeta(context.Background(), domain.InstanceMetaRequest{NodeID: node}); err != nil {
+			t.Errorf("a %d-character node id was rejected: %v", n, err)
+		}
+		if repo.nodeID != node {
+			t.Errorf("a %d-character node id did not reach the repository", n)
+		}
+	}
+}
+
 func TestInstanceIngestion_RejectsBeforeTheRepository(t *testing.T) {
 	long := func(n int) string { return strings.Repeat("x", n) }
 	ctx := context.Background()
@@ -128,9 +143,9 @@ func TestInstanceIngestion_RejectsBeforeTheRepository(t *testing.T) {
 			return err
 		}, "nodeId is required"},
 		{"node id too long", func(s InstanceIngestionService) error {
-			_, err := s.UpsertInstanceMeta(ctx, domain.InstanceMetaRequest{NodeID: long(37)})
+			_, err := s.UpsertInstanceMeta(ctx, domain.InstanceMetaRequest{NodeID: long(129)})
 			return err
-		}, "nodeId must be at most 36"},
+		}, "nodeId must be at most 128"},
 		{"deployment number too long", func(s InstanceIngestionService) error {
 			_, err := s.UpsertInstanceMeta(ctx, domain.InstanceMetaRequest{NodeID: "n", InstanceNodeMeta: domain.InstanceNodeMeta{DeploymentNumber: long(51)}})
 			return err

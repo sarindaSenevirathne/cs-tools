@@ -115,6 +115,8 @@ import {
   proposalPassedMessage,
   windowChangedMessage,
   projectFrozenMessage,
+  approvedReadOnlyMessage,
+  APPROVED_STATES,
   requirementCannotBeRemovedMessage,
   requirementGatePassedMessage,
   requirementNeedsProjectMessage,
@@ -1278,20 +1280,61 @@ test.describe("change request approval flow — editing the customer checkboxes"
     await expectStages(detail, "c p p p p p p p n p n", { approval: true, review: true });
   });
 
-  test("Customer Approval is disabled with an explanation once the CR is scheduled; Customer Review can still be added (the project is stored)", async ({
+  test("once the CR is scheduled (approved) both boxes are read-only with the notice, and only a work note can be added", async ({
     page,
   }) => {
-    await installFakeChangeRequestApi(page, "standard", FAKE_CREATOR, {}, ON_ACME);
+    const api = await installFakeChangeRequestApi(page, "standard", FAKE_CREATOR, {}, ON_ACME);
     const detail = new ChangeRequestDetailPage(page);
     await openDetail(detail);
     await detail.requestApproval();
     await expect(detail.currentStep()).toContainText("Scheduled");
 
     await detail.openEditDialog();
+    await expect(detail.editApprovedNotice()).toBeVisible();
     await expect(detail.editCustomerApprovalCheckbox()).toBeDisabled();
-    await expect(detail.editDialog().getByText(/locked/i).first()).toBeVisible();
-    await expect(detail.editCustomerReviewCheckbox()).toBeEnabled();
-    await expect(detail.editDialog().getByText(REQUIREMENT_ONCE_SAVED)).toBeVisible();
+    await expect(detail.editCustomerReviewCheckbox()).toBeDisabled();
+    await expect(detail.editDialog().getByText(REQUIREMENT_ONCE_SAVED)).toHaveCount(0);
+    // The API refuses what the dialog no longer offers, in the backend's words.
+    expect(await patchFromPage(page, { customerReviewRequired: true })).toEqual({
+      status: 400,
+      message: approvedReadOnlyMessage(["customerReviewRequired"], "scheduled"),
+    });
+    expect(api.flags().customerReviewRequired).toBe(false);
+  });
+
+  test("after the CAB approval every field is read-only, the implementation plan included, and a work note is all the form adds", async ({ page }) => {
+    const api = await installFakeChangeRequestApi(page, "normal", FAKE_CREATOR, {}, ON_ACME);
+    const detail = new ChangeRequestDetailPage(page);
+    await openDetail(detail);
+    api.setState("scheduled");
+    await page.reload();
+    await expect(detail.currentStep()).toContainText("Scheduled");
+
+    await detail.openEditDialog();
+    await expect(detail.editApprovedNotice()).toBeVisible();
+    await expect(detail.editDialog().getByRole("textbox", { name: /^subject/i })).toBeDisabled();
+    await expect(
+      detail.editDialog().getByRole("group", { name: /implementation plan/i }).locator("[contenteditable], textarea").first(),
+    ).not.toBeEditable();
+    await expect(detail.editDeploymentsField()).toBeDisabled();
+    await expect(detail.editCustomerApprovalCheckbox()).toBeDisabled();
+    await expect(detail.addWorkNoteButton()).toBeDisabled();
+
+    await detail.editWorkNoteField().fill("Implementation window confirmed with the on-call SRE.");
+    const [request] = await Promise.all([
+      page.waitForRequest((r) => r.method() === "PATCH" && r.url().endsWith(`/change-requests/${FAKE_CR_ID}`)),
+      detail.addWorkNoteButton().click(),
+    ]);
+    expect(request.postDataJSON()).toEqual({ workNote: "Implementation window confirmed with the on-call SRE." });
+    await expect(detail.editDialog()).toHaveCount(0);
+    expect(api.journal()).toContainEqual({ kind: "workNote", text: "Implementation window confirmed with the on-call SRE." });
+
+    // The API refuses an edit the form no longer offers, in the backend's words, and writes nothing of it.
+    expect(await patchFromPage(page, { implementationPlan: "<p>Something else</p>", workNote: "riding along" })).toEqual({
+      status: 400,
+      message: approvedReadOnlyMessage(["implementationPlan"], "scheduled"),
+    });
+    expect(api.journal().filter((e) => e.text === "riding along")).toHaveLength(0);
   });
 
   test("Customer Review is disabled once the CR has reached customer review", async ({ page }) => {
@@ -1326,13 +1369,16 @@ test.describe("change request approval flow — editing the customer checkboxes"
 });
 
 /** What the Edit dialog says about one customer requirement's box: enabled (and the line under it), or disabled with the reason. */
-type BoxRule = { enabled: true; says?: string } | { enabled: false; says: string };
+// A disabled box with no `says` is one only the approved-content lock disables: its line then names no lock of its own.
+type BoxRule = { enabled: true; says?: string } | { enabled: false; says?: string };
 const GATE_PASSED = (box: "approval" | "review") => `Locked: the change request has already reached the customer ${box} step or later.`;
 const OPEN = (): BoxRule => ({ enabled: true });
 const ADDABLE: BoxRule = { enabled: true, says: REQUIREMENT_ONCE_SAVED };
 const ADD_ONLY: BoxRule = { enabled: false, says: REQUIREMENT_ADD_ONLY_REASON };
 const NEEDS_PROJECT: BoxRule = { enabled: false, says: REQUIREMENT_NEEDS_PROJECT_REASON };
 const PASSED = (box: "approval" | "review"): BoxRule => ({ enabled: false, says: GATE_PASSED(box) });
+// Once approved every field is read-only (the notice above the form says why): a box no other rule locks is simply disabled.
+const APPROVED_READ_ONLY: BoxRule = { enabled: false };
 
 // The Edit dialog in EVERY state, against the fake of the backend (`api.setState` puts the change in the state out of band,
 // the dialog is opened on that stored state): the table of the lock, row by row, as the product owner decided it and as the
@@ -1354,11 +1400,11 @@ const DIALOG_TABLE: Array<{
   { state: "assess", approval: false, review: false, project: false, projectEditable: false, approvalBox: NEEDS_PROJECT, reviewBox: NEEDS_PROJECT },
   { state: "authorize", approval: false, review: false, project: true, projectEditable: false, approvalBox: ADDABLE, reviewBox: ADDABLE },
   { state: "authorize", approval: true, review: true, project: true, projectEditable: false, approvalBox: ADD_ONLY, reviewBox: ADD_ONLY },
-  { state: "customer_approval", approval: true, review: false, project: true, projectEditable: false, approvalBox: ADD_ONLY, reviewBox: ADDABLE },
-  { state: "scheduled", approval: false, review: false, project: true, projectEditable: false, approvalBox: PASSED("approval"), reviewBox: ADDABLE },
+  { state: "customer_approval", approval: true, review: false, project: true, projectEditable: false, approvalBox: ADD_ONLY, reviewBox: APPROVED_READ_ONLY },
+  { state: "scheduled", approval: false, review: false, project: true, projectEditable: false, approvalBox: PASSED("approval"), reviewBox: APPROVED_READ_ONLY },
   { state: "scheduled", approval: false, review: false, project: false, projectEditable: false, approvalBox: PASSED("approval"), reviewBox: NEEDS_PROJECT },
-  { state: "implement", approval: true, review: false, project: true, projectEditable: false, approvalBox: ADD_ONLY, reviewBox: ADDABLE },
-  { state: "review", approval: false, review: false, project: true, projectEditable: false, approvalBox: PASSED("approval"), reviewBox: ADDABLE },
+  { state: "implement", approval: true, review: false, project: true, projectEditable: false, approvalBox: ADD_ONLY, reviewBox: APPROVED_READ_ONLY },
+  { state: "review", approval: false, review: false, project: true, projectEditable: false, approvalBox: PASSED("approval"), reviewBox: APPROVED_READ_ONLY },
   { state: "review", approval: false, review: true, project: true, projectEditable: false, approvalBox: PASSED("approval"), reviewBox: ADD_ONLY },
   { state: "customer_review", approval: true, review: true, project: true, projectEditable: false, approvalBox: ADD_ONLY, reviewBox: ADD_ONLY },
   { state: "customer_review", approval: false, review: false, project: true, projectEditable: false, approvalBox: PASSED("approval"), reviewBox: PASSED("review") },
@@ -1385,6 +1431,9 @@ test.describe("change request approval flow — the Edit dialog follows the lock
       }
       await detail.openEditDialog();
 
+      // From the approval on, every field is read-only, under one notice.
+      if (APPROVED_STATES.includes(row.state)) await expect(detail.editApprovedNotice()).toBeVisible();
+      else await expect(detail.editApprovedNotice()).toHaveCount(0);
       if (row.projectEditable) {
         await expect(detail.editProjectField()).toBeEnabled();
         await expect(detail.editDialog().getByText(PROJECT_FROZEN_REASON)).toHaveCount(0);
@@ -1537,20 +1586,22 @@ test.describe("change request lifecycle — project and deployments (mocked back
     await page.reload();
     await expect(detail.currentStep()).toContainText("Scheduled");
 
-    // Still editable while Scheduled ...
+    // Approved: the scope (every field) is read-only from here on, with the reason ...
     await detail.openEditDialog();
-    await expect(detail.editDeploymentsField()).toBeEnabled();
+    await expect(detail.editApprovedNotice()).toBeVisible();
+    await expect(detail.editDialog().getByText(/can't be changed once the change request has been approved/i)).toBeVisible();
+    await expect(detail.editDeploymentsField()).toBeDisabled();
     await detail.editDialog().getByRole("button", { name: "Cancel" }).click();
 
     await page.getByRole("button", { name: "Start implementation" }).click();
     await expect(detail.currentStep()).toContainText("Implement");
 
-    // 5. ... and locked, with the reason, from Implement on. The detail still shows it.
+    // 5. ... and still, from Implement on. The detail still shows it; only a work note can be added.
     await detail.openEditDialog();
-    await expect(detail.editDialog().getByText(/can't be changed once implementation has started/i)).toBeVisible();
+    await expect(detail.editDialog().getByText(/can't be changed once the change request has been approved/i)).toBeVisible();
     await expect(detail.editProjectField()).toBeDisabled();
     await expect(detail.editDeploymentsField()).toBeDisabled();
-    await expect(detail.saveButton()).toBeDisabled();
+    await expect(detail.addWorkNoteButton()).toBeDisabled();
     await detail.editDialog().getByRole("button", { name: "Cancel" }).click();
     await expect(detail.overviewChips("Deployments")).toHaveText([ACME_PROD!.name]);
   });
@@ -4951,7 +5002,7 @@ test.describe("migrated (legacy) change requests in the CSM portal (real stack)"
     expect(await stateOf(id)).toBe("scheduled");
   });
 
-  test("a legacy change request in Scheduled with its flags false and a Customer Project: the Edit dialog freezes the project, closes the approval box (its gate is passed) and still lets the review box be added", async ({ page }) => {
+  test("a legacy change request in Scheduled with its flags false and a Customer Project: the Edit dialog freezes the project and, the change being approved, every field: the review box can no longer be added", async ({ page }) => {
     await pictureWindow(page);
     const detail = new ChangeRequestDetailPage(page);
     await detail.goto(legacyId("CHG0039105"));
@@ -4961,16 +5012,14 @@ test.describe("migrated (legacy) change requests in the CSM portal (real stack)"
     await expect(detail.editDialog().getByText(PROJECT_FROZEN_REASON)).toBeVisible();
     await expect(detail.editCustomerApprovalCheckbox()).toBeDisabled();
     await expect(detail.editDialog().getByText(/^Locked: the change request has already reached the customer approval step or later\./)).toBeVisible();
-    await expect(detail.editCustomerReviewCheckbox()).toBeEnabled();
-    await expect(detail.editDialog().getByText(REQUIREMENT_ONCE_SAVED)).toBeVisible();
+    await expect(detail.editApprovedNotice()).toBeVisible();
+    await expect(detail.editCustomerReviewCheckbox()).toBeDisabled();
     await shotTo(page, "32-csm-legacy-scheduled-edit-dialog");
-    await detail.editCustomerReviewCheckbox().check();
-    await detail.saveEdit();
-    await expect(detail.editDialog()).toHaveCount(0);
-    expect((await staff("jane").get(legacyId("CHG0039105"))).body.customerReviewRequired).toBe(true);
-    // ...and then it stays: add-only holds for a migrated row exactly as for a native one.
-    const untick = await staff("jane").patch(legacyId("CHG0039105"), { customerReviewRequired: false });
-    expect(untick.status).toBe(400);
+    // The real API says the same: an approved change takes no new requirement, migrated or native.
+    const tick = await staff("jane").patch(legacyId("CHG0039105"), { customerReviewRequired: true });
+    expect(tick.status).toBe(400);
+    expect(tick.body.message).toBe(approvedReadOnlyMessage(["customerReviewRequired"], "scheduled"));
+    expect((await staff("jane").get(legacyId("CHG0039105"))).body.customerReviewRequired).toBe(false);
   });
 });
 

@@ -69,7 +69,7 @@ func doPatchMe(h *UserHandler, body string) *httptest.ResponseRecorder {
 }
 
 func newPatchHandler(rec *patchRecorder, scimResult *string, scimErr error) *UserHandler {
-	return NewUserHandler(&patchEntityClient{rec: rec}, &patchSCIMClient{rec: rec, result: scimResult, err: scimErr}, false)
+	return NewUserHandler(&patchEntityClient{rec: rec}, &patchSCIMClient{rec: rec, result: scimResult, err: scimErr}, false, nil)
 }
 
 func TestPatchMe_PhoneGoesToSCIMThenEntity(t *testing.T) {

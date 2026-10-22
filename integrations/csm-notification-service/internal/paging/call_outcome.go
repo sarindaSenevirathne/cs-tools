@@ -32,9 +32,10 @@ import (
 // it, nothing more. Whether the phone rang, was answered, was busy or failed
 // is only in Twilio's console -- this service sets no StatusCallback, and
 // could not take one: its only route is /health and it is visible to the
-// organization alone. So, opt-in, a goroutine on the server's context asks
-// Twilio how each placed call ended (TwilioClient.GetCall), the way a
-// paging-number test call already does (testcall.go), and logs one line:
+// organization alone. So, unless ALERTING_CALL_OUTCOME_CHECK is "false", a
+// goroutine on the server's context asks Twilio how each placed call ended
+// (TwilioClient.GetCall), the way a paging-number test call already does
+// (testcall.go), and logs one line:
 //
 //	escalation: call outcome  incidentId=... level=LEVEL_0 attempt=1
 //	    recipientId=... callSid=CA... result=no-answer twilioStatus=no-answer

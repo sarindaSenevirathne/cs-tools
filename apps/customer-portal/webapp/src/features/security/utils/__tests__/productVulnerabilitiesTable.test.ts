@@ -16,8 +16,10 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  buildProductVulnerabilitiesSearchRequest,
   countProductVulnerabilityTableActiveFilters,
   formatProductVulnerabilitiesClearFiltersLabel,
+  toSeverityFilterId,
 } from "@features/security/utils/productVulnerabilitiesTable";
 
 describe("productVulnerabilitiesTable utils", () => {
@@ -36,5 +38,37 @@ describe("productVulnerabilitiesTable utils", () => {
     expect(formatProductVulnerabilitiesClearFiltersLabel(3)).toBe(
       "Clear Filters (3)",
     );
+  });
+
+  it("converts the severity select value to a number and guards NaN", () => {
+    expect(toSeverityFilterId("4")).toBe(4);
+    expect(toSeverityFilterId(3)).toBe(3);
+    expect(toSeverityFilterId("")).toBeUndefined();
+    expect(toSeverityFilterId(undefined)).toBeUndefined();
+    expect(toSeverityFilterId("critical")).toBeUndefined();
+  });
+
+  it("builds a paged request that omits empty filters", () => {
+    expect(buildProductVulnerabilitiesSearchRequest("", {}, 0, 10)).toEqual({
+      filters: {},
+      pagination: { offset: 0, limit: 10 },
+    });
+    expect(
+      buildProductVulnerabilitiesSearchRequest(
+        "  log4j ",
+        { severityId: "4", productName: "product-a", productVersion: "" },
+        3,
+        25,
+      ),
+    ).toEqual({
+      filters: { searchQuery: "log4j", severityId: 4, productName: "product-a" },
+      pagination: { offset: 75, limit: 25 },
+    });
+  });
+
+  it("never requests more than 50 rows and drops a non-numeric severity", () => {
+    expect(
+      buildProductVulnerabilitiesSearchRequest("", { severityId: "x" }, 2, 500),
+    ).toEqual({ filters: {}, pagination: { offset: 100, limit: 50 } });
   });
 });

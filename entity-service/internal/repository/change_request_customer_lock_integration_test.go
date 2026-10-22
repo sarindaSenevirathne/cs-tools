@@ -75,6 +75,27 @@ func lockDeref(s *string) string {
 	return *s
 }
 
+// holdReasonOf reads change_request.on_hold_reason ("" when NULL): the field these
+// tests send beside the one under test as "the rest of the request". It is not one
+// the approved-content lock judges, so it can go through in every state; the title
+// used to be the carrier, but a title is read-only once the change is approved.
+func approvedState(state string) bool {
+	switch state {
+	case "CUSTOMER_APPROVAL", "SCHEDULED", "IMPLEMENT", "REVIEW", "CUSTOMER_REVIEW", "CLOSED", "ROLLBACK":
+		return true
+	}
+	return false
+}
+
+func (f *crFlow) holdReasonOf(id string) string {
+	f.t.Helper()
+	var s string
+	if err := f.scoped.QueryRow(f.sys, `SELECT COALESCE(on_hold_reason, '') FROM change_request WHERE id = $1`, id).Scan(&s); err != nil {
+		f.t.Fatalf("read on_hold_reason: %v", err)
+	}
+	return s
+}
+
 func (f *crFlow) subjectOf(id string) string {
 	f.t.Helper()
 	var s string
@@ -166,10 +187,10 @@ func TestChangeRequestLockIntegration_ProjectIsFrozenAfterRequestApproval(t *tes
 		f.wantValidationError("a project-only move in "+state, err, lockMsgFrozen)
 
 		// The stored value resent is an accepted no-op, with other fields along.
-		if _, err := f.patch(withProject, domain.PatchChangeRequestRequest{ProjectID: sp(crScopeProjectA), Title: sp("renamed in " + state)}); err != nil {
+		if _, err := f.patch(withProject, domain.PatchChangeRequestRequest{ProjectID: sp(crScopeProjectA), OnHoldReason: sp("noted in " + state)}); err != nil {
 			t.Fatalf("%s: resending the stored project: %v", state, err)
 		}
-		if got := f.subjectOf(withProject); got != "renamed in "+state {
+		if got := f.holdReasonOf(withProject); got != "noted in "+state {
 			t.Fatalf("%s: the resend did not write the rest of the PATCH: %q", state, got)
 		}
 
@@ -225,6 +246,7 @@ func TestChangeRequestLockIntegration_BoxesAreAddOnlyAfterNew(t *testing.T) {
 		"off":           lockMsgTurnOff,
 		"needs-project": lockMsgNeedsProject,
 		"gate":          "can no longer be changed: the change request has already",
+		"approved":      "can no longer be changed: the change request has been approved",
 	}
 	f := newCustomerGroupFlow(t)
 	for state, w := range want {
@@ -238,9 +260,15 @@ func TestChangeRequestLockIntegration_BoxesAreAddOnlyAfterNew(t *testing.T) {
 				req = domain.PatchChangeRequestRequest{CustomerReviewRequired: &value}
 				name = "customerReviewRequired"
 			}
-			req.Title = sp("must not be written")
+			req.OnHoldReason = sp("must not be written")
 			_, err := f.patch(id, req)
 			label := fmt.Sprintf("%s %s=%v (project %v, was %v)", state, name, value, project != nil, ticked)
+			// Past the approval every field is read-only (change_request_approved_lock.go),
+			// the boxes included: what the customer lock alone would let through is refused
+			// there, while what it refuses keeps its own words (it is judged first).
+			if outcome == "ok" && value != ticked && approvedState(state) {
+				outcome = "approved"
+			}
 			if outcome == "ok" {
 				if err != nil {
 					t.Fatalf("%s: %v", label, err)
@@ -256,7 +284,7 @@ func TestChangeRequestLockIntegration_BoxesAreAddOnlyAfterNew(t *testing.T) {
 			if a != ticked || r != ticked {
 				t.Fatalf("%s: a refused PATCH changed the boxes to %v/%v", label, a, r)
 			}
-			if got := f.subjectOf(id); got != crFlowSubject {
+			if got := f.holdReasonOf(id); got != "" {
 				t.Fatalf("%s: a refused PATCH wrote the rest of the request: %q", label, got)
 			}
 		}

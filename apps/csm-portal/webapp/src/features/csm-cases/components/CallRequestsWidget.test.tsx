@@ -82,6 +82,15 @@ describe("CallRequestsWidget: Mark as completed", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
+  it("shows an empty meeting-link placeholder on a scheduled call", () => {
+    hooks.requests = [
+      call("a", 2, "Pending on WSO2"),
+      call("b", 3, "Scheduled"),
+    ];
+    renderWidget();
+    expect(screen.getAllByText("Meeting link: --")).toHaveLength(1);
+  });
+
   it("is offered on scheduled and notes-pending calls only", () => {
     hooks.requests = [
       call("a", 2, "Pending on WSO2"),

@@ -217,8 +217,9 @@ rejects a body with no JSON object); the `{id}` in the versions path must be a U
 
 **One deliberate deviation from "bytes through":** each response's enum-valued
 field is upper-cased here, without changing entity-service — product `class`,
-version `currentSupportStatus`, deployment `type`, and deployed-product
-`category` (`upperEnumFields`).
+version `currentSupportStatus`, deployment `type`, and a deployed product's
+`category` and `deployment.type` (`upperEnumFields`; a dotted name reaches into a
+nested object).
 Everything else is kept exactly as received, including member order and number
 text — only those string values are rewritten in place. A body that is not a
 single JSON object (null, another type, or trailing data) is a 500. Request

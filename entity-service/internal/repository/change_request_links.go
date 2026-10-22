@@ -57,10 +57,12 @@ const maxChangeRequestLinkIDs = 100
 
 // changeRequestLinksLockedStates are the states from which a change request's
 // project, deployments, environments and deployment products can no longer be
-// changed: implementation has started (or the change is over), so the scope the
-// change was approved for is fixed. New .. Scheduled (and a legacy NULL state)
-// are the edit window.
+// changed: the change has been approved (change_request_approved_lock.go: CAB
+// approval received, or a Standard change scheduled), or it is over, so the scope
+// the change was approved for is fixed. New, Assess and Authorize (and a legacy
+// NULL state) are the edit window.
 var changeRequestLinksLockedStates = map[string]bool{
+	"CUSTOMER_APPROVAL": true, "SCHEDULED": true,
 	"IMPLEMENT": true, "REVIEW": true, "CUSTOMER_REVIEW": true,
 	"ROLLBACK": true, "CLOSED": true, "CANCELED": true,
 }
@@ -637,7 +639,7 @@ func planChangeRequestLinks(ctx context.Context, tx pgx.Tx, id string, req domai
 		changedField = "deploymentProductIds"
 	}
 	if changedField != "" && changeRequestLinksLockedStates[snap.state] {
-		return nil, linkValidationf("%s can no longer be changed: the change request is in state %q (project, deployments and deployment products are editable only before implementation starts)",
+		return nil, linkValidationf("%s can no longer be changed: the change request is in state %q (project, deployments and deployment products are editable only until the change request is approved)",
 			changedField, strings.ToLower(snap.state))
 	}
 

@@ -54,15 +54,11 @@ const (
 	ResolvedViaNone            ResolvedVia = "none"
 )
 
-// businessContactRole is the Roles value that marks a project's Business
-// Contact. Project roles come from the CSM Postgres database (copied from
-// Salesforce), as upper-case enum labels in the contacts search's "roles"
-// field: confirmed against a live csm-integration-service v1.1 response on
-// 2026-10-01. csm-integration-service v1.0 (ServiceNow) doesn't return
-// project roles at all, only ServiceNow access roles such as
-// sn_customerservice.customer, so on v1.0 no contact matches and the
-// Primary Contact fallback is used.
-const businessContactRole = "BUSINESS_CONTACT"
+// BusinessContactRole is the Roles value that marks a project's Business
+// Contact, CSM's upper-case project role label. Salesforce labels the same
+// role "Business Contact"; the sweep's Salesforce reader maps it to this
+// value, so the rule below reads one vocabulary whichever source fed it.
+const BusinessContactRole = "BUSINESS_CONTACT"
 
 // Resolution is the outcome of resolving who should receive a project's
 // customer-facing ACP notice. NeedsAMNudge signals a *different* email (a
@@ -163,7 +159,7 @@ func businessContacts(projectContacts []ProjectContact) []Contact {
 
 func hasBusinessContactRole(c ProjectContact) bool {
 	for _, r := range c.Roles {
-		if r == businessContactRole {
+		if r == BusinessContactRole {
 			return true
 		}
 	}

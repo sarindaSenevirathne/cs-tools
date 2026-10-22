@@ -15,7 +15,7 @@
 // under the License.
 
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider, createTheme } from "@wso2/oxygen-ui";
 import ActivityCommentInput from "@case-details-activity/ActivityCommentInput";
 import { ErrorBannerProvider } from "@context/error-banner/ErrorBannerContext";
@@ -46,6 +46,15 @@ vi.mock("@asgardeo/react", () => ({
     isSignedIn: true,
     isLoading: false,
   })),
+}));
+
+const useCustomerPermissionsMock = vi.fn(() => ({
+  canCreateCase: true,
+  isLoading: false,
+}));
+
+vi.mock("@hooks/useCustomerPermissions", () => ({
+  useCustomerPermissions: () => useCustomerPermissionsMock(),
 }));
 
 // Stub the real (Lexical) editor with a plain textarea so tests can drive
@@ -82,6 +91,14 @@ function renderInput(caseId = "case-001") {
 }
 
 describe("ActivityCommentInput", () => {
+  beforeEach(() => {
+    useCustomerPermissionsMock.mockReset();
+    useCustomerPermissionsMock.mockReturnValue({
+      canCreateCase: true,
+      isLoading: false,
+    });
+  });
+
   it("should render editor and send button", () => {
     renderInput();
     expect(screen.getByTestId("case-description-editor")).toBeInTheDocument();
@@ -114,5 +131,23 @@ describe("ActivityCommentInput", () => {
     expect(
       await screen.findByText(/upload large images as attachments instead/i),
     ).toBeInTheDocument();
+  });
+
+  it("renders nothing for a read-only (isReadOnly INTERNAL) caller", () => {
+    useCustomerPermissionsMock.mockReturnValue({
+      canCreateCase: false,
+      isLoading: false,
+    });
+    const { container } = renderInput();
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("renders nothing while permissions are still loading", () => {
+    useCustomerPermissionsMock.mockReturnValue({
+      canCreateCase: true,
+      isLoading: true,
+    });
+    const { container } = renderInput();
+    expect(container).toBeEmptyDOMElement();
   });
 });

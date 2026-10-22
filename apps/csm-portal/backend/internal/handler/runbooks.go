@@ -32,7 +32,7 @@ import (
 const (
 	// maxRunbookImportEntries mirrors entity-service's own cap so an oversized import is refused here first.
 	maxRunbookImportEntries = 5000
-	// maxRunbookImportBodyBytes matches entity-service's import limit: 5000 entries with the longest alert name and link fit.
+	// maxRunbookImportBodyBytes matches entity-service's import limit: 5000 single-alert entries with the longest alert name and link fit.
 	maxRunbookImportBodyBytes = 32 << 20
 )
 
@@ -56,8 +56,19 @@ func NewRunbookHandler(entity entityRunbookClient) *RunbookHandler {
 }
 
 type runbookBody struct {
-	AlertName  string  `json:"alertName"`
-	RunbookURL *string `json:"runbookUrl"`
+	Name       string   `json:"name,omitempty"`
+	RunbookURL *string  `json:"runbookUrl"`
+	Alerts     []string `json:"alerts"`
+}
+
+// hasAlert reports whether the runbook has at least one alert name.
+func (b runbookBody) hasAlert() bool {
+	for _, a := range b.Alerts {
+		if strings.TrimSpace(a) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // ListRunbooks handles GET /runbooks.
@@ -134,12 +145,12 @@ func (h *RunbookHandler) ImportRunbooks(w http.ResponseWriter, r *http.Request) 
 		Runbooks []runbookBody `json:"runbooks"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil || len(req.Runbooks) == 0 || len(req.Runbooks) > maxRunbookImportEntries {
-		writeError(w, http.StatusBadRequest, "Send between 1 and 5000 runbooks, each with an alert name.")
+		writeError(w, http.StatusBadRequest, "Send between 1 and 5000 runbooks.")
 		return
 	}
 	for _, rb := range req.Runbooks {
-		if strings.TrimSpace(rb.AlertName) == "" {
-			writeError(w, http.StatusBadRequest, "Every runbook needs an alert name.")
+		if !rb.hasAlert() {
+			writeError(w, http.StatusBadRequest, "Every runbook needs at least one alert name.")
 			return
 		}
 	}
@@ -155,8 +166,8 @@ func readRunbookBody(w http.ResponseWriter, r *http.Request) ([]byte, string, bo
 		return nil, "", false
 	}
 	var req runbookBody
-	if err := json.Unmarshal(body, &req); err != nil || strings.TrimSpace(req.AlertName) == "" {
-		writeError(w, http.StatusBadRequest, "Send an alert name and, optionally, a runbook link.")
+	if err := json.Unmarshal(body, &req); err != nil || strings.TrimSpace(req.Name) == "" || !req.hasAlert() {
+		writeError(w, http.StatusBadRequest, "Send a name, at least one alert name and, optionally, a runbook link.")
 		return nil, "", false
 	}
 	return mustJSON(req), callerID, true

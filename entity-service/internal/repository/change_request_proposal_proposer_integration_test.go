@@ -283,7 +283,10 @@ func TestChangeRequestProposalIntegration_AGenuineProposalAfterAnUnrelatedStaffE
 		{"a work note", patchAs(domain.PatchChangeRequestRequest{WorkNote: sp("looking at it")})},
 		{"an additional note", patchAs(domain.PatchChangeRequestRequest{Comment: sp("we will get back to you")})},
 		{"the hold on and off", patchAs(domain.PatchChangeRequestRequest{OnHold: boolp(true), OnHoldReason: sp("freeze")}, domain.PatchChangeRequestRequest{OnHold: boolp(false)})},
-		{"an engineer assigned", patchAs(domain.PatchChangeRequestRequest{AssignedEngineerID: sp(crFlowPeerAID)})},
+		// In Customer Approval the change has been approved, so its fields are read-only
+		// (an engineer can no longer be assigned); a whole-form resend still goes through
+		// and still replaces the last writer.
+		{"a whole-form resend", patchAs(domain.PatchChangeRequestRequest{Title: sp(crFlowSubject)})},
 	}
 	for _, withParent := range []bool{false, true} {
 		withParent := withParent
