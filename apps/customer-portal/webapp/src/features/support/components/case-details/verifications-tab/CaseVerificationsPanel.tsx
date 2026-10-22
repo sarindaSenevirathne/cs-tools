@@ -121,7 +121,12 @@ function buildTimelineEvents(records: PendingVerificationView[]): VerificationTi
         key: `${record.id}-verified`,
         type: "verified",
         timestamp: record.verifiedAt,
-        actorEmail: record.verifiedBy ?? record.addedBy,
+        // verified_by is DB-guaranteed non-null whenever verified_on is set
+        // (chk_verified_by_matches_verified_on), so this fallback should
+        // never actually fire -- it only guards against misattributing the
+        // verification to whoever added the round if that invariant were
+        // ever violated.
+        actorEmail: record.verifiedBy ?? "Unknown verifier",
         addedAt: record.addedAt,
       });
     }
