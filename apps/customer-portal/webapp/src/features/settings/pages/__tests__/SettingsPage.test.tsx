@@ -15,7 +15,7 @@
 // under the License.
 
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import SettingsPage from "@features/settings/pages/SettingsPage";
 
 const useParamsMock = vi.fn();
@@ -28,7 +28,18 @@ vi.mock("react-router", () => ({
 }));
 
 vi.mock("@components/tab-bar/TabBar", () => ({
-  default: ({ activeTab }: { activeTab: string }) => <div>tab:{activeTab}</div>,
+  default: ({
+    activeTab,
+    tabs,
+  }: {
+    activeTab: string;
+    tabs: Array<{ id: string }>;
+  }) => (
+    <div>
+      <div>tab:{activeTab}</div>
+      <div>tabs:{tabs.map((t) => t.id).join(",")}</div>
+    </div>
+  ),
 }));
 
 vi.mock("@features/settings/components/SettingsAiAssistant", () => ({
@@ -41,6 +52,10 @@ vi.mock("@features/settings/components/SettingsUserManagement", () => ({
 
 vi.mock("@features/settings/components/SettingsRegistryTokens", () => ({
   default: () => <div>registry-settings</div>,
+}));
+
+vi.mock("@features/settings/components/SettingsVerification", () => ({
+  default: () => <div>verification-settings</div>,
 }));
 
 vi.mock("@features/settings/api/useGetUserDetails", () => ({
@@ -78,6 +93,59 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
     expect(screen.getByText("user-management")).toBeInTheDocument();
+  });
+
+  describe("CUSTOMER_PORTAL_ALLOW_PENDING_VERIFICATION_SETTINGS kill switch", () => {
+    afterEach(() => {
+      window.config = {
+        ...window.config,
+        CUSTOMER_PORTAL_ALLOW_PENDING_VERIFICATION_SETTINGS: undefined,
+      };
+    });
+
+    it("shows the Pending Verification tab and renders it when enabled (default)", () => {
+      useParamsMock.mockReturnValue({ projectId: "p-1" });
+      useGetUserDetailsMock.mockReturnValue({ data: { roles: [] } });
+      useGetProjectDetailsMock.mockReturnValue({ data: {} });
+      consumePendingSettingsTabMock.mockReturnValue("verification");
+
+      render(<SettingsPage />);
+
+      expect(screen.getByText(/tabs:.*verification/)).toBeInTheDocument();
+      expect(screen.getByText("verification-settings")).toBeInTheDocument();
+    });
+
+    it("hides the tab from the tab bar when explicitly disabled", () => {
+      window.config = {
+        ...window.config,
+        CUSTOMER_PORTAL_ALLOW_PENDING_VERIFICATION_SETTINGS: false,
+      };
+      useParamsMock.mockReturnValue({ projectId: "p-1" });
+      useGetUserDetailsMock.mockReturnValue({ data: { roles: [] } });
+      useGetProjectDetailsMock.mockReturnValue({ data: {} });
+      consumePendingSettingsTabMock.mockReturnValue(null);
+
+      render(<SettingsPage />);
+
+      const tabsLine = screen.getByText(/^tabs:/);
+      expect(tabsLine.textContent).not.toContain("verification");
+    });
+
+    it("redirects a stored/deep-linked verification tab to User Management when disabled", () => {
+      window.config = {
+        ...window.config,
+        CUSTOMER_PORTAL_ALLOW_PENDING_VERIFICATION_SETTINGS: false,
+      };
+      useParamsMock.mockReturnValue({ projectId: "p-1" });
+      useGetUserDetailsMock.mockReturnValue({ data: { roles: [] } });
+      useGetProjectDetailsMock.mockReturnValue({ data: {} });
+      consumePendingSettingsTabMock.mockReturnValue("verification");
+
+      render(<SettingsPage />);
+
+      expect(screen.queryByText("verification-settings")).not.toBeInTheDocument();
+      expect(screen.getByText("user-management")).toBeInTheDocument();
+    });
   });
 });
 

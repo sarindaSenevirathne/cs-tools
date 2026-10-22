@@ -63,6 +63,12 @@ export interface CustomerPortalWindowConfig {
    */
   CUSTOMER_PORTAL_ALLOW_DEPLOYMENT_SETUP_DURING_CASE_CREATION?: boolean;
   /**
+   * Kill switch for the Pending Verification settings tab, hidden until the
+   * auto-closure scheduler integration is deployed. Default ON when unset —
+   * flip to false to hide the tab.
+   */
+  CUSTOMER_PORTAL_ALLOW_PENDING_VERIFICATION_SETTINGS?: boolean;
+  /**
    * Base URL of customer-portal-activity-stream-service, the case-activity
    * SSE stream. A separate Choreo component from the main backend, so this
    * is its own key rather than being derived from

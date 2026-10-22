@@ -298,6 +298,16 @@ window.config = {
   //           alert or CTA, and the form is never blocked on empty options.
   CUSTOMER_PORTAL_ALLOW_DEPLOYMENT_SETUP_DURING_CASE_CREATION: true,
 
+  // ── Pending Verification settings tab ───────────────────────────────────────
+  //
+  // CUSTOMER_PORTAL_ALLOW_PENDING_VERIFICATION_SETTINGS  (optional — default: true)
+  //   Kill switch for the "Pending Verification" tab on the project Settings
+  //   page (where customers enable/disable the feature for their project).
+  //   true  – tab shown (default when this key is omitted).
+  //   false – tab hidden entirely; a stored/deep-linked tab selection of
+  //           "verification" falls back to User Management instead.
+  CUSTOMER_PORTAL_ALLOW_PENDING_VERIFICATION_SETTINGS: true,
+
   // ── Case-activity live stream (SSE) ─────────────────────────────────────────
   //
   // CUSTOMER_PORTAL_STREAM_BASE_URL  (optional)

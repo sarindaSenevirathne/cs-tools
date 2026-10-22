@@ -20,6 +20,7 @@ import { useState, useMemo, useEffect, type JSX } from "react";
 import useGetUserDetails from "@features/settings/api/useGetUserDetails";
 import useGetProjectDetails from "@api/useGetProjectDetails";
 import useCustomerPermissions, { normalizeCustomerRoles } from "@hooks/useCustomerPermissions";
+import { isPendingVerificationSettingsEnabled } from "@config/pendingVerificationSettingsConfig";
 import TabBar from "@components/tab-bar/TabBar";
 import SettingsAiAssistant from "@features/settings/components/SettingsAiAssistant";
 import SettingsVerification from "@features/settings/components/SettingsVerification";
@@ -84,25 +85,37 @@ export default function SettingsPage(): JSX.Element {
     );
   }, [projectDetails?.type?.label]);
 
-  const tabs = useMemo(
-    () =>
-      hideRestrictedTabs
-        ? SETTINGS_PAGE_TABS.filter(
-            (tab) => tab.id !== SettingsPageTabId.REGISTRY_TOKENS,
-          )
-        : [...SETTINGS_PAGE_TABS],
-    [hideRestrictedTabs],
+  // Kill switch for the Pending Verification tab, hidden until the
+  // auto-closure scheduler integration is deployed -- see
+  // isPendingVerificationSettingsEnabled's own doc comment.
+  const isVerificationSettingsEnabled = useMemo(
+    () => isPendingVerificationSettingsEnabled(),
+    [],
   );
 
+  const tabs = useMemo(() => {
+    let result: Array<(typeof SETTINGS_PAGE_TABS)[number]> = [
+      ...SETTINGS_PAGE_TABS,
+    ];
+    if (hideRestrictedTabs) {
+      result = result.filter((tab) => tab.id !== SettingsPageTabId.REGISTRY_TOKENS);
+    }
+    if (!isVerificationSettingsEnabled) {
+      result = result.filter((tab) => tab.id !== SettingsPageTabId.VERIFICATION);
+    }
+    return result;
+  }, [hideRestrictedTabs, isVerificationSettingsEnabled]);
+
   const safeActiveTab = useMemo(() => {
-    if (
-      hideRestrictedTabs &&
-      resolveSettingsPageTabId(activeTab) === SettingsPageTabId.REGISTRY_TOKENS
-    ) {
+    const resolved = resolveSettingsPageTabId(activeTab);
+    if (hideRestrictedTabs && resolved === SettingsPageTabId.REGISTRY_TOKENS) {
       return SettingsPageTabId.AI;
     }
+    if (!isVerificationSettingsEnabled && resolved === SettingsPageTabId.VERIFICATION) {
+      return SettingsPageTabId.USERS;
+    }
     return activeTab;
-  }, [activeTab, hideRestrictedTabs]);
+  }, [activeTab, hideRestrictedTabs, isVerificationSettingsEnabled]);
 
   const displayTab = useMemo(
     () => resolveSettingsPageTabId(safeActiveTab),
